@@ -1,0 +1,41 @@
+{
+  "name": "@conductor/mcp-ado",
+  "version": "1.0.0",
+  "description": "MCP server exposing Azure DevOps PR/iteration/comment tools (ado.get_pr, ado.list_pr_comments, ado.comment_pr, ado.list_iterations, ado.get_pr_status) to Conductor recipes. Wraps the ADO REST API; auth via ADO_BEARER_TOKEN (AAD, preferred) or ADO_PAT (basic-auth fallback). Default org/project resolved from ADO_ORG / ADO_PROJECT env vars when not supplied per-call.",
+  "type": "module",
+  "bin": {
+    "conductor-mcp-ado": "./src/index.ts"
+  },
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.4.0"
+  },
+  "license": "MIT",
+  "keywords": [
+    "mcp",
+    "azure-devops",
+    "ado",
+    "conductor",
+    "pull-request"
+  ]
+}

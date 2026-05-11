@@ -1,0 +1,128 @@
+# Conductor plugin manifest. See spec §10.2.
+#
+# This manifest is the single source of truth for what the plugin ships.
+# Conductor reads it at boot (and on file-watcher events) and registers
+# every entry under `provides` into the appropriate runtime scope.
+#
+# Files referenced below are relative to this manifest's directory. The
+# validator rejects path-escape attempts (`..`) and ids that collide
+# within the same `provides` list.
+
+id: ado
+name: "Azure DevOps"
+version: "1.0.0"
+description: >
+  Recipes, skills, trigger types, and hostable tools for working with
+  Azure DevOps pull requests, comments, and iterations. Bundles three
+  trigger types: a cold "new PR watcher", a hot "comment watcher", and
+  a mixed-mode "PR pulse watcher". All three are capabilities — agents
+  register concrete instances via `trigger.register` with the params
+  the type declares.
+
+author: "Conductor team"
+license: "MIT"
+homepage: "https://github.com/conductor/plugin-ado"
+
+provides:
+  skills:
+    - { id: analyze-pr-comment,   file: skills/analyze-pr-comment.md }
+    - { id: summarize-pr-changes, file: skills/summarize-pr-changes.md }
+
+  recipes:
+    - { id: pr-review,             file: recipes/pr-review.yaml }
+    - { id: respond-to-pr-comment, file: recipes/respond-to-pr-comment.yaml }
+
+  # Trigger TYPES — capabilities, not instances (spec §8.2).
+  # Each type declares its parameter schema, default cron (optional), and
+  # callback binding. Agents activate a type by calling:
+  #   trigger.register({ type_id: 'ado.new-pr-watcher', params: { repo: 'auth-svc' } })
+  # which mints a registered-trigger row in `.conductor/triggers.json`.
+  trigger_types:
+    # ---- Cold trigger — poll for new PRs and start a review for each ----
+    - id: ado.new-pr-watcher
+      file: triggers/ado-new-pr-watcher.ts
+      description: >
+        Detect new PRs in a repo; start a pr-review thread for each via
+        callback. Cold trigger — ticks on the default cron schedule whether
+        or not any pr-review threads are live. Self-state tracks
+        lastCheckedAt per registration.
+      binds_callback_to_recipe: pr-review
+      default_cron: "*/5 * * * *"
+      identity_param: repo
+      parameters:
+        - { name: repo,           type: string,  required: true,
+            description: "ADO repo name to watch for new PRs." }
+        - { name: assigned_to,    type: string,  required: false,
+            description: "Filter to PRs assigned to this user (uniqueName)." }
+        - { name: opened_by,      type: string,  required: false,
+            description: "Filter to PRs opened by this user; useful to exclude self-authored PRs." }
+        - { name: include_drafts, type: boolean, required: false, default: false,
+            description: "If false (default), drafts are skipped." }
+
+    # ---- Hot trigger — watch one PR's comments while a thread is alive ----
+    - id: ado.comment-watcher
+      file: triggers/ado-comment-watcher.ts
+      description: >
+        Wake an existing thread on new PR comments. Hot trigger — registered
+        per-thread by the pr-review recipe; auto-unregistered when the
+        subscriber thread terminates.
+      binds_callback_to: thread_resume
+      default_cron: "*/30 * * * * *"
+      identity_param: pr_id
+      parameters:
+        - { name: repo,      type: string,  required: true,
+            description: "ADO repo name containing the PR." }
+        - { name: pr_id,     type: integer, required: true,
+            description: "PR id to watch comments on." }
+        - { name: self_user, type: string,  required: false,
+            description: "Filter out comments authored by this user to avoid reply loops." }
+
+    # ---- Mixed Mode A+B trigger — long-running pulse watcher ----
+    - id: ado.pr-pulse-watcher
+      file: triggers/ado-pr-pulse-watcher.ts
+      description: >
+        Mixed Mode A+B watcher — burst of live events (comments + iterations)
+        for a configurable budget, then a final summary on exit. No default
+        cron — typically one-shot/manual.
+      binds_callback_to: thread_resume
+      identity_param: pr_id
+      parameters:
+        - { name: repo,              type: string,  required: true,
+            description: "ADO repo name containing the PR." }
+        - { name: pr_id,             type: integer, required: true,
+            description: "PR id to monitor." }
+        - { name: max_run_sec,       type: integer, required: false, default: 60,
+            description: "Total seconds this invocation is allowed to run." }
+        - { name: poll_interval_sec, type: integer, required: false, default: 5,
+            description: "Seconds between polls inside the loop." }
+        - { name: self_user,         type: string,  required: false,
+            description: "Skip events authored by this user." }
+
+  # Hostable tools (spec §10.3) — single-file scripts hosted in-process by
+  # the Conductor MCP server. These supersede the legacy mcp-server/ approach
+  # (kept on disk as `_legacy-mcp-server/` for reference). Each id is namespaced
+  # `<plugin>.<verb>` and surfaces as an MCP tool unchanged. Recipes still
+  # reference them as `ado.get_pr`, `ado.list_pr_comments`, etc.
+  tools:
+    - { id: ado.get_pr,            file: tools/get_pr.ts }
+    - { id: ado.list_pr_comments,  file: tools/list_pr_comments.ts }
+    - { id: ado.comment_pr,        file: tools/comment_pr.ts }
+    - { id: ado.list_iterations,   file: tools/list_iterations.ts }
+    - { id: ado.get_pr_status,     file: tools/get_pr_status.ts }
+
+  # mcp_servers entries are reserved for heavyweight cases that don't fit a
+  # single-file hostable tool — e.g., a long-running indexer or a stateful
+  # daemon. The legacy `mcp/ado.json` config (commented out below) pointed at
+  # `_legacy-mcp-server/`; the same five tools now live as hostable tools.
+  # mcp_servers:
+  #   - { id: ado-heavy-indexer, file: mcp/ado-heavy-indexer.json }
+
+requires:
+  # Plugin requires Conductor 1.0+ — first release that exposes the plugin model.
+  conductor_version: ">=1.0.0"
+  # Required at runtime by the ADO MCP server and the trigger scripts.
+  # Missing env vars don't fail load — they fail at the first tool call with a
+  # clear "ADO_ORG env var required" message from the script (see triggers/*.ts).
+  env:
+    - ADO_ORG
+    - ADO_BEARER_TOKEN

@@ -1,0 +1,451 @@
+/**
+ * tools/trigger.ts
+ *
+ * The trigger MCP surface (spec §6.1 + §8) — split cleanly into TYPES
+ * (capabilities shipped by plugins) and REGISTERED instances (concrete
+ * bindings persisted in `.conductor/triggers.json`).
+ *
+ * Seven tools:
+ *
+ *   - trigger.list_types        — capabilities available from loaded plugins
+ *   - trigger.list_registered   — active registered instances
+ *   - trigger.register          — bind a type to concrete params (writes
+ *                                 to triggers.json `registered[]`)
+ *   - trigger.unregister        — remove a registered instance (type stays)
+ *   - trigger.update_params     — modify params and/or cron without
+ *                                 unregister/re-register
+ *   - trigger.enable / .disable — toggle the `enabled` flag
+ *   - trigger.fire              — manual fire (logged in the stub; real
+ *                                 Conductor POSTs to the registered
+ *                                 instance's webhook endpoint)
+ *
+ * Cron has three states per registration (spec §8.4):
+ *
+ *   - string                      → override the type's default_cron
+ *   - null / undefined            → inherit the type's default_cron
+ *   - false / ""                  → cron disabled (webhook/manual only)
+ *
+ * Param validation: the type's `parameters[]` declaration is converted into
+ * a hand-rolled validator. Defaults are applied for absent optional params.
+ * Required params missing surface as PARAM_VALIDATION with structured errors.
+ */
+
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { z } from 'zod';
+import { isValidCronExpression, validateTriggerParams } from '../validators.ts';
+import { mintId } from '../store.ts';
+import {
+  mintRegisteredId,
+  readTriggersFile,
+  writeTriggersFile,
+  type RegisteredTrigger,
+} from '../triggers-store.ts';
+import {
+  triggersJsonPath,
+  type RegisteredTriggerType,
+  type Workspace,
+} from '../workspace.ts';
+import { notFound, structuredError } from '../scope.ts';
+import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+/** Build the structured-error response for a parameter-validation failure. */
+function paramValidationError(
+  errors: Array<{ path: string; code: string; message: string }>,
+): CallToolResult {
+  const text = errors.map((e) => `${e.path}: ${e.message}`).join('\n');
+  return {
+    isError: true,
+    content: [{ type: 'text', text: `Parameter validation failed:\n${text}` }],
+    structuredContent: { code: 'PARAM_VALIDATION', message: 'Parameter validation failed.', errors },
+  };
+}
+
+/** Resolve a `cron` field on a registration into one of three normalized values. */
+function normalizeCron(raw: unknown): { ok: true; cron: string | null | false } | { ok: false; message: string } {
+  if (raw === undefined) return { ok: true, cron: null };
+  if (raw === null) return { ok: true, cron: null };
+  if (raw === false || raw === '') return { ok: true, cron: false };
+  if (typeof raw === 'string') {
+    if (!isValidCronExpression(raw)) {
+      return { ok: false, message: `cron expression ${JSON.stringify(raw)} is not a valid 5- or 6-field cron.` };
+    }
+    return { ok: true, cron: raw };
+  }
+  return { ok: false, message: 'cron must be a string (override), null (inherit), or false (disable).' };
+}
+
+/**
+ * Project a registered trigger to the structured-content shape returned by
+ * `trigger.list_registered`. Resolves cron inheritance from the type so the
+ * agent sees the effective schedule without a second lookup.
+ */
+function projectRegistered(
+  reg: RegisteredTrigger,
+  ws: Workspace,
+): RegisteredTrigger & { resolved_cron: string | false | null; type_exists: boolean } {
+  const type = ws.triggerTypes.get(reg.type);
+  let resolved: string | false | null;
+  if (reg.cron === false) {
+    resolved = false; // disabled
+  } else if (reg.cron === null) {
+    resolved = type?.default_cron ?? null; // inherit, may still be null
+  } else {
+    resolved = reg.cron;
+  }
+  return { ...reg, resolved_cron: resolved, type_exists: !!type };
+}
+
+/** Convert a RegisteredTriggerType to the projection returned by trigger.list_types. */
+function projectType(t: RegisteredTriggerType): Record<string, unknown> {
+  const binding =
+    t.binds_callback_to_recipe !== undefined
+      ? { binds_callback_to_recipe: t.binds_callback_to_recipe }
+      : t.binds_callback_to !== undefined
+        ? { binds_callback_to: t.binds_callback_to }
+        : {};
+  return {
+    id: t.id,
+    source_plugin_id: t.source_plugin_id,
+    scope: t.scope,
+    description: t.description ?? '',
+    file: t.file,
+    file_abs: t.file_abs,
+    default_cron: t.default_cron ?? null,
+    accepts_webhook: t.accepts_webhook ?? true,
+    identity_param: t.identity_param ?? null,
+    parameters: t.parameters ?? [],
+    ...binding,
+  };
+}
+
+// ============================================================================
+// Registration
+// ============================================================================
+
+export function registerTriggerTools(server: McpServer, ws: Workspace): void {
+  // -- trigger.list_types ---------------------------------------------------
+  server.registerTool(
+    'trigger.list_types',
+    {
+      description:
+        'List trigger TYPES (capabilities) discovered from enabled plugins (spec §8.2 / §10.4). Each entry carries the parameter schema, default cron, callback binding, and source plugin. Use trigger.register to create a concrete instance from one.',
+      inputSchema: {
+        scope: z
+          .string()
+          .regex(/^plugin:[a-z][a-z0-9-]*$/, 'plugin:<id>')
+          .optional()
+          .describe('Filter to a single plugin scope (e.g. "plugin:ado"). Default: all plugins.'),
+        search: z
+          .string()
+          .min(1)
+          .optional()
+          .describe('Substring filter against id or description.'),
+      },
+    },
+    async (args) => {
+      const all = [...ws.triggerTypes.values()].sort((a, b) => a.id.localeCompare(b.id));
+      let filtered = all;
+      if (args.scope) {
+        filtered = filtered.filter((t) => t.scope === args.scope);
+      }
+      if (args.search) {
+        const q = args.search.toLowerCase();
+        filtered = filtered.filter(
+          (t) =>
+            t.id.toLowerCase().includes(q) ||
+            (t.description ?? '').toLowerCase().includes(q),
+        );
+      }
+      const projected = filtered.map(projectType);
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Found ${projected.length} trigger type(s)${ws.triggerTypeErrors.length > 0 ? ` (with ${ws.triggerTypeErrors.length} load error(s))` : ''}.`,
+          },
+        ],
+        structuredContent: {
+          trigger_types: projected,
+          count: projected.length,
+          load_errors: ws.triggerTypeErrors,
+        },
+      };
+    },
+  );
+
+  // -- trigger.list_registered ----------------------------------------------
+  server.registerTool(
+    'trigger.list_registered',
+    {
+      description:
+        'List REGISTERED trigger instances from `.conductor/triggers.json` (spec §8.3). Each entry shows the bound params, cron resolution (inherited/overridden/disabled), and last-run status. Use trigger.list_types to see available capabilities.',
+      inputSchema: {
+        enabled: z.boolean().optional(),
+        type_id: z.string().min(1).optional().describe('Filter to a single trigger type id.'),
+        subscriber_thread_id: z
+          .string()
+          .min(1)
+          .optional()
+          .describe('Filter to hot triggers bound to this thread.'),
+      },
+    },
+    async (args) => {
+      const file = readTriggersFile(triggersJsonPath(ws));
+      let rows = file.registered.map((r) => projectRegistered(r, ws));
+      if (args.enabled !== undefined) {
+        rows = rows.filter((r) => r.enabled === args.enabled);
+      }
+      if (args.type_id) {
+        rows = rows.filter((r) => r.type === args.type_id);
+      }
+      if (args.subscriber_thread_id) {
+        rows = rows.filter((r) => r.subscriber_thread_id === args.subscriber_thread_id);
+      }
+      return {
+        content: [{ type: 'text', text: `Found ${rows.length} registered trigger(s).` }],
+        structuredContent: { registered: rows, count: rows.length },
+      };
+    },
+  );
+
+  // -- trigger.register -----------------------------------------------------
+  server.registerTool(
+    'trigger.register',
+    {
+      description:
+        'Register a concrete instance of a trigger type with bound params (spec §8.3). Validates `params` against the type\'s `parameters[]` schema, mints a unique id (using `identity_param` if declared, else hashing all params), and appends to `.conductor/triggers.json`. Returns the new registered-instance id.',
+      inputSchema: {
+        type_id: z.string().min(1).describe('Trigger TYPE id (e.g. "ado.new-pr-watcher"). See trigger.list_types.'),
+        params: z
+          .record(z.string(), z.unknown())
+          .describe('Concrete param values. Validated against the type\'s parameters schema.'),
+        cron: z
+          .union([z.string(), z.null(), z.literal(false), z.literal('')])
+          .optional()
+          .describe('cron override. string=override; null/absent=inherit type default; false/""=disable cron (webhook/manual only).'),
+        subscriber_thread_id: z
+          .string()
+          .min(1)
+          .optional()
+          .describe('For hot triggers — binds this registration to a thread. Auto-cleanup when the thread terminates.'),
+        expires_at: z.number().optional().describe('Unix-ms — auto-delete after.'),
+        once: z.boolean().optional().describe('Self-delete after first successful run.'),
+      },
+    },
+    async (args) => {
+      const type = ws.triggerTypes.get(args.type_id);
+      if (!type) {
+        return structuredError(
+          'TRIGGER_TYPE_NOT_FOUND',
+          `Trigger type ${args.type_id} is not declared by any loaded plugin.`,
+          { type_id: args.type_id },
+        );
+      }
+
+      // Validate params against the type's schema.
+      const paramsCheck = validateTriggerParams(type.parameters, args.params);
+      if (!paramsCheck.ok) {
+        return paramValidationError(paramsCheck.errors);
+      }
+
+      // Normalize cron.
+      const cronCheck = normalizeCron(args.cron);
+      if (!cronCheck.ok) {
+        return paramValidationError([{ path: 'cron', code: 'CRON_INVALID', message: cronCheck.message }]);
+      }
+
+      // Mint the id.
+      const id = mintRegisteredId(type.id, paramsCheck.params, type.identity_param);
+
+      // Collision check.
+      const path = triggersJsonPath(ws);
+      const file = readTriggersFile(path);
+      if (file.registered.some((r) => r.id === id)) {
+        return structuredError(
+          'TRIGGER_ALREADY_REGISTERED',
+          `A registered trigger with id ${id} already exists. Use trigger.update_params or trigger.unregister first.`,
+          { id, type_id: type.id },
+        );
+      }
+
+      // Build initial state from defaults — the type's parameter defaults
+      // become the starting `state` shape (spec §8.5).
+      const initialState: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(paramsCheck.params)) {
+        initialState[k] = v;
+      }
+
+      const row: RegisteredTrigger = {
+        id,
+        type: type.id,
+        params: paramsCheck.params,
+        cron: cronCheck.cron,
+        enabled: true,
+        subscriber_thread_id: args.subscriber_thread_id ?? null,
+        expires_at: args.expires_at ?? null,
+        once: args.once ?? false,
+        registered_at: Date.now(),
+        state: initialState,
+        last_run_at: null,
+        last_run_status: null,
+        last_run_error: null,
+      };
+
+      file.registered = [...file.registered, row];
+      writeTriggersFile(path, file);
+
+      return {
+        content: [{ type: 'text', text: `Registered trigger ${id} (type=${type.id}).` }],
+        structuredContent: { id, type: type.id, registered: projectRegistered(row, ws) },
+      };
+    },
+  );
+
+  // -- trigger.unregister ---------------------------------------------------
+  server.registerTool(
+    'trigger.unregister',
+    {
+      description:
+        'Remove a registered trigger instance by id (spec §8.3). The underlying TYPE stays available — call trigger.register again to recreate.',
+      inputSchema: { id: z.string().min(1) },
+    },
+    async (args) => {
+      const path = triggersJsonPath(ws);
+      const file = readTriggersFile(path);
+      const before = file.registered.length;
+      file.registered = file.registered.filter((r) => r.id !== args.id);
+      if (file.registered.length === before) {
+        return notFound('registered_trigger', args.id);
+      }
+      writeTriggersFile(path, file);
+      return {
+        content: [{ type: 'text', text: `Unregistered trigger ${args.id}.` }],
+        structuredContent: { id: args.id, removed: 1 },
+      };
+    },
+  );
+
+  // -- trigger.update_params ------------------------------------------------
+  server.registerTool(
+    'trigger.update_params',
+    {
+      description:
+        'Modify the params and/or cron of a registered trigger without unregister/re-register (spec §8.3). Re-validates params against the type schema. The registered id is stable — even when an identity param changes, the id is NOT remitted (use unregister + register if you want a new id).',
+      inputSchema: {
+        id: z.string().min(1),
+        params: z
+          .record(z.string(), z.unknown())
+          .optional()
+          .describe('When present, REPLACES params entirely; re-validated against the type schema.'),
+        cron: z
+          .union([z.string(), z.null(), z.literal(false), z.literal('')])
+          .optional()
+          .describe('When present, replaces the cron field. Pass null to inherit; false/"" to disable.'),
+      },
+    },
+    async (args) => {
+      const path = triggersJsonPath(ws);
+      const file = readTriggersFile(path);
+      const idx = file.registered.findIndex((r) => r.id === args.id);
+      if (idx < 0) return notFound('registered_trigger', args.id);
+      const row = file.registered[idx];
+
+      if (args.params === undefined && args.cron === undefined) {
+        return structuredError(
+          'NO_CHANGES',
+          'trigger.update_params requires at least one of `params` or `cron`.',
+          { id: args.id },
+        );
+      }
+
+      let nextParams = row.params;
+      if (args.params !== undefined) {
+        const type = ws.triggerTypes.get(row.type);
+        if (!type) {
+          return structuredError(
+            'TRIGGER_TYPE_NOT_FOUND',
+            `Cannot validate params: trigger type ${row.type} is no longer declared by any plugin.`,
+            { id: args.id, type_id: row.type },
+          );
+        }
+        const check = validateTriggerParams(type.parameters, args.params);
+        if (!check.ok) return paramValidationError(check.errors);
+        nextParams = check.params;
+      }
+
+      let nextCron = row.cron;
+      if (args.cron !== undefined) {
+        const cronCheck = normalizeCron(args.cron);
+        if (!cronCheck.ok) {
+          return paramValidationError([{ path: 'cron', code: 'CRON_INVALID', message: cronCheck.message }]);
+        }
+        nextCron = cronCheck.cron;
+      }
+
+      const updated: RegisteredTrigger = { ...row, params: nextParams, cron: nextCron };
+      file.registered[idx] = updated;
+      writeTriggersFile(path, file);
+      return {
+        content: [{ type: 'text', text: `Updated trigger ${args.id}.` }],
+        structuredContent: { id: args.id, registered: projectRegistered(updated, ws) },
+      };
+    },
+  );
+
+  // -- trigger.enable / trigger.disable -------------------------------------
+  for (const action of ['enable', 'disable'] as const) {
+    server.registerTool(
+      `trigger.${action}`,
+      {
+        description: `${action === 'enable' ? 'Enable' : 'Disable'} a registered trigger by flipping its 'enabled' flag (spec §8.3). The registration row stays on disk; disabled triggers are skipped by the cron daemon but can still be fired manually via trigger.fire.`,
+        inputSchema: { id: z.string().min(1) },
+      },
+      async (args) => {
+        const path = triggersJsonPath(ws);
+        const file = readTriggersFile(path);
+        const idx = file.registered.findIndex((r) => r.id === args.id);
+        if (idx < 0) return notFound('registered_trigger', args.id);
+        const next: RegisteredTrigger = { ...file.registered[idx], enabled: action === 'enable' };
+        file.registered[idx] = next;
+        writeTriggersFile(path, file);
+        return {
+          content: [
+            { type: 'text', text: `${action === 'enable' ? 'Enabled' : 'Disabled'} trigger ${args.id}.` },
+          ],
+          structuredContent: { id: args.id, enabled: action === 'enable' },
+        };
+      },
+    );
+  }
+
+  // -- trigger.fire ---------------------------------------------------------
+  server.registerTool(
+    'trigger.fire',
+    {
+      description:
+        '(Stub) Fire a registered trigger by id. Real Conductor POSTs to the registered instance\'s `/hooks/<id>` webhook; this stub logs intent and returns a queued run_id. Works regardless of cron state — manual fires always succeed.',
+      inputSchema: {
+        id: z.string().min(1),
+        payload: z.unknown().optional(),
+      },
+    },
+    async (args) => {
+      const path = triggersJsonPath(ws);
+      const file = readTriggersFile(path);
+      const reg = file.registered.find((r) => r.id === args.id);
+      if (!reg) return notFound('registered_trigger', args.id);
+      const runId = mintId('run');
+      process.stderr.write(
+        `[trigger.fire stub] would POST to /hooks/${reg.id} (type=${reg.type}) with payload=${JSON.stringify(args.payload ?? {})}\n`,
+      );
+      return {
+        content: [{ type: 'text', text: `Queued trigger ${reg.id} (run_id=${runId}).` }],
+        structuredContent: { id: reg.id, type: reg.type, run_id: runId, status: 'queued' },
+      };
+    },
+  );
+}

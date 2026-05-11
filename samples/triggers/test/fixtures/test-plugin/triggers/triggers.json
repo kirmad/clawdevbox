@@ -1,0 +1,13 @@
+{
+  "_comment": "Plugin-scoped triggers registry. Mirrors plugins/ado/triggers/triggers.json — the registry is the cron daemon's view of what scripts are live, with the absolute command (post-resolution from plugin.yaml).",
+  "triggers": [
+    {
+      "id": "heartbeat",
+      "description": "Emit a single Mode B callback with prompt 'plugin heartbeat tick' each time the cron fires. Used by Scenario G of the trigger test harness.",
+      "command": "tsx $CONDUCTOR_PROJECT_DIR/.conductor/plugins/test-plugin/triggers/heartbeat.ts",
+      "cron": "*/30 * * * * *",
+      "timeout_seconds": 30
+    }
+  ],
+  "_runtime": []
+}

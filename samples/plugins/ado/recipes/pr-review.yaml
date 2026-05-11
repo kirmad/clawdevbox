@@ -1,0 +1,83 @@
+# Conductor template (TaskDock-shape). See spec §7.2 for the schema.
+#
+# This is the parent recipe for reviewing an Azure DevOps PR. It owns:
+#   1. fetching the PR + iteration
+#   2. summarizing changes (delegates to the summarize-pr-changes skill)
+#   3. drafting inline review comments (delegates to analyze-pr-comment skill)
+#   4. requesting user approval before posting
+#   5. registering the comment-watcher hot trigger so the thread can
+#      react to follow-up reviewer comments without re-spawning
+#
+# The steps are *starting-point prose* — the agent adapts as the work
+# demands. They are NOT enforced by an engine.
+
+id: pr-review
+name: "PR Review (ADO)"
+description: >
+  Review an Azure DevOps PR iteration: summarize changes, classify risk,
+  draft inline comments, request user approval before posting, then keep
+  watching for follow-up comments until the PR closes.
+kind: pr_review
+default_client: claude
+mcp_servers:
+  - ado
+  - conductor
+timeout_minutes: 0          # no host-imposed timeout; user cancels via thread.cancel
+
+steps:
+  - id: 1
+    goal: >
+      Read the PR + the iteration under review via `ado.get_pr` and
+      `ado.get_pr_iteration`. Consult the `summarize-pr-changes` skill
+      and produce the 5-bullet summary it specifies. Emit it via
+      `view.emit({ view_id: 'pr_summary', type: 'pr_summary',
+      payload: { bullets } })` and update the inbox card's
+      `agent_message` to the first bullet truncated to ~80 chars.
+
+  - id: 2
+    goal: >
+      Classify each diff region (mechanical / logic / test / config /
+      dependency). Surface risks the summary flagged. If risk is high
+      (auth, persistence, public API, perf-critical path) and the user
+      hasn't pre-approved auto-review for this repo, call
+      `approval.request` with the risk list before drafting comments.
+    depends: [1]
+
+  - id: 3
+    goal: >
+      Draft inline review comments. Consult the `analyze-pr-comment`
+      skill for tone and structure (this skill describes the same
+      question/change-request/affirmation taxonomy that the
+      `respond-to-pr-comment` sub-recipe applies in reverse — here you
+      are *originating* feedback, there you are *responding* to it).
+      Group draft comments by file. Show them all via `view.emit` with
+      `view_id: 'pr_draft_comments'`; then call `approval.request` so
+      the user can approve / reject / edit each one.
+    depends: [2]
+
+  - id: 4
+    goal: >
+      On approval, post the comments via `ado.comment_pr` one at a time.
+      On rejection or edit, revise and re-request approval. Append a
+      `thread.append_message` summary after the batch posts.
+    depends: [3]
+
+  - id: 5
+    goal: >
+      Register the `ado-comment-watcher` trigger (shipped in this
+      plugin) scoped to this thread so follow-up reviewer comments
+      route here automatically. Use `trigger.upsert` with
+      `subscriber_thread_id` (auto-inferred from the MCP session),
+      `cron: "*/30 * * * * *"`, and initial `state: { prId, repo,
+      lastCommentId, selfUser }`. Then call `thread.set_state` to
+      `suspended` so the CLI exits cleanly — it will be re-spawned by
+      the trigger when a new comment arrives.
+    depends: [4]
+
+  - id: 6
+    goal: >
+      Optional follow-up step: when invoked by the comment watcher with
+      a new comment in the prompt, delegate to the
+      `respond-to-pr-comment` sub-recipe (consult its prose inline; no
+      child thread needed). After responding, re-enter `suspended`.
+    depends: [5]
