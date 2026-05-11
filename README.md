@@ -16,9 +16,7 @@
 ```
 clawdevbox/
 ├── docs/
-│   ├── design.md         The simplified architecture spec.
-│   └── research/         Background — agent-CLI patterns,
-│                         Goose deep-dive, legacy audit.
+│   └── design.md         The simplified architecture spec.
 └── samples/
     ├── mcp-server/       Reference MCP server (Node + node-pty + ws).
     │                     Built-in renderers, recipe / skill / trigger /
@@ -97,13 +95,6 @@ See [`docs/design.md`](docs/design.md) for the full architecture spec (~1900 lin
 - §7 — Recipes.
 - §8 — Triggers (Type vs. Registered, parameter schema, cron lifecycle).
 - §10 — Plugins (manifest, discovery, scope/shadowing, hostable tools, git-based install).
-
-## Research
-
-- [`docs/research/agent-cli-architectures.md`](docs/research/agent-cli-architectures.md) — How GitHub Copilot CLI, Claude Code, Cursor agents, Aider, and others structure themselves.
-- [`docs/research/goose-deep-dive.md`](docs/research/goose-deep-dive.md) — Block's Goose: recipe model, executor architecture, lessons.
-- [`docs/research/goose-vs-clawdevbox-arch.md`](docs/research/goose-vs-clawdevbox-arch.md) — Side-by-side comparison of choices.
-- [`docs/research/legacy-taskdock-audit.md`](docs/research/legacy-taskdock-audit.md) — What worked in the predecessor and what we kept.
 
 ## License
 
