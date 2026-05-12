@@ -9,7 +9,7 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { cpSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir, platform } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -19,7 +19,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const projectRoot = resolve(__dirname, '..');
 const entry = resolve(projectRoot, 'src/index.ts');
-const repoSampleAdoPlugin = resolve(projectRoot, '..', 'plugins', 'ado');
+const repoSampleAdoPlugin = resolve(projectRoot, '..', 'samples', 'plugins', 'ado');
 
 // ----------------------------------------------------------------------------
 // Test harness
@@ -130,7 +130,24 @@ class ServerHarness {
   }
 
   shutdown() {
-    try { this.child.kill('SIGTERM'); } catch { /* ignore */ }
+    // On Windows, child.kill('SIGTERM') doesn't reliably terminate the
+    // npx → tsx → node process tree spawned via shell: true. Use taskkill
+    // /T to walk the tree. Without this, the test runner hangs after the
+    // last assertion because npx + grandchildren keep the event loop alive.
+    if (this.child && !this.child.killed) {
+      try {
+        if (platform() === 'win32' && this.child.pid) {
+          spawnSync('taskkill', ['/PID', String(this.child.pid), '/T', '/F'], { stdio: 'ignore' });
+        } else {
+          this.child.kill('SIGTERM');
+        }
+      } catch { /* ignore */ }
+    }
+    // Detach + destroy the stdio pipes so Node's event loop doesn't
+    // hold references to them after the child is gone.
+    try { this.child?.stdin?.destroy(); } catch { /* ignore */ }
+    try { this.child?.stdout?.destroy(); } catch { /* ignore */ }
+    try { this.child?.stderr?.destroy(); } catch { /* ignore */ }
     if (existsSync(this.tmpRoot)) {
       try { rmSync(this.tmpRoot, { recursive: true, force: true }); } catch { /* ignore */ }
     }
@@ -163,7 +180,8 @@ test('conductor MCP server smoke', async (t) => {
       'inbox.list', 'inbox.read', 'inbox.upsert', 'inbox.set_state', 'inbox.snooze', 'inbox.archive',
       'thread.spawn', 'thread.append_message', 'thread.read', 'thread.set_state', 'thread.cancel', 'thread.wake',
       'approval.request', 'approval.resolve', 'approval.list_pending',
-      'artifact.write', 'view.emit', 'search.memory', 'signal.emit', 'signal.list',
+      'artifact.add', 'artifact.list', 'artifact.get', 'artifact.delete',
+      'renderer.list', 'renderer.read', 'renderer.write', 'renderer.delete',
     ]) {
       assert.ok(names.includes(n), `missing tool: ${n}`);
     }
@@ -263,16 +281,6 @@ test('conductor MCP server smoke', async (t) => {
 
     const stillPending = await h.call('approval.list_pending', { thread_id: threadId });
     assert.equal(stillPending.structuredContent?.approvals?.length, 0);
-  });
-
-  await t.test('stub tools return NOT_IMPLEMENTED_IN_STUB', async () => {
-    const res = await h.call('artifact.write', {
-      thread_id: 'thr_x',
-      kind: 'note',
-      path: '/tmp/x',
-    });
-    assert.equal(res.isError, true);
-    assert.equal(res.structuredContent?.code, 'NOT_IMPLEMENTED_IN_STUB');
   });
 
   await t.test('recipe.upsert validates shape and rejects malformed sources', async () => {

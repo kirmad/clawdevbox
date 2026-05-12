@@ -11,7 +11,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const sampleRecipePath = resolve(here, '..', 'recipes', 'simple-prompt.yaml');
+const sampleRecipePath = resolve(here, '..', 'samples', 'recipes', 'simple-prompt.yaml');
 
 // 1) Set up an isolated workspace + WORKSPACES_ROOT
 const workspacesRoot = mkdtempSync(join(tmpdir(), 'conductor-e2e-'));

@@ -28,10 +28,11 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const projectRoot = resolve(__dirname, '..');
 const entry = resolve(projectRoot, 'src/index.ts');
-const repoSampleAdoPlugin = resolve(projectRoot, '..', 'plugins', 'ado');
+const repoSampleAdoPlugin = resolve(projectRoot, '..', 'samples', 'plugins', 'ado');
 const repoSampleSimplePromptRecipe = resolve(
   projectRoot,
   '..',
+  'samples',
   'recipes',
   'simple-prompt.yaml',
 );
@@ -156,7 +157,18 @@ class WsHarness {
   }
 
   shutdown() {
-    try { this.child.kill('SIGTERM'); } catch { /* ignore */ }
+    if (this.child && !this.child.killed) {
+      try {
+        if (platform() === 'win32' && this.child.pid) {
+          spawnSync('taskkill', ['/PID', String(this.child.pid), '/T', '/F'], { stdio: 'ignore' });
+        } else {
+          this.child.kill('SIGTERM');
+        }
+      } catch { /* ignore */ }
+    }
+    try { this.child?.stdin?.destroy(); } catch { /* ignore */ }
+    try { this.child?.stdout?.destroy(); } catch { /* ignore */ }
+    try { this.child?.stderr?.destroy(); } catch { /* ignore */ }
     if (existsSync(this.tmpRoot)) {
       try { rmSync(this.tmpRoot, { recursive: true, force: true }); } catch { /* ignore */ }
     }
@@ -440,7 +452,13 @@ test('workspace + recipe.run surface', async (t) => {
       assert.equal(inst.message, 'all done');
       assert.deepEqual(inst.result, { score: 42 });
     } finally {
-      try { child.kill('SIGTERM'); } catch { /* ignore */ }
+      try {
+        if (platform() === 'win32' && child.pid) {
+          spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore' });
+        } else {
+          child.kill('SIGTERM');
+        }
+      } catch { /* ignore */ }
     }
   });
 

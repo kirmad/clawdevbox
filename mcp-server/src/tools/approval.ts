@@ -1,9 +1,9 @@
 /**
  * tools/approval.ts
  *
- * approval.request / resolve / list_pending — backed by the in-memory
- * ApprovalStore. Real Conductor surfaces these as askUser modals in the
- * renderer; the stub just records them so tests can read them back.
+ * approval.request / resolve / list_pending — backed by the in-process
+ * ApprovalStore. UI hosts (the Conductor desktop app) surface these as
+ * askUser modals; programmatic callers resolve them via `approval.resolve`.
  */
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';

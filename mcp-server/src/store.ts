@@ -1,16 +1,15 @@
 /**
  * store.ts
  *
- * In-memory state for inbox items, threads, messages, and approvals.
+ * Per-process state for inbox items, threads, messages, and approvals.
  *
- * This is a stub — the real Conductor sidecar persists this in better-sqlite3
- * (see spec §5 "Data model"). We mirror the same row shapes so the tool
- * surface (§6.1) is identical; only durability differs. The store is module-
- * scoped: a single Process = a single in-memory DB. Each call to a tool
- * resolves through these maps.
+ * Row shapes follow spec §5 "Data model" so the tool surface (§6.1) is
+ * stable; durability is the only thing that differs from a future
+ * SQLite-backed kernel. The store is module-scoped: a single process owns
+ * a single in-memory DB. Restarting the server clears it.
  *
- * All ids generated here use a coarse `<prefix>_<base36-random>` pattern so
- * the output is human-recognizable in test logs without pulling in nanoid.
+ * Ids use a coarse `<prefix>_<base36-random>` pattern so they're
+ * human-recognizable in test logs without pulling in nanoid.
  */
 
 // ============================================================================

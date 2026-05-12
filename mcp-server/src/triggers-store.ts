@@ -101,8 +101,8 @@ export function writeTriggersFile(path: string, file: TriggersFile): void {
  *
  * Deterministic stable hashing requires canonical key ordering — we sort the
  * top-level keys before stringifying. Nested objects/arrays use their natural
- * JSON.stringify order; that's "good enough" for the sample stub. Real
- * Conductor uses canonical-json (RFC 8785) to be fully order-independent.
+ * JSON.stringify order; canonical-json (RFC 8785) is a future upgrade if
+ * deeper nesting starts producing collisions.
  */
 export function mintRegisteredId(
   typeId: string,

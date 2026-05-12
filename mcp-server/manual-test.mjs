@@ -35,7 +35,7 @@ import { fileURLToPath } from 'node:url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const entry = resolve(__dirname, 'src/index.ts');
-const repoSampleAdoPlugin = resolve(__dirname, '..', 'plugins', 'ado');
+const repoSampleAdoPlugin = resolve(__dirname, '..', 'samples', 'plugins', 'ado');
 
 const tmpRoot = mkdtempSync(join(tmpdir(), 'conductor-mcp-stub-'));
 const conductorDir = join(tmpRoot, '.conductor');
@@ -54,7 +54,7 @@ const globalDir = join(tmpRoot, '.global');
 mkdirSync(globalDir, { recursive: true });
 const workspacesRoot = join(tmpRoot, '.workspaces');
 mkdirSync(workspacesRoot, { recursive: true });
-const repoSampleSimplePromptRecipe = resolve(__dirname, '..', 'recipes', 'simple-prompt.yaml');
+const repoSampleSimplePromptRecipe = resolve(__dirname, '..', 'samples', 'recipes', 'simple-prompt.yaml');
 
 // Junction the Conductor server's node_modules into the temp workspace root
 // so the ADO plugin's hostable tools (which `import 'zod'`) resolve via Node's
@@ -71,7 +71,7 @@ const repoSampleSimplePromptRecipe = resolve(__dirname, '..', 'recipes', 'simple
 
 // Optional: load the ADO test config (bearer token + PR id) for step 10.
 // If absent / unreadable, step 10 falls back to a "no real call" branch.
-const testConfigPath = resolve(__dirname, '..', 'triggers', 'test', 'test-config.json');
+const testConfigPath = resolve(__dirname, '..', 'samples', 'triggers', 'test', 'test-config.json');
 let adoTestConfig = null;
 try {
   adoTestConfig = JSON.parse(readFileSync(testConfigPath, 'utf8'));

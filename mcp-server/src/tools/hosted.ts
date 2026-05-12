@@ -28,6 +28,7 @@ import { join, resolve as pathResolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+import { logger } from '../logger.ts';
 import { z } from 'zod';
 import type { Workspace } from '../workspace.ts';
 
@@ -242,8 +243,9 @@ export function registerHostedTools(
   ws: Workspace,
 ): void {
   for (const err of registry.errors) {
-    process.stderr.write(
-      `[mcp-conductor] hosted-tool error in plugin ${err.plugin_id}: tool=${err.tool_id} file=${err.file}: ${err.error}\n`,
+    logger.warn(
+      { pluginId: err.plugin_id, toolId: err.tool_id, file: err.file, err: err.error },
+      'hosted-tool discovery error',
     );
   }
   for (const tool of registry.tools) {
@@ -311,14 +313,11 @@ export function buildToolContext(args: BuildToolContextArgs): ToolContext {
 }
 
 function makeStderrLogger(pluginId: string): ToolLogger {
-  const write = (level: string, msg: string, meta?: Record<string, unknown>): void => {
-    const tail = meta && Object.keys(meta).length > 0 ? ' ' + JSON.stringify(meta) : '';
-    process.stderr.write(`[plugin:${pluginId}] [${level}] ${msg}${tail}\n`);
-  };
+  const child = logger.child({ pluginId });
   return {
-    info: (m, meta) => write('info', m, meta),
-    warn: (m, meta) => write('warn', m, meta),
-    error: (m, meta) => write('error', m, meta),
+    info: (m, meta) => child.info(meta ?? {}, m),
+    warn: (m, meta) => child.warn(meta ?? {}, m),
+    error: (m, meta) => child.error(meta ?? {}, m),
   };
 }
 

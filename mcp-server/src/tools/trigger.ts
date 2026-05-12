@@ -15,9 +15,10 @@
  *   - trigger.update_params     — modify params and/or cron without
  *                                 unregister/re-register
  *   - trigger.enable / .disable — toggle the `enabled` flag
- *   - trigger.fire              — manual fire (logged in the stub; real
- *                                 Conductor POSTs to the registered
- *                                 instance's webhook endpoint)
+ *   - trigger.fire              — manually fire a registered trigger; emits
+ *                                 a queued run_id. The actual webhook POST
+ *                                 to the registered instance's `/hooks/<id>`
+ *                                 endpoint is the scheduler's job.
  *
  * Cron has three states per registration (spec §8.4):
  *
@@ -32,6 +33,7 @@
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
+import { logger } from '../logger.ts';
 import { isValidCronExpression, validateTriggerParams } from '../validators.ts';
 import { mintId } from '../store.ts';
 import {
@@ -427,7 +429,7 @@ export function registerTriggerTools(server: McpServer, ws: Workspace): void {
     'trigger.fire',
     {
       description:
-        '(Stub) Fire a registered trigger by id. Real Conductor POSTs to the registered instance\'s `/hooks/<id>` webhook; this stub logs intent and returns a queued run_id. Works regardless of cron state — manual fires always succeed.',
+        'Manually fire a registered trigger by id. Returns a queued run_id and logs the fire intent. A future in-process cron daemon (or external scheduler) handles the actual webhook POST to `/hooks/<id>`. Works regardless of cron state — manual fires always succeed.',
       inputSchema: {
         id: z.string().min(1),
         payload: z.unknown().optional(),
@@ -439,8 +441,9 @@ export function registerTriggerTools(server: McpServer, ws: Workspace): void {
       const reg = file.registered.find((r) => r.id === args.id);
       if (!reg) return notFound('registered_trigger', args.id);
       const runId = mintId('run');
-      process.stderr.write(
-        `[trigger.fire stub] would POST to /hooks/${reg.id} (type=${reg.type}) with payload=${JSON.stringify(args.payload ?? {})}\n`,
+      logger.info(
+        { triggerId: reg.id, triggerType: reg.type, runId, payload: args.payload ?? null },
+        'trigger.fire queued',
       );
       return {
         content: [{ type: 'text', text: `Queued trigger ${reg.id} (run_id=${runId}).` }],

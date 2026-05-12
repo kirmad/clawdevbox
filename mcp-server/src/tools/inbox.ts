@@ -146,8 +146,9 @@ export function registerInboxTools(server: McpServer): void {
     async (args) => {
       const item = inbox.archive(args.id);
       if (!item) return notFound('inbox_item', args.id);
-      // Touch threads so they can opt to terminate themselves (the stub leaves
-      // them alone; the real sidecar would cascade if the item moves to archived).
+      // Threads attached to an archived inbox item could cascade-terminate;
+      // current build leaves them running and lets `thread.cancel` clean up
+      // explicitly. Add cascade once the SQLite kernel lands.
       threads;
       return {
         content: [{ type: 'text', text: `Archived ${item.id}.` }],

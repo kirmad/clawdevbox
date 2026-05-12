@@ -2,15 +2,17 @@
  * tools/thread.ts
  *
  * thread.spawn / append_message / read / set_state / cancel / wake — backed
- * by the in-memory ThreadStore. `thread.spawn` does NOT spawn the CLI
- * process (spec §6.1: that's the scheduler's job); it just inserts the row.
+ * by the in-process ThreadStore. `thread.spawn` does NOT spawn the CLI
+ * process (per spec §6.1: that's the scheduler's job); it just inserts the row.
  *
- * thread.wake is a stub: real Conductor invokes `claude --resume <id>` via
- * a Tauri shell-command IPC; here we just log intent.
+ * `thread.wake` records the wake intent and flips state to 'running'. The
+ * agent process is re-spawned by whichever component owns the CLI lifecycle
+ * (Conductor desktop app's shell-command IPC, or a future scheduler tool).
  */
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
+import { logger } from '../logger.ts';
 import { notFound, structuredError } from '../scope.ts';
 import { inbox, threads, type ThreadState } from '../store.ts';
 
@@ -156,13 +158,13 @@ export function registerThreadTools(server: McpServer): void {
     'thread.wake',
     {
       description:
-        '(Stub) Wake a suspended thread. Real Conductor spawns `claude --resume <id>` via the Tauri shell-command IPC; the stub just appends a wake message and logs intent.',
+        'Wake a suspended thread: record a `wake_requested` message and flip the thread state to `running`. The host (Conductor desktop app or external scheduler) is responsible for re-spawning the underlying CLI process — this tool only updates the kernel state and emits the intent so any subscriber can act.',
       inputSchema: { thread_id: z.string().min(1) },
     },
     async (args) => {
       const t = threads.read(args.thread_id);
       if (!t) return notFound('thread', args.thread_id);
-      process.stderr.write(`[thread.wake stub] would spawn \`claude --resume ${args.thread_id}\`\n`);
+      logger.info({ threadId: args.thread_id }, 'thread.wake requested');
       threads.appendMessage(args.thread_id, 'wake_requested', { ts: Date.now() }, 'system');
       const updated = threads.setState(args.thread_id, 'running');
       if (!updated) {

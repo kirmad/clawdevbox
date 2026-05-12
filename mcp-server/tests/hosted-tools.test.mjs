@@ -14,7 +14,7 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { cpSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir, platform } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -24,7 +24,27 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const projectRoot = resolve(__dirname, '..');
 const entry = resolve(projectRoot, 'src/index.ts');
-const repoSampleAdoPlugin = resolve(projectRoot, '..', 'plugins', 'ado');
+const repoSampleAdoPlugin = resolve(projectRoot, '..', 'samples', 'plugins', 'ado');
+
+// The harness copies the plugin into a tmpRoot and junctions
+// `mcp-server/node_modules` into `tmpRoot/node_modules` so the plugin's
+// hostable tools resolve `zod` etc. via Node's ESM walk-up. The pure-
+// function unit test below imports the plugin tool directly from
+// `samples/plugins/ado/tools/get_pr.ts`, which has no node_modules walk-up
+// path back to the server. Create a sibling junction so resolution lands
+// in the server's node_modules. Skips silently if already present.
+{
+  const adoNodeModules = join(repoSampleAdoPlugin, 'node_modules');
+  if (!existsSync(adoNodeModules)) {
+    const linkType = platform() === 'win32' ? 'junction' : 'dir';
+    try {
+      symlinkSync(resolve(projectRoot, 'node_modules'), adoNodeModules, linkType);
+    } catch {
+      // EPERM on Windows when no developer-mode / not admin — pure-function
+      // test will surface a clearer module-not-found message.
+    }
+  }
+}
 
 const EXPECTED_ADO_TOOLS = [
   'ado.get_pr',
@@ -140,7 +160,18 @@ class ServerHarness {
   }
 
   shutdown() {
-    try { this.child.kill('SIGTERM'); } catch { /* ignore */ }
+    if (this.child && !this.child.killed) {
+      try {
+        if (platform() === 'win32' && this.child.pid) {
+          spawnSync('taskkill', ['/PID', String(this.child.pid), '/T', '/F'], { stdio: 'ignore' });
+        } else {
+          this.child.kill('SIGTERM');
+        }
+      } catch { /* ignore */ }
+    }
+    try { this.child?.stdin?.destroy(); } catch { /* ignore */ }
+    try { this.child?.stdout?.destroy(); } catch { /* ignore */ }
+    try { this.child?.stderr?.destroy(); } catch { /* ignore */ }
     if (existsSync(this.tmpRoot)) {
       try { rmSync(this.tmpRoot, { recursive: true, force: true }); } catch { /* ignore */ }
     }

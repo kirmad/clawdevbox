@@ -17,13 +17,13 @@
 clawdevbox/
 ├── docs/
 │   └── design.md         The simplified architecture spec.
+├── mcp-server/           Reference MCP server (Node + node-pty + ws).
+│                         Built-in renderers, recipe / skill / trigger /
+│                         artifact / renderer / workspace / inbox tools,
+│                         terminal + artifact HTTP viewer, Playwright
+│                         verification scripts.
+├── sdk/                  TypeScript SDK skeleton.
 └── samples/
-    ├── mcp-server/       Reference MCP server (Node + node-pty + ws).
-    │                     Built-in renderers, recipe / skill / trigger /
-    │                     artifact / renderer / workspace / inbox tools,
-    │                     terminal + artifact HTTP viewer, Playwright
-    │                     verification scripts.
-    ├── sdk/              TypeScript SDK skeleton.
     ├── triggers/         Trigger script samples (TS + Python),
     │                     mock-conductor test driver.
     ├── recipes/          Recipe YAML samples (simple-prompt).
@@ -35,7 +35,7 @@ clawdevbox/
 
 ```bash
 git clone https://github.com/<your-org>/clawdevbox
-cd clawdevbox/samples/mcp-server
+cd clawdevbox/mcp-server
 npm install
 npx playwright install chromium
 ```

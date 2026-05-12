@@ -55,14 +55,6 @@ export function pluginScopeReadonly(scope: string): CallToolResult {
   );
 }
 
-export function notImplementedStub(tool: string): CallToolResult {
-  return structuredError(
-    'NOT_IMPLEMENTED_IN_STUB',
-    `${tool} is not implemented in this stub. The real Conductor sidecar implements it with backed-by-SQLite or sidecar-side semantics.`,
-    { tool },
-  );
-}
-
 export function notFound(kind: string, id: string): CallToolResult {
   return structuredError(
     'NOT_FOUND',
