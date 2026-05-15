@@ -114,9 +114,14 @@ export function readFromScope(
   pathForWritable: ScopeLookup,
 ): ResolvedRead | null {
   if (isWritableScope(scope)) {
-    const path = pathForWritable(ws, scope, id);
-    if (!existsSync(path)) return null;
-    return { scope, path, source: readFileSync(path, 'utf8') };
+    const primary = pathForWritable(ws, scope, id);
+    const candidates = [primary, ...alternateScopePaths(primary, kind)];
+    for (const p of candidates) {
+      if (existsSync(p)) {
+        return { scope, path: p, source: readFileSync(p, 'utf8') };
+      }
+    }
+    return null;
   }
 
   const pluginId = pluginIdOfScope(scope);
@@ -140,6 +145,22 @@ function pluginFileResolve(dir: string, relFile: string): string | null {
   const abs = pathResolve(dir, relFile);
   if (!abs.startsWith(dir + sep) && abs !== dir) return null;
   return abs;
+}
+
+/**
+ * Given a "primary" file path computed via `recipePath`/`skillPath`, return
+ * the alternate extensions we tolerate on disk. Recipes accept `.yaml`,
+ * `.yml`, and `.json` (spec §7.4 + Phase 7.6 upsert format arg).
+ */
+function alternateScopePaths(primary: string, kind: ReadKind): string[] {
+  if (kind !== 'recipe') return [];
+  const lower = primary.toLowerCase();
+  const base = primary.slice(0, primary.lastIndexOf('.'));
+  const alts: string[] = [];
+  if (lower.endsWith('.yaml')) alts.push(`${base}.yml`, `${base}.json`);
+  else if (lower.endsWith('.yml')) alts.push(`${base}.yaml`, `${base}.json`);
+  else if (lower.endsWith('.json')) alts.push(`${base}.yaml`, `${base}.yml`);
+  return alts;
 }
 
 /**
@@ -195,7 +216,8 @@ export function listAllInScope(
   const wantPlugin = scope === 'all' || scope.startsWith('plugin:');
 
   const ext = kind === 'recipe' ? '.yaml' : '.md';
-  const altExt = kind === 'recipe' ? '.yml' : null;
+  const altExts =
+    kind === 'recipe' ? ['.yml', '.json'] : [];
 
   const scanDir = (dir: string, scopeTag: Scope) => {
     if (!existsSync(dir)) return;
@@ -207,8 +229,7 @@ export function listAllInScope(
     }
     for (const f of entries) {
       const lower = f.toLowerCase();
-      const matches =
-        lower.endsWith(ext) || (altExt !== null && lower.endsWith(altExt));
+      const matches = lower.endsWith(ext) || altExts.some((e) => lower.endsWith(e));
       if (!matches) continue;
       const id = f.slice(0, f.lastIndexOf('.'));
       if (!/^[a-z][a-z0-9-]*$/.test(id)) continue;

@@ -240,6 +240,76 @@ test('clawdevbox MCP server smoke', async (t) => {
     assert.equal(res.structuredContent?.code, 'PLUGIN_SCOPE_READONLY');
   });
 
+  await t.test('recipe.upsert format=yaml writes <id>.yaml (default)', async () => {
+    const res = await h.call('recipe.upsert', {
+      id: 'fmt-yaml',
+      scope: 'project',
+      source: 'id: fmt-yaml\nname: F\ndescription: d\nsteps:\n  - id: s\n    goal: g\n',
+    });
+    assert.ok(!res.isError, JSON.stringify(res));
+    assert.equal(res.structuredContent?.format, 'yaml');
+    assert.ok(String(res.structuredContent?.path ?? '').endsWith('.yaml'));
+    const projDir = h.tmpRoot;
+    assert.ok(existsSync(join(projDir, '.clawdevbox', 'recipes', 'fmt-yaml.yaml')));
+    assert.equal(existsSync(join(projDir, '.clawdevbox', 'recipes', 'fmt-yaml.json')), false);
+  });
+
+  await t.test('recipe.upsert format=json writes <id>.json', async () => {
+    const res = await h.call('recipe.upsert', {
+      id: 'fmt-json',
+      scope: 'project',
+      source: JSON.stringify({
+        id: 'fmt-json',
+        name: 'J',
+        description: 'd',
+        steps: [{ id: 's', goal: 'g' }],
+      }),
+      format: 'json',
+    });
+    assert.ok(!res.isError, JSON.stringify(res));
+    assert.equal(res.structuredContent?.format, 'json');
+    assert.ok(String(res.structuredContent?.path ?? '').endsWith('.json'));
+    const projDir = h.tmpRoot;
+    assert.ok(existsSync(join(projDir, '.clawdevbox', 'recipes', 'fmt-json.json')));
+    assert.equal(existsSync(join(projDir, '.clawdevbox', 'recipes', 'fmt-json.yaml')), false);
+
+    // recipe.read should still resolve it.
+    const read = await h.call('recipe.read', { id: 'fmt-json' });
+    assert.ok(!read.isError, JSON.stringify(read));
+    assert.equal(read.structuredContent?.parsed?.id, 'fmt-json');
+  });
+
+  await t.test('recipe.upsert format toggle removes the sibling file', async () => {
+    // Start as yaml.
+    await h.call('recipe.upsert', {
+      id: 'fmt-toggle',
+      scope: 'project',
+      source: 'id: fmt-toggle\nname: T\ndescription: d\nsteps:\n  - id: s\n    goal: g\n',
+    });
+    const projDir = h.tmpRoot;
+    const yamlPath = join(projDir, '.clawdevbox', 'recipes', 'fmt-toggle.yaml');
+    const jsonPath = join(projDir, '.clawdevbox', 'recipes', 'fmt-toggle.json');
+    assert.ok(existsSync(yamlPath));
+    assert.equal(existsSync(jsonPath), false);
+
+    // Now upsert as json — yaml sibling should disappear.
+    const res = await h.call('recipe.upsert', {
+      id: 'fmt-toggle',
+      scope: 'project',
+      source: JSON.stringify({
+        id: 'fmt-toggle',
+        name: 'T',
+        description: 'd',
+        steps: [{ id: 's', goal: 'g' }],
+      }),
+      format: 'json',
+    });
+    assert.ok(!res.isError, JSON.stringify(res));
+    assert.equal(existsSync(yamlPath), false, 'yaml sibling should be removed');
+    assert.ok(existsSync(jsonPath));
+    assert.ok((res.structuredContent?.removed_siblings ?? []).some((p) => p.endsWith('.yaml')));
+  });
+
   await t.test('plugin.list shows the ADO plugin', async () => {
     const res = await h.call('plugin.list', {});
     const plugins = res.structuredContent?.plugins ?? [];

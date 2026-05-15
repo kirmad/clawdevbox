@@ -11,10 +11,11 @@
  */
 
 import { existsSync, readFileSync, unlinkSync } from 'node:fs';
-import { resolve as resolvePath } from 'node:path';
+import { dirname, join } from 'node:path';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
+import { dump as yamlDump } from 'js-yaml';
 import {
   hasSession as ptyHasSession,
   killPty as ptyKill,
@@ -156,11 +157,15 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
     'recipe.upsert',
     {
       description:
-        'Write a recipe to project or global scope. Plugin scope is read-only — copy to project to customize (spec §10.6). Shape-validates before disk write (spec §7.4).',
+        'Write a recipe to project or global scope. Plugin scope is read-only — copy to project to customize (spec §10.6). Shape-validates before disk write (spec §7.4). `format` selects the on-disk encoding: `yaml` (default) writes `<id>.yaml`; `json` writes `<id>.json`. Whichever format you pick, the duplicate-id file in the other format is atomically removed so a recipe always lives in exactly one extension.',
       inputSchema: {
         id: z.string().min(1).describe('Recipe id; must match [a-z][a-z0-9-]*.'),
         scope: writableScope,
-        source: z.string().min(1).describe('Full YAML body of the recipe.'),
+        source: z.string().min(1).describe('Full YAML or JSON body of the recipe.'),
+        format: z
+          .enum(['yaml', 'json'])
+          .optional()
+          .describe("On-disk format. Default 'yaml'."),
       },
     },
     async (args) => {
@@ -184,11 +189,40 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
         ]);
       }
 
-      const target = recipePath(ws, args.scope as 'project' | 'global', args.id);
-      writeFileAtomic(target, args.source);
+      const format = (args.format ?? 'yaml') as 'yaml' | 'json';
+      const dir = dirname(recipePath(ws, args.scope as 'project' | 'global', args.id));
+      const target = join(dir, `${args.id}.${format}`);
+      const body =
+        format === 'json'
+          ? JSON.stringify(parsed ?? {}, null, 2) + '\n'
+          : yamlDump(parsed ?? {});
+      writeFileAtomic(target, body);
+
+      // Remove any sibling file in the other format so a single recipe id
+      // never resolves through two extensions simultaneously.
+      const otherExts = format === 'yaml' ? ['json'] : ['yaml', 'yml'];
+      const removedPaths: string[] = [];
+      for (const ext of otherExts) {
+        const sibling = join(dir, `${args.id}.${ext}`);
+        if (existsSync(sibling)) {
+          try {
+            unlinkSync(sibling);
+            removedPaths.push(sibling);
+          } catch {
+            // best-effort
+          }
+        }
+      }
+
       return {
-        content: [{ type: 'text', text: `Wrote recipe ${args.id} to ${args.scope} scope.` }],
-        structuredContent: { id: args.id, scope: args.scope, path: target },
+        content: [{ type: 'text', text: `Wrote recipe ${args.id} to ${args.scope} scope (${format}).` }],
+        structuredContent: {
+          id: args.id,
+          scope: args.scope,
+          path: target,
+          format,
+          removed_siblings: removedPaths,
+        },
       };
     },
   );
@@ -207,11 +241,23 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
       const guard = ensureWritableScope(args.scope);
       if (guard) return guard;
       const target = recipePath(ws, args.scope as 'project' | 'global', args.id);
-      if (!existsSync(target)) return notFound('recipe', args.id);
-      unlinkSync(target);
+      const dir = dirname(target);
+      const candidates = [target, join(dir, `${args.id}.yml`), join(dir, `${args.id}.json`)];
+      const removed: string[] = [];
+      for (const p of candidates) {
+        if (existsSync(p)) {
+          try {
+            unlinkSync(p);
+            removed.push(p);
+          } catch {
+            // best-effort
+          }
+        }
+      }
+      if (removed.length === 0) return notFound('recipe', args.id);
       return {
         content: [{ type: 'text', text: `Deleted recipe ${args.id} from ${args.scope} scope.` }],
-        structuredContent: { id: args.id, scope: args.scope, path: target },
+        structuredContent: { id: args.id, scope: args.scope, path: target, removed },
       };
     },
   );
