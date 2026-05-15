@@ -137,7 +137,7 @@ export interface PluginEntry {
  */
 export interface RegisteredTriggerType extends PluginTriggerType {
   source_plugin_id: string;
-  scope: `plugin:${string}`;
+  scope: `plugin:${string}` | 'global' | 'project';
   /** Absolute path to the script file under the plugin directory. */
   file_abs: string;
 }
