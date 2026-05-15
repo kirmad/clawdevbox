@@ -191,3 +191,38 @@ test('trigger.list_templates returns only agent-authored types', async () => {
   });
 });
 
+test('trigger.update_template replaces script content and bumps description', async () => {
+  await withHarness(async (h) => {
+    await h.call('trigger.create_template', {
+      id: 'local.upd', scope: 'project', runtime: 'tsx',
+      description: 'first', script: '// v1\n',
+    });
+    const upd = await h.call('trigger.update_template', {
+      id: 'local.upd', description: 'second', script: '// v2\n',
+    });
+    assert.ok(!upd.isError, JSON.stringify(upd));
+    const tplPath = join(h.callerProjectDir, '.clawdevbox', 'trigger-types', 'local.upd', 'template.yaml');
+    const scriptPath = join(h.callerProjectDir, '.clawdevbox', 'trigger-types', 'local.upd', 'trigger.ts');
+    assert.match(readFileSync(tplPath, 'utf8'), /second/);
+    assert.match(readFileSync(scriptPath, 'utf8'), /v2/);
+  });
+});
+
+test('trigger.update_template rejects no-changes call with NO_CHANGES', async () => {
+  await withHarness(async (h) => {
+    await h.call('trigger.create_template', {
+      id: 'local.nopu', scope: 'project', runtime: 'tsx', description: 'x', script: '// x\n',
+    });
+    const r = await h.call('trigger.update_template', { id: 'local.nopu' });
+    assert.equal(r.isError, true);
+    assert.equal(r.structuredContent.code, 'NO_CHANGES');
+  });
+});
+
+test('trigger.update_template returns TRIGGER_TEMPLATE_NOT_FOUND for missing id', async () => {
+  await withHarness(async (h) => {
+    const r = await h.call('trigger.update_template', { id: 'local.absent', description: 'x' });
+    assert.equal(r.isError, true);
+    assert.equal(r.structuredContent.code, 'TRIGGER_TEMPLATE_NOT_FOUND');
+  });
+});

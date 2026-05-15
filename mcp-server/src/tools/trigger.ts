@@ -31,7 +31,7 @@
  * Required params missing surface as PARAM_VALIDATION with structured errors.
  */
 
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync } from 'node:fs';
 import { resolve as pathResolve, sep } from 'node:path';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
@@ -39,6 +39,7 @@ import { logger } from '../logger.ts';
 import {
   isValidCronExpression,
   validateAgentAuthoredTemplate,
+  validateRuntime,
   validateTriggerParams,
   type TriggerRuntime,
 } from '../validators.ts';
@@ -50,6 +51,7 @@ import {
   type RegisteredTrigger,
 } from '../triggers-store.ts';
 import {
+  findTemplate,
   templateExists,
   writeTemplate,
   type TemplateManifest,
@@ -584,6 +586,92 @@ export function registerTriggerTools(server: McpServer, ws: Workspace): void {
       return {
         content: [{ type: 'text', text: `Found ${projected.length} agent-authored template(s).` }],
         structuredContent: { trigger_types: projected, count: projected.length },
+      };
+    },
+  );
+
+  // -- trigger.update_template --------------------------------------------
+  server.registerTool(
+    'trigger.update_template',
+    {
+      description:
+        'Update an agent-authored trigger template in place (project or global). Manifest fields omitted from the call are preserved; script is replaced only when `script` or `script_file` is supplied. Reloads `ws.triggerTypes` on success.',
+      inputSchema: {
+        id: z.string().min(1),
+        description: z.string().optional(),
+        runtime: z.enum(['node', 'tsx', 'python', 'bash']).optional(),
+        script: z.string().optional(),
+        script_file: z.string().optional(),
+        default_cron: z.string().optional(),
+        identity_param: z.string().optional(),
+        accepts_webhook: z.boolean().optional(),
+        binds_callback_to_recipe: z.string().optional(),
+        binds_callback_to: z.literal('thread_resume').optional(),
+        parameters: z.array(z.record(z.string(), z.unknown())).optional(),
+      },
+    },
+    async (args) => {
+      const existing = findTemplate(ws, args.id);
+      if (!existing) return structuredError('TRIGGER_TEMPLATE_NOT_FOUND',
+        `Template ${args.id} not found.`, { id: args.id });
+
+      const hasScript = typeof args.script === 'string';
+      const hasFile = typeof args.script_file === 'string';
+      if (hasScript && hasFile) {
+        return structuredError('INVALID_REQUEST',
+          'Provide at most one of `script` or `script_file`.',
+          { script_provided: true, script_file_provided: true });
+      }
+      const manifestKeys: Array<keyof typeof args> = [
+        'description', 'runtime', 'default_cron', 'identity_param',
+        'accepts_webhook', 'binds_callback_to_recipe', 'binds_callback_to', 'parameters',
+      ];
+      const anyManifestChange = manifestKeys.some((k) => args[k] !== undefined);
+      if (!hasScript && !hasFile && !anyManifestChange) {
+        return structuredError('NO_CHANGES',
+          'trigger.update_template requires at least one field to change.',
+          { id: args.id });
+      }
+
+      const merged: TemplateManifest = { ...existing.manifest };
+      if (args.runtime !== undefined) {
+        const r = validateRuntime(args.runtime);
+        if (!r.ok) return validationError([{ path: 'runtime', code: 'ENUM', message: r.message }]);
+        merged.runtime = r.runtime;
+        merged.file = `trigger.${r.runtime === 'tsx' ? 'ts' : r.runtime === 'node' ? 'js' : r.runtime === 'python' ? 'py' : 'sh'}`;
+      }
+      if (args.description !== undefined) merged.description = args.description;
+      if (args.default_cron !== undefined) merged.default_cron = args.default_cron;
+      if (args.identity_param !== undefined) merged.identity_param = args.identity_param;
+      if (args.accepts_webhook !== undefined) merged.accepts_webhook = args.accepts_webhook;
+      if (args.binds_callback_to_recipe !== undefined) merged.binds_callback_to_recipe = args.binds_callback_to_recipe;
+      if (args.binds_callback_to !== undefined) merged.binds_callback_to = args.binds_callback_to;
+      if (Array.isArray(args.parameters)) merged.parameters = args.parameters as TemplateManifest['parameters'];
+
+      const validation = validateAgentAuthoredTemplate(merged);
+      if (!validation.ok) return validationError(validation.errors);
+
+      let scriptContent: string;
+      if (hasScript) {
+        scriptContent = args.script!;
+      } else if (hasFile) {
+        const guard = ensureFileUnderClawdevbox(ws.projectDir, args.script_file!);
+        if (!guard.ok) return guard.error;
+        scriptContent = readFileSync(guard.path, 'utf8');
+      } else {
+        scriptContent = readFileSync(existing.scriptAbs, 'utf8');
+      }
+
+      if (args.runtime !== undefined && existing.manifest.runtime !== merged.runtime) {
+        try { rmSync(existing.scriptAbs, { force: true }); } catch { /* ignore */ }
+      }
+
+      const written = writeTemplate(ws, existing.scope, { manifest: merged, scriptContent });
+      reloadTypeRegistries(ws);
+
+      return {
+        content: [{ type: 'text', text: `Updated template ${args.id}.` }],
+        structuredContent: { id: args.id, scope: existing.scope, path: written.dir },
       };
     },
   );
