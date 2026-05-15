@@ -3,6 +3,24 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
+
+function hasCmd(cmd) {
+  const r = spawnSync(process.platform === 'win32' ? 'where' : 'which', [cmd], { stdio: 'ignore' });
+  return r.status === 0;
+}
+
+/**
+ * Probe whether a runtime is genuinely usable, not just on PATH. On Windows,
+ * `bash` may resolve to the WSL launcher (`C:\Windows\System32\bash.exe`) with
+ * no distro installed; `where bash` succeeds but invoking it fails. The probe
+ * runs `<cmd> <noopArg>` with a short timeout and checks the exit code.
+ */
+function runtimeUsable(cmd, noopArg) {
+  if (!hasCmd(cmd)) return false;
+  const r = spawnSync(cmd, [noopArg], { stdio: 'ignore', timeout: 3000, shell: process.platform === 'win32' });
+  return r.status === 0;
+}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -150,4 +168,61 @@ test('runner: timeout kills the process and reports timed_out', async () => {
   } finally {
     await recv.stop();
   }
+});
+
+test('runner: node runtime', { skip: !hasCmd('node') }, async () => {
+  const { runTriggerScript } = await import('../src/trigger-runner.ts');
+  const recv = await startReceiver('node-secret');
+  try {
+    const result = await runTriggerScript({
+      scriptPath: resolve(fixturesDir, 'heartbeat.js'),
+      runtime: 'node',
+      envelope: {
+        trigger_event_name: 'TriggerFired',
+        trigger_id: 'test', run_id: 'run_node',
+        callback_url: recv.url, state: {}, payload: null,
+      },
+      callbackSecret: 'node-secret', timeoutMs: 30000,
+    });
+    assert.equal(result.exit_code, 0, `stderr: ${result.stderr}`);
+    assert.equal(recv.calls.length, 1);
+  } finally { await recv.stop(); }
+});
+
+test('runner: python runtime', { skip: !hasCmd(process.platform === 'win32' ? 'python' : 'python3') }, async () => {
+  const { runTriggerScript } = await import('../src/trigger-runner.ts');
+  const recv = await startReceiver('py-secret');
+  try {
+    const result = await runTriggerScript({
+      scriptPath: resolve(fixturesDir, 'heartbeat.py'),
+      runtime: 'python',
+      envelope: {
+        trigger_event_name: 'TriggerFired',
+        trigger_id: 'test', run_id: 'run_py',
+        callback_url: recv.url, state: {}, payload: null,
+      },
+      callbackSecret: 'py-secret', timeoutMs: 30000,
+    });
+    assert.equal(result.exit_code, 0, `stderr: ${result.stderr}`);
+    assert.equal(recv.calls.length, 1);
+  } finally { await recv.stop(); }
+});
+
+test('runner: bash runtime', { skip: !runtimeUsable('bash', '--version') }, async () => {
+  const { runTriggerScript } = await import('../src/trigger-runner.ts');
+  const recv = await startReceiver('bash-secret');
+  try {
+    const result = await runTriggerScript({
+      scriptPath: resolve(fixturesDir, 'heartbeat.sh'),
+      runtime: 'bash',
+      envelope: {
+        trigger_event_name: 'TriggerFired',
+        trigger_id: 'test', run_id: 'run_bash',
+        callback_url: recv.url, state: {}, payload: null,
+      },
+      callbackSecret: 'bash-secret', timeoutMs: 30000,
+    });
+    assert.equal(result.exit_code, 0, `stderr: ${result.stderr}`);
+    assert.equal(recv.calls.length, 1);
+  } finally { await recv.stop(); }
 });
