@@ -152,6 +152,37 @@ export async function handleCronApi(
   const path = url.pathname;
   const method = req.method ?? 'GET';
 
+  // ----- /callback/<fire_id> ------------------------------------------------
+  // Per-fire bearer (NOT cfg.http.token) — the dispatcher mints a fresh
+  // secret per script binding and injects it as CLAWDEVBOX_MCP_SECRET.
+  {
+    const m = path.match(/^\/callback\/([^/]+)\/?$/);
+    if (m) {
+      if (method !== 'POST') {
+        sendJson(res, 405, { error: 'method not allowed' });
+        return true;
+      }
+      const fireId = decodeURIComponent(m[1]!);
+      const presented = bearer(req);
+      if (!presented) {
+        reject401(res, 'missing bearer token');
+        return true;
+      }
+      const body = (await readJson<unknown>(req)) ?? {};
+      const result = ctx.dispatcher.recordCallback(fireId, presented, body);
+      if (result === 'unauthorized') {
+        reject401(res, 'invalid bearer token');
+        return true;
+      }
+      if (result === 'not_found') {
+        sendJson(res, 404, { error: 'fire not found or not in flight', fire_id: fireId });
+        return true;
+      }
+      sendJson(res, 200, { ok: true, received_at: Date.now() });
+      return true;
+    }
+  }
+
   if (!path.startsWith('/api/cron/') && !path.startsWith('/api/fires')) {
     return false;
   }

@@ -21,7 +21,7 @@
  * `stop()` is awaitable: stops accepting new picks, drains in-flight up to
  * `drainMs`, marks the survivors `failed/service_shutdown`.
  */
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import type { Database } from 'better-sqlite3';
@@ -46,6 +46,13 @@ import { resolveWorkspacesRoot } from './workspaces-store.ts';
 
 /** Error code emitted by the resume-binding stub. Phase 2 will implement it. */
 export const AGENT_SESSION_RESUME_NOT_IMPLEMENTED = 'agent_session_resume_not_implemented';
+
+function constantTimeEquals(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let r = 0;
+  for (let i = 0; i < a.length; i++) r |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return r === 0;
+}
 
 interface TriggerRow {
   id: string;
@@ -106,6 +113,7 @@ export class Dispatcher {
   private callbackUrlBase: string;
   private scriptTimeoutMs: number;
   private inFlight = new Set<string>();
+  private activeRuns = new Map<string, { secret: string; outDir: string }>();
   private stopped = false;
   private runRecipeFn: ((args: RunRecipeBindingArgs) => Promise<RunRecipeBindingResult>) | null;
 
@@ -187,6 +195,55 @@ export class Dispatcher {
       retrying_count: get('retrying'),
       dead_count: get('dead'),
     };
+  }
+
+  /**
+   * Mode-B callback drop. Validates the bearer against the per-fire secret
+   * minted in `runScriptBinding`, then appends `body` to that attempt's
+   * `callbacks.json` file. The file is a JSON array — we read-modify-write
+   * so concurrent calls atomically grow it.
+   *
+   * Returns:
+   *   - `'not_found'`     no script binding is currently running for this fire
+   *   - `'unauthorized'`  the presented secret doesn't match
+   *   - `'ok'`            body persisted to disk (best-effort)
+   */
+  recordCallback(
+    fire_id: string,
+    presentedSecret: string,
+    body: unknown,
+  ): 'ok' | 'unauthorized' | 'not_found' {
+    const entry = this.activeRuns.get(fire_id);
+    if (!entry) return 'not_found';
+    if (!constantTimeEquals(entry.secret, presentedSecret)) return 'unauthorized';
+    try {
+      const cbPath = join(entry.outDir, 'callbacks.json');
+      let existing: unknown[] = [];
+      if (existsSync(cbPath)) {
+        try {
+          const parsed = JSON.parse(readFileSync(cbPath, 'utf8'));
+          if (Array.isArray(parsed)) existing = parsed;
+        } catch {
+          /* corrupt — overwrite */
+        }
+      } else {
+        mkdirSync(entry.outDir, { recursive: true });
+      }
+      existing.push({
+        mode: 'B',
+        path: `/callback/${fire_id}`,
+        method: 'POST',
+        body,
+        received_at: Date.now(),
+      });
+      writeFileSync(cbPath, JSON.stringify(existing, null, 2));
+    } catch (err) {
+      logger.warn(
+        { err: err instanceof Error ? err.message : String(err), fire_id },
+        'dispatcher: callback write failed',
+      );
+    }
+    return 'ok';
   }
 
   private async runFire(fire: FireRow): Promise<void> {
@@ -272,6 +329,7 @@ export class Dispatcher {
       this.recordFailure(fire, trigger, errStr);
     } finally {
       this.inFlight.delete(fire.fire_id);
+      this.activeRuns.delete(fire.fire_id);
       if (!this.stopped) this.pickUp();
     }
   }
@@ -426,6 +484,10 @@ export class Dispatcher {
     const runtime = ((typeManifest as unknown as { runtime?: TriggerRuntime }).runtime ?? 'tsx') as TriggerRuntime;
     const callbackSecret = randomBytes(16).toString('hex');
     const callbackUrl = `${this.callbackUrlBase}/callback/${fire.fire_id}`;
+    // Register the per-fire secret + outDir so /callback/<fire_id> can
+    // validate the bearer and append the body to attempt-N/callbacks.json
+    // while the script is running.
+    this.activeRuns.set(fire.fire_id, { secret: callbackSecret, outDir });
 
     const state = (JSON.parse(trigger.state_json) as Record<string, unknown>) || {};
     delete (state as Record<string, unknown>).__subscriber_thread_id;
@@ -456,8 +518,19 @@ export class Dispatcher {
       );
     }
 
-    // Mode A callback extraction. Mode B captures land in /callback/* (Phase 8).
-    const callbacks: Array<{ mode: 'A' | 'B'; body: unknown; received_at: number }> = [];
+    // Mode A callback extraction. Mode B callbacks were already appended
+    // to callbacks.json by /callback/<fire_id> in real time — read them
+    // first so we don't clobber them.
+    let callbacks: Array<{ mode: 'A' | 'B'; body: unknown; received_at: number; [k: string]: unknown }> = [];
+    try {
+      const cbPath = join(outDir, 'callbacks.json');
+      if (existsSync(cbPath)) {
+        const parsed = JSON.parse(readFileSync(cbPath, 'utf8'));
+        if (Array.isArray(parsed)) callbacks = parsed;
+      }
+    } catch {
+      /* best-effort */
+    }
     const parsed = result.stdout_parsed as
       | { callback?: { body?: unknown }; state?: unknown }
       | null;
