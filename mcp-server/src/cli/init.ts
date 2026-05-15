@@ -40,6 +40,7 @@ import {
 } from '../config.ts';
 import { DEFAULT_VAPID_SUBJECT, generateVapidKeys } from '../notifications.ts';
 import { deriveTunnelName } from '../tunnel.ts';
+import { loadWorkspaceFromEnv } from '../workspace.ts';
 import type { Flags } from './index.ts';
 import {
   discoverPluginsInDir,
@@ -421,33 +422,11 @@ export async function runInit(flags: Flags): Promise<void> {
       }
     }
 
-    const cfg: ClawdevboxConfig = {
-      version: CONFIG_VERSION,
-      // Global configs omit project_dir — the project is the cwd at
-      // server-launch time.
-      ...(installScope === 'project' ? { project_dir: projectDir } : {}),
-      global_dir: globalDir,
-      workspaces_root: join(globalDir, 'workspaces'),
-      http: { port, host: DEFAULT_HTTP_HOST, token },
-      tunnel:
-        tunnelKind === 'devtunnel'
-          ? {
-              kind: 'devtunnel',
-              name: tunnelName,
-              allow_anonymous: tunnelAllowAnon,
-              auto_start: true,
-            }
-          : { kind: 'none' },
-      notifications: notificationsConfig,
-    };
-
-    const written =
-      installScope === 'global'
-        ? writeGlobalConfig(globalDir, cfg)
-        : writeConfig(projectDir, cfg);
-
     // Install selected built-in plugins. Errors per-plugin are reported in
     // the summary; we don't abort init if one plugin fails to install.
+    // NOTE: plugin install happens BEFORE the config-file write so the
+    // workspace reload below sees freshly-installed `provides.agent_clis[]`
+    // entries when the chooser builds its options.
     interface PluginResult {
       id: string;
       origin: string;
@@ -514,6 +493,50 @@ export async function runInit(flags: Flags): Promise<void> {
     if (pluginResults.length > 0) {
       ensureGlobalNodeModulesLink(globalDir);
     }
+
+    // ---- Workspace reload -------------------------------------------------
+    // Plugins were just installed; load a workspace so reloadTypeRegistries
+    // picks up their provides.agent_clis[] entries. Subsequent phases (the
+    // CLI chooser) read `ws.agentCliProviders` off this. Failure is
+    // non-fatal — the user can fix and rerun.
+    try {
+      const tmpEnv = {
+        ...process.env,
+        CLAWDEVBOX_PROJECT_DIR: projectDir,
+        CLAWDEVBOX_GLOBAL_DIR: globalDir,
+      };
+      await loadWorkspaceFromEnv(tmpEnv);
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[clawdevbox] post-install workspace load failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+
+    const cfg: ClawdevboxConfig = {
+      version: CONFIG_VERSION,
+      // Global configs omit project_dir — the project is the cwd at
+      // server-launch time.
+      ...(installScope === 'project' ? { project_dir: projectDir } : {}),
+      global_dir: globalDir,
+      workspaces_root: join(globalDir, 'workspaces'),
+      http: { port, host: DEFAULT_HTTP_HOST, token },
+      tunnel:
+        tunnelKind === 'devtunnel'
+          ? {
+              kind: 'devtunnel',
+              name: tunnelName,
+              allow_anonymous: tunnelAllowAnon,
+              auto_start: true,
+            }
+          : { kind: 'none' },
+      notifications: notificationsConfig,
+    };
+
+    const written =
+      installScope === 'global'
+        ? writeGlobalConfig(globalDir, cfg)
+        : writeConfig(projectDir, cfg);
 
     const tunnelLine =
       tunnelKind === 'devtunnel'
