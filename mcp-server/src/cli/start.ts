@@ -77,6 +77,7 @@ import {
   stopTunnel,
   type TunnelStatus,
 } from '../tunnel.ts';
+import { closeDatabase, openDatabase } from '../db/index.ts';
 import { readTriggersFile } from '../triggers-store.ts';
 import { loadWorkspaceFromEnv, triggersJsonPath, WorkspaceConfigError } from '../workspace.ts';
 import type { Flags } from './index.ts';
@@ -174,6 +175,14 @@ export async function runStart(flags: Flags): Promise<void> {
     }
     throw err;
   }
+
+  // Open the kernel DB. Runs migrations on every boot. Done before the HTTP
+  // server binds so a migration failure surfaces before any request lands.
+  const opened = openDatabase(cfg.globalDir);
+  logger.info(
+    { path: opened.path, schema_version: opened.schemaVersion },
+    'db opened',
+  );
 
   const { server, hostedRegistry } = await buildServer(ws);
 
@@ -660,6 +669,7 @@ export async function runStart(flags: Flags): Promise<void> {
   const shutdown = (signal: NodeJS.Signals): void => {
     logger.info({ signal }, 'shutting down');
     stopTunnel().finally(() => {
+      closeDatabase();
       httpServer.close(() => process.exit(0));
     });
     // Hard exit after grace period in case sockets keep us alive.
