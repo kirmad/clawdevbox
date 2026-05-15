@@ -25,6 +25,7 @@ import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
 import { listAgentAuthoredTemplates, toRegisteredType } from './template-store.ts';
+import { BUILTIN_RENDERER_TYPES } from './renderer-registry.ts';
 import type { AgentCliProvider, AgentCliProviderError } from './agent-clis/types.ts';
 import { registerBuiltinProviders } from './agent-clis/index.ts';
 import { loadPluginProviders } from './agent-clis/load-plugin.ts';
@@ -183,6 +184,21 @@ export interface Workspace {
   agentCliProviders: Map<string, AgentCliProvider>;
   /** Provider load errors (collisions, malformed plugin modules). */
   agentCliProviderErrors: AgentCliProviderError[];
+  /**
+   * Plugin-provided renderer registry. Keyed by renderer `type` (matches the
+   * `artifact.type` field). Built from each plugin's resolved
+   * `capabilities.renderers`; first-loaded wins on id collisions (sorted by
+   * plugin id). Built-in renderer types cannot be shadowed — those load
+   * attempts land in `rendererErrors` with `BUILTIN_COLLISION`.
+   */
+  pluginRenderers: Map<string, { type: string; pluginId: string; absoluteFile: string }>;
+  /** Renderer-registry load errors (collisions). */
+  rendererErrors: Array<{
+    plugin_id: string;
+    type: string;
+    error: string;
+    code: 'BUILTIN_COLLISION' | 'PLUGIN_COLLISION';
+  }>;
 }
 
 /** Read CLAWDEVBOX_PROJECT_DIR (required) + CLAWDEVBOX_GLOBAL_DIR (optional). */
@@ -207,6 +223,8 @@ export async function loadWorkspaceFromEnv(env: NodeJS.ProcessEnv = process.env)
     triggerTypeErrors: [],
     agentCliProviders: new Map(),
     agentCliProviderErrors: [],
+    pluginRenderers: new Map(),
+    rendererErrors: [],
   };
   await reloadTypeRegistries(ws);
   warnIfLegacyProjectPlugins(ws);
@@ -369,6 +387,8 @@ export async function reloadTypeRegistries(ws: Workspace): Promise<void> {
   ws.plugins.clear();
   ws.triggerTypes.clear();
   ws.triggerTypeErrors.length = 0;
+  ws.pluginRenderers.clear();
+  ws.rendererErrors.length = 0;
   // Clear and reseed the agent-CLI registry on every reload. Built-ins always
   // go first so plugin-provided providers can't shadow built-in ids.
   ws.agentCliProviders = new Map();
@@ -507,6 +527,39 @@ export async function reloadTypeRegistries(ws: Workspace): Promise<void> {
           source_plugin_id: pid,
           scope: `plugin:${pid}`,
           file_abs: fileAbs,
+        });
+      }
+    }
+
+    // Third pass — build the plugin-renderer registry. Same precedence rule:
+    // sort by plugin id, first-loaded wins. Built-in collisions are dropped.
+    for (const pid of pluginIds) {
+      const plugin = ws.plugins.get(pid)!;
+      if (plugin.status !== 'enabled') continue;
+      for (const r of plugin.capabilities.renderers ?? []) {
+        if (BUILTIN_RENDERER_TYPES.has(r.type)) {
+          ws.rendererErrors.push({
+            plugin_id: pid,
+            type: r.type,
+            error: `renderer type '${r.type}' collides with a built-in renderer; plugin entry ignored.`,
+            code: 'BUILTIN_COLLISION',
+          });
+          continue;
+        }
+        const existing = ws.pluginRenderers.get(r.type);
+        if (existing) {
+          ws.rendererErrors.push({
+            plugin_id: pid,
+            type: r.type,
+            error: `renderer type '${r.type}' already declared by plugin ${existing.pluginId}; first declaration wins`,
+            code: 'PLUGIN_COLLISION',
+          });
+          continue;
+        }
+        ws.pluginRenderers.set(r.type, {
+          type: r.type,
+          pluginId: pid,
+          absoluteFile: r.absoluteFile,
         });
       }
     }
