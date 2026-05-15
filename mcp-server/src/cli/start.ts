@@ -677,8 +677,9 @@ export async function runStart(flags: Flags): Promise<void> {
 
   // Spawn the dev-buddy main agent. Failures are non-fatal — the home page
   // still loads; the agent tab just shows a disconnected terminal.
-  const mainAgent = startMainAgent({
+  const mainAgent = await startMainAgent({
     workspace: ws,
+    cfg,
     host: cfg.http.host,
     port: boundPort,
   });
@@ -732,7 +733,7 @@ export async function runStart(flags: Flags): Promise<void> {
       `  Terminal:   http://${cfg.http.host}:${boundPort}/terminal/<instance_id>\n` +
       `  Artifacts:  http://${cfg.http.host}:${boundPort}/artifact/<id>\n` +
       `  Health:     http://${cfg.http.host}:${boundPort}/healthz\n` +
-      `  Main agent: ${mainAgent.running ? 'agency copilot (running)' : 'NOT running — `agency` not on PATH? open / and check the Agent tab'}\n` +
+      `  Main agent: ${mainAgent.running ? `${mainAgent.agent_cli} (running)` : `NOT running — provider '${mainAgent.agent_cli}' not registered or its binary is not on PATH; open / and check the Agent tab`}\n` +
       tunnelBannerLine +
       `\nPress Ctrl+C to stop.\n`,
   );

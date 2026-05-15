@@ -6,10 +6,10 @@
  * the home page can attach via `/terminal/main/ws` like any other pty.
  *
  * Boot sequence:
- *   1. Write `<workspace>/.mcp.json` + `<workspace>/agency.toml` so the
- *      spawned `agency copilot` sees the clawdevbox MCP server.
- *   2. Spawn `agency copilot` (interactive — no `-p`) inside a hidden
- *      ConPTY (no console window flash on Windows).
+ *   1. Resolve the configured provider (`cfg.defaultAgentCli ?? 'copilot'`)
+ *      from `ws.agentCliProviders`.
+ *   2. Delegate `spawnSession({ mode: 'interactive', role: 'main-agent' })`
+ *      — the provider owns binary resolution, argv, and `.mcp.json` write.
  *   3. Register the IPty with pty-registry. Late attachers see the
  *      scrollback snapshot + live stream.
  *
@@ -23,11 +23,12 @@
 
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { resolve as resolvePath } from 'node:path';
-import * as pty from 'node-pty';
 import { emitChange } from './event-bus.ts';
 import { logger } from './logger.ts';
 import { hasSession, killPty, listSessions, registerPty } from './pty-registry.ts';
 import type { Workspace } from './workspace.ts';
+import type { ResolvedConfig } from './config.ts';
+import { buildProviderCtx } from './agent-clis/shared.ts';
 
 export const MAIN_AGENT_INSTANCE_ID = 'main';
 
@@ -35,12 +36,13 @@ export interface MainAgentStatus {
   instance_id: string;
   running: boolean;
   exited: boolean;
-  agent_cli: 'copilot';
+  agent_cli: string;
   view_url_path: string;
 }
 
 interface MainAgentOptions {
   workspace: Workspace;
+  cfg: ResolvedConfig;
   /** HTTP host the spawned agent should call back to (informational). */
   host?: string;
   /** HTTP port the spawned agent should call back to (informational). */
@@ -48,6 +50,11 @@ interface MainAgentOptions {
 }
 
 let agentPid: number | null = null;
+let agentCliId: string = 'copilot';
+
+function mintMainAgentSessionId(): string {
+  return 'main-' + Date.now().toString(36);
+}
 
 const DEV_BUDDY_SKILL_ID = 'dev-buddy';
 
@@ -135,51 +142,13 @@ function seedDevBuddySkill(ws: Workspace): void {
   }
 }
 
-function writeMcpAndAgencyConfig(ws: Workspace): void {
-  // `.mcp.json` for any MCP client that respects the workspace config.
-  const mcpConfigPath = resolvePath(ws.projectDir, '.mcp.json');
-  const mcpConfig = {
-    mcpServers: {
-      clawdevbox: {
-        type: 'local',
-        command: 'npx',
-        args: ['-y', 'clawdevbox', 'mcp'],
-        env: {
-          CLAWDEVBOX_PROJECT_DIR: ws.projectDir,
-          CLAWDEVBOX_GLOBAL_DIR: ws.globalDir,
-        },
-        tools: ['*'],
-      },
-    },
-  };
-  writeFileSync(mcpConfigPath, JSON.stringify(mcpConfig, null, 2) + '\n', 'utf8');
-
-  // `agency.toml` — agency's `copilot --resume` flow merges this into the
-  // copilot mcp-config bundle (workspace `.mcp.json` is dropped on resume).
-  // We mirror the same server entry so the resumed copilot tool inventory
-  // includes clawdevbox tools.
-  const agencyTomlPath = resolvePath(ws.projectDir, 'agency.toml');
-  const tomlEscape = (s: string) => s.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-  const agencyToml =
-    `[mcps.servers.clawdevbox]\n` +
-    `type = "stdio"\n` +
-    `command = "${tomlEscape('npx')}"\n` +
-    `args = ["-y", "clawdevbox", "mcp"]\n` +
-    `tools = ["*"]\n` +
-    `\n` +
-    `[mcps.servers.clawdevbox.env]\n` +
-    `CLAWDEVBOX_PROJECT_DIR = "${tomlEscape(ws.projectDir)}"\n` +
-    `CLAWDEVBOX_GLOBAL_DIR = "${tomlEscape(ws.globalDir)}"\n`;
-  writeFileSync(agencyTomlPath, agencyToml, 'utf8');
-}
-
 export function getMainAgentStatus(): MainAgentStatus {
   const session = listSessions().find((s) => s.instanceId === MAIN_AGENT_INSTANCE_ID);
   return {
     instance_id: MAIN_AGENT_INSTANCE_ID,
     running: session ? !session.exited : false,
     exited: session ? session.exited : false,
-    agent_cli: 'copilot',
+    agent_cli: agentCliId,
     view_url_path: `/terminal/${MAIN_AGENT_INSTANCE_ID}`,
   };
 }
@@ -187,11 +156,11 @@ export function getMainAgentStatus(): MainAgentStatus {
 /**
  * Start the main agent. No-op if one is already running.
  *
- * Returns the status (existing or freshly spawned). Spawn failures (e.g.
- * `agency` not on PATH) are logged and surface in the returned `running`
- * flag — they do not throw so the HTTP server stays up.
+ * Returns the status (existing or freshly spawned). Spawn failures (CLI
+ * binary missing, provider not registered, etc.) are logged and surface in
+ * the returned `running` flag — they do not throw so the HTTP server stays up.
  */
-export function startMainAgent(opts: MainAgentOptions): MainAgentStatus {
+export async function startMainAgent(opts: MainAgentOptions): Promise<MainAgentStatus> {
   if (hasSession(MAIN_AGENT_INSTANCE_ID)) {
     const status = getMainAgentStatus();
     if (status.running) return status;
@@ -199,65 +168,70 @@ export function startMainAgent(opts: MainAgentOptions): MainAgentStatus {
     // fall out naturally and spawn a new one.
   }
 
-  try {
-    writeMcpAndAgencyConfig(opts.workspace);
-  } catch (err) {
-    logger.warn(
-      { err: err instanceof Error ? err.message : String(err) },
-      'main-agent: failed to write workspace .mcp.json / agency.toml',
-    );
-  }
   seedDevBuddySkill(opts.workspace);
 
-  const isWin = process.platform === 'win32';
-  const agencyBin = process.env.CLAWDEVBOX_AGENCY_PATH ?? (isWin ? 'agency.exe' : 'agency');
+  const providerId = opts.cfg.defaultAgentCli ?? 'copilot';
+  agentCliId = providerId;
+  const provider = opts.workspace.agentCliProviders.get(providerId);
+  if (!provider) {
+    logger.warn(
+      {
+        providerId,
+        available: [...opts.workspace.agentCliProviders.keys()],
+      },
+      'main-agent: configured provider is not registered; home page agent tab will be empty',
+    );
+    return getMainAgentStatus();
+  }
 
-  // Interactive — no `-p`. The user types in the browser xterm, the agent
-  // streams output back, just like a local terminal.
-  const ptyArgs = ['copilot'];
-
-  const cols = 120;
-  const rows = 30;
+  const host = opts.host ?? opts.cfg.http.host;
+  const port = opts.port ?? opts.cfg.http.port;
+  const providerCtx = buildProviderCtx(opts.workspace, opts.cfg);
 
   try {
-    const proc = pty.spawn(agencyBin, ptyArgs, {
-      name: 'xterm-256color',
-      cols,
-      rows,
-      cwd: opts.workspace.projectDir,
-      env: {
-        ...process.env,
+    const handle = await provider.spawnSession(providerCtx, {
+      mode: 'interactive',
+      init: { kind: 'new', session_id: mintMainAgentSessionId() },
+      role: 'main-agent',
+      workspaceInfo: { id: 'project', path: opts.workspace.projectDir },
+      ambientEnv: {
         CLAWDEVBOX_PROJECT_DIR: opts.workspace.projectDir,
         CLAWDEVBOX_GLOBAL_DIR: opts.workspace.globalDir,
-      } as Record<string, string>,
+      },
+      mcp: {
+        url: `http://${host}:${port}/mcp`,
+        secret: opts.cfg.http.token ?? '',
+      },
+      ptyCols: 120,
+      ptyRows: 30,
     });
-    agentPid = proc.pid ?? null;
+    agentPid = handle.pid ?? null;
 
     registerPty({
       instanceId: MAIN_AGENT_INSTANCE_ID,
       workspaceId: 'project',
-      cols,
-      rows,
-      ipty: proc,
+      cols: 120,
+      rows: 30,
+      ipty: handle.pty,
     });
 
-    proc.onExit(({ exitCode, signal }) => {
+    handle.exited.then(({ exitCode, signal }) => {
       logger.info({ exitCode, signal, pid: agentPid }, 'main-agent: exited');
       agentPid = null;
       emitChange('agent');
-    });
+    }).catch(() => { /* exited promise never rejects */ });
 
     emitChange('agent');
     logger.info(
-      { agentCli: 'copilot', pid: agentPid, projectDir: opts.workspace.projectDir },
+      { agentCli: providerId, pid: agentPid, projectDir: opts.workspace.projectDir },
       'main-agent: started',
     );
   } catch (err) {
     logger.warn(
       {
         err: err instanceof Error ? err.message : String(err),
-        agencyBin,
-        hint: 'install agency-cli or set CLAWDEVBOX_AGENCY_PATH',
+        providerId,
+        hint: `provider '${providerId}' failed to spawn — check its binary is installed and on PATH`,
       },
       'main-agent: spawn failed; home page will show an empty terminal',
     );
@@ -267,7 +241,7 @@ export function startMainAgent(opts: MainAgentOptions): MainAgentStatus {
 }
 
 /** Kill the running main agent (if any) and respawn. */
-export function restartMainAgent(opts: MainAgentOptions): MainAgentStatus {
+export async function restartMainAgent(opts: MainAgentOptions): Promise<MainAgentStatus> {
   if (hasSession(MAIN_AGENT_INSTANCE_ID)) {
     killPty(MAIN_AGENT_INSTANCE_ID);
   }

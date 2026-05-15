@@ -131,6 +131,12 @@ export interface ResolvedConfig {
   };
   /** Path to the config file that produced this (null if defaults-only). */
   configPath: string | null;
+  /**
+   * Default agent CLI provider id for the main agent (and recipe.run when
+   * unspecified). Phase 5 wires the config merge logic; for now the field
+   * is optional so the kernel can read it and fall back to 'copilot'.
+   */
+  defaultAgentCli?: string;
 }
 
 export class ConfigError extends Error {
