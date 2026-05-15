@@ -239,6 +239,12 @@ def transform_family(slug: str) -> str:
 
     body = re.sub(r"\.\./\.\./mcp-server/", "../mcp-server/", body)
 
+    body = re.sub(
+        r"\[([^\]]+)\]\(\.\./([A-Za-z0-9_.-]+\.md)(#[^\)]*)?\)",
+        lambda m: f"[{m.group(1)}](./{m.group(2)}{m.group(3) or ''})",
+        body,
+    )
+
     return body.rstrip() + "\n"
 
 

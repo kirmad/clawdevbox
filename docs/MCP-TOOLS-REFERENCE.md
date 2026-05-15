@@ -1225,7 +1225,7 @@ Validated server-side before every disk write by `validateRecipeSource()` in
 | `name`           | string     | Non-empty.                                                                    |
 | `description`    | string     | Non-empty.                                                                    |
 | `kind`           | string?    | Enum: `pr_review` \| `workitem` \| `incident` \| `epic` \| `custom`.         |
-| `default_client` | string?    | Enum: `claude` \| `copilot`.                                                 |
+| `default_client` | string?    | Any registered agent-CLI provider id (built-ins: `claude`, `copilot`; plugins may add more — see [`agent-clis.md`](./agent-clis.md)). Validated against `ws.agentCliProviders` at run time, not parse time. |
 | `mcp_servers`    | string[]?  | Array of strings.                                                             |
 | `timeout_minutes`| number?    | `>= 0`.                                                                       |
 | `steps`          | object[]?  | Each step: integer `id` (unique), non-empty `goal`, optional `depends: int[]`.|
@@ -1396,7 +1396,7 @@ below for the end-to-end mechanism.
 | `params`                   | `Record<string, unknown>`                  | no                      | Recorded on the instance for downstream consumption. Not passed to the CLI.                  |
 | `workspace_id`             | string                                     | no                      | Reuse an existing workspace; otherwise a fresh one is minted via `createWorkspace`.          |
 | `attach_to_inbox_item_id`  | string                                     | no                      | Echoed in the response; not used internally.                                                 |
-| `agent_cli`                | `'copilot' \| 'claude' \| 'echo-stub'`     | no                      | Default `'copilot'`. `echo-stub` is a test no-op.                                            |
+| `agent_cli`                | string                                     | no                      | Any registered provider id (built-ins: `copilot`, `claude`, `echo-stub`; plugins may add more). Default resolution chain below. `echo-stub` is a test no-op. |
 | `session_id`               | string                                     | no                      | Explicit agent-CLI session id. Auto-minted as `cdb_<base36>` if omitted.                     |
 | `resume_of`                | string                                     | no                      | Recipe-instance id to resume; switches the CLI flag from `--name=` (or `--session-id`) to `--resume`. |
 
@@ -1414,7 +1414,7 @@ below for the end-to-end mechanism.
   workspace_path: string;
   attach_to_inbox_item_id: string | null;
   pid: number | null;                // null if spawn never returned a pid (echo-stub may already have exited)
-  agent_cli: 'copilot' | 'claude' | 'echo-stub';
+  agent_cli: string;                 // provider id (built-in or plugin-registered)
   session_id: string;                // explicit CLI session id (cdb_<...> when auto-minted)
   resume_of: string | null;
   status: 'spawned';                 // initial; the instance row is the source of truth thereafter
@@ -1425,7 +1425,29 @@ below for the end-to-end mechanism.
 
 **Errors:** `INVALID_REQUEST` (id+source XOR), `INVALID_ID`, `NOT_FOUND`
 (recipe), `VALIDATION_FAILED` (inline source malformed), `WORKSPACE_NOT_FOUND`,
-`WORKSPACE_CREATE_FAILED`, `SPAWN_FAILED`.
+`WORKSPACE_CREATE_FAILED`, `UNKNOWN_AGENT_CLI` (resolved provider id not
+in `ws.agentCliProviders`), `SPAWN_FAILED`.
+
+##### `agent_cli` argument
+
+The `agent_cli` argument accepts **any registered provider id**, not
+just the OSS built-ins. Built-ins are `copilot`, `claude`, and
+`echo-stub`; plugin-supplied providers register through
+`provides.agent_clis[]` in `plugin.yaml`. The current list is
+discoverable via `GET /api/agent-clis`. See
+[`docs/agent-clis.md`](./agent-clis.md) for authoring details.
+
+Resolution order if omitted (first hit wins):
+
+1. explicit `agent_cli` on the `recipe.run` call
+2. recipe-level `default_client` field
+3. project config `default_agent_cli`
+4. global config `default_agent_cli`
+5. hardcoded fallback: `'copilot'`
+
+If the resolved id is not registered, `recipe.run` returns
+`UNKNOWN_AGENT_CLI` and lists the available providers in the error
+message.
 
 **Ad-hoc vs saved**: ad-hoc runs are useful when the agent composes a one-off
 recipe on the fly (e.g. "summarize this list of files"). The full YAML is still
