@@ -95,6 +95,10 @@ export interface InboxItem {
   agent_tone?: AgentTone;
   state: InboxState;
   snoozed_until?: number;        // unix ms
+  /** Link to a specific recipe step (DB FK). Optional. */
+  recipe_step_id?: string | null;
+  /** Link to the agent session that produced this item (DB FK). Optional. */
+  agent_session_id?: string | null;
   created_at: number;
   updated_at: number;
   [k: string]: unknown;
