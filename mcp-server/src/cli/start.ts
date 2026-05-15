@@ -83,6 +83,7 @@ import { readTriggersFile } from '../triggers-store.ts';
 import { loadWorkspaceFromEnv, triggersJsonPath, WorkspaceConfigError } from '../workspace.ts';
 import { Dispatcher } from '../dispatcher.ts';
 import { Scheduler } from '../scheduler.ts';
+import { handleCronApi, type CronApiContext } from './cron-api.ts';
 import type { Flags } from './index.ts';
 
 function str(flags: Flags, key: string): string | undefined {
@@ -201,6 +202,14 @@ export async function runStart(flags: Flags): Promise<void> {
     mcpUrl: `http://${cfg.http.host}:${cfg.http.port}/mcp`,
     projectDir: ws.projectDir,
   });
+
+  // Cron API context — populated once the dispatcher/scheduler exist.
+  // The request handler closure reads `cronApiCtx` per-request, so by the
+  // time the listener is actually accepting requests it's been assigned.
+  let cronApiCtx: CronApiContext | null = null;
+
+  const serviceStartedAt = Date.now();
+  const ownVersion = readOwnVersion();
   const httpServer = createServer(async (req, res) => {
     const url = new URL(req.url ?? '/', `http://${cfg.http.host}`);
 
@@ -592,6 +601,11 @@ export async function runStart(flags: Flags): Promise<void> {
       return;
     }
 
+    // Trigger-kernel introspection / control + Mode B callbacks.
+    if (cronApiCtx) {
+      if (await handleCronApi(req, res, cronApiCtx)) return;
+    }
+
     dispatchTerminalRequest(req, res);
   });
 
@@ -621,6 +635,20 @@ export async function runStart(flags: Flags): Promise<void> {
   dispatcher.start();
   const scheduler = new Scheduler(opened.db, dispatcher, ws);
   scheduler.start();
+  cronApiCtx = {
+    db: opened.db,
+    scheduler,
+    dispatcher,
+    dbPath: opened.path,
+    schemaVersion: opened.schemaVersion,
+    service: {
+      pid: process.pid,
+      port: boundPort,
+      started_at: serviceStartedAt,
+      version: ownVersion,
+    },
+    expectedToken,
+  };
   logger.info(
     {
       max_concurrent: cfg.cron.max_concurrent,
