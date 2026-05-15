@@ -501,6 +501,14 @@ function validateTriggerTypeEntry(entry: unknown, p: string): ValidationError[] 
     }
   }
 
+  // runtime (optional on plugin-shipped types — defaults to 'tsx')
+  if (e.runtime !== undefined) {
+    const r = validateRuntime(e.runtime);
+    if (!r.ok) {
+      errors.push({ path: `${p}.runtime`, code: 'ENUM', message: r.message });
+    }
+  }
+
   return errors;
 }
 
@@ -592,3 +600,73 @@ function describeType(value: unknown): string {
   if (Array.isArray(value)) return 'array';
   return typeof value;
 }
+
+// ============================================================================
+// Agent-authored trigger template validators (Task 0.2)
+// ============================================================================
+
+const RUNTIMES = new Set(['node', 'tsx', 'python', 'bash']);
+const LOCAL_TRIGGER_ID_PATTERN = /^local\.[a-z][a-z0-9-]*(\.[a-z][a-z0-9-]*)*$/;
+
+export type TriggerRuntime = 'node' | 'tsx' | 'python' | 'bash';
+
+export function validateRuntime(
+  value: unknown,
+): { ok: true; runtime: TriggerRuntime } | { ok: false; message: string } {
+  if (typeof value !== 'string' || !RUNTIMES.has(value)) {
+    return { ok: false, message: `runtime must be one of: ${[...RUNTIMES].join(', ')}` };
+  }
+  return { ok: true, runtime: value as TriggerRuntime };
+}
+
+export function validateLocalTriggerTypeId(
+  id: string,
+): { ok: true } | { ok: false; message: string } {
+  if (typeof id !== 'string' || !LOCAL_TRIGGER_ID_PATTERN.test(id)) {
+    return { ok: false, message: `id must match ${LOCAL_TRIGGER_ID_PATTERN} (start with 'local.')` };
+  }
+  return { ok: true };
+}
+
+/**
+ * Full-shape validator for an agent-authored template manifest. Reuses the
+ * plugin-side validateTriggerTypeEntry but layers on the local. id requirement
+ * and the required runtime field.
+ */
+export function validateAgentAuthoredTemplate(parsed: unknown): ValidationResult {
+  if (!isPlainObject(parsed)) {
+    return { ok: false, errors: [{ path: '$', code: 'NOT_OBJECT', message: 'template must be a YAML map.' }] };
+  }
+  const errors: ValidationError[] = [];
+  const e = parsed as Record<string, unknown>;
+
+  if (typeof e.id === 'string') {
+    const idCheck = validateLocalTriggerTypeId(e.id);
+    if (!idCheck.ok) {
+      errors.push({ path: 'id', code: 'PATTERN', message: idCheck.message });
+    }
+  } else {
+    errors.push({ path: 'id', code: 'REQUIRED', message: 'id is required.' });
+  }
+
+  if (e.runtime === undefined) {
+    errors.push({ path: 'runtime', code: 'REQUIRED', message: 'runtime is required for agent-authored templates.' });
+  } else {
+    const runtimeCheck = validateRuntime(e.runtime);
+    if (!runtimeCheck.ok) {
+      errors.push({ path: 'runtime', code: 'ENUM', message: runtimeCheck.message });
+    }
+  }
+
+  // Reuse the plugin-side per-entry validator for everything else (file, parameters,
+  // cron, binding XOR, identity_param, accepts_webhook). It writes paths prefixed
+  // with the passed-in `p`; we strip the prefix to keep our error paths flat.
+  const reused = validateTriggerTypeEntry(parsed, '$');
+  for (const err of reused) {
+    if (err.path === '$.id') continue; // we already validated id with the local. rule
+    errors.push({ ...err, path: err.path.startsWith('$.') ? err.path.slice(2) : err.path });
+  }
+
+  return errors.length === 0 ? { ok: true } : { ok: false, errors };
+}
+
