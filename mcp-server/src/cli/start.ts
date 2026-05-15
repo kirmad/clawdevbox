@@ -84,6 +84,7 @@ import { loadWorkspaceFromEnv, triggersJsonPath, WorkspaceConfigError } from '..
 import { Dispatcher } from '../dispatcher.ts';
 import { Scheduler } from '../scheduler.ts';
 import { handleCronApi, type CronApiContext } from './cron-api.ts';
+import { handleAgentCliApi } from './agent-clis-api.ts';
 import type { Flags } from './index.ts';
 
 function str(flags: Flags, key: string): string | undefined {
@@ -600,6 +601,9 @@ export async function runStart(flags: Flags): Promise<void> {
       res.end(JSON.stringify(status));
       return;
     }
+
+    // Agent-CLI provider registry — bearer-protected list endpoint.
+    if (await handleAgentCliApi(req, res, ws, cfg, expectedToken)) return;
 
     // Trigger-kernel introspection / control + Mode B callbacks.
     if (cronApiCtx) {
