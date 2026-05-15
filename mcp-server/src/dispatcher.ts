@@ -44,6 +44,9 @@ import { resolveRead } from './scope.ts';
 import { runRecipe } from './recipe-runner.ts';
 import { resolveWorkspacesRoot } from './workspaces-store.ts';
 
+/** Error code emitted by the resume-binding stub. Phase 2 will implement it. */
+export const AGENT_SESSION_RESUME_NOT_IMPLEMENTED = 'agent_session_resume_not_implemented';
+
 interface TriggerRow {
   id: string;
   workspace_id: string;
@@ -221,10 +224,28 @@ export class Dispatcher {
 
       let result: { recipe_instance_id?: string; agent_session_id?: string; exit_code?: number | null };
 
+      logger.debug(
+        {
+          fire_id: fire.fire_id,
+          trigger_id: trigger.id,
+          binding: bindsToRecipe
+            ? 'recipe'
+            : bindsTo === 'agent_session_resume'
+              ? 'agent_session_resume'
+              : 'script',
+          attempt: fire.attempt,
+        },
+        'dispatcher: running fire',
+      );
+
       if (bindsToRecipe) {
         result = await this.runRecipeBinding(fire, trigger, wsRow, bindsToRecipe);
       } else if (bindsTo === 'agent_session_resume') {
-        throw new Error('agent_session_resume_not_implemented');
+        // Phase 2 will implement this: spawn a fresh agent CLI process
+        // with --resume <cli_session_id> against the suspended session
+        // recorded by the trigger's recipe_step_id. For Phase 1 we
+        // surface the error so the fire dead-letters cleanly.
+        throw new Error(AGENT_SESSION_RESUME_NOT_IMPLEMENTED);
       } else {
         result = await this.runScriptBinding(fire, trigger, outDir, typeManifest);
       }
