@@ -314,3 +314,69 @@ test('cliPluginDiscover: returns [] when plugin list fails', async () => {
     },
   );
 });
+
+// ============================================================================
+// runPluginSync subcommand
+// ============================================================================
+
+import { runPluginSync } from '../src/cli/plugin-sync.ts';
+
+function makeProjectTree() {
+  const root = mkdtempSync(join(tmpdir(), 'pluginsync-proj-'));
+  const globalDir = join(root, '.global');
+  mkdirSync(globalDir, { recursive: true });
+  return { root, globalDir };
+}
+
+test('runPluginSync: --help exits 0 without touching providers', async () => {
+  const { root, globalDir } = makeProjectTree();
+  const prevProj = process.env.CLAWDEVBOX_PROJECT_DIR;
+  const prevGlobal = process.env.CLAWDEVBOX_GLOBAL_DIR;
+  process.env.CLAWDEVBOX_PROJECT_DIR = root;
+  process.env.CLAWDEVBOX_GLOBAL_DIR = globalDir;
+  try {
+    const r = await runPluginSync(['--help']);
+    assert.equal(r.exitCode, 0);
+  } finally {
+    process.env.CLAWDEVBOX_PROJECT_DIR = prevProj;
+    process.env.CLAWDEVBOX_GLOBAL_DIR = prevGlobal;
+  }
+});
+
+test('runPluginSync: --direction=invalid returns exitCode 2', async () => {
+  const { root, globalDir } = makeProjectTree();
+  const prevProj = process.env.CLAWDEVBOX_PROJECT_DIR;
+  const prevGlobal = process.env.CLAWDEVBOX_GLOBAL_DIR;
+  process.env.CLAWDEVBOX_PROJECT_DIR = root;
+  process.env.CLAWDEVBOX_GLOBAL_DIR = globalDir;
+  try {
+    const r = await runPluginSync(['--direction=bogus']);
+    assert.equal(r.exitCode, 2);
+  } finally {
+    process.env.CLAWDEVBOX_PROJECT_DIR = prevProj;
+    process.env.CLAWDEVBOX_GLOBAL_DIR = prevGlobal;
+  }
+});
+
+test('runPluginSync: --respect-config + clientSync.mode=off short-circuits', async () => {
+  const { root, globalDir } = makeProjectTree();
+  // Write a config that disables sync.
+  const cfgMod = await import('../src/config.ts');
+  cfgMod.writeGlobalConfig(globalDir, {
+    version: cfgMod.CONFIG_VERSION,
+    global_dir: globalDir,
+    client_sync: { mode: 'off' },
+  });
+  const prevProj = process.env.CLAWDEVBOX_PROJECT_DIR;
+  const prevGlobal = process.env.CLAWDEVBOX_GLOBAL_DIR;
+  process.env.CLAWDEVBOX_PROJECT_DIR = root;
+  process.env.CLAWDEVBOX_GLOBAL_DIR = globalDir;
+  try {
+    const r = await runPluginSync(['--respect-config']);
+    assert.equal(r.exitCode, 0);
+    assert.equal(r.syncReport, undefined);
+  } finally {
+    process.env.CLAWDEVBOX_PROJECT_DIR = prevProj;
+    process.env.CLAWDEVBOX_GLOBAL_DIR = prevGlobal;
+  }
+});

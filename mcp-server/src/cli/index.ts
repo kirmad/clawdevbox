@@ -184,6 +184,14 @@ Usage:
       fallback). Removing a marketplace does not uninstall plugins that
       came from it.
 
+  clawdevbox plugin sync [--direction=both|push|pull] [--dry-run] [--respect-config]
+      Bidirectional plugin sync with the configured agent CLI. Direction A
+      installs clawdevbox-managed plugins/marketplaces into the CLI via its
+      own \`plugin install\` / \`plugin marketplace add\` commands; Direction
+      B registers CLI-installed plugins that ship clawdevbox.* extensions
+      into the clawdevbox workspace. Honors cfg.client_sync only when
+      --respect-config is passed.
+
   clawdevbox --help
       Show this message.
 
@@ -256,6 +264,25 @@ async function main(): Promise<void> {
     case 'marketplace': {
       const { runMarketplace } = await import('./marketplace.ts');
       process.exit(await runMarketplace(parsed.positional));
+    }
+    case 'plugin': {
+      // Today the only `plugin` subcommand exposed via the CLI is `sync`.
+      // Plugin install / uninstall / list / etc. are MCP tools.
+      const sub = parsed.positional[0];
+      if (sub === 'sync') {
+        const { runPluginSync } = await import('./plugin-sync.ts');
+        const rest = parsed.positional.slice(1);
+        // Re-thread boolean flags that parseArgv consumed.
+        if (parsed.flags['dry-run'] === true) rest.push('--dry-run');
+        if (parsed.flags['respect-config'] === true) rest.push('--respect-config');
+        if (typeof parsed.flags.direction === 'string') rest.push(`--direction=${parsed.flags.direction}`);
+        const result = await runPluginSync(rest);
+        process.exit(result.exitCode);
+      }
+      process.stderr.write(`unknown plugin subcommand: ${sub ?? '(none)'}\n`);
+      process.stderr.write(`Usage: clawdevbox plugin sync [--direction=both|push|pull] [--dry-run] [--respect-config]\n`);
+      process.exitCode = 2;
+      return;
     }
     default:
       process.stderr.write(`unknown command: ${parsed.command}\n\n`);
