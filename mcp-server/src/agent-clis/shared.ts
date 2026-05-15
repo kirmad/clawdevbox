@@ -266,6 +266,7 @@ export async function cliPluginSync(
     }
     if (opts.dryRun) {
       report.marketplacesAdded.push(m.id);
+      knownMarketplaces.add(m.id);
       continue;
     }
     const res = await runCli(binding, ['plugin', 'marketplace', 'add', m.source]);

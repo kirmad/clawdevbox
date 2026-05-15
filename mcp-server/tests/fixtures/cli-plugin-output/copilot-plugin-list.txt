@@ -1,3 +1,3 @@
 Installed plugins:
-  ΓÇó superpowers@superpowers-marketplace (v5.1.0)
-  ΓÇó cfv@ic3-ai-plugins (v1.4.0)
+  • superpowers@superpowers-marketplace (v5.1.0)
+  • cfv@ic3-ai-plugins (v1.4.0)
