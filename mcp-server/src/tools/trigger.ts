@@ -51,6 +51,7 @@ import {
   type RegisteredTrigger,
 } from '../triggers-store.ts';
 import {
+  deleteTemplate,
   findTemplate,
   templateExists,
   writeTemplate,
@@ -672,6 +673,42 @@ export function registerTriggerTools(server: McpServer, ws: Workspace): void {
       return {
         content: [{ type: 'text', text: `Updated template ${args.id}.` }],
         structuredContent: { id: args.id, scope: existing.scope, path: written.dir },
+      };
+    },
+  );
+
+  // -- trigger.delete_template -------------------------------------------
+  server.registerTool(
+    'trigger.delete_template',
+    {
+      description:
+        'Delete an agent-authored trigger template by id. Refuses to delete plugin-shipped TYPES (use plugin.uninstall) or templates referenced by registered instances (unregister first).',
+      inputSchema: { id: z.string().min(1) },
+    },
+    async (args) => {
+      const existing = findTemplate(ws, args.id);
+      if (!existing) {
+        const inMap = ws.triggerTypes.get(args.id);
+        if (inMap && inMap.scope.startsWith('plugin:')) {
+          return structuredError('TRIGGER_TEMPLATE_NOT_AUTHORED',
+            `${args.id} is a plugin-shipped trigger type. Use plugin.uninstall to remove it.`,
+            { id: args.id, scope: inMap.scope });
+        }
+        return structuredError('TRIGGER_TEMPLATE_NOT_FOUND',
+          `Template ${args.id} not found.`, { id: args.id });
+      }
+      const file = readTriggersFile(triggersJsonPath(ws));
+      const refs = file.registered.filter((r) => r.type === args.id).map((r) => r.id);
+      if (refs.length > 0) {
+        return structuredError('TRIGGER_TEMPLATE_IN_USE',
+          `Template ${args.id} is referenced by ${refs.length} registered instance(s). Unregister them first.`,
+          { id: args.id, registered_ids: refs });
+      }
+      const removed = deleteTemplate(ws, existing.scope, args.id);
+      reloadTypeRegistries(ws);
+      return {
+        content: [{ type: 'text', text: `Deleted template ${args.id} (scope=${existing.scope}).` }],
+        structuredContent: { id: args.id, scope: existing.scope, removed },
       };
     },
   );

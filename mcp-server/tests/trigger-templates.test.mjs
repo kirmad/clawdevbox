@@ -226,3 +226,45 @@ test('trigger.update_template returns TRIGGER_TEMPLATE_NOT_FOUND for missing id'
     assert.equal(r.structuredContent.code, 'TRIGGER_TEMPLATE_NOT_FOUND');
   });
 });
+
+test('trigger.delete_template removes the directory and reloads registry', async () => {
+  await withHarness(async (h) => {
+    await h.call('trigger.create_template', {
+      id: 'local.del', scope: 'project', runtime: 'tsx',
+      description: 'x', script: '// x\n',
+    });
+    const dir = join(h.callerProjectDir, '.clawdevbox', 'trigger-types', 'local.del');
+    assert.ok(existsSync(dir));
+    const res = await h.call('trigger.delete_template', { id: 'local.del' });
+    assert.ok(!res.isError, JSON.stringify(res));
+    assert.equal(existsSync(dir), false);
+    const list = await h.call('trigger.list_types', { search: 'local.del' });
+    assert.equal(list.structuredContent.trigger_types.length, 0);
+  });
+});
+
+test('trigger.delete_template refuses while a registered instance still references it', async () => {
+  await withHarness(async (h) => {
+    await h.call('trigger.create_template', {
+      id: 'local.busy', scope: 'project', runtime: 'tsx',
+      description: 'x', script: '// x\n',
+      parameters: [{ name: 'repo', type: 'string', required: true }],
+    });
+    const reg = await h.call('trigger.register', {
+      type_id: 'local.busy', params: { repo: 'svc' },
+    });
+    assert.ok(!reg.isError);
+    const del = await h.call('trigger.delete_template', { id: 'local.busy' });
+    assert.equal(del.isError, true);
+    assert.equal(del.structuredContent.code, 'TRIGGER_TEMPLATE_IN_USE');
+    assert.ok(Array.isArray(del.structuredContent.registered_ids));
+  });
+});
+
+test('trigger.delete_template refuses to delete a plugin-shipped TYPE', async () => {
+  await withHarness(async (h) => {
+    const res = await h.call('trigger.delete_template', { id: 'ado.new-pr-watcher' });
+    assert.equal(res.isError, true);
+    assert.equal(res.structuredContent.code, 'TRIGGER_TEMPLATE_NOT_AUTHORED');
+  });
+});
