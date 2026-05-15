@@ -31,10 +31,17 @@
  * Required params missing surface as PARAM_VALIDATION with structured errors.
  */
 
+import { existsSync, readFileSync } from 'node:fs';
+import { resolve as pathResolve, sep } from 'node:path';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { logger } from '../logger.ts';
-import { isValidCronExpression, validateTriggerParams } from '../validators.ts';
+import {
+  isValidCronExpression,
+  validateAgentAuthoredTemplate,
+  validateTriggerParams,
+  type TriggerRuntime,
+} from '../validators.ts';
 import { mintId } from '../store.ts';
 import {
   mintRegisteredId,
@@ -43,12 +50,35 @@ import {
   type RegisteredTrigger,
 } from '../triggers-store.ts';
 import {
+  templateExists,
+  writeTemplate,
+  type TemplateManifest,
+} from '../template-store.ts';
+import {
+  reloadTypeRegistries,
   triggersJsonPath,
   type RegisteredTriggerType,
   type Workspace,
 } from '../workspace.ts';
-import { notFound, structuredError } from '../scope.ts';
+import { notFound, structuredError, validationError } from '../scope.ts';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+
+function ensureFileUnderClawdevbox(projectDir: string, relPath: string):
+  { ok: true; path: string } | { ok: false; error: CallToolResult } {
+  const root = pathResolve(projectDir, '.clawdevbox');
+  const abs = pathResolve(projectDir, relPath);
+  if (!abs.startsWith(root + sep) && abs !== root) {
+    return { ok: false, error: structuredError('SCRIPT_FILE_OUTSIDE_WORKSPACE',
+      `script_file must resolve under .clawdevbox/. Got: ${relPath}`,
+      { script_file: relPath, resolved: abs }) };
+  }
+  if (!existsSync(abs)) {
+    return { ok: false, error: structuredError('SCRIPT_FILE_NOT_FOUND',
+      `script_file does not exist: ${relPath}`,
+      { script_file: relPath, resolved: abs }) };
+  }
+  return { ok: true, path: abs };
+}
 
 // ============================================================================
 // Helpers
@@ -448,6 +478,83 @@ export function registerTriggerTools(server: McpServer, ws: Workspace): void {
       return {
         content: [{ type: 'text', text: `Queued trigger ${reg.id} (run_id=${runId}).` }],
         structuredContent: { id: reg.id, type: reg.type, run_id: runId, status: 'queued' },
+      };
+    },
+  );
+
+  // -- trigger.create_template ---------------------------------------------
+  server.registerTool(
+    'trigger.create_template',
+    {
+      description:
+        'Create a new agent-authored trigger TYPE on disk. Persisted as `<scope>/trigger-types/<id>/template.yaml + trigger.<ext>`. Reloads `ws.triggerTypes` so `trigger.register` can immediately consume it. Id must start with `local.`.',
+      inputSchema: {
+        id: z.string().min(1).describe("Type id; must match /^local\\.[a-z][a-z0-9-]*(\\.[a-z][a-z0-9-]*)*$/."),
+        scope: z.enum(['project', 'global']).optional().describe("Default 'project'."),
+        description: z.string().min(1),
+        runtime: z.enum(['node', 'tsx', 'python', 'bash']),
+        script: z.string().optional().describe('Inline script source. XOR with script_file.'),
+        script_file: z.string().optional().describe('Path under <projectDir>/.clawdevbox/. Copied into the template dir.'),
+        default_cron: z.string().optional(),
+        identity_param: z.string().optional(),
+        accepts_webhook: z.boolean().optional(),
+        binds_callback_to_recipe: z.string().optional(),
+        binds_callback_to: z.literal('thread_resume').optional(),
+        parameters: z.array(z.record(z.string(), z.unknown())).optional(),
+      },
+    },
+    async (args) => {
+      const scope = args.scope ?? 'project';
+      const hasScript = typeof args.script === 'string';
+      const hasFile = typeof args.script_file === 'string';
+      if (hasScript === hasFile) {
+        return structuredError('INVALID_REQUEST',
+          'Provide exactly one of `script` (inline) or `script_file` (path).',
+          { script_provided: hasScript, script_file_provided: hasFile });
+      }
+
+      const manifest: TemplateManifest = {
+        id: args.id,
+        file: `trigger.${args.runtime === 'tsx' ? 'ts' : args.runtime === 'node' ? 'js' : args.runtime === 'python' ? 'py' : 'sh'}`,
+        runtime: args.runtime as TriggerRuntime,
+        description: args.description,
+      };
+      if (args.default_cron !== undefined) manifest.default_cron = args.default_cron;
+      if (args.identity_param !== undefined) manifest.identity_param = args.identity_param;
+      if (args.accepts_webhook !== undefined) manifest.accepts_webhook = args.accepts_webhook;
+      if (args.binds_callback_to_recipe !== undefined) manifest.binds_callback_to_recipe = args.binds_callback_to_recipe;
+      if (args.binds_callback_to !== undefined) manifest.binds_callback_to = args.binds_callback_to;
+      if (Array.isArray(args.parameters)) manifest.parameters = args.parameters as TemplateManifest['parameters'];
+
+      const validation = validateAgentAuthoredTemplate(manifest);
+      if (!validation.ok) {
+        return validationError(validation.errors);
+      }
+
+      if (templateExists(ws, scope, args.id)) {
+        return structuredError('TRIGGER_TEMPLATE_EXISTS',
+          `A template with id ${args.id} already exists in scope ${scope}.`,
+          { id: args.id, scope });
+      }
+
+      let scriptContent: string;
+      if (hasScript) {
+        scriptContent = args.script!;
+      } else {
+        const fileGuard = ensureFileUnderClawdevbox(ws.projectDir, args.script_file!);
+        if (!fileGuard.ok) return fileGuard.error;
+        scriptContent = readFileSync(fileGuard.path, 'utf8');
+      }
+
+      const written = writeTemplate(ws, scope, { manifest, scriptContent });
+      reloadTypeRegistries(ws);
+
+      return {
+        content: [{ type: 'text', text: `Created template ${args.id} (scope=${scope}).` }],
+        structuredContent: {
+          id: args.id, scope, path: written.dir,
+          script_path: written.scriptAbs, type_exists: true,
+        },
       };
     },
   );
