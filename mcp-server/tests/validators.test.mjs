@@ -13,6 +13,10 @@ import {
   parseRecipeSource,
   validatePluginAgentCliEntry,
   validatePluginManifest,
+  validatePluginManifestJson,
+  validateAgencyJson,
+  validateMarketplaceJson,
+  validateMarketplaceConfig,
 } from '../src/validators.ts';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -453,4 +457,203 @@ test('validatePluginManifest detects duplicate agent_clis ids within a plugin', 
   if (!r.ok) {
     assert.ok(r.errors.some((e) => e.path === 'provides.agent_clis[1].id' && e.code === 'DUPLICATE'));
   }
+});
+// ============================================================================
+// validatePluginManifestJson (Claude-aligned .claude-plugin/plugin.json)
+// ============================================================================
+
+test("validatePluginManifestJson: missing name reports REQUIRED", () => {
+  const errs = validatePluginManifestJson({});
+  assert.ok(errs.some((e) => e.path === "name" && e.code === "REQUIRED"));
+});
+
+test("validatePluginManifestJson: bad name pattern rejected", () => {
+  const errs = validatePluginManifestJson({ name: "Bad_Name" });
+  assert.ok(errs.some((e) => e.path === "name" && e.code === "PATTERN"));
+});
+
+test("validatePluginManifestJson: author requires name field", () => {
+  const errs = validatePluginManifestJson({
+    name: "demo",
+    author: { email: "x@example.com" },
+  });
+  assert.ok(errs.some((e) => e.path === "author.name" && e.code === "REQUIRED"));
+});
+
+test("validatePluginManifestJson: status without testedWith fails", () => {
+  const errs = validatePluginManifestJson({
+    name: "demo",
+    status: { experimental: true },
+  });
+  assert.ok(errs.some((e) => e.path === "status.testedWith" && e.code === "REQUIRED"));
+});
+
+test("validatePluginManifestJson: valid full manifest passes", () => {
+  const errs = validatePluginManifestJson({
+    name: "demo-plugin",
+    version: "1.0.0",
+    description: "A demo plugin",
+    author: { name: "Demo Author", email: "a@example.com" },
+    homepage: "https://example.com",
+    repository: "https://example.com/repo",
+    license: "MIT",
+    keywords: ["demo", "test"],
+    skills: "./skills",
+    agents: ["./agents", "./more-agents"],
+    commands: "./commands",
+    mcpServers: { mcpServers: { foo: { command: "node" } } },
+    hooks: "./hooks/hooks.json",
+    status: { testedWith: "Claude 1.0", experimental: false, notes: "stable" },
+    clawdevbox: {
+      recipes: [{ id: "do-thing", file: "recipes/do.yaml" }],
+      tools: [{ id: "demo.do_thing", file: "tools/do.ts", runtime: "tsx" }],
+    },
+    requires: { clawdevbox_version: ">=1.0.0", env: ["FOO"] },
+  });
+  assert.deepEqual(errs, []);
+});
+
+test("validatePluginManifestJson: traversal in skills path rejected", () => {
+  const errs = validatePluginManifestJson({
+    name: "demo",
+    skills: "../escape",
+  });
+  assert.ok(errs.some((e) => e.path === "skills" && e.code === "PATH_ESCAPE"));
+});
+
+test("validatePluginManifestJson: traversal in skills array entry rejected", () => {
+  const errs = validatePluginManifestJson({
+    name: "demo",
+    skills: ["./skills", "/absolute/bad"],
+  });
+  assert.ok(errs.some((e) => e.path === "skills[1]" && e.code === "PATH_ESCAPE"));
+});
+
+test("validatePluginManifestJson: bad clawdevbox.tools entry rejected", () => {
+  const errs = validatePluginManifestJson({
+    name: "demo",
+    clawdevbox: {
+      tools: [{ id: "no-namespace", file: "tools/x.ts" }],
+    },
+  });
+  assert.ok(
+    errs.some(
+      (e) => e.path === "clawdevbox.tools[0].id" && e.code === "PATTERN",
+    ),
+  );
+});
+
+test("validatePluginManifestJson: valid clawdevbox block passes", () => {
+  const errs = validatePluginManifestJson({
+    name: "demo",
+    clawdevbox: {
+      recipes: [{ id: "r1", file: "recipes/r1.yaml" }],
+      tools: [{ id: "demo.t1", file: "tools/t1.ts" }],
+      trigger_types: [
+        {
+          id: "demo.watch",
+          file: "triggers/watch.ts",
+          parameters: [{ name: "x", type: "string" }],
+        },
+      ],
+      agent_clis: [{ id: "demo", module: "dist/demo.js" }],
+    },
+  });
+  assert.deepEqual(errs, []);
+});
+
+// ============================================================================
+// validateAgencyJson
+// ============================================================================
+
+test("validateAgencyJson: valid engines and category passes", () => {
+  const errs = validateAgencyJson({
+    engines: ["claude", "copilot", "clawdevbox", "*"],
+    category: "productivity",
+  });
+  assert.deepEqual(errs, []);
+});
+
+test("validateAgencyJson: bad engine name pattern rejected", () => {
+  const errs = validateAgencyJson({ engines: ["Claude"] });
+  assert.ok(errs.some((e) => e.path === "engines[0]" && e.code === "PATTERN"));
+});
+
+test("validateAgencyJson: non-array engines rejected", () => {
+  const errs = validateAgencyJson({ engines: "claude" });
+  assert.ok(errs.some((e) => e.path === "engines" && e.code === "TYPE"));
+});
+
+// ============================================================================
+// validateMarketplaceJson
+// ============================================================================
+
+test("validateMarketplaceJson: missing name reports REQUIRED", () => {
+  const errs = validateMarketplaceJson({
+    owner: { name: "Me" },
+    plugins: [],
+  });
+  assert.ok(errs.some((e) => e.path === "name" && e.code === "REQUIRED"));
+});
+
+test("validateMarketplaceJson: missing owner reports REQUIRED", () => {
+  const errs = validateMarketplaceJson({ name: "mp", plugins: [] });
+  assert.ok(errs.some((e) => e.path === "owner" && e.code === "REQUIRED"));
+});
+
+test("validateMarketplaceJson: missing plugins reports REQUIRED", () => {
+  const errs = validateMarketplaceJson({ name: "mp", owner: { name: "Me" } });
+  assert.ok(errs.some((e) => e.path === "plugins" && e.code === "REQUIRED"));
+});
+
+test("validateMarketplaceJson: plugin entry missing source rejected", () => {
+  const errs = validateMarketplaceJson({
+    name: "mp",
+    owner: { name: "Me" },
+    plugins: [{ name: "demo" }],
+  });
+  assert.ok(
+    errs.some((e) => e.path === "plugins[0].source" && e.code === "REQUIRED"),
+  );
+});
+
+test("validateMarketplaceJson: valid catalog with object source passes", () => {
+  const errs = validateMarketplaceJson({
+    name: "mp",
+    owner: { name: "Me", email: "me@example.com" },
+    description: "Cool catalog",
+    plugins: [
+      { name: "demo", source: "./demo" },
+      {
+        name: "remote",
+        source: { source: "github", repo: "owner/repo", ref: "main" },
+        category: "tools",
+      },
+    ],
+  });
+  assert.deepEqual(errs, []);
+});
+
+// ============================================================================
+// validateMarketplaceConfig
+// ============================================================================
+
+test("validateMarketplaceConfig: missing shared.name reports REQUIRED", () => {
+  const errs = validateMarketplaceConfig({ shared: {} });
+  assert.ok(
+    errs.some((e) => e.path === "shared.name" && e.code === "REQUIRED"),
+  );
+});
+
+test("validateMarketplaceConfig: valid shared + clawdevbox slot passes", () => {
+  const errs = validateMarketplaceConfig({
+    shared: {
+      name: "mp",
+      metadata: { description: "desc", version: "1.0.0" },
+      owner: { name: "Me", email: "me@example.com" },
+    },
+    claude: { metadata: { description: "claude variant" } },
+    clawdevbox: { metadata: { description: "clawdevbox variant" } },
+  });
+  assert.deepEqual(errs, []);
 });

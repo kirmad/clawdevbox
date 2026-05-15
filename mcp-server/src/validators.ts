@@ -11,6 +11,15 @@
  */
 
 import { load as yamlLoad } from 'js-yaml';
+import type {
+  PluginManifest as PluginManifestJson,
+  AgencyJson,
+  MarketplaceJson,
+  MarketplaceConfig,
+  PluginStatus,
+  ClawdevboxExtensions,
+  McpServerConfig,
+} from './manifest/types.ts';
 
 export interface ValidationError {
   path: string;
@@ -967,3 +976,762 @@ export function validateAgentAuthoredTemplate(parsed: unknown): ValidationResult
   return errors.length === 0 ? { ok: true } : { ok: false, errors };
 }
 
+
+
+// ============================================================================
+// Claude-aligned plugin.json manifest (spec §3) + Marketplace (§4)
+//
+// These validators operate on the new `.claude-plugin/plugin.json` shape and
+// its marketplace siblings. They coexist with the legacy yaml-shaped
+// `validatePluginManifest` above until Phase 2 cuts the loader over.
+//
+// All return `ValidationError[]` (empty = ok) — easier to compose than the
+// `ValidationResult` discriminated union the older validators use.
+// ============================================================================
+
+const KEBAB_NAME_PATTERN = /^[a-z][a-z0-9-]*$/;
+const ENGINE_NAME_PATTERN = /^[a-z][a-z0-9-]*$/;
+
+/**
+ * Reject path strings that try to escape the plugin root: any `..` segment,
+ * a leading POSIX root (`/`), a leading backslash, or a Windows drive prefix
+ * (`C:` etc.). Used by every Claude-style path field (skills, agents, etc.).
+ */
+function isUnsafeRelPath(p: string): boolean {
+  if (typeof p !== 'string') return true;
+  if (p.length === 0) return true;
+  if (p.startsWith('/') || p.startsWith('\\')) return true;
+  if (/^[A-Za-z]:/.test(p)) return true;
+  return p.split(/[\\/]/).some((seg) => seg === '..');
+}
+
+/**
+ * Validate a path field that may be a string or string[]. Each entry is
+ * checked with `isUnsafeRelPath`. The field is optional — undefined is fine.
+ */
+function checkStringOrStringArrayPath(
+  value: unknown,
+  fieldPath: string,
+  errors: ValidationError[],
+): void {
+  if (value === undefined) return;
+  if (typeof value === 'string') {
+    if (isUnsafeRelPath(value)) {
+      errors.push({
+        path: fieldPath,
+        code: 'PATH_ESCAPE',
+        message: `${fieldPath} must be a relative path with no ".." segments.`,
+      });
+    }
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((entry, i) => {
+      if (typeof entry !== 'string') {
+        errors.push({
+          path: `${fieldPath}[${i}]`,
+          code: 'TYPE',
+          message: `${fieldPath}[${i}] must be a string.`,
+        });
+      } else if (isUnsafeRelPath(entry)) {
+        errors.push({
+          path: `${fieldPath}[${i}]`,
+          code: 'PATH_ESCAPE',
+          message: `${fieldPath}[${i}] must be a relative path with no ".." segments.`,
+        });
+      }
+    });
+    return;
+  }
+  errors.push({
+    path: fieldPath,
+    code: 'TYPE',
+    message: `${fieldPath} must be a string or array of strings.`,
+  });
+}
+
+function checkOptionalString(value: unknown, fieldPath: string, errors: ValidationError[]): void {
+  if (value !== undefined && typeof value !== 'string') {
+    errors.push({ path: fieldPath, code: 'TYPE', message: `${fieldPath} must be a string.` });
+  }
+}
+
+function checkOptionalStringArray(
+  value: unknown,
+  fieldPath: string,
+  errors: ValidationError[],
+): void {
+  if (value === undefined) return;
+  if (!Array.isArray(value)) {
+    errors.push({ path: fieldPath, code: 'TYPE', message: `${fieldPath} must be an array.` });
+    return;
+  }
+  value.forEach((entry, i) => {
+    if (typeof entry !== 'string') {
+      errors.push({
+        path: `${fieldPath}[${i}]`,
+        code: 'TYPE',
+        message: `${fieldPath}[${i}] must be a string.`,
+      });
+    }
+  });
+}
+
+/**
+ * Validate the Microsoft `status` extension subtree.
+ * `testedWith` is required when the status object is present.
+ */
+function validatePluginStatus(value: unknown, errors: ValidationError[]): void {
+  if (!isPlainObject(value)) {
+    errors.push({ path: 'status', code: 'TYPE', message: 'status must be an object.' });
+    return;
+  }
+  const s = value as Record<string, unknown>;
+  if (!isNonEmptyString(s.testedWith)) {
+    errors.push({
+      path: 'status.testedWith',
+      code: 'REQUIRED',
+      message: 'status.testedWith is required when status is present.',
+    });
+  }
+  if (s.experimental !== undefined && typeof s.experimental !== 'boolean') {
+    errors.push({
+      path: 'status.experimental',
+      code: 'TYPE',
+      message: 'status.experimental must be a boolean.',
+    });
+  }
+  if (s.notes !== undefined && typeof s.notes !== 'string') {
+    errors.push({ path: 'status.notes', code: 'TYPE', message: 'status.notes must be a string.' });
+  }
+}
+
+function validateAuthor(value: unknown, fieldPath: string, errors: ValidationError[]): void {
+  if (value === undefined) return;
+  if (!isPlainObject(value)) {
+    errors.push({ path: fieldPath, code: 'TYPE', message: `${fieldPath} must be an object.` });
+    return;
+  }
+  const a = value as Record<string, unknown>;
+  if (!isNonEmptyString(a.name)) {
+    errors.push({
+      path: `${fieldPath}.name`,
+      code: 'REQUIRED',
+      message: `${fieldPath}.name is required.`,
+    });
+  }
+  if (a.email !== undefined && typeof a.email !== 'string') {
+    errors.push({
+      path: `${fieldPath}.email`,
+      code: 'TYPE',
+      message: `${fieldPath}.email must be a string.`,
+    });
+  }
+  if (a.url !== undefined && typeof a.url !== 'string') {
+    errors.push({
+      path: `${fieldPath}.url`,
+      code: 'TYPE',
+      message: `${fieldPath}.url must be a string.`,
+    });
+  }
+}
+
+/**
+ * Validate a single `clawdevbox.recipes[]` or `clawdevbox.tools[]` entry:
+ * `id` kebab/dotted, `file` a safe relative path.
+ */
+function validateSimpleProvideEntry(
+  entry: unknown,
+  fieldPath: string,
+  idPattern: RegExp,
+  errors: ValidationError[],
+): void {
+  if (!isPlainObject(entry)) {
+    errors.push({ path: fieldPath, code: 'TYPE', message: `${fieldPath} must be an object.` });
+    return;
+  }
+  const e = entry as Record<string, unknown>;
+  if (!isNonEmptyString(e.id)) {
+    errors.push({
+      path: `${fieldPath}.id`,
+      code: 'REQUIRED',
+      message: `${fieldPath}.id is required.`,
+    });
+  } else if (!idPattern.test(e.id)) {
+    errors.push({
+      path: `${fieldPath}.id`,
+      code: 'PATTERN',
+      message: `${fieldPath}.id must match ${idPattern}.`,
+    });
+  }
+  if (!isNonEmptyString(e.file)) {
+    errors.push({
+      path: `${fieldPath}.file`,
+      code: 'REQUIRED',
+      message: `${fieldPath}.file is required.`,
+    });
+  } else if (isUnsafeRelPath(e.file)) {
+    errors.push({
+      path: `${fieldPath}.file`,
+      code: 'PATH_ESCAPE',
+      message: `${fieldPath}.file must be a relative path with no ".." segments.`,
+    });
+  }
+}
+
+function validateClawdevboxToolEntry(
+  entry: unknown,
+  fieldPath: string,
+  errors: ValidationError[],
+): void {
+  validateSimpleProvideEntry(entry, fieldPath, TOOL_ID_PATTERN, errors);
+  if (!isPlainObject(entry)) return;
+  const e = entry as Record<string, unknown>;
+  if (e.runtime !== undefined) {
+    const r = validateRuntime(e.runtime);
+    if (!r.ok) {
+      errors.push({ path: `${fieldPath}.runtime`, code: 'ENUM', message: r.message });
+    }
+  }
+}
+
+function validateClawdevboxExtensions(value: unknown, errors: ValidationError[]): void {
+  if (!isPlainObject(value)) {
+    errors.push({ path: 'clawdevbox', code: 'TYPE', message: 'clawdevbox must be an object.' });
+    return;
+  }
+  const c = value as Record<string, unknown>;
+
+  if (c.recipes !== undefined) {
+    if (!Array.isArray(c.recipes)) {
+      errors.push({
+        path: 'clawdevbox.recipes',
+        code: 'TYPE',
+        message: 'clawdevbox.recipes must be an array.',
+      });
+    } else {
+      const seen = new Set<string>();
+      c.recipes.forEach((entry, i) => {
+        const p = `clawdevbox.recipes[${i}]`;
+        validateSimpleProvideEntry(entry, p, ID_PATTERN, errors);
+        if (isPlainObject(entry) && isNonEmptyString((entry as Record<string, unknown>).id)) {
+          const id = (entry as Record<string, unknown>).id as string;
+          if (seen.has(id)) {
+            errors.push({
+              path: `${p}.id`,
+              code: 'DUPLICATE',
+              message: `recipe id ${id} duplicated within plugin.`,
+            });
+          } else {
+            seen.add(id);
+          }
+        }
+      });
+    }
+  }
+
+  if (c.tools !== undefined) {
+    if (!Array.isArray(c.tools)) {
+      errors.push({
+        path: 'clawdevbox.tools',
+        code: 'TYPE',
+        message: 'clawdevbox.tools must be an array.',
+      });
+    } else {
+      const seen = new Set<string>();
+      c.tools.forEach((entry, i) => {
+        const p = `clawdevbox.tools[${i}]`;
+        validateClawdevboxToolEntry(entry, p, errors);
+        if (isPlainObject(entry) && isNonEmptyString((entry as Record<string, unknown>).id)) {
+          const id = (entry as Record<string, unknown>).id as string;
+          if (seen.has(id)) {
+            errors.push({
+              path: `${p}.id`,
+              code: 'DUPLICATE',
+              message: `tool id ${id} duplicated within plugin.`,
+            });
+          } else {
+            seen.add(id);
+          }
+        }
+      });
+    }
+  }
+
+  if (c.trigger_types !== undefined) {
+    if (!Array.isArray(c.trigger_types)) {
+      errors.push({
+        path: 'clawdevbox.trigger_types',
+        code: 'TYPE',
+        message: 'clawdevbox.trigger_types must be an array.',
+      });
+    } else {
+      const seenIds = new Set<string>();
+      c.trigger_types.forEach((entry, i) => {
+        const p = `clawdevbox.trigger_types[${i}]`;
+        const entryErrors = validateTriggerTypeEntry(entry, p);
+        errors.push(...entryErrors);
+        if (isPlainObject(entry) && isNonEmptyString((entry as Record<string, unknown>).id)) {
+          const id = (entry as Record<string, unknown>).id as string;
+          if (seenIds.has(id)) {
+            errors.push({
+              path: `${p}.id`,
+              code: 'DUPLICATE',
+              message: `trigger_type id ${id} duplicated within plugin.`,
+            });
+          } else {
+            seenIds.add(id);
+          }
+        }
+      });
+    }
+  }
+
+  if (c.agent_clis !== undefined) {
+    if (!Array.isArray(c.agent_clis)) {
+      errors.push({
+        path: 'clawdevbox.agent_clis',
+        code: 'TYPE',
+        message: 'clawdevbox.agent_clis must be an array.',
+      });
+    } else {
+      const seenIds = new Set<string>();
+      c.agent_clis.forEach((entry, i) => {
+        // validatePluginAgentCliEntry writes paths prefixed `provides.agent_clis[i]`;
+        // remap to the new `clawdevbox.agent_clis[i]` prefix for caller-friendly messages.
+        const reused = validatePluginAgentCliEntry(entry, i).map((err) => ({
+          ...err,
+          path: err.path.replace(/^provides\.agent_clis/, 'clawdevbox.agent_clis'),
+        }));
+        errors.push(...reused);
+        if (isPlainObject(entry) && isNonEmptyString((entry as Record<string, unknown>).id)) {
+          const id = (entry as Record<string, unknown>).id as string;
+          if (seenIds.has(id)) {
+            errors.push({
+              path: `clawdevbox.agent_clis[${i}].id`,
+              code: 'DUPLICATE',
+              message: `agent_cli id ${id} duplicated within plugin.`,
+            });
+          } else {
+            seenIds.add(id);
+          }
+        }
+      });
+    }
+  }
+}
+
+function validateMcpServersField(value: unknown, errors: ValidationError[]): void {
+  if (value === undefined) return;
+  if (typeof value === 'string') {
+    if (isUnsafeRelPath(value)) {
+      errors.push({
+        path: 'mcpServers',
+        code: 'PATH_ESCAPE',
+        message: 'mcpServers path must be a relative path with no ".." segments.',
+      });
+    }
+    return;
+  }
+  if (isPlainObject(value)) {
+    // Permissive: either a wrapper `{ mcpServers: {...} }` or a flat
+    // `{ <serverId>: {...} }` map. We don't validate server config shape —
+    // the upstream MCP spec evolves and forward-compat matters.
+    return;
+  }
+  errors.push({
+    path: 'mcpServers',
+    code: 'TYPE',
+    message: 'mcpServers must be a path string or inline object.',
+  });
+}
+
+function validateHooksField(value: unknown, fieldPath: string, errors: ValidationError[]): void {
+  if (value === undefined) return;
+  if (typeof value === 'string') {
+    if (isUnsafeRelPath(value)) {
+      errors.push({
+        path: fieldPath,
+        code: 'PATH_ESCAPE',
+        message: `${fieldPath} path must be a relative path with no ".." segments.`,
+      });
+    }
+    return;
+  }
+  if (isPlainObject(value)) return;
+  errors.push({
+    path: fieldPath,
+    code: 'TYPE',
+    message: `${fieldPath} must be a path string or inline object.`,
+  });
+}
+
+/**
+ * Validate `.claude-plugin/plugin.json`. Coexists with the legacy
+ * `validatePluginManifest` (yaml shape) above. Returns `ValidationError[]`
+ * — empty array means valid.
+ */
+export function validatePluginManifestJson(parsed: unknown): ValidationError[] {
+  const errors: ValidationError[] = [];
+  if (!isPlainObject(parsed)) {
+    return [{ path: '$', code: 'NOT_OBJECT', message: 'plugin.json must be a JSON object.' }];
+  }
+  const m = parsed as Record<string, unknown>;
+
+  // name (required, kebab-case)
+  if (!isNonEmptyString(m.name)) {
+    errors.push({ path: 'name', code: 'REQUIRED', message: 'name is required.' });
+  } else if (!KEBAB_NAME_PATTERN.test(m.name)) {
+    errors.push({
+      path: 'name',
+      code: 'PATTERN',
+      message: `name must match ${KEBAB_NAME_PATTERN}.`,
+    });
+  }
+
+  checkOptionalString(m.$schema, '$schema', errors);
+  checkOptionalString(m.version, 'version', errors);
+  checkOptionalString(m.description, 'description', errors);
+  validateAuthor(m.author, 'author', errors);
+  checkOptionalString(m.homepage, 'homepage', errors);
+  checkOptionalString(m.repository, 'repository', errors);
+  checkOptionalString(m.license, 'license', errors);
+  checkOptionalStringArray(m.keywords, 'keywords', errors);
+
+  // Component path fields.
+  checkStringOrStringArrayPath(m.skills, 'skills', errors);
+  checkStringOrStringArrayPath(m.agents, 'agents', errors);
+  checkStringOrStringArrayPath(m.commands, 'commands', errors);
+  checkStringOrStringArrayPath(m.outputStyles, 'outputStyles', errors);
+  validateMcpServersField(m.mcpServers, errors);
+  validateHooksField(m.hooks, 'hooks', errors);
+  validateHooksField(m.lspServers, 'lspServers', errors);
+
+  if (m.experimental !== undefined) {
+    if (!isPlainObject(m.experimental)) {
+      errors.push({ path: 'experimental', code: 'TYPE', message: 'experimental must be an object.' });
+    } else {
+      const x = m.experimental as Record<string, unknown>;
+      checkStringOrStringArrayPath(x.themes, 'experimental.themes', errors);
+      checkStringOrStringArrayPath(x.monitors, 'experimental.monitors', errors);
+    }
+  }
+
+  if (m.userConfig !== undefined && !isPlainObject(m.userConfig)) {
+    errors.push({ path: 'userConfig', code: 'TYPE', message: 'userConfig must be an object.' });
+  }
+  if (m.channels !== undefined && !Array.isArray(m.channels)) {
+    errors.push({ path: 'channels', code: 'TYPE', message: 'channels must be an array.' });
+  }
+  if (m.dependencies !== undefined && !Array.isArray(m.dependencies)) {
+    errors.push({ path: 'dependencies', code: 'TYPE', message: 'dependencies must be an array.' });
+  }
+
+  if (m.status !== undefined) {
+    validatePluginStatus(m.status, errors);
+  }
+
+  if (m.clawdevbox !== undefined) {
+    validateClawdevboxExtensions(m.clawdevbox, errors);
+  }
+
+  if (m.requires !== undefined) {
+    if (!isPlainObject(m.requires)) {
+      errors.push({ path: 'requires', code: 'TYPE', message: 'requires must be an object.' });
+    } else {
+      const r = m.requires as Record<string, unknown>;
+      checkOptionalString(r.clawdevbox_version, 'requires.clawdevbox_version', errors);
+      checkOptionalStringArray(r.env, 'requires.env', errors);
+    }
+  }
+
+  return errors;
+}
+
+/**
+ * Validate `agency.json` (Microsoft per-plugin sidecar). Both fields optional.
+ * Each engine id must be lowercase kebab or `"*"`.
+ */
+export function validateAgencyJson(parsed: unknown): ValidationError[] {
+  const errors: ValidationError[] = [];
+  if (!isPlainObject(parsed)) {
+    return [{ path: '$', code: 'NOT_OBJECT', message: 'agency.json must be a JSON object.' }];
+  }
+  const a = parsed as Record<string, unknown>;
+
+  if (a.engines !== undefined) {
+    if (!Array.isArray(a.engines)) {
+      errors.push({ path: 'engines', code: 'TYPE', message: 'engines must be an array.' });
+    } else {
+      a.engines.forEach((entry, i) => {
+        if (typeof entry !== 'string') {
+          errors.push({
+            path: `engines[${i}]`,
+            code: 'TYPE',
+            message: `engines[${i}] must be a string.`,
+          });
+        } else if (entry !== '*' && !ENGINE_NAME_PATTERN.test(entry)) {
+          errors.push({
+            path: `engines[${i}]`,
+            code: 'PATTERN',
+            message: `engines[${i}] must match ${ENGINE_NAME_PATTERN} or be "*".`,
+          });
+        }
+      });
+    }
+  }
+
+  if (a.category !== undefined) {
+    if (typeof a.category !== 'string' || a.category.length === 0) {
+      errors.push({
+        path: 'category',
+        code: 'TYPE',
+        message: 'category must be a non-empty string.',
+      });
+    }
+  }
+
+  return errors;
+}
+
+function validateMarketplacePluginEntry(
+  entry: unknown,
+  fieldPath: string,
+  errors: ValidationError[],
+): void {
+  if (!isPlainObject(entry)) {
+    errors.push({ path: fieldPath, code: 'TYPE', message: `${fieldPath} must be an object.` });
+    return;
+  }
+  const e = entry as Record<string, unknown>;
+
+  if (!isNonEmptyString(e.name)) {
+    errors.push({
+      path: `${fieldPath}.name`,
+      code: 'REQUIRED',
+      message: `${fieldPath}.name is required.`,
+    });
+  } else if (!KEBAB_NAME_PATTERN.test(e.name)) {
+    errors.push({
+      path: `${fieldPath}.name`,
+      code: 'PATTERN',
+      message: `${fieldPath}.name must match ${KEBAB_NAME_PATTERN}.`,
+    });
+  }
+
+  if (e.source === undefined) {
+    errors.push({
+      path: `${fieldPath}.source`,
+      code: 'REQUIRED',
+      message: `${fieldPath}.source is required.`,
+    });
+  } else if (typeof e.source === 'string') {
+    if (e.source.length === 0) {
+      errors.push({
+        path: `${fieldPath}.source`,
+        code: 'TYPE',
+        message: `${fieldPath}.source must be a non-empty string.`,
+      });
+    }
+  } else if (isPlainObject(e.source)) {
+    const s = e.source as Record<string, unknown>;
+    const kind = s.source;
+    if (kind !== 'github' && kind !== 'git' && kind !== 'path') {
+      errors.push({
+        path: `${fieldPath}.source.source`,
+        code: 'ENUM',
+        message: `${fieldPath}.source.source must be one of: github, git, path.`,
+      });
+    }
+  } else {
+    errors.push({
+      path: `${fieldPath}.source`,
+      code: 'TYPE',
+      message: `${fieldPath}.source must be a string or object.`,
+    });
+  }
+
+  checkOptionalString(e.version, `${fieldPath}.version`, errors);
+  checkOptionalString(e.description, `${fieldPath}.description`, errors);
+  validateAuthor(e.author, `${fieldPath}.author`, errors);
+  checkOptionalStringArray(e.keywords, `${fieldPath}.keywords`, errors);
+  checkOptionalString(e.category, `${fieldPath}.category`, errors);
+  if (e.strict !== undefined && typeof e.strict !== 'boolean') {
+    errors.push({
+      path: `${fieldPath}.strict`,
+      code: 'TYPE',
+      message: `${fieldPath}.strict must be a boolean.`,
+    });
+  }
+  checkOptionalStringArray(e.tags, `${fieldPath}.tags`, errors);
+  if (e.status !== undefined) {
+    // Reuse validatePluginStatus but remap the `status.*` prefix.
+    const before = errors.length;
+    validatePluginStatus(e.status, errors);
+    for (let i = before; i < errors.length; i++) {
+      errors[i] = {
+        ...errors[i],
+        path: errors[i].path.replace(/^status/, `${fieldPath}.status`),
+      };
+    }
+  }
+}
+
+/**
+ * Validate `.claude-plugin/marketplace.json`. Verifies the catalog skeleton:
+ * name, owner, plugins[] with name+source on each entry.
+ */
+export function validateMarketplaceJson(parsed: unknown): ValidationError[] {
+  const errors: ValidationError[] = [];
+  if (!isPlainObject(parsed)) {
+    return [
+      { path: '$', code: 'NOT_OBJECT', message: 'marketplace.json must be a JSON object.' },
+    ];
+  }
+  const m = parsed as Record<string, unknown>;
+
+  checkOptionalString(m.$schema, '$schema', errors);
+
+  if (!isNonEmptyString(m.name)) {
+    errors.push({ path: 'name', code: 'REQUIRED', message: 'name is required.' });
+  } else if (!KEBAB_NAME_PATTERN.test(m.name)) {
+    errors.push({
+      path: 'name',
+      code: 'PATTERN',
+      message: `name must match ${KEBAB_NAME_PATTERN}.`,
+    });
+  }
+
+  if (m.owner === undefined) {
+    errors.push({ path: 'owner', code: 'REQUIRED', message: 'owner is required.' });
+  } else if (!isPlainObject(m.owner)) {
+    errors.push({ path: 'owner', code: 'TYPE', message: 'owner must be an object.' });
+  } else {
+    const o = m.owner as Record<string, unknown>;
+    if (!isNonEmptyString(o.name)) {
+      errors.push({ path: 'owner.name', code: 'REQUIRED', message: 'owner.name is required.' });
+    }
+    if (o.email !== undefined && typeof o.email !== 'string') {
+      errors.push({ path: 'owner.email', code: 'TYPE', message: 'owner.email must be a string.' });
+    }
+  }
+
+  checkOptionalString(m.description, 'description', errors);
+  checkOptionalString(m.version, 'version', errors);
+
+  if (m.metadata !== undefined) {
+    if (!isPlainObject(m.metadata)) {
+      errors.push({ path: 'metadata', code: 'TYPE', message: 'metadata must be an object.' });
+    } else {
+      const md = m.metadata as Record<string, unknown>;
+      checkOptionalString(md.description, 'metadata.description', errors);
+      checkOptionalString(md.version, 'metadata.version', errors);
+      checkOptionalString(md.pluginRoot, 'metadata.pluginRoot', errors);
+    }
+  }
+
+  if (m.plugins === undefined) {
+    errors.push({ path: 'plugins', code: 'REQUIRED', message: 'plugins is required.' });
+  } else if (!Array.isArray(m.plugins)) {
+    errors.push({ path: 'plugins', code: 'TYPE', message: 'plugins must be an array.' });
+  } else {
+    m.plugins.forEach((entry, i) => {
+      validateMarketplacePluginEntry(entry, `plugins[${i}]`, errors);
+    });
+  }
+
+  checkOptionalStringArray(
+    m.allowCrossMarketplaceDependenciesOn,
+    'allowCrossMarketplaceDependenciesOn',
+    errors,
+  );
+
+  return errors;
+}
+
+/**
+ * Validate `marketplace-config.json` (Microsoft extension, §4.3). Permissive:
+ * only `shared.name` is required. Engine-specific slots (`claude`, `copilot`,
+ * `clawdevbox`, …) are type-checked as objects only; their contents are
+ * forward-compat.
+ */
+export function validateMarketplaceConfig(parsed: unknown): ValidationError[] {
+  const errors: ValidationError[] = [];
+  if (!isPlainObject(parsed)) {
+    return [
+      {
+        path: '$',
+        code: 'NOT_OBJECT',
+        message: 'marketplace-config.json must be a JSON object.',
+      },
+    ];
+  }
+  const c = parsed as Record<string, unknown>;
+
+  if (c.shared === undefined) {
+    errors.push({ path: 'shared', code: 'REQUIRED', message: 'shared is required.' });
+  } else if (!isPlainObject(c.shared)) {
+    errors.push({ path: 'shared', code: 'TYPE', message: 'shared must be an object.' });
+  } else {
+    const s = c.shared as Record<string, unknown>;
+    if (!isNonEmptyString(s.name)) {
+      errors.push({
+        path: 'shared.name',
+        code: 'REQUIRED',
+        message: 'shared.name is required.',
+      });
+    }
+    if (s.metadata !== undefined) {
+      if (!isPlainObject(s.metadata)) {
+        errors.push({
+          path: 'shared.metadata',
+          code: 'TYPE',
+          message: 'shared.metadata must be an object.',
+        });
+      } else {
+        const md = s.metadata as Record<string, unknown>;
+        checkOptionalString(md.description, 'shared.metadata.description', errors);
+        checkOptionalString(md.version, 'shared.metadata.version', errors);
+      }
+    }
+    if (s.owner !== undefined) {
+      if (!isPlainObject(s.owner)) {
+        errors.push({
+          path: 'shared.owner',
+          code: 'TYPE',
+          message: 'shared.owner must be an object.',
+        });
+      } else {
+        const o = s.owner as Record<string, unknown>;
+        if (o.name !== undefined && typeof o.name !== 'string') {
+          errors.push({
+            path: 'shared.owner.name',
+            code: 'TYPE',
+            message: 'shared.owner.name must be a string.',
+          });
+        }
+        if (o.email !== undefined && typeof o.email !== 'string') {
+          errors.push({
+            path: 'shared.owner.email',
+            code: 'TYPE',
+            message: 'shared.owner.email must be a string.',
+          });
+        }
+      }
+    }
+  }
+
+  // Engine slots — permissive: must be an object if present, contents free-form.
+  for (const key of Object.keys(c)) {
+    if (key === 'shared') continue;
+    if (c[key] !== undefined && c[key] !== null && !isPlainObject(c[key])) {
+      errors.push({
+        path: key,
+        code: 'TYPE',
+        message: `${key} must be an object.`,
+      });
+    }
+  }
+
+  return errors;
+}
