@@ -126,6 +126,11 @@ export interface AgentCliProvider {
   readonly displayName: string;
   readonly description: string;
   readonly source: 'builtin' | `plugin:${string}`;
+  /** Hide from the init chooser, the SPA agent-CLI list (default), and from
+   *  `clawdevbox config set default_agent_cli` autocompletion. Recipes can
+   *  still target the provider explicitly. Used by `echo-stub` to keep the
+   *  testing fixture out of user-facing surfaces. */
+  readonly internal?: boolean;
 
   /** Probe whether the binary is on PATH / installed. Non-throwing.
    *  Optional — provider can be `available: true` unconditionally
@@ -205,7 +210,9 @@ Built-in providers are registered before plugins, so they can never lose to a pl
 
 ## 5. Built-in providers
 
-Three new files in `mcp-server/src/agent-clis/`:
+OSS ships **two user-facing built-ins** (`copilot`, `claude`) plus **one internal-only** built-in (`echo-stub`, marked `internal: true` so it's hidden from the init chooser and from the default SPA listing but still callable from tests and recipes that explicitly request it).
+
+Files in `mcp-server/src/agent-clis/`:
 
 ### 5.1 `copilot.ts`
 
@@ -269,7 +276,7 @@ Same shape. Differences:
 
 ### 5.3 `echo-stub.ts`
 
-Synthesizes a JS script body, writes it to `<workspace>/.clawdevbox/echo-stub/<session_id>.js`, spawns it with `process.execPath`. Used by tests. Always `available: true`.
+Marked `internal: true`. Synthesizes a JS script body, writes it to `<workspace>/.clawdevbox/echo-stub/<session_id>.js`, spawns it with `process.execPath`. Used by tests. Always `available: true`. Hidden from the init chooser and from `GET /api/agent-clis` by default (use `?include_internal=true` to see it).
 
 ### 5.4 `mcp-server/src/agent-clis/shared.ts`
 
@@ -451,11 +458,38 @@ If the final resolved id isn't in `ws.agentCliProviders`, the caller returns an 
 
 ## 9. `clawdevbox init` chooser
 
-After the existing scope + plugin steps in `cli/init.ts`, add a new step before the final "Initialized" note.
+The chooser runs **AFTER the existing `--plugin <source>` install pass** so a single-command setup like
 
-### Detection phase
+```bash
+clawdevbox init --plugin git+https://github.com/microsoft/agency-cli-clawdevbox-plugin
+```
 
-Run `provider.detect?.(ctx)` for every registered provider in parallel (5-second per-provider timeout). Collect results into a list:
+installs the agency plugin first, then surfaces agency in the chooser alongside the OSS built-ins.
+
+### Order of operations in `cli/init.ts`
+
+```
+existing flow (unchanged):
+  1. scope (project/global), port, token, tunnel, notifications
+  2. BUILTIN_PLUGINS multi-select (sample plugins like `ado`)
+  3. --plugin source discovery + multi-select
+  4. scaffold workspace + global directories
+  5. install all selected plugins into <globalDir>/plugins/
+
+NEW after step 5:
+  6. reload workspace registry — call `await reloadTypeRegistries(ws)` so the
+     provider registry includes any agent_cli providers that just arrived via
+     plugin install
+  7. agent-CLI chooser (this section)
+  8. provider.setup?.(ctx, { scope }) on the picked provider
+  9. write the config file with `default_agent_cli: <id>` added
+```
+
+The reload at step 6 is the only structural change to the existing `cli/init.ts` flow — everything else is additive.
+
+### Detection phase (step 7)
+
+Run `provider.detect?.(ctx)` for every NON-internal registered provider in parallel (5-second per-provider timeout). Internal providers (e.g., echo-stub) are skipped entirely. Collect results into a list:
 
 ```ts
 type Candidate = {
@@ -473,20 +507,26 @@ Use the existing `@clack/prompts` `select` helper:
   ❯ GitHub Copilot CLI       (✓ copilot.exe 1.2.3)
     Anthropic Claude Code    (✓ claude 0.8.0)
     Microsoft Agency         (✓ agency.exe 4.5)   ← only when agency-cli plugin installed
-    Echo stub (testing)      (always available)
     [skip — pick later via `clawdevbox config set`]
 ```
 
 - Each option's hint string comes from `detect.available ? `✓ ${binary} ${version}` : detect.reason ?? 'not installed'`.
-- Default selection: the first `available: true` provider in registration order (copilot wins by default).
+- Default selection: the first `available: true` provider in registration order (copilot wins by default if it detects).
 - If the user picks `[skip]`, no field is written; the runtime fallback (`'copilot'` hardcoded) takes over.
 - If the user picks an unavailable provider, surface a warning ("you can still proceed; clawdevbox will use this when the binary is installed") but accept the choice.
 
 ### Persist
 
-Write `default_agent_cli: <id>` to the config file already being written by init (project or global, depending on `installScope`).
+Write `default_agent_cli: <id>` to the config file already being written by init (project or global, matching `installScope`).
 
 After selection, call `provider.setup?.(ctx, { scope: installScope })` so the provider can do its own one-time setup (warn about API keys, etc.).
+
+### Reconfiguration outside init
+
+A small new subcommand, `clawdevbox config set default_agent_cli <id>`, writes just that one field without re-running the full init wizard. Validates the id is in `ws.agentCliProviders`. Used when:
+
+- A plugin was already installed before this kernel ships and the user wants to flip the default.
+- A user wants to switch between built-ins without a full re-init.
 
 ### Display in summary
 
@@ -503,9 +543,9 @@ Lives in a separate Microsoft-internal repo. Its files:
 ```
 agency-cli/
   plugin.yaml
-  scripts/
-    agency-provider.js     ← compiled from agency-provider.ts
-    agency-provider.ts     ← source
+  package.json              ← peerDependency: "clawdevbox": "^X"
+  src/agency-provider.ts    ← source
+  dist/agency-provider.js   ← compiled, what plugin.yaml's module: points at
   README.md
 ```
 
@@ -518,10 +558,37 @@ version: 1.0.0
 provides:
   agent_clis:
     - id: agency
-      module: scripts/agency-provider.js
+      module: dist/agency-provider.js
       display_name: "Microsoft Agency"
       description: "Wraps Copilot with Microsoft-internal context routing."
 ```
+
+### Recommended user-facing install command (from the plugin README)
+
+A single command does everything:
+
+```bash
+clawdevbox init --plugin git+https://github.com/microsoft/agency-cli-clawdevbox-plugin
+```
+
+Internally that's:
+
+1. `cli/init.ts` resolves the `--plugin` source (git clone into a temp dir).
+2. Discovers `plugin.yaml` → asks the user to confirm installation.
+3. Installs into `<globalDir>/plugins/agency-cli/`.
+4. Reloads the workspace registry → `ws.agentCliProviders.has('agency') === true`.
+5. The agent-CLI chooser shows Microsoft Agency alongside copilot/claude.
+6. User picks agency → config gets `default_agent_cli: agency`.
+
+For local development of the plugin itself:
+
+```bash
+clawdevbox init --plugin C:\src\agency-cli-clawdevbox-plugin
+```
+
+This junctions the plugin (no copy) so edits to `dist/agency-provider.js` are picked up by a service restart.
+
+### Provider implementation
 
 `agency-provider.js` (compiled from TS) implements `AgentCliProvider`:
 
@@ -592,21 +659,20 @@ These are nice-to-haves; the kernel works without them. Spec includes the API en
 
 `GET /api/agent-clis` — bearer auth required.
 
+Optional query param `include_internal=true` (default false) controls whether internal providers like `echo-stub` are surfaced. The SPA always uses the default (internal hidden); tests can opt in.
+
 ```json
 {
   "configured": "copilot",
   "providers": [
     { "id": "copilot", "display_name": "GitHub Copilot CLI", "description": "...",
-      "source": "builtin",
+      "source": "builtin", "internal": false,
       "detect": { "available": true, "binary": "copilot.exe", "version": "1.2.3" } },
     { "id": "claude", "display_name": "Anthropic Claude Code", "description": "...",
-      "source": "builtin",
+      "source": "builtin", "internal": false,
       "detect": { "available": true, "binary": "claude", "version": "0.8.0" } },
-    { "id": "echo-stub", "display_name": "Echo Stub (testing)", "description": "...",
-      "source": "builtin",
-      "detect": { "available": true } },
     { "id": "agency", "display_name": "Microsoft Agency", "description": "...",
-      "source": "plugin:agency-cli",
+      "source": "plugin:agency-cli", "internal": false,
       "detect": { "available": false, "reason": "agency.exe not found on PATH" } }
   ],
   "errors": [
@@ -618,10 +684,14 @@ These are nice-to-haves; the kernel works without them. Spec includes the API en
 ## 13. Backward compatibility
 
 - Existing recipe files with `default_client: 'copilot'` or `'claude'` keep working — those names are exactly the built-in provider ids.
-- `recipe.run({agent_cli: 'echo-stub'})` keeps working — echo-stub is a built-in.
+- `recipe.run({agent_cli: 'echo-stub'})` keeps working — echo-stub is a built-in (just marked `internal: true`, so it's hidden from chooser/UI but still resolvable by id).
 - Existing call sites that pass `agentCli` as a literal `'copilot' | 'claude' | 'echo-stub'` continue compiling; the union widens to `string` at the boundaries that need it.
 - Config without `default_agent_cli` set: the resolution chain falls to the hardcoded `'copilot'`. Existing users who haven't re-init'd see no behavior change.
-- `main-agent.ts` agency hardcoding is REMOVED. Existing Microsoft installations need the `agency-cli` plugin installed and `default_agent_cli: agency` in their config. The migration step: install plugin → re-init → done. Document in the plugin's README.
+- `main-agent.ts` agency hardcoding is REMOVED. Existing Microsoft installations migrate via a single command:
+  ```bash
+  clawdevbox init --plugin git+https://.../agency-cli-clawdevbox-plugin
+  ```
+  Re-running init on an already-configured workspace is non-destructive — the existing init flow pre-checks already-installed plugins so other selections aren't dropped. The new step adds the agency provider, the chooser surfaces it, the user picks it, and `default_agent_cli: agency` lands in the existing config file.
 - `CLAWDEVBOX_AGENCY_PATH` env var: moves to the agency plugin. The kernel stops reading it. The plugin's `agency-provider.js` reads it directly.
 - `CLAWDEVBOX_COPILOT_PATH`, `CLAWDEVBOX_CLAUDE_PATH` env vars: stay; read by the built-in providers.
 
@@ -674,17 +744,18 @@ These are nice-to-haves; the kernel works without them. Spec includes the API en
 ## 16. Implementation phases (informs the plan, not the design)
 
 1. **Type definitions + loader skeleton** — `agent-clis/types.ts`, `agent-clis/index.ts`, `Workspace.agentCliProviders` + `agentCliProviderErrors`, async `reloadTypeRegistries`.
-2. **Built-in providers** — `copilot.ts`, `claude.ts`, `echo-stub.ts`, `shared.ts`, plus unit tests.
+2. **Built-in providers** — `copilot.ts`, `claude.ts`, `echo-stub.ts` (with `internal: true`), `shared.ts`, plus unit tests.
 3. **Plugin manifest extension** — `provides.agent_clis[]`, validator, dynamic-import loader.
 4. **Refactor `recipe-runner.ts`** — drop the if/else chain, route through providers, update tests.
 5. **Refactor `cli/start.ts` resume path** — same.
 6. **Refactor `main-agent.ts`** — remove agency.exe + agency.toml hardcoding, route through provider, update `MainAgentStatus`.
 7. **Config field** — `default_agent_cli` on `ClawdevboxConfig` + `ResolvedConfig`.
-8. **Init chooser** — detect + select + persist + setup hook.
-9. **API endpoint** — `GET /api/agent-clis`.
-10. **Tools schema updates** — `tools/recipe.ts` and `validators.ts` open-up.
-11. **Docs** — `docs/agent-clis.md` (new), update `docs/tools/recipe.md` and `docs/plugins.md`, regenerate master reference.
-12. **End-to-end smoke** — fake plugin loaded, full round-trip.
+8. **Init chooser** — add the post-`--plugin`-install reload + detect + select + persist + setup hook steps to `cli/init.ts`.
+9. **`clawdevbox config set` subcommand** — minimal helper that validates the value and writes the single field.
+10. **API endpoint** — `GET /api/agent-clis` with `include_internal` query.
+11. **Tools schema updates** — `tools/recipe.ts` and `validators.ts` open-up.
+12. **Docs** — `docs/agent-clis.md` (new), update `docs/tools/recipe.md` and `docs/plugins.md`, regenerate master reference.
+13. **End-to-end smoke** — fake plugin loaded via `init --plugin <local-folder>`, full round-trip.
 
 The plan splits these into sized tasks for subagent execution.
 
