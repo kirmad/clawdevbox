@@ -14,7 +14,17 @@
 
 import { EventEmitter } from 'node:events';
 
-export type ChangeTopic = 'inbox' | 'recipes' | 'agent' | 'tunnel' | 'notifications' | 'triggers' | 'approvals';
+export type ChangeTopic =
+  | 'inbox'
+  | 'recipes'
+  | 'agent'
+  | 'tunnel'
+  | 'notifications'
+  | 'triggers'
+  | 'approvals'
+  | 'fires'
+  | 'sessions'
+  | 'artifacts';
 
 const bus = new EventEmitter();
 // Many SSE clients can subscribe concurrently — lift the default 10 cap.
