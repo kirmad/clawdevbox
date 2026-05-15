@@ -202,3 +202,200 @@ test('mintFireId and attemptDir helpers', () => {
   const dir = attemptDir('C:\\tmp\\ws', id, 2);
   assert.ok(dir.endsWith(`fires\\${id}\\attempt-2`) || dir.endsWith(`fires/${id}/attempt-2`));
 });
+
+// ---------------------------------------------------------------- recipe-steps + step-events
+import {
+  addSteps,
+  getStep,
+  getStepById,
+  listSteps,
+  materializeSteps,
+  MONOTONIC_TRANSITIONS,
+  removeSteps,
+  StepTransitionError,
+  StepValidationError,
+  transitionStatus,
+  updateMeta,
+} from '../src/db/recipe-steps-store.ts';
+import { appendEvent, listEvents } from '../src/db/step-events-store.ts';
+
+function mkInstance(db, ws_id, id = 'ri_test_1') {
+  db.prepare(
+    `INSERT INTO recipe_instances (id, workspace_id, workspace_path, started_at, status)
+     VALUES (?, ?, ?, ?, 'running')`,
+  ).run(id, ws_id, 'C:\\tmp\\proj', Date.now());
+  return id;
+}
+
+test('materializeSteps creates rows with step_index, defaults', () => {
+  const db = open();
+  const ws = ensureWorkspace(db, { path: 'C:\\tmp\\s1' });
+  const ri = mkInstance(db, ws.id, 'ri_s1');
+  const rows = materializeSteps(db, ri, [
+    { id: 'one', goal: 'do one' },
+    { id: 'two', goal: 'do two', depends: ['one'] },
+  ]);
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].step_index, 0);
+  assert.equal(rows[1].step_index, 1);
+  assert.equal(rows[0].status, 'pending');
+  db.close();
+});
+
+test('materializeSteps rejects unresolved depends', () => {
+  const db = open();
+  const ws = ensureWorkspace(db, { path: 'C:\\tmp\\s2' });
+  const ri = mkInstance(db, ws.id, 'ri_s2');
+  assert.throws(
+    () => materializeSteps(db, ri, [{ id: 'a', goal: 'g', depends: ['ghost'] }]),
+    StepValidationError,
+  );
+  db.close();
+});
+
+test('materializeSteps rejects duplicate step ids', () => {
+  const db = open();
+  const ws = ensureWorkspace(db, { path: 'C:\\tmp\\s3' });
+  const ri = mkInstance(db, ws.id, 'ri_s3');
+  assert.throws(
+    () => materializeSteps(db, ri, [{ id: 'x', goal: 'g' }, { id: 'x', goal: 'g' }]),
+    StepValidationError,
+  );
+  db.close();
+});
+
+test('transitionStatus enforces monotonic rule', () => {
+  const db = open();
+  const ws = ensureWorkspace(db, { path: 'C:\\tmp\\t1' });
+  const ri = mkInstance(db, ws.id, 'ri_t1');
+  const [a] = materializeSteps(db, ri, [{ id: 'one', goal: 'g' }]);
+  const running = transitionStatus(db, a.id, { status: 'running' });
+  assert.equal(running.status, 'running');
+  assert.ok(running.started_at != null);
+  assert.throws(
+    () => transitionStatus(db, a.id, { status: 'pending' }),
+    StepTransitionError,
+  );
+  const done = transitionStatus(db, a.id, { status: 'done' });
+  assert.equal(done.status, 'done');
+  assert.ok(done.completed_at != null);
+  // Terminal cannot transition further.
+  assert.throws(
+    () => transitionStatus(db, a.id, { status: 'running' }),
+    StepTransitionError,
+  );
+  db.close();
+});
+
+test('transitionStatus state merge vs replace, emits events', () => {
+  const db = open();
+  const ws = ensureWorkspace(db, { path: 'C:\\tmp\\t2' });
+  const ri = mkInstance(db, ws.id, 'ri_t2');
+  const [a] = materializeSteps(db, ri, [{ id: 'one', goal: 'g' }]);
+  transitionStatus(db, a.id, { status: 'running', state: { count: 1 } });
+  transitionStatus(db, a.id, { state: { added: true } });
+  let row = getStepById(db, a.id);
+  let st = JSON.parse(row.state_json);
+  assert.equal(st.count, 1);
+  assert.equal(st.added, true);
+  transitionStatus(db, a.id, { state_replace: { only: 'this' } });
+  row = getStepById(db, a.id);
+  st = JSON.parse(row.state_json);
+  assert.deepEqual(st, { only: 'this' });
+  const events = listEvents(db, { recipe_step_id: a.id });
+  const types = events.map((e) => e.type);
+  assert.ok(types.includes('status_changed'));
+  assert.ok(types.includes('state_patched'));
+  db.close();
+});
+
+test('addSteps + removeSteps with depends guard', () => {
+  const db = open();
+  const ws = ensureWorkspace(db, { path: 'C:\\tmp\\t3' });
+  const ri = mkInstance(db, ws.id, 'ri_t3');
+  materializeSteps(db, ri, [{ id: 'a', goal: 'g' }]);
+  addSteps(db, ri, [{ id: 'b', goal: 'g', depends: ['a'] }]);
+  assert.equal(listSteps(db, ri).length, 2);
+  // Cannot remove a because b depends on it.
+  assert.throws(() => removeSteps(db, ri, ['a']), StepValidationError);
+  // Remove b first, then a.
+  removeSteps(db, ri, ['b']);
+  removeSteps(db, ri, ['a']);
+  assert.equal(listSteps(db, ri).length, 0);
+  db.close();
+});
+
+test('removeSteps rejects running step', () => {
+  const db = open();
+  const ws = ensureWorkspace(db, { path: 'C:\\tmp\\t4' });
+  const ri = mkInstance(db, ws.id, 'ri_t4');
+  const [a] = materializeSteps(db, ri, [{ id: 'a', goal: 'g' }]);
+  transitionStatus(db, a.id, { status: 'running' });
+  assert.throws(() => removeSteps(db, ri, ['a']), StepValidationError);
+  db.close();
+});
+
+test('updateMeta returns trigger diff', () => {
+  const db = open();
+  const ws = ensureWorkspace(db, { path: 'C:\\tmp\\t5' });
+  const ri = mkInstance(db, ws.id, 'ri_t5');
+  materializeSteps(db, ri, [{
+    id: 'a',
+    goal: 'g',
+    triggers: [{ type: 'ado.x', cron: '* * * * *' }],
+  }]);
+  const result = updateMeta(db, ri, 'a', {
+    triggers: [{ type: 'ado.y', cron: '* * * * *' }],
+  });
+  assert.equal(result.added_triggers.length, 1);
+  assert.equal(result.added_triggers[0].type, 'ado.y');
+  assert.equal(result.removed_triggers.length, 1);
+  assert.equal(result.removed_triggers[0].type, 'ado.x');
+  db.close();
+});
+
+test('appendEvent / listEvents round-trip', () => {
+  const db = open();
+  const ws = ensureWorkspace(db, { path: 'C:\\tmp\\t6' });
+  const ri = mkInstance(db, ws.id, 'ri_t6');
+  const [a] = materializeSteps(db, ri, [{ id: 'a', goal: 'g' }]);
+  appendEvent(db, {
+    recipe_step_id: a.id,
+    recipe_instance_id: ri,
+    type: 'message',
+    message: 'hi',
+    payload: { k: 'v' },
+  });
+  const events = listEvents(db, { recipe_step_id: a.id });
+  assert.equal(events.length, 1);
+  assert.equal(events[0].message, 'hi');
+  assert.equal(JSON.parse(events[0].payload_json).k, 'v');
+  db.close();
+});
+
+test('listSteps returns rows in step_index order', () => {
+  const db = open();
+  const ws = ensureWorkspace(db, { path: 'C:\\tmp\\t7' });
+  const ri = mkInstance(db, ws.id, 'ri_t7');
+  materializeSteps(db, ri, [
+    { id: 'a', goal: 'g' },
+    { id: 'b', goal: 'g' },
+    { id: 'c', goal: 'g' },
+  ]);
+  const rows = listSteps(db, ri);
+  assert.deepEqual(rows.map((r) => r.step_id), ['a', 'b', 'c']);
+  db.close();
+});
+
+test('MONOTONIC_TRANSITIONS exported and well-formed', () => {
+  assert.ok(MONOTONIC_TRANSITIONS.pending.includes('running'));
+  assert.equal(MONOTONIC_TRANSITIONS.done.length, 0);
+});
+
+test('getStep returns null for missing step', () => {
+  const db = open();
+  const ws = ensureWorkspace(db, { path: 'C:\\tmp\\t8' });
+  const ri = mkInstance(db, ws.id, 'ri_t8');
+  assert.equal(getStep(db, ri, 'nope'), null);
+  db.close();
+});
