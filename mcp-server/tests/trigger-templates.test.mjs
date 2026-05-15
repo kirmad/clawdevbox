@@ -268,3 +268,58 @@ test('trigger.delete_template refuses to delete a plugin-shipped TYPE', async ()
     assert.equal(res.structuredContent.code, 'TRIGGER_TEMPLATE_NOT_AUTHORED');
   });
 });
+test('trigger.register XOR(type_id|script|script_file) — neither is INVALID_REQUEST', async () => {
+  await withHarness(async (h) => {
+    const r = await h.call('trigger.register', { params: {} });
+    assert.equal(r.isError, true);
+    assert.equal(r.structuredContent.code, 'INVALID_REQUEST');
+  });
+});
+
+test('trigger.register with inline script writes _oneoff template + once:true cron:false defaults', async () => {
+  await withHarness(async (h) => {
+    const r = await h.call('trigger.register', {
+      script: '// inline\n', runtime: 'tsx',
+    });
+    assert.ok(!r.isError, JSON.stringify(r));
+    assert.equal(r.structuredContent.adhoc, true);
+    assert.match(r.structuredContent.template_id, /^local\.oneoff\./);
+    assert.equal(r.structuredContent.registered.once, true);
+    assert.equal(r.structuredContent.registered.cron, false);
+    const dir = join(h.callerProjectDir, '.clawdevbox', 'trigger-types', '_oneoff', r.structuredContent.template_id);
+    assert.ok(existsSync(join(dir, 'template.yaml')));
+    assert.ok(existsSync(join(dir, 'trigger.ts')));
+  });
+});
+
+test('trigger.register with script but no runtime fails RUNTIME_REQUIRED', async () => {
+  await withHarness(async (h) => {
+    const r = await h.call('trigger.register', { script: '// x\n' });
+    assert.equal(r.isError, true);
+    assert.equal(r.structuredContent.code, 'RUNTIME_REQUIRED');
+  });
+});
+
+test('trigger.register with subscriber_thread_id sets binds_callback_to thread_resume in the auto-template', async () => {
+  await withHarness(async (h) => {
+    const r = await h.call('trigger.register', {
+      script: '// hot\n', runtime: 'tsx', subscriber_thread_id: 'thr_abc',
+    });
+    assert.ok(!r.isError);
+    const tplPath = join(h.callerProjectDir, '.clawdevbox', 'trigger-types', '_oneoff',
+      r.structuredContent.template_id, 'template.yaml');
+    assert.match(readFileSync(tplPath, 'utf8'), /binds_callback_to:\s*thread_resume/);
+  });
+});
+
+test('trigger.unregister removes _oneoff dir for one-off registrations', async () => {
+  await withHarness(async (h) => {
+    const reg = await h.call('trigger.register', { script: '// once\n', runtime: 'tsx' });
+    assert.ok(!reg.isError);
+    const dir = join(h.callerProjectDir, '.clawdevbox', 'trigger-types', '_oneoff', reg.structuredContent.template_id);
+    assert.ok(existsSync(dir));
+    const un = await h.call('trigger.unregister', { id: reg.structuredContent.id });
+    assert.ok(!un.isError);
+    assert.equal(existsSync(dir), false);
+  });
+});

@@ -51,9 +51,14 @@ import {
   type RegisteredTrigger,
 } from '../triggers-store.ts';
 import {
+  deleteOneOffTemplate,
   deleteTemplate,
   findTemplate,
+  loadOneOffTemplate,
+  mintOneOffId,
   templateExists,
+  toRegisteredType,
+  writeOneOffTemplate,
   writeTemplate,
   type TemplateManifest,
 } from '../template-store.ts';
@@ -252,90 +257,117 @@ export function registerTriggerTools(server: McpServer, ws: Workspace): void {
     'trigger.register',
     {
       description:
-        'Register a concrete instance of a trigger type with bound params (spec §8.3). Validates `params` against the type\'s `parameters[]` schema, mints a unique id (using `identity_param` if declared, else hashing all params), and appends to `.clawdevbox/triggers.json`. Returns the new registered-instance id.',
+        'Register a trigger instance. Three mutually-exclusive sources: (a) `type_id` for a saved TYPE; (b) `script` for an inline one-off; (c) `script_file` for a file under `.clawdevbox/`. One-off paths default to `once: true`, `cron: false` (manual/webhook only). Validates params against the type schema (where one exists), mints `<type_id>#<key>` (or auto-template id for one-offs), and writes to `triggers.json`.',
       inputSchema: {
-        type_id: z.string().min(1).describe('Trigger TYPE id (e.g. "ado.new-pr-watcher"). See trigger.list_types.'),
-        params: z
-          .record(z.string(), z.unknown())
-          .describe('Concrete param values. Validated against the type\'s parameters schema.'),
-        cron: z
-          .union([z.string(), z.null(), z.literal(false), z.literal('')])
-          .optional()
-          .describe('cron override. string=override; null/absent=inherit type default; false/""=disable cron (webhook/manual only).'),
-        subscriber_thread_id: z
-          .string()
-          .min(1)
-          .optional()
-          .describe('For hot triggers — binds this registration to a thread. Auto-cleanup when the thread terminates.'),
-        expires_at: z.number().optional().describe('Unix-ms — auto-delete after.'),
-        once: z.boolean().optional().describe('Self-delete after first successful run.'),
+        type_id: z.string().min(1).optional(),
+        script: z.string().optional(),
+        script_file: z.string().optional(),
+        runtime: z.enum(['node', 'tsx', 'python', 'bash']).optional()
+          .describe('Required when script or script_file is supplied.'),
+        params: z.record(z.string(), z.unknown()).optional(),
+        cron: z.union([z.string(), z.null(), z.literal(false), z.literal('')]).optional(),
+        subscriber_thread_id: z.string().min(1).optional(),
+        expires_at: z.number().optional(),
+        once: z.boolean().optional(),
       },
     },
     async (args) => {
-      const type = ws.triggerTypes.get(args.type_id);
-      if (!type) {
-        return structuredError(
-          'TRIGGER_TYPE_NOT_FOUND',
-          `Trigger type ${args.type_id} is not declared by any loaded plugin.`,
-          { type_id: args.type_id },
-        );
+      const sources = [args.type_id, args.script, args.script_file].filter((x) => typeof x === 'string').length;
+      if (sources !== 1) {
+        return structuredError('INVALID_REQUEST',
+          'Provide exactly one of `type_id`, `script`, or `script_file`.',
+          { type_id_provided: !!args.type_id, script_provided: !!args.script, script_file_provided: !!args.script_file });
       }
 
-      // Validate params against the type's schema.
-      const paramsCheck = validateTriggerParams(type.parameters, args.params);
+      let typeId: string;
+      let isAdhoc = false;
+      let oneoffTemplateId: string | null = null;
+
+      if (args.type_id) {
+        typeId = args.type_id;
+      } else {
+        if (!args.runtime) {
+          return structuredError('RUNTIME_REQUIRED',
+            'runtime is required when supplying script or script_file.', {});
+        }
+        let scriptContent: string;
+        if (args.script) {
+          scriptContent = args.script;
+        } else {
+          const guard = ensureFileUnderClawdevbox(ws.projectDir, args.script_file!);
+          if (!guard.ok) return guard.error;
+          scriptContent = readFileSync(guard.path, 'utf8');
+        }
+        oneoffTemplateId = mintOneOffId();
+        writeOneOffTemplate(ws, {
+          id: oneoffTemplateId,
+          runtime: args.runtime as TriggerRuntime,
+          scriptContent,
+          bindsCallbackTo: args.subscriber_thread_id ? 'thread_resume' : undefined,
+        });
+        const loaded = loadOneOffTemplate(ws, oneoffTemplateId);
+        if (!loaded) {
+          return structuredError('TRIGGER_TEMPLATE_WRITE_FAILED',
+            'Failed to read back the one-off template just written.', { id: oneoffTemplateId });
+        }
+        ws.triggerTypes.set(oneoffTemplateId, toRegisteredType(loaded));
+        typeId = oneoffTemplateId;
+        isAdhoc = true;
+      }
+
+      const type = ws.triggerTypes.get(typeId);
+      if (!type) {
+        return structuredError('TRIGGER_TYPE_NOT_FOUND',
+          `Trigger type ${typeId} is not declared by any loaded plugin or template.`,
+          { type_id: typeId });
+      }
+
+      const params = args.params ?? {};
+      const paramsCheck = validateTriggerParams(type.parameters, params);
       if (!paramsCheck.ok) {
+        if (isAdhoc && oneoffTemplateId) deleteOneOffTemplate(ws, oneoffTemplateId);
         return paramValidationError(paramsCheck.errors);
       }
 
-      // Normalize cron.
-      const cronCheck = normalizeCron(args.cron);
+      const cronInput = args.cron === undefined && isAdhoc ? false : args.cron;
+      const cronCheck = normalizeCron(cronInput);
       if (!cronCheck.ok) {
+        if (isAdhoc && oneoffTemplateId) deleteOneOffTemplate(ws, oneoffTemplateId);
         return paramValidationError([{ path: 'cron', code: 'CRON_INVALID', message: cronCheck.message }]);
       }
 
-      // Mint the id.
       const id = mintRegisteredId(type.id, paramsCheck.params, type.identity_param);
-
-      // Collision check.
       const path = triggersJsonPath(ws);
       const file = readTriggersFile(path);
       if (file.registered.some((r) => r.id === id)) {
-        return structuredError(
-          'TRIGGER_ALREADY_REGISTERED',
-          `A registered trigger with id ${id} already exists. Use trigger.update_params or trigger.unregister first.`,
-          { id, type_id: type.id },
-        );
+        if (isAdhoc && oneoffTemplateId) deleteOneOffTemplate(ws, oneoffTemplateId);
+        return structuredError('TRIGGER_ALREADY_REGISTERED',
+          `A registered trigger with id ${id} already exists.`,
+          { id, type_id: type.id });
       }
 
-      // Build initial state from defaults — the type's parameter defaults
-      // become the starting `state` shape (spec §8.5).
       const initialState: Record<string, unknown> = {};
-      for (const [k, v] of Object.entries(paramsCheck.params)) {
-        initialState[k] = v;
-      }
+      for (const [k, v] of Object.entries(paramsCheck.params)) initialState[k] = v;
 
       const row: RegisteredTrigger = {
-        id,
-        type: type.id,
-        params: paramsCheck.params,
-        cron: cronCheck.cron,
-        enabled: true,
+        id, type: type.id, params: paramsCheck.params,
+        cron: cronCheck.cron, enabled: true,
         subscriber_thread_id: args.subscriber_thread_id ?? null,
         expires_at: args.expires_at ?? null,
-        once: args.once ?? false,
+        once: args.once ?? (isAdhoc ? true : false),
         registered_at: Date.now(),
         state: initialState,
-        last_run_at: null,
-        last_run_status: null,
-        last_run_error: null,
+        last_run_at: null, last_run_status: null, last_run_error: null,
       };
-
       file.registered = [...file.registered, row];
       writeTriggersFile(path, file);
 
       return {
-        content: [{ type: 'text', text: `Registered trigger ${id} (type=${type.id}).` }],
-        structuredContent: { id, type: type.id, registered: projectRegistered(row, ws) },
+        content: [{ type: 'text', text: `Registered trigger ${id} (type=${type.id}${isAdhoc ? ', adhoc' : ''}).` }],
+        structuredContent: {
+          id, type: type.id, registered: projectRegistered(row, ws),
+          adhoc: isAdhoc, template_id: oneoffTemplateId,
+        },
       };
     },
   );
@@ -345,21 +377,26 @@ export function registerTriggerTools(server: McpServer, ws: Workspace): void {
     'trigger.unregister',
     {
       description:
-        'Remove a registered trigger instance by id (spec §8.3). The underlying TYPE stays available — call trigger.register again to recreate.',
+        'Remove a registered trigger instance by id. For one-off registrations, also drops the auto-template directory under `_oneoff/`. The underlying TYPE stays available for non-oneoff types.',
       inputSchema: { id: z.string().min(1) },
     },
     async (args) => {
       const path = triggersJsonPath(ws);
       const file = readTriggersFile(path);
-      const before = file.registered.length;
+      const row = file.registered.find((r) => r.id === args.id);
+      if (!row) return notFound('registered_trigger', args.id);
       file.registered = file.registered.filter((r) => r.id !== args.id);
-      if (file.registered.length === before) {
-        return notFound('registered_trigger', args.id);
-      }
       writeTriggersFile(path, file);
+      let oneoffRemoved = false;
+      if (row.type.startsWith('local.oneoff.')) {
+        oneoffRemoved = deleteOneOffTemplate(ws, row.type);
+        ws.triggerTypes.delete(row.type);
+      }
       return {
-        content: [{ type: 'text', text: `Unregistered trigger ${args.id}.` }],
-        structuredContent: { id: args.id, removed: 1 },
+        content: [
+          { type: 'text', text: `Unregistered trigger ${args.id}${oneoffRemoved ? ' (template removed)' : ''}.` },
+        ],
+        structuredContent: { id: args.id, removed: 1, oneoff_template_removed: oneoffRemoved },
       };
     },
   );
