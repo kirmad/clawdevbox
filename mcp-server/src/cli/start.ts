@@ -190,6 +190,18 @@ export async function runStart(flags: Flags): Promise<void> {
   );
   scanLegacyFiles(cfg, opened.db);
 
+  // Bidirectional plugin sync (spec §6). Eager when cfg.clientSync.mode='auto'
+  // or 'discover-only'; otherwise a no-op. Failures degrade to WARN.
+  try {
+    const { maybeRunClientSync } = await import('../agent-clis/lifecycle.ts');
+    await maybeRunClientSync(ws, cfg, 'boot');
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'boot-time client plugin sync failed',
+    );
+  }
+
   const { server, hostedRegistry } = await buildServer(ws);
 
   // Stateful Streamable HTTP — the SDK manages a session per client.

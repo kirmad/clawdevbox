@@ -57,6 +57,21 @@ import {
   type Workspace,
 } from '../workspace.ts';
 
+/** Fire-and-forget bidirectional client plugin sync after a mutation. */
+async function fireClientSync(
+  ws: Workspace,
+  event: 'plugin-install' | 'plugin-uninstall',
+): Promise<void> {
+  try {
+    const { maybeRunClientSync } = await import('../agent-clis/lifecycle.ts');
+    const { resolveConfig } = await import('../config.ts');
+    const cfg = resolveConfig({ projectDir: ws.projectDir, globalDir: ws.globalDir });
+    await maybeRunClientSync(ws, cfg, event);
+  } catch {
+    // Lifecycle errors never abort the calling operation.
+  }
+}
+
 interface StateFile {
   plugins?: Record<string, { enabled?: boolean }>;
 }
@@ -418,6 +433,7 @@ export function registerPluginTools(server: McpServer, ws: Workspace): void {
       }
       removeInstallRecord(ws, args.id);
       await reloadPluginRegistry(ws);
+      await fireClientSync(ws, 'plugin-uninstall');
       return {
         content: [{ type: 'text', text: `Uninstalled plugin ${args.id}.` }],
         structuredContent: { id: args.id, dir: targetDir },
@@ -554,6 +570,7 @@ async function installFromGit(ws: Workspace, from: string, ref: string | null): 
     writeInstallRecord(ws, manifest.name, record);
 
     await reloadPluginRegistry(ws);
+    await fireClientSync(ws, 'plugin-install');
     return {
       content: [{ type: 'text', text: `Installed plugin ${manifest.name} from ${from}.` }],
       structuredContent: { id: manifest.name, dir: destDir, origin: record },
@@ -647,6 +664,7 @@ async function installFromLocalFolder(ws: Workspace, sourcePath: string): Promis
   }
 
   await reloadPluginRegistry(ws);
+  await fireClientSync(ws, 'plugin-install');
   const messages = [`Installed plugin ${manifest.name} as a local-folder link → ${absoluteSource}.`];
   if (nodeModulesHint) messages.push(nodeModulesHint);
   return {

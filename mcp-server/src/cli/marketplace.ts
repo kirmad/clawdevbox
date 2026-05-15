@@ -40,6 +40,23 @@ import { isAbsolute, join, resolve } from 'node:path';
 import { resolveConfig } from '../config.ts';
 import { loadMarketplace, LoadMarketplaceError } from '../manifest/load-marketplace.ts';
 
+/** Fire-and-forget bidirectional client plugin sync after a marketplace mutation. */
+async function fireClientSync(
+  event: 'marketplace-add' | 'marketplace-remove',
+): Promise<void> {
+  try {
+    const cfg = resolveConfig();
+    if (cfg.clientSync.mode === 'off' || cfg.clientSync.mode === 'manual') return;
+    const { loadWorkspaceFromEnv } = await import('../workspace.ts');
+    const { maybeRunClientSync } = await import('../agent-clis/lifecycle.ts');
+    const env = { ...process.env, CLAWDEVBOX_PROJECT_DIR: cfg.projectDir, CLAWDEVBOX_GLOBAL_DIR: cfg.globalDir };
+    const ws = await loadWorkspaceFromEnv(env);
+    await maybeRunClientSync(ws, cfg, event);
+  } catch {
+    // Lifecycle errors never abort the calling operation.
+  }
+}
+
 interface MarketplaceRecord {
   id: string;
   kind: 'git' | 'local';
@@ -219,6 +236,7 @@ async function addGit(globalDir: string, source: string): Promise<number> {
   if (resolved.warnings.length) {
     for (const w of resolved.warnings) process.stdout.write(`  warning: ${w}\n`);
   }
+  await fireClientSync('marketplace-add');
   return 0;
 }
 
@@ -278,6 +296,7 @@ async function addLocal(globalDir: string, source: string): Promise<number> {
   if (resolved.warnings.length) {
     for (const w of resolved.warnings) process.stdout.write(`  warning: ${w}\n`);
   }
+  await fireClientSync('marketplace-add');
   return 0;
 }
 
@@ -438,5 +457,6 @@ async function runRemove(args: string[]): Promise<number> {
   process.stdout.write(
     `removed marketplace '${id}'. Installed plugins are unaffected.\n`,
   );
+  await fireClientSync('marketplace-remove');
   return 0;
 }
