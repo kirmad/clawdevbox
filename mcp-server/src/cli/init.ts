@@ -53,6 +53,10 @@ import {
   type DiscoveredPlugin,
   type ResolvedSource,
 } from './plugin-sources.ts';
+import { filterByEngines } from '../manifest/load-marketplace.ts';
+import { validateAgencyJson } from '../validators.ts';
+import { readFileSync } from 'node:fs';
+import type { AgencyJson } from '../manifest/types.ts';
 
 // Plugin storage is now global (see §10 in docs/design.md). The project
 // dir keeps recipes/skills/triggers/artifacts only; plugins live under
@@ -385,11 +389,33 @@ export async function runInit(flags: Flags): Promise<void> {
         );
         continue;
       }
+      // Engines filter (spec §4.4): each discovered plugin may have a
+      // sibling agency.json. Hide incompatible plugins from the prompt
+      // (and surface a diagnostic line). configuredAgentCli is whatever
+      // the existing global config records — the new provider isn't
+      // picked until later in init.
+      const cliId = readExistingDefaultAgentCli(globalDir);
+      const compatible: DiscoveredPlugin[] = [];
+      for (const p of plugins) {
+        const agency = readAgencyJsonAt(p.dir);
+        const flt = filterByEngines(agency, cliId);
+        if (flt.include) {
+          compatible.push(p);
+        } else {
+          sourceDiagnostics.push(`--plugin ${raw}: skipped ${p.id} (${flt.reason})`);
+        }
+      }
+      if (compatible.length === 0) {
+        sourceDiagnostics.push(
+          `--plugin ${raw}: no engine-compatible plugins to install.`,
+        );
+        continue;
+      }
       // Pre-check plugins that already live in the global plugins store
       // so a re-run doesn't accidentally drop them. Install won't overwrite
       // an existing directory anyway, but the pre-check makes the intent
       // obvious to the user.
-      const preChecked = plugins
+      const preChecked = compatible
         .filter((p) => existsSync(join(globalPluginsDirPath, p.id)))
         .map((p) => p.id);
       const chosenIds = abortIfCancel(
@@ -398,7 +424,7 @@ export async function runInit(flags: Flags): Promise<void> {
           string
         >({
           message: `Plugins discovered in ${raw} — pick which to install:`,
-          options: plugins.map((p) => ({
+          options: compatible.map((p) => ({
             value: p.id,
             label: `${p.name} (${p.id}@${p.version})`,
             hint:
@@ -410,7 +436,7 @@ export async function runInit(flags: Flags): Promise<void> {
         }),
       );
       for (const id of chosenIds) {
-        const plugin = plugins.find((p) => p.id === id);
+        const plugin = compatible.find((p) => p.id === id);
         if (plugin) externalPicks.push({ origin: source.origin, plugin, source, isSinglePluginAtRoot });
       }
     }
@@ -925,3 +951,28 @@ async function tryInstallService(args: {
 
   return { ok: true, pid, logPath, autoStart, autoStartError };
 }
+
+// ----- Engine-filter helpers (Phase 5 / spec sec 4.4) -----------------------
+
+function readExistingDefaultAgentCli(globalDir: string): string | null {
+  try {
+    const cfg = readGlobalConfig(globalDir);
+    return cfg?.default_agent_cli ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function readAgencyJsonAt(pluginDir: string): AgencyJson | undefined {
+  const p = join(pluginDir, 'agency.json');
+  if (!existsSync(p)) return undefined;
+  try {
+    const parsed = JSON.parse(readFileSync(p, 'utf8'));
+    const errs = validateAgencyJson(parsed);
+    if (errs.length > 0) return undefined;
+    return parsed as AgencyJson;
+  } catch {
+    return undefined;
+  }
+}
+

@@ -43,7 +43,10 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import { notFound, structuredError, validationError } from '../scope.ts';
-import { validatePluginManifestJson } from '../validators.ts';
+import { validatePluginManifestJson, validateAgencyJson } from '../validators.ts';
+import { filterByEngines } from '../manifest/load-marketplace.ts';
+import { readGlobalConfig } from '../config.ts';
+import type { AgencyJson } from '../manifest/types.ts';
 import {
   globalPluginsDir,
   pluginDir,
@@ -454,6 +457,35 @@ export function registerPluginTools(server: McpServer, ws: Workspace): void {
 // ============================================================================
 
 /**
+ * Read a plugin's sibling `agency.json` (Microsoft per-plugin sidecar) if
+ * it's present and shape-valid. Returns `undefined` for missing or
+ * malformed sidecars — the install path still proceeds and `filterByEngines`
+ * treats `undefined` as "no filter".
+ */
+function tryReadAgencyJsonSync(pluginDir: string): AgencyJson | undefined {
+  const p = join(pluginDir, 'agency.json');
+  if (!existsSync(p)) return undefined;
+  try {
+    const parsed = JSON.parse(readFileSync(p, 'utf8'));
+    const errs = validateAgencyJson(parsed);
+    if (errs.length > 0) return undefined;
+    return parsed as AgencyJson;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Resolve the engine id (configured agent-CLI provider or null). */
+function configuredAgentCli(ws: Workspace): string | null {
+  try {
+    const cfg = readGlobalConfig(ws.globalDir);
+    return cfg?.default_agent_cli ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Clone a git repo into a sibling temp dir, validate the manifest, atomic
  * rename to `<global_dir>/plugins/<id>/`. Full clones (no `--depth 1`) so
  * `plugin.update` can fetch+reset across branches/tags/SHAs reliably.
@@ -493,6 +525,14 @@ async function installFromGit(ws: Workspace, from: string, ref: string | null): 
     if (validationErrs.length > 0) return validationError(validationErrs);
 
     const manifest = parsed as { name: string };
+    // Engines filter (spec §4.4): respect agency.json's `engines` list.
+    const agency = tryReadAgencyJsonSync(tmp);
+    const filter = filterByEngines(agency, configuredAgentCli(ws));
+    if (!filter.include) {
+      return structuredError('ENGINE_MISMATCH', filter.reason ?? 'plugin not compatible with current engine', {
+        id: manifest.name,
+      });
+    }
     const destDir = pluginDir(ws, manifest.name);
     if (existsSync(destDir)) {
       return structuredError(
@@ -555,6 +595,14 @@ async function installFromLocalFolder(ws: Workspace, sourcePath: string): Promis
   if (validationErrs.length > 0) return validationError(validationErrs);
 
   const manifest = parsed as { name: string; clawdevbox?: { tools?: unknown[] } };
+  // Engines filter (spec §4.4): respect agency.json's `engines` list.
+  const agency = tryReadAgencyJsonSync(absoluteSource);
+  const filter = filterByEngines(agency, configuredAgentCli(ws));
+  if (!filter.include) {
+    return structuredError('ENGINE_MISMATCH', filter.reason ?? 'plugin not compatible with current engine', {
+      id: manifest.name,
+    });
+  }
   const destDir = pluginDir(ws, manifest.name);
   if (existsSync(destDir)) {
     return structuredError(
