@@ -323,3 +323,97 @@ test('trigger.unregister removes _oneoff dir for one-off registrations', async (
     assert.equal(existsSync(dir), false);
   });
 });
+test('trigger.test with inline script captures Mode B callback', async () => {
+  await withHarness(async (h) => {
+    const script = `
+async function readStdin() {
+  const chunks = [];
+  for await (const c of process.stdin) chunks.push(c);
+  return Buffer.concat(chunks).toString('utf8');
+}
+const env = JSON.parse(await readStdin());
+const secret = process.env.CLAWDEVBOX_MCP_SECRET ?? '';
+await fetch(env.callback_url, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json', Authorization: \`Bearer \${secret}\` },
+  body: JSON.stringify({ prompt: 'inline test', context: {} }),
+});
+process.stdout.write(JSON.stringify({ state: { ok: true } }));
+`;
+    const r = await h.call('trigger.test', { script, runtime: 'tsx', timeout_ms: 30000 });
+    assert.ok(!r.isError, JSON.stringify(r));
+    assert.equal(r.structuredContent.exit_code, 0);
+    assert.equal(r.structuredContent.timed_out, false);
+    assert.ok(Array.isArray(r.structuredContent.callbacks));
+    assert.equal(r.structuredContent.callbacks.length, 1);
+    assert.equal(r.structuredContent.callbacks[0].mode, 'B');
+    assert.equal(r.structuredContent.callbacks[0].body.prompt, 'inline test');
+  });
+});
+
+test('trigger.test by template_id resolves a saved template', async () => {
+  await withHarness(async (h) => {
+    const script = `
+async function readStdin() {
+  const chunks = [];
+  for await (const c of process.stdin) chunks.push(c);
+  return Buffer.concat(chunks).toString('utf8');
+}
+const env = JSON.parse(await readStdin());
+process.stdout.write(JSON.stringify({ callback: { body: { prompt: 'tpl-test' } } }));
+`;
+    await h.call('trigger.create_template', {
+      id: 'local.tpl-test', scope: 'project', runtime: 'tsx',
+      description: 'tpl', script,
+    });
+    const r = await h.call('trigger.test', { template_id: 'local.tpl-test', timeout_ms: 30000 });
+    assert.ok(!r.isError, JSON.stringify(r));
+    assert.equal(r.structuredContent.exit_code, 0);
+    assert.equal(r.structuredContent.callbacks.length, 1);
+    assert.equal(r.structuredContent.callbacks[0].mode, 'A');
+    assert.equal(r.structuredContent.callbacks[0].body.prompt, 'tpl-test');
+  });
+});
+
+test('trigger.test by registered id uses the bound params + state', async () => {
+  await withHarness(async (h) => {
+    const script = `
+async function readStdin() {
+  const chunks = [];
+  for await (const c of process.stdin) chunks.push(c);
+  return Buffer.concat(chunks).toString('utf8');
+}
+const env = JSON.parse(await readStdin());
+process.stdout.write(JSON.stringify({ callback: { body: { prompt: 'reg', state: env.state } } }));
+`;
+    await h.call('trigger.create_template', {
+      id: 'local.regtest', scope: 'project', runtime: 'tsx',
+      description: 'reg', script,
+      parameters: [{ name: 'repo', type: 'string', required: true }],
+    });
+    const reg = await h.call('trigger.register', {
+      type_id: 'local.regtest', params: { repo: 'svc' }, cron: false,
+    });
+    assert.ok(!reg.isError);
+    const r = await h.call('trigger.test', { id: reg.structuredContent.id, timeout_ms: 30000 });
+    assert.ok(!r.isError, JSON.stringify(r));
+    assert.equal(r.structuredContent.callbacks[0].body.state.repo, 'svc');
+  });
+});
+
+test('trigger.test enforces XOR(id|template_id|script)', async () => {
+  await withHarness(async (h) => {
+    const r = await h.call('trigger.test', {});
+    assert.equal(r.isError, true);
+    assert.equal(r.structuredContent.code, 'INVALID_REQUEST');
+  });
+});
+
+test('trigger.test honors timeout_ms and reports timed_out', async () => {
+  await withHarness(async (h) => {
+    const script = `await new Promise(() => {});`;
+    const r = await h.call('trigger.test', { script, runtime: 'tsx', timeout_ms: 800 });
+    assert.ok(!r.isError, JSON.stringify(r));
+    assert.equal(r.structuredContent.timed_out, true);
+  });
+});

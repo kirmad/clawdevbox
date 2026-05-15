@@ -31,10 +31,15 @@
  * Required params missing surface as PARAM_VALIDATION with structured errors.
  */
 
-import { existsSync, readFileSync, rmSync } from 'node:fs';
-import { resolve as pathResolve, sep } from 'node:path';
+import { createServer } from 'node:http';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { join, resolve as pathResolve, sep } from 'node:path';
+import { tmpdir } from 'node:os';
+import { randomBytes } from 'node:crypto';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
+import { runTriggerScript } from '../trigger-runner.ts';
+import type { TriggerTypeParameter } from '../workspace.ts';
 import { logger } from '../logger.ts';
 import {
   isValidCronExpression,
@@ -746,6 +751,198 @@ export function registerTriggerTools(server: McpServer, ws: Workspace): void {
       return {
         content: [{ type: 'text', text: `Deleted template ${args.id} (scope=${existing.scope}).` }],
         structuredContent: { id: args.id, scope: existing.scope, removed },
+      };
+    },
+  );
+
+  // -- trigger.test ---------------------------------------------------------
+  server.registerTool(
+    'trigger.test',
+    {
+      description:
+        'Run a trigger script with a synthesized envelope and capture the result. NON-MUTATING — does not write to triggers.json or update state. Three input sources (XOR): `id` (registered instance), `template_id` (saved type, any scope), or `script` + `runtime` (inline). Captures Mode A (stdout `callback.body`) and Mode B (HTTP POST to a fresh ephemeral 127.0.0.1 receiver) callbacks; receiver enforces `Authorization: Bearer <fresh-secret>` like the real /callback/* endpoints. Hard timeout (default 30s).',
+      inputSchema: {
+        id: z.string().min(1).optional(),
+        template_id: z.string().min(1).optional(),
+        script: z.string().optional(),
+        runtime: z.enum(['node', 'tsx', 'python', 'bash']).optional(),
+        params: z.record(z.string(), z.unknown()).optional(),
+        state: z.record(z.string(), z.unknown()).optional(),
+        payload: z.unknown().optional(),
+        timeout_ms: z.number().int().positive().max(600000).optional(),
+      },
+    },
+    async (args) => {
+      const sources = [args.id, args.template_id, args.script].filter((x) => typeof x === 'string').length;
+      if (sources !== 1) {
+        return structuredError('INVALID_REQUEST',
+          'Provide exactly one of `id`, `template_id`, or `script`.', {});
+      }
+
+      let scriptPath: string;
+      let runtime: TriggerRuntime;
+      let parameters: TriggerTypeParameter[] = [];
+      let resolvedTriggerId: string;
+      let defaultParams: Record<string, unknown> = {};
+      let defaultState: Record<string, unknown> = {};
+
+      let tmpScriptDir: string | null = null;
+
+      if (args.script) {
+        if (!args.runtime) {
+          return structuredError('RUNTIME_REQUIRED',
+            'runtime is required when supplying script.', {});
+        }
+        runtime = args.runtime as TriggerRuntime;
+        const ext = runtime === 'tsx' ? 'mts' : runtime === 'node' ? 'mjs' : runtime === 'python' ? 'py' : 'sh';
+        tmpScriptDir = mkdtempSync(join(tmpdir(), 'cdb-trigger-test-'));
+        const tmpScriptPath = join(tmpScriptDir, `inline.${ext}`);
+        writeFileSync(tmpScriptPath, args.script);
+        scriptPath = tmpScriptPath;
+        resolvedTriggerId = 'inline';
+      } else if (args.template_id) {
+        const loaded = findTemplate(ws, args.template_id) ?? loadOneOffTemplate(ws, args.template_id);
+        const typeFromRegistry = ws.triggerTypes.get(args.template_id);
+        if (!loaded && !typeFromRegistry) {
+          return structuredError('TRIGGER_TEMPLATE_NOT_FOUND',
+            `Template ${args.template_id} not found.`, { template_id: args.template_id });
+        }
+        if (loaded) {
+          scriptPath = loaded.scriptAbs;
+          runtime = (loaded.manifest.runtime ?? 'tsx') as TriggerRuntime;
+          parameters = (loaded.manifest.parameters ?? []) as TriggerTypeParameter[];
+        } else {
+          scriptPath = typeFromRegistry!.file_abs;
+          runtime = ((typeFromRegistry as unknown as { runtime?: TriggerRuntime }).runtime ?? 'tsx') as TriggerRuntime;
+          parameters = typeFromRegistry!.parameters ?? [];
+        }
+        resolvedTriggerId = args.template_id;
+      } else {
+        // by registered id
+        const file = readTriggersFile(triggersJsonPath(ws));
+        const row = file.registered.find((r) => r.id === args.id);
+        if (!row) return notFound('registered_trigger', args.id!);
+        const type = ws.triggerTypes.get(row.type);
+        const oneoffLoaded = type ? null : loadOneOffTemplate(ws, row.type);
+        if (!type && !oneoffLoaded) {
+          return structuredError('TRIGGER_TYPE_NOT_FOUND',
+            `Type ${row.type} for registration ${row.id} not found.`,
+            { id: row.id, type_id: row.type });
+        }
+        if (type) {
+          scriptPath = type.file_abs;
+          runtime = ((type as unknown as { runtime?: TriggerRuntime }).runtime ?? 'tsx') as TriggerRuntime;
+          parameters = type.parameters ?? [];
+        } else {
+          scriptPath = oneoffLoaded!.scriptAbs;
+          runtime = oneoffLoaded!.manifest.runtime;
+          parameters = oneoffLoaded!.manifest.parameters ?? [];
+        }
+        resolvedTriggerId = row.id;
+        defaultParams = row.params;
+        defaultState = row.state;
+      }
+
+      // tsx/node need ESM resolution for top-level await; ensure the script
+      // sits beside a `{"type":"module"}` package.json. For inline we own the
+      // tmp dir; for templates copy the script (NON-MUTATING) into a tmp dir.
+      if (runtime === 'tsx' || runtime === 'node') {
+        if (!tmpScriptDir) {
+          tmpScriptDir = mkdtempSync(join(tmpdir(), 'cdb-trigger-test-'));
+          const ext = runtime === 'tsx' ? 'mts' : 'mjs';
+          const copied = join(tmpScriptDir, `script.${ext}`);
+          writeFileSync(copied, readFileSync(scriptPath, 'utf8'));
+          scriptPath = copied;
+        }
+        const pkgPath = join(tmpScriptDir, 'package.json');
+        if (!existsSync(pkgPath)) {
+          writeFileSync(pkgPath, '{"type":"module"}');
+        }
+      }
+
+      const params = args.params ?? defaultParams;
+      if (parameters.length > 0) {
+        const paramsCheck = validateTriggerParams(parameters, params);
+        if (!paramsCheck.ok) {
+          if (tmpScriptDir) { try { rmSync(tmpScriptDir, { recursive: true, force: true }); } catch { /* ignore */ } }
+          return paramValidationError(paramsCheck.errors);
+        }
+      }
+      const state = args.state ?? (Object.keys(defaultState).length > 0 ? defaultState : { ...params });
+      const payload = args.payload ?? null;
+
+      const secret = randomBytes(24).toString('hex');
+      const captures: Array<{ mode: 'A' | 'B'; path: string; method: string; body: unknown; received_at: number }> = [];
+      const httpServer = createServer((req, res) => {
+        let body = '';
+        req.on('data', (c) => { body += c.toString('utf8'); });
+        req.on('end', () => {
+          if (req.headers['authorization'] !== `Bearer ${secret}`) {
+            res.statusCode = 401;
+            res.end(JSON.stringify({ error: 'unauthorized' }));
+            return;
+          }
+          let parsed: unknown;
+          try { parsed = JSON.parse(body); } catch { parsed = body; }
+          captures.push({
+            mode: 'B', path: req.url ?? '/', method: req.method ?? 'POST',
+            body: parsed, received_at: Date.now(),
+          });
+          res.statusCode = 200;
+          res.end(JSON.stringify({ ok: true }));
+        });
+      });
+      await new Promise<void>((r) => httpServer.listen(0, '127.0.0.1', r));
+      const port = (httpServer.address() as { port: number }).port;
+      const runId = mintId('run');
+      const callbackUrl = `http://127.0.0.1:${port}/callback/test/${runId}`;
+
+      let runResult: Awaited<ReturnType<typeof runTriggerScript>> | null = null;
+      try {
+        runResult = await runTriggerScript({
+          scriptPath, runtime,
+          envelope: {
+            trigger_event_name: 'TriggerFired',
+            trigger_id: resolvedTriggerId, run_id: runId,
+            callback_url: callbackUrl, state, payload,
+          },
+          callbackSecret: secret,
+          timeoutMs: args.timeout_ms ?? 30000,
+        });
+      } finally {
+        await new Promise<void>((r) => httpServer.close(() => r()));
+        if (tmpScriptDir) {
+          try { rmSync(tmpScriptDir, { recursive: true, force: true }); } catch { /* ignore */ }
+        }
+      }
+
+      // Mode A — extract from stdout_parsed.callback.body if present.
+      const parsed = runResult.stdout_parsed as { callback?: { body?: unknown } } | null;
+      const modeAList: typeof captures = [];
+      if (parsed && typeof parsed === 'object' && parsed.callback && typeof parsed.callback === 'object') {
+        modeAList.push({
+          mode: 'A', path: callbackUrl, method: 'POST',
+          body: (parsed.callback as { body?: unknown }).body ?? null,
+          received_at: Date.now(),
+        });
+      }
+      const callbacks = [...modeAList, ...captures];
+
+      return {
+        content: [{
+          type: 'text',
+          text: `trigger.test (${resolvedTriggerId}): exit=${runResult.exit_code}, timed_out=${runResult.timed_out}, callbacks=${callbacks.length}, ${runResult.duration_ms}ms`,
+        }],
+        structuredContent: {
+          run_id: runId,
+          exit_code: runResult.exit_code,
+          duration_ms: runResult.duration_ms,
+          timed_out: runResult.timed_out,
+          stdout: runResult.stdout,
+          stderr: runResult.stderr,
+          stdout_parsed: runResult.stdout_parsed,
+          callbacks,
+        },
       };
     },
   );
