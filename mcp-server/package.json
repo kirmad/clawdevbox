@@ -34,6 +34,7 @@
     "@toon-format/toon": "^2.1.0",
     "@types/qrcode-terminal": "^0.12.2",
     "@types/ws": "^8.18.1",
+    "better-sqlite3": "^11.10.0",
     "cron-parser": "^4.9.0",
     "cronstrue": "^2.59.0",
     "js-yaml": "^4.1.0",
@@ -48,6 +49,7 @@
   },
   "devDependencies": {
     "@playwright/test": "^1.59.1",
+    "@types/better-sqlite3": "^7.6.13",
     "@types/js-yaml": "^4.0.9",
     "@types/node": "^20.0.0",
     "@types/web-push": "^3.6.4",
