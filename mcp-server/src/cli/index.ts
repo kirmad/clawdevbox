@@ -169,6 +169,16 @@ Usage:
                            when no explicit agent_cli is supplied. Validated
                            against the live provider registry.
 
+  clawdevbox marketplace add <source>
+  clawdevbox marketplace list
+  clawdevbox marketplace update [<id>]
+  clawdevbox marketplace remove <id>
+      Manage plugin marketplace catalogs under <globalDir>/marketplaces/.
+      <source> is a git URL or absolute folder; catalogs are read via
+      .claude-plugin/marketplace.json (or .github/plugin/marketplace.json
+      fallback). Removing a marketplace does not uninstall plugins that
+      came from it.
+
   clawdevbox --help
       Show this message.
 
@@ -237,6 +247,10 @@ async function main(): Promise<void> {
       // parseArgv strips the leading subcommand from positional; re-add it so
       // runConfigSet sees ['set', '<key>', '<value>', ...].
       process.exit(await runConfigSet(sub));
+    }
+    case 'marketplace': {
+      const { runMarketplace } = await import('./marketplace.ts');
+      process.exit(await runMarketplace(parsed.positional));
     }
     default:
       process.stderr.write(`unknown command: ${parsed.command}\n\n`);
