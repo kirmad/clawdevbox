@@ -171,3 +171,23 @@ test('trigger.create_template rejects double-create with TRIGGER_TEMPLATE_EXISTS
     assert.equal(r2.structuredContent.code, 'TRIGGER_TEMPLATE_EXISTS');
   });
 });
+
+test('trigger.list_templates returns only agent-authored types', async () => {
+  await withHarness(async (h) => {
+    await h.call('trigger.create_template', {
+      id: 'local.alpha', scope: 'project', runtime: 'tsx',
+      description: 'a', script: '// a\n',
+    });
+    await h.call('trigger.create_template', {
+      id: 'local.beta', scope: 'global', runtime: 'tsx',
+      description: 'b', script: '// b\n',
+    });
+    const list = await h.call('trigger.list_templates', {});
+    const ids = list.structuredContent.trigger_types.map((t) => t.id).sort();
+    assert.deepEqual(ids, ['local.alpha', 'local.beta']);
+    const filtered = await h.call('trigger.list_templates', { scope: 'project' });
+    const fids = filtered.structuredContent.trigger_types.map((t) => t.id);
+    assert.deepEqual(fids, ['local.alpha']);
+  });
+});
+

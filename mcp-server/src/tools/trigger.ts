@@ -558,4 +558,33 @@ export function registerTriggerTools(server: McpServer, ws: Workspace): void {
       };
     },
   );
+
+  // -- trigger.list_templates ----------------------------------------------
+  server.registerTool(
+    'trigger.list_templates',
+    {
+      description:
+        'List agent-authored trigger TYPES (project + global scopes). Equivalent to `trigger.list_types` filtered to scope in {project, global}.',
+      inputSchema: {
+        scope: z.enum(['project', 'global']).optional(),
+        search: z.string().min(1).optional(),
+      },
+    },
+    async (args) => {
+      const all = [...ws.triggerTypes.values()].sort((a, b) => a.id.localeCompare(b.id));
+      let filtered = all.filter((t) => t.scope === 'project' || t.scope === 'global');
+      if (args.scope) filtered = filtered.filter((t) => t.scope === args.scope);
+      if (args.search) {
+        const q = args.search.toLowerCase();
+        filtered = filtered.filter((t) =>
+          t.id.toLowerCase().includes(q) || (t.description ?? '').toLowerCase().includes(q),
+        );
+      }
+      const projected = filtered.map(projectType);
+      return {
+        content: [{ type: 'text', text: `Found ${projected.length} agent-authored template(s).` }],
+        structuredContent: { trigger_types: projected, count: projected.length },
+      };
+    },
+  );
 }
