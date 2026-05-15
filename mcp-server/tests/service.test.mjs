@@ -177,6 +177,95 @@ test('global config — project_dir is optional and round-trips when omitted', a
 });
 
 // ----------------------------------------------------------------------------
+// default_agent_cli (Phase 5 §8)
+// ----------------------------------------------------------------------------
+
+test('resolveConfig — defaultAgentCli is null when neither layer sets it', async () => {
+  const cfg = await import(configModUrl);
+  const { tmpRoot, cleanup } = makeProject();
+  try {
+    const resolved = cfg.resolveConfig({
+      projectDir: tmpRoot,
+      globalDir: join(tmpRoot, '.global'),
+      env: {},
+    });
+    assert.equal(resolved.defaultAgentCli, null);
+  } finally {
+    cleanup();
+  }
+});
+
+test('resolveConfig — project default_agent_cli overrides global', async () => {
+  const cfg = await import(configModUrl);
+  const { tmpRoot, cleanup } = makeProject();
+  try {
+    const globalDir = join(tmpRoot, '.global');
+    mkdirSync(globalDir, { recursive: true });
+    cfg.writeGlobalConfig(globalDir, {
+      version: cfg.CONFIG_VERSION,
+      global_dir: globalDir,
+      default_agent_cli: 'claude',
+    });
+    // Global only → resolves to global value.
+    let resolved = cfg.resolveConfig({ projectDir: tmpRoot, globalDir, env: {} });
+    assert.equal(resolved.defaultAgentCli, 'claude');
+
+    cfg.writeConfig(tmpRoot, {
+      version: cfg.CONFIG_VERSION,
+      project_dir: tmpRoot,
+      global_dir: globalDir,
+      default_agent_cli: 'agency',
+    });
+    // Project wins.
+    resolved = cfg.resolveConfig({ projectDir: tmpRoot, globalDir, env: {} });
+    assert.equal(resolved.defaultAgentCli, 'agency');
+  } finally {
+    cleanup();
+  }
+});
+
+test('validateConfig — rejects invalid default_agent_cli', async () => {
+  const cfg = await import(configModUrl);
+  const { tmpRoot, cleanup } = makeProject();
+  try {
+    const globalDir = join(tmpRoot, '.global');
+    mkdirSync(globalDir, { recursive: true });
+    // Write an invalid value directly to disk.
+    const badConfig = {
+      version: cfg.CONFIG_VERSION,
+      global_dir: globalDir,
+      default_agent_cli: '-bad-id',
+    };
+    const p = cfg.globalConfigPath(globalDir);
+    const { writeFileSync } = await import('node:fs');
+    writeFileSync(p, JSON.stringify(badConfig), 'utf8');
+    assert.throws(
+      () => cfg.readGlobalConfig(globalDir),
+      /default_agent_cli/,
+    );
+
+    // Empty string
+    writeFileSync(p, JSON.stringify({ ...badConfig, default_agent_cli: '' }), 'utf8');
+    assert.throws(() => cfg.readGlobalConfig(globalDir), /default_agent_cli/);
+
+    // Non-string
+    writeFileSync(p, JSON.stringify({ ...badConfig, default_agent_cli: 123 }), 'utf8');
+    assert.throws(() => cfg.readGlobalConfig(globalDir), /default_agent_cli/);
+
+    // Valid id is accepted.
+    writeFileSync(
+      p,
+      JSON.stringify({ ...badConfig, default_agent_cli: 'my.plugin-cli_v2' }),
+      'utf8',
+    );
+    const ok = cfg.readGlobalConfig(globalDir);
+    assert.equal(ok.default_agent_cli, 'my.plugin-cli_v2');
+  } finally {
+    cleanup();
+  }
+});
+
+// ----------------------------------------------------------------------------
 // service.ts — state file round-trip + spawn/stop
 // ----------------------------------------------------------------------------
 

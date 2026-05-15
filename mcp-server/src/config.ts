@@ -104,6 +104,13 @@ export interface ClawdevboxConfig {
   tunnel?: ClawdevboxTunnelConfig;
   notifications?: ClawdevboxNotificationsConfig;
   cron?: ClawdevboxCronConfig;
+  /**
+   * Default agent-CLI provider id used by the main agent and by
+   * `recipe.run` when no `agent_cli` arg is supplied. The runtime fallback
+   * (`'copilot'`) is applied at the call edge, not in the resolver — this
+   * field is `null` when neither config layer sets it.
+   */
+  default_agent_cli?: string;
 }
 
 export interface ResolvedConfig {
@@ -132,11 +139,12 @@ export interface ResolvedConfig {
   /** Path to the config file that produced this (null if defaults-only). */
   configPath: string | null;
   /**
-   * Default agent CLI provider id for the main agent (and recipe.run when
-   * unspecified). Phase 5 wires the config merge logic; for now the field
-   * is optional so the kernel can read it and fall back to 'copilot'.
+   * Default agent-CLI provider id for the main agent (and `recipe.run` when
+   * unspecified). Resolved with project > global precedence; `null` when
+   * neither layer sets it. Callers apply the `'copilot'` fallback at the
+   * call edge.
    */
-  defaultAgentCli?: string;
+  defaultAgentCli: string | null;
 }
 
 export class ConfigError extends Error {
@@ -349,6 +357,20 @@ function validateConfig(parsed: unknown, source: string): ClawdevboxConfig {
     }
   }
 
+  let default_agent_cli: string | undefined;
+  if (obj.default_agent_cli !== undefined) {
+    if (
+      typeof obj.default_agent_cli !== 'string' ||
+      obj.default_agent_cli.length === 0 ||
+      !/^[a-z0-9][a-z0-9._-]*$/i.test(obj.default_agent_cli)
+    ) {
+      throw new ConfigError(
+        `${source}: default_agent_cli must be a non-empty provider id matching [a-z0-9][a-z0-9._-]* (got ${JSON.stringify(obj.default_agent_cli)})`,
+      );
+    }
+    default_agent_cli = obj.default_agent_cli;
+  }
+
   let http: ClawdevboxHttpConfig | undefined;
   if (obj.http !== undefined) {
     if (!obj.http || typeof obj.http !== 'object') {
@@ -384,6 +406,7 @@ function validateConfig(parsed: unknown, source: string): ClawdevboxConfig {
     tunnel,
     notifications,
     cron,
+    default_agent_cli,
   };
 }
 
@@ -500,6 +523,8 @@ export function resolveConfig(opts: ResolveOptions = {}): ResolvedConfig {
     layered((c) => c.cron?.dispatcher_drain_ms) ??
     15_000;
 
+  const defaultAgentCli = layered((c) => c.default_agent_cli) ?? null;
+
   // Pick a representative configPath: prefer project layer when present,
   // otherwise the global layer, otherwise null.
   const configPathUsed = projectCfg
@@ -528,6 +553,7 @@ export function resolveConfig(opts: ResolveOptions = {}): ResolvedConfig {
       dispatcher_drain_ms: cronDrainMs,
     },
     configPath: configPathUsed,
+    defaultAgentCli,
   };
 }
 
