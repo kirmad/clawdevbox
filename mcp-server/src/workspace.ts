@@ -556,6 +556,7 @@ function emptyCapabilities(): ResolvedCapabilities {
     tools: [],
     triggerTypes: [],
     agentClis: [],
+    renderers: [],
   };
 }
 

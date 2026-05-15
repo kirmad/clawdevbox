@@ -21,7 +21,8 @@
 
 import { promises as fsp } from 'node:fs';
 import { existsSync, statSync } from 'node:fs';
-import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { load as yamlLoad } from 'js-yaml';
 import {
   validatePluginManifestJson,
   validateAgencyJson,
@@ -35,21 +36,9 @@ import type {
   PluginStatus,
   PluginProvideEntry,
   ClawdevboxToolEntry,
+  PluginRendererEntry,
 } from './types.ts';
 import type { PluginTriggerType, PluginAgentCliEntry } from '../workspace.ts';
-
-/**
- * Type-guard: a `clawdevbox.*` polymorphic field that is an array of objects
- * (Tier 3 of the spec: explicit entries). Returns false for strings,
- * string[], and undefined.
- */
-function isEntryArray<E>(value: unknown): value is E[] {
-  return (
-    Array.isArray(value) &&
-    value.length > 0 &&
-    value.every((v) => typeof v === 'object' && v !== null && !Array.isArray(v))
-  );
-}
 
 // ============================================================================
 // Public types
@@ -87,6 +76,13 @@ export interface ResolvedTool {
   runtime?: string;
 }
 
+export interface ResolvedRenderer {
+  type: string;
+  module: string;
+  absoluteFile: string;
+  description?: string;
+}
+
 export interface ResolvedCapabilities {
   skills: ResolvedSkill[];
   agents: ResolvedAgent[];
@@ -97,6 +93,7 @@ export interface ResolvedCapabilities {
   tools: ResolvedTool[];
   triggerTypes: PluginTriggerType[];
   agentClis: PluginAgentCliEntry[];
+  renderers: ResolvedRenderer[];
   status?: PluginStatus;
 }
 
@@ -111,7 +108,8 @@ export type LoadErrorScope =
   | 'recipes'
   | 'tools'
   | 'trigger_types'
-  | 'agent_clis';
+  | 'agent_clis'
+  | 'renderers';
 
 export interface LoadError {
   scope: LoadErrorScope;
@@ -227,30 +225,18 @@ export async function loadPluginFromDir(pluginDir: string): Promise<LoadedPlugin
   const mcpServers = await resolveMcpServers(pluginDir, manifest.mcpServers, loadErrors);
   const hooks = await resolveHooks(pluginDir, manifest.hooks, loadErrors);
 
-  // clawdevbox extensions — pass-through (file existence is a runtime concern).
-  // NOTE: the polymorphic `string | string[] | Entry[]` shapes are fully
-  // resolved by the auto-discovery code path added later. For now we treat
-  // only the explicit Entry[] case (Tier 3) and leave the other shapes as
-  // empty until that lands.
+  // clawdevbox extensions — polymorphic fields (`string | string[] | Entry[]`)
+  // are resolved by `resolveCapability` against the per-capability convention
+  // directory. Tier 3 (explicit Entry[]) bypasses auto-discovery; other shapes
+  // trigger directory scans. See docs/specs/2026-05-15-plugin-capability-autodiscovery-design.md.
   const cdb = manifest.clawdevbox;
-  const recipesIn = isEntryArray<PluginProvideEntry>(cdb?.recipes) ? cdb!.recipes as PluginProvideEntry[] : [];
-  const toolsIn = isEntryArray<ClawdevboxToolEntry>(cdb?.tools) ? cdb!.tools as ClawdevboxToolEntry[] : [];
-  const triggerTypesIn = isEntryArray<PluginTriggerType>(cdb?.trigger_types) ? cdb!.trigger_types as PluginTriggerType[] : [];
-  const agentClisIn = isEntryArray<PluginAgentCliEntry>(cdb?.agent_clis) ? cdb!.agent_clis as PluginAgentCliEntry[] : [];
+  const pluginName = manifest.name;
 
-  const recipes: ResolvedRecipe[] = recipesIn.map((r) => ({
-    id: r.id,
-    file: r.file,
-    absoluteFile: resolve(pluginDir, r.file),
-  }));
-  const tools: ResolvedTool[] = toolsIn.map((t) => ({
-    id: t.id,
-    file: t.file,
-    absoluteFile: resolve(pluginDir, t.file),
-    runtime: t.runtime,
-  }));
-  const triggerTypes: PluginTriggerType[] = [...triggerTypesIn];
-  const agentClis: PluginAgentCliEntry[] = [...agentClisIn];
+  const recipes = await discoverRecipes(pluginDir, cdb?.recipes, loadErrors);
+  const tools = await discoverTools(pluginDir, cdb?.tools, pluginName, loadErrors);
+  const triggerTypes = await discoverTriggerTypes(pluginDir, cdb?.trigger_types, pluginName, loadErrors);
+  const agentClis = await discoverAgentClis(pluginDir, cdb?.agent_clis, loadErrors);
+  const renderers = await discoverRenderers(pluginDir, cdb?.renderers, loadErrors);
 
   const capabilities: ResolvedCapabilities = {
     skills,
@@ -262,6 +248,7 @@ export async function loadPluginFromDir(pluginDir: string): Promise<LoadedPlugin
     tools,
     triggerTypes,
     agentClis,
+    renderers,
     status: manifest.status,
   };
 
@@ -552,3 +539,460 @@ function isUnderPlugin(abs: string, pluginDir: string): boolean {
 
 // Suppress unused-import warning for dirname (kept for future hook resolution).
 void dirname;
+
+// ============================================================================
+// clawdevbox capability auto-discovery (spec
+// docs/specs/2026-05-15-plugin-capability-autodiscovery-design.md)
+//
+// Every clawdevbox.* field accepts `string | string[] | Entry[]`:
+//
+//   - undefined ⇒ scan <pluginDir>/<defaultDir>
+//   - string    ⇒ scan <pluginDir>/<value> as a single directory
+//   - string[]  ⇒ for each: scan if directory, else treat as a single file
+//   - Entry[]   ⇒ use as-is (Tier 3: explicit author control)
+// ============================================================================
+
+function isObjectEntryArray(value: unknown): value is Array<Record<string, unknown>> {
+  return (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.every((v) => typeof v === 'object' && v !== null && !Array.isArray(v))
+  );
+}
+
+async function resolveCapability<E>(opts: {
+  manifestValue: string | string[] | E[] | undefined;
+  pluginDir: string;
+  defaultDir: string;
+  scope: LoadErrorScope;
+  errors: LoadError[];
+  scanDir: (absoluteDir: string) => Promise<E[]>;
+  fileToEntry?: (absoluteFile: string) => E | null;
+  fromExplicit?: (entries: E[]) => E[];
+}): Promise<E[]> {
+  const { manifestValue, pluginDir, defaultDir, scope, errors, scanDir, fileToEntry, fromExplicit } =
+    opts;
+
+  // Tier 3: explicit Entry[] — author controls every entry.
+  if (isObjectEntryArray(manifestValue)) {
+    const arr = manifestValue as unknown as E[];
+    return fromExplicit ? fromExplicit(arr) : [...arr];
+  }
+
+  // Tier 2b: explicit string[] — each entry is a path (dir or file).
+  if (Array.isArray(manifestValue) && manifestValue.every((v) => typeof v === 'string')) {
+    const out: E[] = [];
+    for (const rel of manifestValue as string[]) {
+      const abs = resolve(pluginDir, rel);
+      if (!isUnderPlugin(abs, pluginDir)) {
+        errors.push({ scope, path: rel, message: `${scope} path escapes plugin directory: ${rel}` });
+        continue;
+      }
+      if (!existsSync(abs)) continue;
+      let st;
+      try {
+        st = statSync(abs);
+      } catch {
+        continue;
+      }
+      if (st.isDirectory()) {
+        out.push(...(await scanDir(abs)));
+      } else if (st.isFile() && fileToEntry) {
+        const entry = fileToEntry(abs);
+        if (entry) out.push(entry);
+      }
+    }
+    return out;
+  }
+
+  // Tier 2a: explicit string — scan that directory in place of the default.
+  if (typeof manifestValue === 'string') {
+    const abs = resolve(pluginDir, manifestValue);
+    if (!isUnderPlugin(abs, pluginDir)) {
+      errors.push({
+        scope,
+        path: manifestValue,
+        message: `${scope} path escapes plugin directory: ${manifestValue}`,
+      });
+      return [];
+    }
+    if (!existsSync(abs)) return [];
+    return scanDir(abs);
+  }
+
+  // Tier 1: undefined — auto-discover from the convention dir if it exists.
+  const abs = join(pluginDir, defaultDir);
+  if (!existsSync(abs)) return [];
+  return scanDir(abs);
+}
+
+/** True for filenames the auto-discovery scan should ignore (private helpers, dotfiles). */
+function isSkippedFilename(name: string): boolean {
+  return name.startsWith('_') || name.startsWith('.');
+}
+
+const RUNTIME_BY_EXT: Record<string, 'tsx' | 'node' | 'python' | 'bash'> = {
+  '.ts': 'tsx',
+  '.js': 'node',
+  '.py': 'python',
+  '.sh': 'bash',
+};
+
+async function listFilesByExt(absDir: string, exts: string[]): Promise<string[]> {
+  let entries;
+  try {
+    entries = await fsp.readdir(absDir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const out: string[] = [];
+  for (const e of entries) {
+    if (!e.isFile()) continue;
+    if (isSkippedFilename(e.name)) continue;
+    const ext = extname(e.name).toLowerCase();
+    if (!exts.includes(ext)) continue;
+    out.push(e.name);
+  }
+  out.sort();
+  return out;
+}
+
+function relFromPlugin(pluginDir: string, abs: string): string {
+  return relative(pluginDir, abs).split(sep).join('/');
+}
+
+// ---------------------------------------------------------------------------
+// 1. Recipes
+// ---------------------------------------------------------------------------
+
+async function discoverRecipes(
+  pluginDir: string,
+  manifestValue: string | string[] | PluginProvideEntry[] | undefined,
+  errors: LoadError[],
+): Promise<ResolvedRecipe[]> {
+  const RECIPE_EXTS = ['.yaml', '.yml', '.json'];
+
+  const scanDir = async (absDir: string): Promise<ResolvedRecipe[]> => {
+    const files = await listFilesByExt(absDir, RECIPE_EXTS);
+    return files.map((name) => {
+      const abs = join(absDir, name);
+      return {
+        id: name.replace(/\.(ya?ml|json)$/i, ''),
+        file: relFromPlugin(pluginDir, abs),
+        absoluteFile: abs,
+      };
+    });
+  };
+
+  const fileToEntry = (abs: string): ResolvedRecipe | null => {
+    const name = basename(abs);
+    if (isSkippedFilename(name)) return null;
+    if (!RECIPE_EXTS.includes(extname(name).toLowerCase())) return null;
+    return {
+      id: name.replace(/\.(ya?ml|json)$/i, ''),
+      file: relFromPlugin(pluginDir, abs),
+      absoluteFile: abs,
+    };
+  };
+
+  const fromExplicit = (entries: PluginProvideEntry[]): ResolvedRecipe[] =>
+    entries.map((r) => ({
+      id: r.id,
+      file: r.file,
+      absoluteFile: resolve(pluginDir, r.file),
+    }));
+
+  return resolveCapability<ResolvedRecipe>({
+    manifestValue: manifestValue as string | string[] | ResolvedRecipe[] | undefined,
+    pluginDir,
+    defaultDir: 'recipes',
+    scope: 'recipes',
+    errors,
+    scanDir,
+    fileToEntry,
+    fromExplicit: (e) => fromExplicit(e as unknown as PluginProvideEntry[]),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// 2. Hostable tools
+// ---------------------------------------------------------------------------
+
+async function discoverTools(
+  pluginDir: string,
+  manifestValue: string | string[] | ClawdevboxToolEntry[] | undefined,
+  pluginName: string,
+  errors: LoadError[],
+): Promise<ResolvedTool[]> {
+  const TOOL_EXTS = ['.ts', '.js', '.py', '.sh'];
+
+  const buildAuto = (abs: string): ResolvedTool => {
+    const name = basename(abs);
+    const ext = extname(name).toLowerCase();
+    const stem = name.slice(0, -ext.length);
+    return {
+      id: `${pluginName}.${stem}`,
+      file: relFromPlugin(pluginDir, abs),
+      absoluteFile: abs,
+      runtime: RUNTIME_BY_EXT[ext],
+    };
+  };
+
+  const scanDir = async (absDir: string): Promise<ResolvedTool[]> => {
+    const files = await listFilesByExt(absDir, TOOL_EXTS);
+    return files.map((name) => buildAuto(join(absDir, name)));
+  };
+
+  const fileToEntry = (abs: string): ResolvedTool | null => {
+    const name = basename(abs);
+    if (isSkippedFilename(name)) return null;
+    if (!TOOL_EXTS.includes(extname(name).toLowerCase())) return null;
+    return buildAuto(abs);
+  };
+
+  const fromExplicit = (entries: ClawdevboxToolEntry[]): ResolvedTool[] =>
+    entries.map((t) => ({
+      id: t.id,
+      file: t.file,
+      absoluteFile: resolve(pluginDir, t.file),
+      runtime: t.runtime ?? RUNTIME_BY_EXT[extname(t.file).toLowerCase()],
+    }));
+
+  return resolveCapability<ResolvedTool>({
+    manifestValue: manifestValue as string | string[] | ResolvedTool[] | undefined,
+    pluginDir,
+    defaultDir: 'tools',
+    scope: 'tools',
+    errors,
+    scanDir,
+    fileToEntry,
+    fromExplicit: (e) => fromExplicit(e as unknown as ClawdevboxToolEntry[]),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// 3. Trigger types (script + YAML sidecar)
+// ---------------------------------------------------------------------------
+
+const TRIGGER_SCRIPT_EXTS = ['.ts', '.js', '.py', '.sh'];
+const TRIGGER_SIDECAR_SUFFIX = '.trigger.yaml';
+
+function buildTriggerType(
+  pluginDir: string,
+  pluginName: string,
+  scriptAbs: string,
+  sidecar: Record<string, unknown>,
+): PluginTriggerType {
+  const scriptName = basename(scriptAbs);
+  const ext = extname(scriptName).toLowerCase();
+  const stem = scriptName.slice(0, -ext.length);
+  const runtime = (sidecar.runtime as PluginTriggerType['runtime']) ?? RUNTIME_BY_EXT[ext];
+  return {
+    id: `${pluginName}.${stem}`,
+    file: relFromPlugin(pluginDir, scriptAbs),
+    description: typeof sidecar.description === 'string' ? sidecar.description : undefined,
+    default_cron: typeof sidecar.default_cron === 'string' ? sidecar.default_cron : undefined,
+    binds_callback_to_recipe:
+      typeof sidecar.binds_callback_to_recipe === 'string'
+        ? (sidecar.binds_callback_to_recipe as string)
+        : undefined,
+    binds_callback_to:
+      sidecar.binds_callback_to === 'thread_resume' ? 'thread_resume' : undefined,
+    identity_param:
+      typeof sidecar.identity_param === 'string' ? sidecar.identity_param : undefined,
+    accepts_webhook:
+      typeof sidecar.accepts_webhook === 'boolean' ? sidecar.accepts_webhook : undefined,
+    parameters: Array.isArray(sidecar.parameters)
+      ? (sidecar.parameters as PluginTriggerType['parameters'])
+      : undefined,
+    runtime,
+  };
+}
+
+async function discoverTriggerTypes(
+  pluginDir: string,
+  manifestValue: string | string[] | PluginTriggerType[] | undefined,
+  pluginName: string,
+  errors: LoadError[],
+): Promise<PluginTriggerType[]> {
+  const scanDir = async (absDir: string): Promise<PluginTriggerType[]> => {
+    let entries;
+    try {
+      entries = await fsp.readdir(absDir, { withFileTypes: true });
+    } catch {
+      return [];
+    }
+    const fileNames = entries.filter((e) => e.isFile()).map((e) => e.name);
+    const scripts = fileNames.filter(
+      (n) => !isSkippedFilename(n) && TRIGGER_SCRIPT_EXTS.includes(extname(n).toLowerCase()),
+    );
+    const sidecars = fileNames.filter((n) => !isSkippedFilename(n) && n.endsWith(TRIGGER_SIDECAR_SUFFIX));
+
+    const out: PluginTriggerType[] = [];
+    const scriptStems = new Set<string>();
+    for (const script of scripts) {
+      const ext = extname(script).toLowerCase();
+      const stem = script.slice(0, -ext.length);
+      scriptStems.add(stem);
+      const sidecarName = `${stem}${TRIGGER_SIDECAR_SUFFIX}`;
+      const sidecarAbs = join(absDir, sidecarName);
+      const scriptAbs = join(absDir, script);
+      if (!existsSync(sidecarAbs)) {
+        errors.push({
+          scope: 'trigger_types',
+          path: relFromPlugin(pluginDir, scriptAbs),
+          message: `trigger '${stem}' has no sidecar (${sidecarName})`,
+        });
+        continue;
+      }
+      let parsed: unknown;
+      try {
+        const text = await fsp.readFile(sidecarAbs, 'utf8');
+        parsed = yamlLoad(text);
+      } catch (err) {
+        errors.push({
+          scope: 'trigger_types',
+          path: relFromPlugin(pluginDir, sidecarAbs),
+          message: `failed to parse trigger sidecar: ${err instanceof Error ? err.message : String(err)}`,
+        });
+        continue;
+      }
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        errors.push({
+          scope: 'trigger_types',
+          path: relFromPlugin(pluginDir, sidecarAbs),
+          message: `trigger sidecar must be a YAML object`,
+        });
+        continue;
+      }
+      out.push(
+        buildTriggerType(
+          pluginDir,
+          pluginName,
+          scriptAbs,
+          parsed as Record<string, unknown>,
+        ),
+      );
+    }
+
+    // Orphan sidecars (sidecar present, no matching script).
+    for (const sc of sidecars) {
+      const stem = sc.slice(0, -TRIGGER_SIDECAR_SUFFIX.length);
+      if (scriptStems.has(stem)) continue;
+      errors.push({
+        scope: 'trigger_types',
+        path: relFromPlugin(pluginDir, join(absDir, sc)),
+        message: `trigger sidecar '${sc}' has no matching script (looked for ${stem}.{ts,js,py,sh})`,
+      });
+    }
+    return out;
+  };
+
+  return resolveCapability<PluginTriggerType>({
+    manifestValue,
+    pluginDir,
+    defaultDir: 'triggers',
+    scope: 'trigger_types',
+    errors,
+    scanDir,
+    // string[] file refs aren't meaningful here without a sidecar — skipped silently.
+  });
+}
+
+// ---------------------------------------------------------------------------
+// 4. Agent CLI providers
+// ---------------------------------------------------------------------------
+
+async function discoverAgentClis(
+  pluginDir: string,
+  manifestValue: string | string[] | PluginAgentCliEntry[] | undefined,
+  errors: LoadError[],
+): Promise<PluginAgentCliEntry[]> {
+  const PROVIDER_EXTS = ['.mjs', '.js'];
+
+  const buildAuto = (abs: string): PluginAgentCliEntry => {
+    const name = basename(abs);
+    const ext = extname(name).toLowerCase();
+    const stem = name.slice(0, -ext.length);
+    return {
+      id: stem,
+      module: relFromPlugin(pluginDir, abs),
+    };
+  };
+
+  const scanDir = async (absDir: string): Promise<PluginAgentCliEntry[]> => {
+    const files = await listFilesByExt(absDir, PROVIDER_EXTS);
+    return files.map((name) => buildAuto(join(absDir, name)));
+  };
+
+  const fileToEntry = (abs: string): PluginAgentCliEntry | null => {
+    const name = basename(abs);
+    if (isSkippedFilename(name)) return null;
+    if (!PROVIDER_EXTS.includes(extname(name).toLowerCase())) return null;
+    return buildAuto(abs);
+  };
+
+  return resolveCapability<PluginAgentCliEntry>({
+    manifestValue,
+    pluginDir,
+    defaultDir: 'agent-clis',
+    scope: 'agent_clis',
+    errors,
+    scanDir,
+    fileToEntry,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// 5. Renderers
+// ---------------------------------------------------------------------------
+
+async function discoverRenderers(
+  pluginDir: string,
+  manifestValue: string | string[] | PluginRendererEntry[] | undefined,
+  errors: LoadError[],
+): Promise<ResolvedRenderer[]> {
+  const RENDERER_EXTS = ['.mjs', '.js'];
+
+  const buildAuto = (abs: string): ResolvedRenderer => {
+    const name = basename(abs);
+    const ext = extname(name).toLowerCase();
+    const stem = name.slice(0, -ext.length);
+    return {
+      type: stem,
+      module: relFromPlugin(pluginDir, abs),
+      absoluteFile: abs,
+    };
+  };
+
+  const scanDir = async (absDir: string): Promise<ResolvedRenderer[]> => {
+    const files = await listFilesByExt(absDir, RENDERER_EXTS);
+    return files.map((name) => buildAuto(join(absDir, name)));
+  };
+
+  const fileToEntry = (abs: string): ResolvedRenderer | null => {
+    const name = basename(abs);
+    if (isSkippedFilename(name)) return null;
+    if (!RENDERER_EXTS.includes(extname(name).toLowerCase())) return null;
+    return buildAuto(abs);
+  };
+
+  const fromExplicit = (entries: PluginRendererEntry[]): ResolvedRenderer[] =>
+    entries.map((e) => ({
+      type: e.type,
+      module: e.module,
+      absoluteFile: resolve(pluginDir, e.module),
+      description: e.description,
+    }));
+
+  return resolveCapability<ResolvedRenderer>({
+    manifestValue: manifestValue as string | string[] | ResolvedRenderer[] | undefined,
+    pluginDir,
+    defaultDir: 'renderers',
+    scope: 'renderers',
+    errors,
+    scanDir,
+    fileToEntry,
+    fromExplicit: (e) => fromExplicit(e as unknown as PluginRendererEntry[]),
+  });
+}
