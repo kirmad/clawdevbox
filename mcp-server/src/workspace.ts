@@ -263,8 +263,23 @@ export function recipePath(ws: Workspace, scope: WritableScope, id: string): str
   return join(ws.globalDir, 'recipes', `${id}${RECIPE_EXT}`);
 }
 
-/** Where a skill lives for a given (writable) scope. */
+/**
+ * Where a skill's SKILL.md lives for a given (writable) scope. Skills are
+ * directory-shaped per spec §3.7: `<scope>/skills/<id>/SKILL.md`, with
+ * supporting files optionally beside it inside the same directory.
+ */
 export function skillPath(ws: Workspace, scope: WritableScope, id: string): string {
+  return join(skillDirPath(ws, scope, id), `SKILL${SKILL_EXT}`);
+}
+
+/** Directory that contains a skill's SKILL.md + supporting files. */
+export function skillDirPath(ws: Workspace, scope: WritableScope, id: string): string {
+  if (scope === 'project') return join(ws.projectDir, '.clawdevbox', 'skills', id);
+  return join(ws.globalDir, 'skills', id);
+}
+
+/** Legacy flat-file path: `<scope>/skills/<id>.md`. Used only to clean up. */
+export function legacySkillFilePath(ws: Workspace, scope: WritableScope, id: string): string {
   if (scope === 'project') return join(ws.projectDir, '.clawdevbox', 'skills', `${id}${SKILL_EXT}`);
   return join(ws.globalDir, 'skills', `${id}${SKILL_EXT}`);
 }

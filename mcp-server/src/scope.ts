@@ -14,8 +14,8 @@
  * everything else builds on.
  */
 
-import { existsSync, readdirSync, readFileSync } from 'node:fs';
-import { join, resolve as pathResolve, sep } from 'node:path';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { dirname, basename, join, resolve as pathResolve, sep } from 'node:path';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import {
   type Scope,
@@ -156,6 +156,16 @@ function pluginFileResolve(dir: string, relFile: string): string | null {
  * `.yml`, and `.json` (spec §7.4 + Phase 7.6 upsert format arg).
  */
 function alternateScopePaths(primary: string, kind: ReadKind): string[] {
+  if (kind === 'skill') {
+    // Tolerate the legacy flat-file `<scope>/skills/<id>.md` so existing
+    // workspaces stay readable until they are rewritten through
+    // skill.upsert (which deletes the legacy file). `primary` is
+    // `<scope>/skills/<id>/SKILL.md`.
+    const skillDir = dirname(primary);
+    const id = basename(skillDir);
+    const parent = dirname(skillDir);
+    return [join(parent, `${id}.md`)];
+  }
   if (kind !== 'recipe') return [];
   const lower = primary.toLowerCase();
   const base = primary.slice(0, primary.lastIndexOf('.'));
@@ -222,7 +232,7 @@ export function listAllInScope(
   const altExts =
     kind === 'recipe' ? ['.yml', '.json'] : [];
 
-  const scanDir = (dir: string, scopeTag: Scope) => {
+  const scanRecipeDir = (dir: string, scopeTag: Scope) => {
     if (!existsSync(dir)) return;
     let entries: string[];
     try {
@@ -237,6 +247,47 @@ export function listAllInScope(
       const id = f.slice(0, f.lastIndexOf('.'));
       if (!/^[a-z][a-z0-9-]*$/.test(id)) continue;
       out.push({ scope: scopeTag, id, path: join(dir, f) });
+    }
+  };
+
+  const scanSkillDir = (dir: string, scopeTag: Scope) => {
+    if (!existsSync(dir)) return;
+    let entries: string[];
+    try {
+      entries = readdirSync(dir);
+    } catch {
+      return;
+    }
+    for (const f of entries) {
+      if (!/^[a-z][a-z0-9-]*$/.test(f)) {
+        // Tolerate legacy flat `<id>.md` files so they remain visible until
+        // rewritten through skill.upsert (which deletes them).
+        if (f.toLowerCase().endsWith('.md')) {
+          const id = f.slice(0, f.lastIndexOf('.'));
+          if (/^[a-z][a-z0-9-]*$/.test(id)) {
+            const p = join(dir, f);
+            try {
+              if (statSync(p).isFile()) {
+                out.push({ scope: scopeTag, id, path: p });
+              }
+            } catch {
+              // ignore
+            }
+          }
+        }
+        continue;
+      }
+      const skillFile = join(dir, f, 'SKILL.md');
+      if (!existsSync(skillFile)) continue;
+      out.push({ scope: scopeTag, id: f, path: skillFile });
+    }
+  };
+
+  const scanDir = (dir: string, scopeTag: Scope) => {
+    if (kind === 'skill') {
+      scanSkillDir(dir, scopeTag);
+    } else {
+      scanRecipeDir(dir, scopeTag);
     }
   };
 

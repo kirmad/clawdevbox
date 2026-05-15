@@ -120,18 +120,21 @@ to do?\`.
   confirming first, unless the user already gave a standing instruction
   like "go ahead and clear archived items".
 - This skill is your default playbook. The user can override anything in
-  this file at any time by editing \`.clawdevbox/skills/dev-buddy.md\` and
+  this file at any time by editing \`.clawdevbox/skills/dev-buddy/SKILL.md\` and
   asking you to reread it.
 `;
 
 function seedDevBuddySkill(ws: Workspace): void {
-  // Skills live at <project>/.clawdevbox/skills/<id>.md per the project
-  // workspace layout. Don't clobber a user-customized version.
-  const skillsDir = resolvePath(ws.projectDir, '.clawdevbox', 'skills');
-  const target = resolvePath(skillsDir, `${DEV_BUDDY_SKILL_ID}.md`);
-  if (existsSync(target)) return;
+  // Skills live at <project>/.clawdevbox/skills/<id>/SKILL.md per spec §3.7.
+  // Don't clobber a user-customized version (either the new directory shape
+  // or a leftover legacy `<id>.md` file).
+  const skillsRoot = resolvePath(ws.projectDir, '.clawdevbox', 'skills');
+  const skillDir = resolvePath(skillsRoot, DEV_BUDDY_SKILL_ID);
+  const target = resolvePath(skillDir, 'SKILL.md');
+  const legacy = resolvePath(skillsRoot, `${DEV_BUDDY_SKILL_ID}.md`);
+  if (existsSync(target) || existsSync(legacy)) return;
   try {
-    mkdirSync(skillsDir, { recursive: true });
+    mkdirSync(skillDir, { recursive: true });
     writeFileSync(target, DEV_BUDDY_SKILL_BODY, 'utf8');
     logger.info({ skill: DEV_BUDDY_SKILL_ID, path: target }, 'main-agent: seeded default dev-buddy skill');
   } catch (err) {

@@ -10,7 +10,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir, platform } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -324,6 +324,105 @@ test('clawdevbox MCP server smoke', async (t) => {
     assert.equal(skills.length, 2);
     const ids = skills.map((s) => s.id).sort();
     assert.deepEqual(ids, ['analyze-pr-comment', 'summarize-pr-changes']);
+  });
+
+  await t.test('skill.upsert writes skills/<id>/SKILL.md (directory shape)', async () => {
+    const id = 'demo-skill';
+    const res = await h.call('skill.upsert', {
+      id,
+      scope: 'project',
+      source: '---\nname: demo-skill\ndescription: a demo\n---\nhello body\n',
+    });
+    assert.ok(!res.isError, JSON.stringify(res));
+    const expected = join(h.tmpRoot, '.clawdevbox', 'skills', id, 'SKILL.md');
+    assert.equal(res.structuredContent?.path, expected);
+    assert.ok(existsSync(expected), `expected SKILL.md at ${expected}`);
+    // Legacy flat file must NOT exist
+    assert.equal(existsSync(join(h.tmpRoot, '.clawdevbox', 'skills', `${id}.md`)), false);
+    // skill.read returns the same source
+    const read = await h.call('skill.read', { id, scope: 'project' });
+    assert.ok(!read.isError, JSON.stringify(read));
+    assert.match(read.structuredContent?.source ?? '', /hello body/);
+  });
+
+  await t.test('skill.upsert injects frontmatter.name when missing', async () => {
+    const id = 'name-injected';
+    const res = await h.call('skill.upsert', {
+      id,
+      scope: 'project',
+      source: '---\ndescription: no name field\n---\nbody\n',
+    });
+    assert.ok(!res.isError, JSON.stringify(res));
+    const fileAt = join(h.tmpRoot, '.clawdevbox', 'skills', id, 'SKILL.md');
+    const text = readFileSync(fileAt, 'utf8');
+    assert.match(text, /name:\s*name-injected/);
+    const read = await h.call('skill.read', { id, scope: 'project' });
+    assert.equal(read.structuredContent?.frontmatter?.name, id);
+  });
+
+  await t.test('skill.upsert rejects mismatched frontmatter.name', async () => {
+    const res = await h.call('skill.upsert', {
+      id: 'wanted-id',
+      scope: 'project',
+      source: '---\nname: other-id\ndescription: d\n---\nbody\n',
+    });
+    assert.equal(res.isError, true);
+    assert.equal(res.structuredContent?.code, 'NAME_MISMATCH');
+  });
+
+  await t.test('skill.upsert overwrites existing skill content', async () => {
+    const id = 'demo-skill';
+    const target = join(h.tmpRoot, '.clawdevbox', 'skills', id, 'SKILL.md');
+    const before = readFileSync(target, 'utf8');
+    const res = await h.call('skill.upsert', {
+      id,
+      scope: 'project',
+      source: '---\nname: demo-skill\ndescription: updated\n---\nNEW BODY\n',
+    });
+    assert.ok(!res.isError);
+    const after = readFileSync(target, 'utf8');
+    assert.notEqual(before, after);
+    assert.match(after, /NEW BODY/);
+  });
+
+  await t.test('skill.upsert with legacy flat <id>.md deletes the legacy after write', async () => {
+    const id = 'legacy-flip';
+    const skillsRoot = join(h.tmpRoot, '.clawdevbox', 'skills');
+    const legacy = join(skillsRoot, `${id}.md`);
+    mkdirSync(skillsRoot, { recursive: true });
+    // Hand-write a legacy flat skill file.
+    writeFileSync(
+      legacy,
+      '---\nname: legacy-flip\ndescription: legacy\n---\nold body\n',
+      'utf8',
+    );
+    assert.ok(existsSync(legacy));
+    const res = await h.call('skill.upsert', {
+      id,
+      scope: 'project',
+      source: '---\nname: legacy-flip\ndescription: new\n---\nnew body\n',
+    });
+    assert.ok(!res.isError, JSON.stringify(res));
+    assert.equal(existsSync(legacy), false, 'legacy flat file should be deleted');
+    assert.ok(existsSync(join(skillsRoot, id, 'SKILL.md')));
+  });
+
+  await t.test('skill.delete removes the entire <id>/ directory', async () => {
+    const id = 'demo-skill';
+    const dir = join(h.tmpRoot, '.clawdevbox', 'skills', id);
+    // Drop a sibling supporting file alongside SKILL.md to prove the rm is
+    // recursive.
+    writeFileSync(join(dir, 'helper.md'), 'side', 'utf8');
+    assert.ok(existsSync(join(dir, 'helper.md')));
+    const res = await h.call('skill.delete', { id, scope: 'project' });
+    assert.ok(!res.isError, JSON.stringify(res));
+    assert.equal(existsSync(dir), false, 'skill dir should be removed recursively');
+  });
+
+  await t.test('skill.delete on unknown id returns NOT_FOUND', async () => {
+    const res = await h.call('skill.delete', { id: 'nope-nada', scope: 'project' });
+    assert.equal(res.isError, true);
+    assert.equal(res.structuredContent?.code, 'NOT_FOUND');
   });
 
   await t.test('inbox + thread + approval round-trip (in-memory stub)', async () => {

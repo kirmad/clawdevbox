@@ -8,7 +8,8 @@
  * runtime.
  */
 
-import { existsSync, readFileSync, unlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, unlinkSync } from 'node:fs';
+import { dump as yamlDump } from 'js-yaml';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { writeFileAtomic } from '../fs-util.ts';
@@ -21,7 +22,13 @@ import {
   validationError,
 } from '../scope.ts';
 import { parseSkill, validateSkillSource } from '../validators.ts';
-import { skillPath, validateId, type Workspace } from '../workspace.ts';
+import {
+  legacySkillFilePath,
+  skillDirPath,
+  skillPath,
+  validateId,
+  type Workspace,
+} from '../workspace.ts';
 
 const scopeFilter = z
   .enum(['project', 'global', 'all'])
@@ -119,10 +126,46 @@ export function registerSkillTools(server: McpServer, ws: Workspace): void {
       if (!idCheck.ok) return structuredError('INVALID_ID', idCheck.message!);
       const guard = ensureWritableScope(args.scope);
       if (guard) return guard;
-      const validation = validateSkillSource(args.source);
+
+      // Inject `name: <id>` into the frontmatter if absent, or reject when
+      // present-but-mismatched. Easier than forcing callers to repeat the id
+      // in two places.
+      const parsed = parseSkill(args.source);
+      let source = args.source;
+      if (parsed.ok) {
+        const fm = parsed.value.frontmatter;
+        const fmName = fm.name;
+        if (typeof fmName === 'string' && fmName !== args.id) {
+          return structuredError(
+            'NAME_MISMATCH',
+            `frontmatter.name '${fmName}' does not match requested id '${args.id}'.`,
+            { id: args.id, frontmatterName: fmName },
+          );
+        }
+        if (fmName === undefined) {
+          const merged: Record<string, unknown> = { name: args.id, ...fm };
+          const dumped = yamlDump(merged, { lineWidth: 1000, noRefs: true }).trimEnd();
+          source = `---\n${dumped}\n---\n${parsed.value.body}`;
+        }
+      }
+
+      const validation = validateSkillSource(source);
       if (!validation.ok) return validationError(validation.errors);
-      const target = skillPath(ws, args.scope as 'project' | 'global', args.id);
-      writeFileAtomic(target, args.source);
+      const scope = args.scope as 'project' | 'global';
+      const dir = skillDirPath(ws, scope, args.id);
+      mkdirSync(dir, { recursive: true });
+      const target = skillPath(ws, scope, args.id);
+      writeFileAtomic(target, source);
+      // Drop any legacy `<scope>/skills/<id>.md` after the new SKILL.md is in
+      // place so the loader doesn't report the id twice.
+      const legacy = legacySkillFilePath(ws, scope, args.id);
+      if (existsSync(legacy)) {
+        try {
+          if (statSync(legacy).isFile()) unlinkSync(legacy);
+        } catch {
+          // best-effort
+        }
+      }
       return {
         content: [{ type: 'text', text: `Wrote skill ${args.id} to ${args.scope} scope.` }],
         structuredContent: { id: args.id, scope: args.scope, path: target },
@@ -140,12 +183,25 @@ export function registerSkillTools(server: McpServer, ws: Workspace): void {
     async (args) => {
       const guard = ensureWritableScope(args.scope);
       if (guard) return guard;
-      const target = skillPath(ws, args.scope as 'project' | 'global', args.id);
-      if (!existsSync(target)) return notFound('skill', args.id);
-      unlinkSync(target);
+      const scope = args.scope as 'project' | 'global';
+      const dir = skillDirPath(ws, scope, args.id);
+      const legacy = legacySkillFilePath(ws, scope, args.id);
+      const dirExists = existsSync(dir);
+      const legacyExists = existsSync(legacy);
+      if (!dirExists && !legacyExists) return notFound('skill', args.id);
+      if (dirExists) {
+        rmSync(dir, { recursive: true, force: true });
+      }
+      if (legacyExists) {
+        try {
+          if (statSync(legacy).isFile()) unlinkSync(legacy);
+        } catch {
+          // best-effort
+        }
+      }
       return {
         content: [{ type: 'text', text: `Deleted skill ${args.id} from ${args.scope} scope.` }],
-        structuredContent: { id: args.id, scope: args.scope, path: target },
+        structuredContent: { id: args.id, scope: args.scope, path: dir },
       };
     },
   );
