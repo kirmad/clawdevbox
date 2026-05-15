@@ -1,7 +1,7 @@
 /**
  * Plugin-provided AgentCliProvider loader (spec §4 "Module loading", §14).
  *
- * Walks each enabled plugin's `manifest.provides.agent_clis[]` (sorted by
+ * Walks each enabled plugin's `manifest.clawdevbox.agent_clis[]` (sorted by
  * plugin id for deterministic first-loaded-wins precedence), dynamic-imports
  * each module under the plugin directory, validates the exported provider
  * shape, and inserts it into `ws.agentCliProviders`.
@@ -34,7 +34,7 @@ export async function loadPluginProviders(ws: Workspace): Promise<void> {
   const sorted = [...ws.plugins.values()].sort((a, b) => a.id.localeCompare(b.id));
   for (const plugin of sorted) {
     if (plugin.status !== 'enabled') continue;
-    const entries = plugin.manifest.provides?.agent_clis ?? [];
+    const entries = plugin.manifest.clawdevbox?.agent_clis ?? [];
     for (const entry of entries) {
       await loadOne(ws, plugin.id, plugin.dir, entry);
     }

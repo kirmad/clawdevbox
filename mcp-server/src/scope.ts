@@ -131,12 +131,15 @@ export function readFromScope(
 
   const list =
     kind === 'recipe'
-      ? plugin.manifest.provides?.recipes
-      : plugin.manifest.provides?.skills;
+      ? plugin.capabilities.recipes
+      : plugin.capabilities.skills;
   if (!list) return null;
   const hit = list.find((e) => e.id === id);
   if (!hit) return null;
-  const abs = pluginFileResolve(plugin.dir, hit.file);
+  // Skills resolve to <dir>/SKILL.md; recipes resolve to the file directly.
+  const abs = kind === 'recipe'
+    ? (hit as { absoluteFile: string }).absoluteFile
+    : join((hit as { absoluteDir: string }).absoluteDir, 'SKILL.md');
   if (!abs || !existsSync(abs)) return null;
   return { scope: `plugin:${pluginId}`, path: abs, source: readFileSync(abs, 'utf8') };
 }
@@ -258,11 +261,13 @@ export function listAllInScope(
       if (!plugin || plugin.status === 'error') continue;
       const list =
         kind === 'recipe'
-          ? plugin.manifest.provides?.recipes
-          : plugin.manifest.provides?.skills;
+          ? plugin.capabilities.recipes
+          : plugin.capabilities.skills;
       if (!list) continue;
       for (const entry of list) {
-        const abs = pluginFileResolve(plugin.dir, entry.file);
+        const abs = kind === 'recipe'
+          ? (entry as { absoluteFile: string }).absoluteFile
+          : join((entry as { absoluteDir: string }).absoluteDir, 'SKILL.md');
         if (!abs || !existsSync(abs)) continue;
         out.push({ scope: `plugin:${pid}`, id: entry.id, path: abs });
       }

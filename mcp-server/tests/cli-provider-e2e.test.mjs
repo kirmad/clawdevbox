@@ -135,8 +135,8 @@ test('E2E: install --plugin → workspace reload → chooser → config persiste
     });
     assert.ok(existsSync(result.destination), 'plugin lands in <globalDir>/plugins/');
     assert.ok(
-      existsSync(join(globalDir, 'plugins', 'test-cli', 'plugin.yaml')),
-      'plugin.yaml is visible under <globalDir>/plugins/test-cli/',
+      existsSync(join(globalDir, 'plugins', 'test-cli', '.claude-plugin', 'plugin.json')),
+      '.claude-plugin/plugin.json is visible under <globalDir>/plugins/test-cli/',
     );
 
     // ---- 2. Workspace reload picks up provides.agent_clis[]

@@ -44,8 +44,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, resolve, sep } from 'node:path';
-import { load as yamlLoad } from 'js-yaml';
-import { validatePluginManifest } from '../validators.ts';
+import { validatePluginManifestJson } from '../validators.ts';
 
 export interface DiscoveredPlugin {
   /** Manifest id (`[a-z][a-z0-9-]*`). */
@@ -158,16 +157,16 @@ export function resolvePluginSource(raw: string): ResolvedSource {
 /**
  * Scan `dir` for valid plugin manifests. Two layouts:
  *
- *   1. Single plugin    — `<dir>/plugin.yaml`.
- *   2. Collection       — `<dir>/<sub>/plugin.yaml` for one or more
- *                          subdirectories. (Common skeleton dirs like
+ *   1. Single plugin    — `<dir>/.claude-plugin/plugin.json`.
+ *   2. Collection       — `<dir>/<sub>/.claude-plugin/plugin.json` for one or
+ *                          more subdirectories. (Common skeleton dirs like
  *                          `.git`, `.github`, `node_modules` and any
  *                          `_legacy*` are skipped.)
  *
- * Returns every plugin we can validate. Sub-directories with a
- * `plugin.yaml` that fails validation are surfaced as part of `errors`
- * (init prints these so the user knows what was skipped); they do NOT
- * count as discovered.
+ * Returns every plugin we can validate. Sub-directories with a plugin
+ * manifest that fails validation are surfaced as part of `errors` (init
+ * prints these so the user knows what was skipped); they do NOT count as
+ * discovered.
  */
 export function discoverPluginsInDir(dir: string): {
   plugins: DiscoveredPlugin[];
@@ -177,7 +176,7 @@ export function discoverPluginsInDir(dir: string): {
   const plugins: DiscoveredPlugin[] = [];
   const errors: Array<{ dir: string; message: string }> = [];
 
-  const rootManifest = join(dir, 'plugin.yaml');
+  const rootManifest = join(dir, '.claude-plugin', 'plugin.json');
   if (existsSync(rootManifest)) {
     const result = readManifest(dir);
     if (result.ok) plugins.push(result.plugin);
@@ -190,7 +189,7 @@ export function discoverPluginsInDir(dir: string): {
     if (SKIP_DIR.has(entry.name)) continue;
     if (entry.name.startsWith('_legacy')) continue;
     const subDir = join(dir, entry.name);
-    if (!existsSync(join(subDir, 'plugin.yaml'))) continue;
+    if (!existsSync(join(subDir, '.claude-plugin', 'plugin.json'))) continue;
     const result = readManifest(subDir);
     if (result.ok) plugins.push(result.plugin);
     else errors.push({ dir: subDir, message: result.message });
@@ -205,16 +204,16 @@ function readManifest(
 ):
   | { ok: true; plugin: DiscoveredPlugin }
   | { ok: false; message: string } {
-  const manifestPath = join(dir, 'plugin.yaml');
+  const manifestPath = join(dir, '.claude-plugin', 'plugin.json');
   let parsed: unknown;
   try {
-    parsed = yamlLoad(readFileSync(manifestPath, 'utf8'));
+    parsed = JSON.parse(readFileSync(manifestPath, 'utf8'));
   } catch (err) {
-    return { ok: false, message: `failed to parse plugin.yaml: ${err instanceof Error ? err.message : String(err)}` };
+    return { ok: false, message: `failed to parse .claude-plugin/plugin.json: ${err instanceof Error ? err.message : String(err)}` };
   }
-  const validation = validatePluginManifest(parsed);
-  if (!validation.ok) {
-    const summary = validation.errors
+  const errors = validatePluginManifestJson(parsed);
+  if (errors.length > 0) {
+    const summary = errors
       .slice(0, 3)
       .map((e) => `${e.path}: ${e.message}`)
       .join('; ');
@@ -228,8 +227,8 @@ function readManifest(
   return {
     ok: true,
     plugin: {
-      id: m.id as string,
-      name: (m.name as string) ?? (m.id as string),
+      id: m.name as string,
+      name: (m.name as string),
       version: (m.version as string) ?? '0.0.0',
       description: (m.description as string) ?? '',
       required_env,

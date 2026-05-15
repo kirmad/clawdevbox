@@ -24,12 +24,18 @@
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
-import { load as yamlLoad } from 'js-yaml';
-import { validatePluginManifest } from './validators.ts';
 import { listAgentAuthoredTemplates, toRegisteredType } from './template-store.ts';
 import type { AgentCliProvider, AgentCliProviderError } from './agent-clis/types.ts';
 import { registerBuiltinProviders } from './agent-clis/index.ts';
 import { loadPluginProviders } from './agent-clis/load-plugin.ts';
+import { loadPluginFromDir, LoadPluginError } from './manifest/load-plugin.ts';
+import type { ResolvedCapabilities, LoadError } from './manifest/load-plugin.ts';
+import type { PluginManifest as ClaudePluginManifest, AgencyJson } from './manifest/types.ts';
+
+// Re-export the canonical manifest type so existing consumers can keep
+// importing `PluginManifest` from this module.
+export type PluginManifest = ClaudePluginManifest;
+export type { ResolvedCapabilities } from './manifest/load-plugin.ts';
 
 // ============================================================================
 // Types
@@ -110,39 +116,21 @@ export interface PluginAgentCliEntry {
   description?: string;
 }
 
-export interface PluginManifest {
-  id: string;
-  name: string;
-  version: string;
-  description: string;
-  author?: string;
-  license?: string;
-  homepage?: string;
-  provides?: {
-    skills?: PluginProvideEntry[];
-    recipes?: PluginProvideEntry[];
-    /**
-     * Trigger TYPES — capabilities, not instances (spec §8.1 / §10.2). To
-     * activate a type, the agent calls `trigger.register({ type_id, params })`
-     * which appends a row to `.clawdevbox/triggers.json` `registered[]`.
-     */
-    trigger_types?: PluginTriggerType[];
-    /** Hostable tools (spec §10.3) — single-file scripts hosted in-process. */
-    tools?: PluginProvideEntry[];
-    mcp_servers?: PluginProvideEntry[];
-    /** AgentCliProvider declarations (spec §4) loaded via dynamic import. */
-    agent_clis?: PluginAgentCliEntry[];
-  };
-  requires?: {
-    clawdevbox_version?: string;
-    env?: string[];
-  };
-}
+// `PluginManifest` is now re-exported from `manifest/types.ts` at the top of
+// this file. The legacy yaml-shaped interface (with `id` / `provides`) was
+// removed in Phase 2 of the marketplace+plugin schema migration.
 
 export interface PluginEntry {
+  /** Mirror of `manifest.name` so existing callers can use `entry.id`. */
   id: string;
   dir: string;
   manifest: PluginManifest;
+  /** Resolved capabilities (skills, agents, commands, MCP, recipes, tools, …). */
+  capabilities: ResolvedCapabilities;
+  /** Per-plugin agency.json sidecar, if present and valid. */
+  agencyJson?: AgencyJson;
+  /** Per-capability load errors that didn't block the plugin from loading. */
+  loadErrors: LoadError[];
   status: 'enabled' | 'disabled' | 'error';
   error?: string;
 }
@@ -396,56 +384,70 @@ export async function reloadTypeRegistries(ws: Workspace): Promise<void> {
       }
       if (!isDir) continue;
 
-      const manifestPath = join(dir, 'plugin.yaml');
-      if (!existsSync(manifestPath)) continue;
-
-      let manifest: PluginManifest;
+      // New loader: read `.claude-plugin/plugin.json` (spec §3). The loader
+      // throws typed `LoadPluginError`s for MISSING_MANIFEST /
+      // INVALID_MANIFEST_JSON / INVALID_MANIFEST_SHAPE — we trap those and
+      // record an error-status plugin entry so the registry stays consistent.
+      let loaded;
       try {
-        const raw = readFileSync(manifestPath, 'utf8');
-        const parsed = yamlLoad(raw);
-        const validation = validatePluginManifest(parsed);
-        if (!validation.ok) {
+        loaded = await loadPluginFromDir(dir);
+      } catch (err) {
+        if (err instanceof LoadPluginError) {
+          if (err.code === 'MISSING_MANIFEST') {
+            // No manifest at all — silently skip; could be a stray junction
+            // or a legacy plugin.yaml left behind during migration.
+            continue;
+          }
           ws.plugins.set(entry, {
             id: entry,
             dir,
-            manifest: { id: entry, name: entry, version: '0.0.0', description: '' },
+            manifest: { name: entry },
+            capabilities: emptyCapabilities(),
+            loadErrors: [],
             status: 'error',
-            error: validation.errors.map((e) => `${e.path}: ${e.message}`).join('; '),
+            error: err.message,
           });
           continue;
         }
-        manifest = parsed as PluginManifest;
-      } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         ws.plugins.set(entry, {
           id: entry,
           dir,
-          manifest: { id: entry, name: entry, version: '0.0.0', description: '' },
+          manifest: { name: entry },
+          capabilities: emptyCapabilities(),
+          loadErrors: [],
           status: 'error',
-          error: `failed to parse plugin.yaml: ${msg}`,
+          error: `failed to load plugin: ${msg}`,
         });
         continue;
       }
 
-      // Manifest id must match directory name. A junctioned local plugin
-      // whose author renames `id:` would otherwise silently double-register
-      // or shadow itself; we'd rather surface the mismatch.
-      if (manifest.id !== entry) {
+      const name = loaded.manifest.name;
+      // Manifest name must match directory name (same rule as the legacy
+      // `id === <dir>` check) so junctioned local plugins can't silently
+      // shadow themselves under a different id.
+      if (name !== entry) {
         ws.plugins.set(entry, {
           id: entry,
           dir,
-          manifest,
+          manifest: loaded.manifest,
+          capabilities: loaded.capabilities,
+          agencyJson: loaded.agencyJson,
+          loadErrors: loaded.loadErrors,
           status: 'error',
-          error: `manifest.id ("${manifest.id}") does not match plugin directory name ("${entry}"). Rename one to match.`,
+          error: `manifest.name ("${name}") does not match plugin directory name ("${entry}"). Rename one to match.`,
         });
         continue;
       }
 
-      const enabled = stateFlags[manifest.id]?.enabled !== false; // default true
-      ws.plugins.set(manifest.id, {
-        id: manifest.id,
+      const enabled = stateFlags[name]?.enabled !== false; // default true
+      ws.plugins.set(name, {
+        id: name,
         dir,
-        manifest,
+        manifest: loaded.manifest,
+        capabilities: loaded.capabilities,
+        agencyJson: loaded.agencyJson,
+        loadErrors: loaded.loadErrors,
         status: enabled ? 'enabled' : 'disabled',
       });
     }
@@ -457,7 +459,7 @@ export async function reloadTypeRegistries(ws: Workspace): Promise<void> {
     for (const pid of pluginIds) {
       const plugin = ws.plugins.get(pid)!;
       if (plugin.status !== 'enabled') continue;
-      const types = plugin.manifest.provides?.trigger_types ?? [];
+      const types = plugin.capabilities.triggerTypes;
       for (const t of types) {
         if (typeof t.id !== 'string' || t.id.length === 0) {
           ws.triggerTypeErrors.push({
@@ -527,6 +529,19 @@ export async function reloadTypeRegistries(ws: Workspace): Promise<void> {
   // Runs AFTER `ws.plugins` is populated and AFTER `registerBuiltinProviders`
   // so built-ins always win id collisions with plugin-provided providers.
   await loadPluginProviders(ws);
+}
+
+function emptyCapabilities(): ResolvedCapabilities {
+  return {
+    skills: [],
+    agents: [],
+    commands: [],
+    mcpServers: {},
+    recipes: [],
+    tools: [],
+    triggerTypes: [],
+    agentClis: [],
+  };
 }
 
 /** @deprecated — use reloadTypeRegistries. Kept for back-compat with plugin.ts callers. */

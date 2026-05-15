@@ -1,0 +1,14 @@
+{
+  "name": "twin-b",
+  "version": "0.1.0",
+  "description": "Fixture for plugin-vs-plugin collision (loser).",
+  "clawdevbox": {
+    "agent_clis": [
+      {
+        "id": "twin",
+        "module": "provider.mjs",
+        "display_name": "Twin B"
+      }
+    ]
+  }
+}

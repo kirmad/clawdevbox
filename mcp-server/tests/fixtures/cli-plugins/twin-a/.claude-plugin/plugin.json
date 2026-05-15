@@ -1,0 +1,14 @@
+{
+  "name": "twin-a",
+  "version": "0.1.0",
+  "description": "Fixture for plugin-vs-plugin collision (winner -- sorted by plugin name).",
+  "clawdevbox": {
+    "agent_clis": [
+      {
+        "id": "twin",
+        "module": "provider.mjs",
+        "display_name": "Twin A"
+      }
+    ]
+  }
+}

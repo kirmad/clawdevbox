@@ -266,7 +266,7 @@ test('external clawdevbox-plugins folder install + load', { skip: !existsSync(pl
       assert.equal(r.destination, dest);
       assert.equal(r.copied, true, `${p.id} should have been installed`);
       assert.equal(r.kind, 'local', `${p.id} from a local folder should record kind=local`);
-      assert.ok(existsSync(join(dest, 'plugin.yaml')));
+      assert.ok(existsSync(join(dest, '.claude-plugin', 'plugin.json')));
       // Sidecar install record lives next to the plugin, not inside it.
       const sidecar = join(h.globalDir, 'plugins', `${p.id}.install.json`);
       assert.ok(existsSync(sidecar), `sidecar install.json missing for ${p.id}`);

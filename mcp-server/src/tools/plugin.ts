@@ -43,16 +43,16 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import { notFound, structuredError, validationError } from '../scope.ts';
-import { validatePluginManifest } from '../validators.ts';
+import { validatePluginManifestJson } from '../validators.ts';
 import {
   globalPluginsDir,
   pluginDir,
   pluginInstallRecordPath,
   reloadPluginRegistry,
   stateJsonPath,
+  type PluginEntry,
   type Workspace,
 } from '../workspace.ts';
-import { load as yamlLoad } from 'js-yaml';
 
 interface StateFile {
   plugins?: Record<string, { enabled?: boolean }>;
@@ -119,27 +119,21 @@ function writeStateFile(ws: Workspace, file: StateFile): void {
   writeFileSync(p, JSON.stringify(file, null, 2) + '\n', 'utf8');
 }
 
-function summarizeProvides(manifest: {
-  provides?: {
-    skills?: unknown[];
-    recipes?: unknown[];
-    triggers?: unknown[];
-    tools?: unknown[];
-    mcp_servers?: unknown[];
-  };
-}): string {
+function summarizeCapabilities(p: PluginEntry): string {
   const counts: Record<string, number> = {
-    skills: manifest.provides?.skills?.length ?? 0,
-    recipes: manifest.provides?.recipes?.length ?? 0,
-    triggers: manifest.provides?.triggers?.length ?? 0,
-    tools: manifest.provides?.tools?.length ?? 0,
-    mcp_servers: manifest.provides?.mcp_servers?.length ?? 0,
+    skills: p.capabilities.skills.length,
+    recipes: p.capabilities.recipes.length,
+    trigger_types: p.capabilities.triggerTypes.length,
+    tools: p.capabilities.tools.length,
+    agents: p.capabilities.agents.length,
+    commands: p.capabilities.commands.length,
+    mcp_servers: Object.keys(p.capabilities.mcpServers).length,
   };
   const parts: string[] = [];
   for (const [k, v] of Object.entries(counts)) {
     if (v > 0) parts.push(`${v} ${k}`);
   }
-  return parts.join(', ') || 'no provides';
+  return parts.join(', ') || 'no capabilities';
 }
 
 /**
@@ -217,7 +211,7 @@ export function registerPluginTools(server: McpServer, ws: Workspace): void {
         version: p.manifest.version,
         description: p.manifest.description,
         status: p.status,
-        provides_summary: summarizeProvides(p.manifest),
+        provides_summary: summarizeCapabilities(p),
         error: p.error,
       }));
       return {
@@ -364,9 +358,9 @@ export function registerPluginTools(server: McpServer, ws: Workspace): void {
         );
       }
       // Re-validate the manifest after the reset.
-      const manifestPath = join(plugin.dir, 'plugin.yaml');
+      const manifestPath = join(plugin.dir, '.claude-plugin', 'plugin.json');
       if (!existsSync(manifestPath)) {
-        return structuredError('MANIFEST_MISSING', `plugin.yaml not found at ${manifestPath} after update`);
+        return structuredError('MANIFEST_MISSING', `.claude-plugin/plugin.json not found at ${manifestPath} after update`);
       }
       await reloadPluginRegistry(ws);
       return {
@@ -481,30 +475,30 @@ async function installFromGit(ws: Workspace, from: string, ref: string | null): 
       );
     }
     // Validate manifest at the temp root
-    const manifestPath = join(tmp, 'plugin.yaml');
+    const manifestPath = join(tmp, '.claude-plugin', 'plugin.json');
     if (!existsSync(manifestPath)) {
       return structuredError(
         'MANIFEST_MISSING',
-        'plugin.yaml not found at the source root. (For multi-plugin git repos, use `clawdevbox init --plugin <git-url>` which can pick a subdir.)',
+        '.claude-plugin/plugin.json not found at the source root. (For multi-plugin git repos, use `clawdevbox init --plugin <git-url>` which can pick a subdir.)',
       );
     }
     let parsed: unknown;
     try {
-      parsed = yamlLoad(readFileSync(manifestPath, 'utf8'));
+      parsed = JSON.parse(readFileSync(manifestPath, 'utf8'));
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       return structuredError('MANIFEST_PARSE_ERROR', msg);
     }
-    const validation = validatePluginManifest(parsed);
-    if (!validation.ok) return validationError(validation.errors);
+    const validationErrs = validatePluginManifestJson(parsed);
+    if (validationErrs.length > 0) return validationError(validationErrs);
 
-    const manifest = parsed as { id: string };
-    const destDir = pluginDir(ws, manifest.id);
+    const manifest = parsed as { name: string };
+    const destDir = pluginDir(ws, manifest.name);
     if (existsSync(destDir)) {
       return structuredError(
         'PLUGIN_ALREADY_INSTALLED',
-        `Plugin '${manifest.id}' is already installed at ${destDir}. Uninstall first to reinstall.`,
-        { id: manifest.id },
+        `Plugin '${manifest.name}' is already installed at ${destDir}. Uninstall first to reinstall.`,
+        { id: manifest.name },
       );
     }
     // Atomic publish
@@ -517,12 +511,12 @@ async function installFromGit(ws: Workspace, from: string, ref: string | null): 
       ref,
       installed_at: Date.now(),
     };
-    writeInstallRecord(ws, manifest.id, record);
+    writeInstallRecord(ws, manifest.name, record);
 
     await reloadPluginRegistry(ws);
     return {
-      content: [{ type: 'text', text: `Installed plugin ${manifest.id} from ${from}.` }],
-      structuredContent: { id: manifest.id, dir: destDir, origin: record },
+      content: [{ type: 'text', text: `Installed plugin ${manifest.name} from ${from}.` }],
+      structuredContent: { id: manifest.name, dir: destDir, origin: record },
     };
   } finally {
     if (!succeeded && existsSync(tmp)) {
@@ -543,30 +537,30 @@ async function installFromGit(ws: Workspace, from: string, ref: string | null): 
  */
 async function installFromLocalFolder(ws: Workspace, sourcePath: string): Promise<CallToolResult> {
   const absoluteSource = resolve(sourcePath);
-  const manifestPath = join(absoluteSource, 'plugin.yaml');
+  const manifestPath = join(absoluteSource, '.claude-plugin', 'plugin.json');
   if (!existsSync(manifestPath)) {
     return structuredError(
       'MANIFEST_MISSING',
-      `plugin.yaml not found in ${absoluteSource}. Provide a path to a folder containing a single plugin.`,
+      `.claude-plugin/plugin.json not found in ${absoluteSource}. Provide a path to a folder containing a single plugin.`,
     );
   }
   let parsed: unknown;
   try {
-    parsed = yamlLoad(readFileSync(manifestPath, 'utf8'));
+    parsed = JSON.parse(readFileSync(manifestPath, 'utf8'));
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     return structuredError('MANIFEST_PARSE_ERROR', msg);
   }
-  const validation = validatePluginManifest(parsed);
-  if (!validation.ok) return validationError(validation.errors);
+  const validationErrs = validatePluginManifestJson(parsed);
+  if (validationErrs.length > 0) return validationError(validationErrs);
 
-  const manifest = parsed as { id: string; provides?: { tools?: unknown[] } };
-  const destDir = pluginDir(ws, manifest.id);
+  const manifest = parsed as { name: string; clawdevbox?: { tools?: unknown[] } };
+  const destDir = pluginDir(ws, manifest.name);
   if (existsSync(destDir)) {
     return structuredError(
       'PLUGIN_ALREADY_INSTALLED',
-      `Plugin '${manifest.id}' is already installed at ${destDir}. Uninstall first to reinstall.`,
-      { id: manifest.id },
+      `Plugin '${manifest.name}' is already installed at ${destDir}. Uninstall first to reinstall.`,
+      { id: manifest.name },
     );
   }
   try {
@@ -585,13 +579,13 @@ async function installFromLocalFolder(ws: Workspace, sourcePath: string): Promis
     source_path: absoluteSource,
     installed_at: Date.now(),
   };
-  writeInstallRecord(ws, manifest.id, record);
+  writeInstallRecord(ws, manifest.name, record);
 
   // Best-effort: junction node_modules in the user's folder so hostable
   // tools' `import 'zod'` resolves via realpath walk-up. Only attempted
   // if the plugin actually has hostable tools.
   let nodeModulesHint: string | null = null;
-  const hasHostableTools = Array.isArray(manifest.provides?.tools) && manifest.provides!.tools!.length > 0;
+  const hasHostableTools = Array.isArray(manifest.clawdevbox?.tools) && manifest.clawdevbox!.tools!.length > 0;
   if (hasHostableTools) {
     const host = locateHostNodeModules();
     if (host) {
@@ -605,10 +599,10 @@ async function installFromLocalFolder(ws: Workspace, sourcePath: string): Promis
   }
 
   await reloadPluginRegistry(ws);
-  const messages = [`Installed plugin ${manifest.id} as a local-folder link → ${absoluteSource}.`];
+  const messages = [`Installed plugin ${manifest.name} as a local-folder link → ${absoluteSource}.`];
   if (nodeModulesHint) messages.push(nodeModulesHint);
   return {
     content: [{ type: 'text', text: messages.join('\n') }],
-    structuredContent: { id: manifest.id, dir: destDir, source_path: absoluteSource, origin: record },
+    structuredContent: { id: manifest.name, dir: destDir, source_path: absoluteSource, origin: record },
   };
 }

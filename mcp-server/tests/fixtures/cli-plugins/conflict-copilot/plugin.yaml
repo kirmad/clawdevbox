@@ -1,8 +1,0 @@
-id: conflict-copilot
-name: Conflict Copilot
-version: 0.1.0
-description: Fixture that tries to register the built-in 'copilot' provider id.
-provides:
-  agent_clis:
-    - id: copilot
-      module: conflict-provider.mjs

@@ -262,14 +262,19 @@ test('plugin loader: path traversal — records MODULE_PATH_TRAVERSAL (defense i
     id: 'traversal',
     dir: pluginDir,
     manifest: {
-      id: 'traversal',
-      name: 'Path Traversal',
+      name: 'traversal',
       version: '0.1.0',
       description: 'synthetic',
-      provides: {
+      clawdevbox: {
         agent_clis: [{ id: 'traversal', module: '../../../etc/evil.js' }],
       },
     },
+    capabilities: {
+      skills: [], agents: [], commands: [], mcpServers: {},
+      recipes: [], tools: [], triggerTypes: [],
+      agentClis: [{ id: 'traversal', module: '../../../etc/evil.js' }],
+    },
+    loadErrors: [],
     status: 'enabled',
   });
   await loadPluginProviders(ws);

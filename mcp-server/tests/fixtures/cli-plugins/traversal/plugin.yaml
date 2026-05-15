@@ -1,8 +1,0 @@
-id: traversal
-name: Path Traversal
-version: 0.1.0
-description: Fixture for MODULE_PATH_TRAVERSAL.
-provides:
-  agent_clis:
-    - id: traversal
-      module: subdir/../../escape.js

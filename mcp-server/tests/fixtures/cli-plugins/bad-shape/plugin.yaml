@@ -1,8 +1,0 @@
-id: bad-shape
-name: Bad Shape
-version: 0.1.0
-description: Fixture for INVALID_PROVIDER_SHAPE.
-provides:
-  agent_clis:
-    - id: bad-shape
-      module: bad-provider.mjs

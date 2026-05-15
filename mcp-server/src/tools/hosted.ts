@@ -111,7 +111,7 @@ export async function discoverTools(ws: Workspace): Promise<HostedToolRegistry> 
 
   for (const plugin of ws.plugins.values()) {
     if (plugin.status !== 'enabled') continue;
-    const list = plugin.manifest.provides?.tools ?? [];
+    const list = plugin.capabilities.tools;
     for (const entry of list) {
       const recordError = (msg: string) => {
         errors.push({
