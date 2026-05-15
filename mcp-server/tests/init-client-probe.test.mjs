@@ -7,6 +7,11 @@ import { join } from 'node:path';
 import { loadWorkspaceFromEnv } from '../src/workspace.ts';
 import { resolveConfig } from '../src/config.ts';
 import { probeClientPlugins } from '../src/cli/probe-client-plugins.ts';
+import {
+  renderPluginCard,
+  renderFinalSummary,
+  runClientPluginProbePrompt,
+} from '../src/cli/init-probe-prompt.ts';
 
 function setupTmpWorkspace() {
   const project = mkdtempSync(join(tmpdir(), 'cdb-probe-'));
@@ -180,3 +185,141 @@ test('probeClientPlugins: per-provider failure does not abort others', async () 
   assert.equal(probed[0].pluginName, 'good-plugin');
   assert.equal(probed[0].providerId, 'claude');
 });
+
+// ---------------------------------------------------------------------------
+// Prompt rendering + interactive loop
+// ---------------------------------------------------------------------------
+
+function fakeProbed(overrides = {}) {
+  return {
+    pluginName: 'ado-pipeline-autodebug',
+    pluginDir: '/fake/path/ado-pipeline-autodebug',
+    providerId: 'claude',
+    manifestPath: '/fake/path/ado-pipeline-autodebug/.claude-plugin/plugin.json',
+    clawdevbox: {
+      recipes: [
+        { id: 'ado.investigate', description: 'Classify ADO pipeline failure.', file: 'recipes/investigate.yaml' },
+      ],
+      tools: [],
+      trigger_types: [
+        { id: 'ado.build-watcher', description: 'Watch for failures', default_cron: '*/5 * * * *', file: 'triggers/watcher.ts' },
+      ],
+      agent_clis: [],
+      renderers: [],
+    },
+    clientSide: {
+      skills: [{ id: 'check-build-status', description: 'Check ADO build status' }],
+      agents: [],
+      commands: [],
+      mcpServers: [],
+    },
+    ...overrides,
+  };
+}
+
+test('renderPluginCard: contains plugin name, recipe id+description, trigger', () => {
+  const card = renderPluginCard(fakeProbed(), 1, 1);
+  assert.ok(card.includes('ado-pipeline-autodebug'));
+  assert.ok(card.includes('1 of 1'));
+  assert.ok(card.includes('Recipes (1)'));
+  assert.ok(card.includes('ado.investigate'));
+  assert.ok(card.includes('Classify ADO pipeline failure.'));
+  assert.ok(card.includes('Trigger types (1)'));
+  assert.ok(card.includes('*/5 * * * *'));
+  assert.ok(card.includes('check-build-status'));
+  // Box drawing borders.
+  assert.ok(card.startsWith('┌'));
+  assert.ok(card.trimEnd().endsWith('┘'));
+});
+
+test('renderPluginCard: omits empty sections', () => {
+  const p = fakeProbed({
+    clawdevbox: { recipes: [], tools: [], trigger_types: [], agent_clis: [], renderers: [] },
+    clientSide: { skills: [], agents: [], commands: [], mcpServers: [] },
+  });
+  const card = renderPluginCard(p, 1, 1);
+  assert.ok(!card.includes('Recipes'));
+  assert.ok(!card.includes('Trigger types'));
+  assert.ok(!card.includes('Components handled by'));
+});
+
+test('renderFinalSummary: lists each selected plugin with provider', () => {
+  const sel = [fakeProbed(), fakeProbed({ pluginName: 'cfv', providerId: 'copilot' })];
+  const out = renderFinalSummary(sel, '/some/path/config.json');
+  assert.ok(out.includes('You selected 2'));
+  assert.ok(out.includes('ado-pipeline-autodebug'));
+  assert.ok(out.includes('(claude)'));
+  assert.ok(out.includes('cfv'));
+  assert.ok(out.includes('(copilot)'));
+  assert.ok(out.includes('/some/path/config.json'));
+});
+
+test('runClientPluginProbePrompt: auto-yes selects every plugin', async () => {
+  const probed = [fakeProbed(), fakeProbed({ pluginName: 'cfv', providerId: 'copilot' })];
+  const confirmFn = async () => true;
+  const selections = await runClientPluginProbePrompt(probed, /*cfg*/ {}, {
+    configPath: '/tmp/config.json',
+    confirmFn,
+    noteFn: () => {},
+  });
+  assert.deepEqual(selections, [
+    { provider: 'claude', name: 'ado-pipeline-autodebug' },
+    { provider: 'copilot', name: 'cfv' },
+  ]);
+});
+
+test('runClientPluginProbePrompt: auto-no yields empty selection', async () => {
+  const probed = [fakeProbed()];
+  const confirmFn = async () => false;
+  const selections = await runClientPluginProbePrompt(probed, {}, {
+    configPath: '/tmp/config.json',
+    confirmFn,
+    noteFn: () => {},
+  });
+  assert.deepEqual(selections, []);
+});
+
+test('runClientPluginProbePrompt: preselect populates initialValue from existing discovered_plugins', async () => {
+  const probed = [
+    fakeProbed({ pluginName: 'ado-pipeline-autodebug', providerId: 'claude' }),
+    fakeProbed({ pluginName: 'fresh-plugin', providerId: 'claude' }),
+  ];
+  const seenInitials = [];
+  const confirmFn = async (opts) => {
+    // First call is the per-plugin confirm; record initialValue + auto-yes.
+    if (opts.message.startsWith('Enable clawdevbox')) {
+      seenInitials.push({ message: opts.message, initialValue: opts.initialValue });
+      return true;
+    }
+    // Final summary confirm.
+    return true;
+  };
+  await runClientPluginProbePrompt(probed, {}, {
+    configPath: '/tmp/config.json',
+    preselect: [{ provider: 'claude', name: 'ado-pipeline-autodebug' }],
+    confirmFn,
+    noteFn: () => {},
+  });
+  assert.equal(seenInitials.length, 2);
+  // First probed plugin was in preselect → initialValue true.
+  assert.equal(seenInitials[0].initialValue, true);
+  // Second probed plugin was NOT in preselect → initialValue false.
+  assert.equal(seenInitials[1].initialValue, false);
+});
+
+test('runClientPluginProbePrompt: empty input returns empty without prompting', async () => {
+  let called = false;
+  const confirmFn = async () => {
+    called = true;
+    return true;
+  };
+  const selections = await runClientPluginProbePrompt([], {}, {
+    configPath: '/tmp/config.json',
+    confirmFn,
+    noteFn: () => {},
+  });
+  assert.deepEqual(selections, []);
+  assert.equal(called, false);
+});
+
+

@@ -46,6 +46,8 @@ import { loadWorkspaceFromEnv, type Workspace } from '../workspace.ts';
 import { buildProviderCtx } from '../agent-clis/shared.ts';
 import type { DetectResult } from '../agent-clis/types.ts';
 import type { Flags } from './index.ts';
+import { probeClientPlugins } from './probe-client-plugins.ts';
+import { runClientPluginProbePrompt } from './init-probe-prompt.ts';
 import {
   discoverPluginsInDir,
   installPluginFromDir,
@@ -533,6 +535,7 @@ export async function runInit(flags: Flags): Promise<void> {
     // via `clawdevbox config set`.
     let chosenProviderId: string | null = null;
     let chosenProviderLabel: string | null = null;
+    let probedSelections: Array<{ provider: string; name: string }> = [];
     try {
       const tmpEnv = {
         ...process.env,
@@ -541,6 +544,30 @@ export async function runInit(flags: Flags): Promise<void> {
       };
       const ws = await loadWorkspaceFromEnv(tmpEnv);
       const tmpCfg = resolveConfig({ projectDir, globalDir });
+
+      // Probe client-installed plugins for clawdevbox.* extensions BEFORE
+      // the agent-CLI chooser (spec §10). The probe surfaces plugins the
+      // CLI already has; the chooser then picks which CLI is default. The
+      // probe is skipped entirely when client_sync.mode === 'off'.
+      if (tmpCfg.clientSync.mode !== 'off') {
+        try {
+          const probed = await probeClientPlugins(ws, tmpCfg);
+          if (probed.length > 0) {
+            const targetConfigPath =
+              installScope === 'global' ? globalConfigPath(globalDir) : configPath(projectDir);
+            probedSelections = await runClientPluginProbePrompt(probed, tmpCfg, {
+              configPath: targetConfigPath,
+              preselect: tmpCfg.clientSync.discoveredPlugins,
+            });
+          }
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.warn(
+            `[clawdevbox] skipping client plugin probe: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
+
       chosenProviderId = await runAgentCliChooser(ws, tmpCfg, installScope);
       if (chosenProviderId) {
         chosenProviderLabel =
@@ -572,6 +599,9 @@ export async function runInit(flags: Flags): Promise<void> {
           : { kind: 'none' },
       notifications: notificationsConfig,
       ...(chosenProviderId ? { default_agent_cli: chosenProviderId } : {}),
+      ...(probedSelections.length > 0
+        ? { client_sync: { discovered_plugins: probedSelections } }
+        : {}),
     };
 
     const written =
