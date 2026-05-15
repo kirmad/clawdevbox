@@ -27,6 +27,7 @@ import { join, resolve, sep } from 'node:path';
 import { load as yamlLoad } from 'js-yaml';
 import { validatePluginManifest } from './validators.ts';
 import { listAgentAuthoredTemplates, toRegisteredType } from './template-store.ts';
+import type { AgentCliProvider, AgentCliProviderError } from './agent-clis/types.ts';
 
 // ============================================================================
 // Types
@@ -174,6 +175,10 @@ export interface Workspace {
   triggerTypes: Map<string, RegisteredTriggerType>;
   /** Type-registry load errors (collisions, missing files). */
   triggerTypeErrors: Array<{ plugin_id: string; type_id: string; error: string }>;
+  /** Agent-CLI provider registry. Built-ins land here first, then plugin-provided overlays. */
+  agentCliProviders: Map<string, AgentCliProvider>;
+  /** Provider load errors (collisions, malformed plugin modules). */
+  agentCliProviderErrors: AgentCliProviderError[];
 }
 
 /** Read CLAWDEVBOX_PROJECT_DIR (required) + CLAWDEVBOX_GLOBAL_DIR (optional). */
@@ -196,6 +201,8 @@ export function loadWorkspaceFromEnv(env: NodeJS.ProcessEnv = process.env): Work
     plugins: new Map(),
     triggerTypes: new Map(),
     triggerTypeErrors: [],
+    agentCliProviders: new Map(),
+    agentCliProviderErrors: [],
   };
   reloadTypeRegistries(ws);
   warnIfLegacyProjectPlugins(ws);
