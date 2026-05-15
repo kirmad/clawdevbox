@@ -9,8 +9,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { loadPluginFromDir, LoadPluginError } from '../src/manifest/load-plugin.ts';
+
+const HERE = dirname(fileURLToPath(import.meta.url));
 
 function mkPlugin(manifest, files = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'cdb-plg-load-'));
@@ -304,3 +307,258 @@ test('loadPluginFromDir: status passes through to capabilities', async () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ============================================================================
+// Auto-discovery for clawdevbox capabilities (spec 2026-05-15 addendum)
+// ============================================================================
+
+// ---- Recipes -------------------------------------------------------------
+
+test('auto-discovery: recipes/ scanned when manifest omits clawdevbox.recipes', async () => {
+  const dir = mkPlugin(
+    { name: 'r-auto', version: '0.1.0' },
+    { 'recipes/foo.yaml': 'id: foo\nname: Foo\nsteps: []\n' },
+  );
+  try {
+    const r = await loadPluginFromDir(dir);
+    assert.equal(r.capabilities.recipes.length, 1);
+    assert.equal(r.capabilities.recipes[0].id, 'foo');
+    assert.ok(r.capabilities.recipes[0].file.endsWith('recipes/foo.yaml'));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('auto-discovery: recipes path-override string scans the given dir', async () => {
+  const dir = mkPlugin(
+    { name: 'r-path', version: '0.1.0', clawdevbox: { recipes: 'custom-recipes' } },
+    {
+      'custom-recipes/alpha.yaml': 'id: alpha\nsteps: []\n',
+      'recipes/should-be-ignored.yaml': 'id: ignored\nsteps: []\n',
+    },
+  );
+  try {
+    const r = await loadPluginFromDir(dir);
+    assert.equal(r.capabilities.recipes.length, 1);
+    assert.equal(r.capabilities.recipes[0].id, 'alpha');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('auto-discovery: explicit clawdevbox.recipes entry array bypasses auto-scan', async () => {
+  const dir = mkPlugin(
+    {
+      name: 'r-explicit',
+      version: '0.1.0',
+      clawdevbox: { recipes: [{ id: 'declared', file: 'somewhere/declared.yaml' }] },
+    },
+    {
+      'recipes/auto-only.yaml': 'id: auto-only\nsteps: []\n',
+    },
+  );
+  try {
+    const r = await loadPluginFromDir(dir);
+    assert.equal(r.capabilities.recipes.length, 1);
+    assert.equal(r.capabilities.recipes[0].id, 'declared');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('auto-discovery: files prefixed with _ are excluded from recipes', async () => {
+  const dir = mkPlugin(
+    { name: 'r-skip', version: '0.1.0' },
+    {
+      'recipes/keep.yaml': 'id: keep\nsteps: []\n',
+      'recipes/_private.yaml': 'id: private\nsteps: []\n',
+    },
+  );
+  try {
+    const r = await loadPluginFromDir(dir);
+    assert.equal(r.capabilities.recipes.length, 1);
+    assert.equal(r.capabilities.recipes[0].id, 'keep');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---- Tools ---------------------------------------------------------------
+
+test('auto-discovery: tools/foo.ts → id <pluginName>.foo, runtime tsx', async () => {
+  const dir = mkPlugin(
+    { name: 'tplugin', version: '0.1.0' },
+    { 'tools/foo.ts': 'export default async function () { return {}; }\n' },
+  );
+  try {
+    const r = await loadPluginFromDir(dir);
+    assert.equal(r.capabilities.tools.length, 1);
+    assert.equal(r.capabilities.tools[0].id, 'tplugin.foo');
+    assert.equal(r.capabilities.tools[0].runtime, 'tsx');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('auto-discovery: tools/_helper.ts excluded from auto-discovery', async () => {
+  const dir = mkPlugin(
+    { name: 'tplugin', version: '0.1.0' },
+    {
+      'tools/echo.ts': 'export default async function () { return {}; }\n',
+      'tools/_helper.ts': 'export const X = 1;\n',
+    },
+  );
+  try {
+    const r = await loadPluginFromDir(dir);
+    assert.equal(r.capabilities.tools.length, 1);
+    assert.equal(r.capabilities.tools[0].id, 'tplugin.echo');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---- Trigger types -------------------------------------------------------
+
+test('auto-discovery: trigger script with sidecar registers full PluginTriggerType', async () => {
+  const dir = mkPlugin(
+    { name: 'tt-auto', version: '0.1.0' },
+    {
+      'triggers/watch.ts': 'process.exit(0);\n',
+      'triggers/watch.trigger.yaml':
+        'description: watches\ndefault_cron: "*/5 * * * *"\nidentity_param: owner\nparameters:\n  - { name: owner, type: string, required: true }\n',
+    },
+  );
+  try {
+    const r = await loadPluginFromDir(dir);
+    assert.equal(r.capabilities.triggerTypes.length, 1);
+    const t = r.capabilities.triggerTypes[0];
+    assert.equal(t.id, 'tt-auto.watch');
+    assert.equal(t.description, 'watches');
+    assert.equal(t.default_cron, '*/5 * * * *');
+    assert.equal(t.identity_param, 'owner');
+    assert.equal(t.runtime, 'tsx');
+    assert.equal(t.parameters?.[0]?.name, 'owner');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('auto-discovery: trigger script without sidecar → LoadError, no entry registered', async () => {
+  const dir = mkPlugin(
+    { name: 'tt-miss', version: '0.1.0' },
+    { 'triggers/orphan.ts': 'process.exit(0);\n' },
+  );
+  try {
+    const r = await loadPluginFromDir(dir);
+    assert.equal(r.capabilities.triggerTypes.length, 0);
+    const err = r.loadErrors.find(
+      (e) => e.scope === 'trigger_types' && /no sidecar/.test(e.message),
+    );
+    assert.ok(err, 'expected a missing-sidecar LoadError');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('auto-discovery: orphan trigger sidecar (no script) → LoadError', async () => {
+  const dir = mkPlugin(
+    { name: 'tt-orphan', version: '0.1.0' },
+    { 'triggers/ghost.trigger.yaml': 'description: ghost\n' },
+  );
+  try {
+    const r = await loadPluginFromDir(dir);
+    assert.equal(r.capabilities.triggerTypes.length, 0);
+    const err = r.loadErrors.find(
+      (e) => e.scope === 'trigger_types' && /no matching script/.test(e.message),
+    );
+    assert.ok(err, 'expected an orphan-sidecar LoadError');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---- Agent CLI providers -------------------------------------------------
+
+test('auto-discovery: agent-clis/foo.mjs → entry { id: foo, module: agent-clis/foo.mjs }', async () => {
+  const dir = mkPlugin(
+    { name: 'ac-auto', version: '0.1.0' },
+    {
+      'agent-clis/myprov.mjs':
+        'export default { id: "myprov", displayName: "MP", source: "builtin", async detect(){return{available:true};}, async spawnSession(){throw new Error("x");} };\n',
+    },
+  );
+  try {
+    const r = await loadPluginFromDir(dir);
+    assert.equal(r.capabilities.agentClis.length, 1);
+    assert.equal(r.capabilities.agentClis[0].id, 'myprov');
+    assert.ok(r.capabilities.agentClis[0].module.endsWith('agent-clis/myprov.mjs'));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---- Renderers -----------------------------------------------------------
+
+test('auto-discovery: renderers/custom-art.mjs → entry { type: "custom-art" }', async () => {
+  const dir = mkPlugin(
+    { name: 'rend-auto', version: '0.1.0' },
+    { 'renderers/custom-art.mjs': 'export default function(){return "";}\n' },
+  );
+  try {
+    const r = await loadPluginFromDir(dir);
+    assert.equal(r.capabilities.renderers.length, 1);
+    assert.equal(r.capabilities.renderers[0].type, 'custom-art');
+    assert.ok(r.capabilities.renderers[0].absoluteFile.endsWith('custom-art.mjs'));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---- Polymorphic shape coverage on one capability -----------------------
+
+test('auto-discovery: tools field accepts string[] of mixed dirs and files', async () => {
+  const dir = mkPlugin(
+    {
+      name: 'mixed',
+      version: '0.1.0',
+      clawdevbox: { tools: ['tools-a', 'tools-b/onefile.ts'] },
+    },
+    {
+      'tools-a/echo.ts': 'export default async function(){return{};}\n',
+      'tools-a/_hidden.ts': 'export const X = 1;\n',
+      'tools-b/onefile.ts': 'export default async function(){return{};}\n',
+    },
+  );
+  try {
+    const r = await loadPluginFromDir(dir);
+    const ids = r.capabilities.tools.map((t) => t.id).sort();
+    assert.deepEqual(ids, ['mixed.echo', 'mixed.onefile']);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---- Everything-auto-discovered fixture ---------------------------------
+
+test('auto-discovery: minimal manifest + convention dirs discovers all five capabilities', async () => {
+  const fixtureDir = join(HERE, 'fixtures', 'auto-discover-plugin');
+  const r = await loadPluginFromDir(fixtureDir);
+  assert.equal(r.loadErrors.length, 0, 'no load errors expected');
+  assert.equal(r.capabilities.recipes.length, 1);
+  assert.equal(r.capabilities.recipes[0].id, 'hello');
+
+  assert.equal(r.capabilities.tools.length, 1);
+  assert.equal(r.capabilities.tools[0].id, 'auto-test.echo');
+  assert.equal(r.capabilities.tools[0].runtime, 'tsx');
+
+  assert.equal(r.capabilities.triggerTypes.length, 1);
+  assert.equal(r.capabilities.triggerTypes[0].id, 'auto-test.ping');
+
+  assert.equal(r.capabilities.agentClis.length, 1);
+  assert.equal(r.capabilities.agentClis[0].id, 'test-cli');
+
+  assert.equal(r.capabilities.renderers.length, 1);
+  assert.equal(r.capabilities.renderers[0].type, 'custom-thing');
+});
+
+

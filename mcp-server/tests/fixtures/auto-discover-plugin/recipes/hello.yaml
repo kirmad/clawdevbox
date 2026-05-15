@@ -1,0 +1,6 @@
+id: hello
+name: Hello Recipe
+description: trivial
+steps:
+  - id: 1
+    goal: say hello
