@@ -14,7 +14,6 @@ import { randomBytes } from 'node:crypto';
 import { createWriteStream, existsSync, mkdirSync, readFileSync, unlinkSync } from 'node:fs';
 import { dirname, resolve as resolvePath } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { load as yamlLoad } from 'js-yaml';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import * as pty from 'node-pty';
@@ -43,7 +42,7 @@ import {
   structuredError,
   validationError,
 } from '../scope.ts';
-import { validateRecipeSource } from '../validators.ts';
+import { parseRecipeSource, validateRecipeSource } from '../validators.ts';
 import { recipePath, validateId, type Workspace } from '../workspace.ts';
 import {
   createWorkspace,
@@ -297,7 +296,7 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
         if (!validation.ok) {
           return validationError(validation.errors);
         }
-        const parsed = yamlLoad(args.source!) as { id: string };
+        const parsed = parseRecipeSource(args.source!) as { id: string };
         recipeId = parsed.id;
         recipeSnapshot = args.source!;
         isAdhoc = true;
@@ -998,7 +997,7 @@ function safeRead(path: string): string | null {
 
 function safeParse(source: string): unknown {
   try {
-    return yamlLoad(source);
+    return parseRecipeSource(source);
   } catch {
     return null;
   }

@@ -10,6 +10,7 @@ import {
   validateAgentAuthoredTemplate,
   validateRecipeParsed,
   validateRecipeSource,
+  parseRecipeSource,
 } from '../src/validators.ts';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -246,4 +247,46 @@ test('step.artifacts.id pattern enforced', () => {
   const r = validateRecipeParsed(bad);
   assert.equal(r.ok, false);
   if (!r.ok) assert.ok(r.errors.some((e) => e.path === 'steps[0].artifacts[0].id'));
+});
+
+test('parseRecipeSource parses YAML', () => {
+  const parsed = parseRecipeSource('id: foo\nname: Foo\n');
+  assert.deepEqual(parsed, { id: 'foo', name: 'Foo' });
+});
+
+test('parseRecipeSource parses JSON object (leading {)', () => {
+  const parsed = parseRecipeSource('{"id":"foo","steps":[]}');
+  assert.deepEqual(parsed, { id: 'foo', steps: [] });
+});
+
+test('parseRecipeSource parses JSON array (leading [)', () => {
+  const parsed = parseRecipeSource('[1,2,3]');
+  assert.deepEqual(parsed, [1, 2, 3]);
+});
+
+test('parseRecipeSource ignores leading whitespace before sniff', () => {
+  const parsed = parseRecipeSource('   \n\t  {"id":"x"}');
+  assert.deepEqual(parsed, { id: 'x' });
+
+  const parsedYaml = parseRecipeSource('   \nid: y\n');
+  assert.deepEqual(parsedYaml, { id: 'y' });
+});
+
+test('parseRecipeSource throws on malformed JSON when leading char is {', () => {
+  assert.throws(() => parseRecipeSource('{not json'));
+});
+
+test('parseRecipeSource throws on malformed YAML', () => {
+  assert.throws(() => parseRecipeSource('id: "unterminated\nname: x'));
+});
+
+test('validateRecipeSource accepts JSON source via the sniff', () => {
+  const json = JSON.stringify({
+    id: 'foo',
+    name: 'Foo',
+    description: 'd',
+    steps: [{ id: 's1', goal: 'go' }],
+  });
+  const res = validateRecipeSource(json);
+  assert.equal(res.ok, true, res.ok ? '' : JSON.stringify(res.errors));
 });

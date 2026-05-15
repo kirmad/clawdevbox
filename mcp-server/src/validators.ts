@@ -59,12 +59,36 @@ function isNonEmptyString(x: unknown): x is string {
 export function validateRecipeSource(source: string): ValidationResult {
   let parsed: unknown;
   try {
-    parsed = yamlLoad(source);
+    parsed = parseRecipeSource(source);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    return { ok: false, errors: [{ path: '$', code: 'YAML_PARSE_ERROR', message: msg }] };
+    const trimmed = source.trimStart();
+    const code =
+      trimmed.startsWith('{') || trimmed.startsWith('[')
+        ? 'JSON_PARSE_ERROR'
+        : 'YAML_PARSE_ERROR';
+    return { ok: false, errors: [{ path: '$', code, message: msg }] };
   }
   return validateRecipeParsed(parsed);
+}
+
+/**
+ * Sniff a recipe source string and parse it as either JSON or YAML.
+ *
+ * Sniff rule (spec §4.4): skip leading whitespace; if the first non-whitespace
+ * character is `{` or `[`, parse as JSON; otherwise parse as YAML. This means
+ * agents and humans can mix formats freely — `recipe.run({source: '...'})`,
+ * `recipe.upsert({source: '...'})`, and on-disk recipe files all go through
+ * this single helper.
+ */
+export function parseRecipeSource(source: string): unknown {
+  let i = 0;
+  while (i < source.length && /\s/.test(source[i])) i++;
+  const first = source[i];
+  if (first === '{' || first === '[') {
+    return JSON.parse(source);
+  }
+  return yamlLoad(source);
 }
 
 export function validateRecipeParsed(parsed: unknown): ValidationResult {
