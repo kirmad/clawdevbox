@@ -19,7 +19,7 @@ FAMILIES = [
     ("plugin",    "Plugin",    7, "Install, list, and toggle global plugins under `<globalDir>/plugins/`."),
     ("recipe",    "Recipe",   10, "CRUD for recipe YAML, plus spawning agent CLIs inside hidden ptys."),
     ("skill",     "Skill",     4, "CRUD for markdown+frontmatter skill files."),
-    ("trigger",   "Trigger",   8, "Plugin-declared trigger types and concrete registered instances."),
+    ("trigger",   "Trigger",   13, "Plugin-declared trigger types, agent-authored templates, registered instances, and `trigger.test`."),
     ("artifact",  "Artifact",  4, "Renderable bundles produced by agents."),
     ("renderer",  "Renderer",  4, "Workspace-shadowable `.mjs` renderers for artifact `type`s."),
     ("inbox",     "Inbox",     6, "Persistent notification center the user reviews from desktop or phone."),
@@ -40,7 +40,7 @@ INTRO = """# Clawdevbox MCP Tools — Complete Reference
 Clawdevbox is a developer-buddy runtime that the [Model Context Protocol
 (MCP)](https://modelcontextprotocol.io) exposes to coding agents through a
 single Node.js server (`mcp-server/`). This document covers all **12 tool
-families** that ship today — 58 tools in total — and the storage, scope, and
+families** that ship today — 63 tools in total — and the storage, scope, and
 event-bus model that holds them together. The rough mental model is:
 
 - A **workspace** is a directory with a `.clawdevbox/` subtree. Workspaces hold
