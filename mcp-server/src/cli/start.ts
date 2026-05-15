@@ -78,6 +78,7 @@ import {
   type TunnelStatus,
 } from '../tunnel.ts';
 import { closeDatabase, openDatabase } from '../db/index.ts';
+import { scanLegacyFiles } from '../db/legacy-files.ts';
 import { readTriggersFile } from '../triggers-store.ts';
 import { loadWorkspaceFromEnv, triggersJsonPath, WorkspaceConfigError } from '../workspace.ts';
 import type { Flags } from './index.ts';
@@ -183,6 +184,7 @@ export async function runStart(flags: Flags): Promise<void> {
     { path: opened.path, schema_version: opened.schemaVersion },
     'db opened',
   );
+  scanLegacyFiles(cfg, opened.db);
 
   const { server, hostedRegistry } = await buildServer(ws);
 

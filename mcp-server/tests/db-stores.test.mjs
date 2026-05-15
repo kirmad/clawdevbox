@@ -564,3 +564,89 @@ test('listArtifactsForWorkspace returns rows', () => {
 test('mintArtifactId shape', () => {
   assert.match(mintArtifactId(), /^art_[a-z0-9]+_[0-9a-f]{4}$/);
 });
+
+// ---------------------------------------------------------------- legacy files
+import { mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { scanLegacyFiles } from '../src/db/legacy-files.ts';
+
+function mkTmp(prefix) {
+  const dir = join(tmpdir(), `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+test('scanLegacyFiles logs and records kv entry for inbox.json', () => {
+  const db = open();
+  const globalDir = mkTmp('legacy-global');
+  const projectDir = mkTmp('legacy-project');
+  const workspacesRoot = mkTmp('legacy-ws');
+  try {
+    writeFileSync(join(globalDir, 'inbox.json'), '{}');
+    const cfg = {
+      projectDir,
+      globalDir,
+      workspacesRoot,
+      configSource: 'defaults',
+      configPath: null,
+      tunnel: {},
+      http: { host: '127.0.0.1', port: 0 },
+      notifications: { enabled: false },
+    };
+    scanLegacyFiles(cfg, db);
+    const inboxPath = join(globalDir, 'inbox.json');
+    const row = db
+      .prepare('SELECT value FROM kv WHERE key = ?')
+      .get(`legacy_file_seen:${inboxPath}`);
+    assert.ok(row, 'expected kv row for inbox.json');
+    // Second scan must not duplicate or error.
+    scanLegacyFiles(cfg, db);
+    const rows = db
+      .prepare("SELECT COUNT(*) AS c FROM kv WHERE key LIKE 'legacy_file_seen:%'")
+      .get();
+    assert.equal(rows.c, 1);
+  } finally {
+    rmSync(globalDir, { recursive: true, force: true });
+    rmSync(projectDir, { recursive: true, force: true });
+    rmSync(workspacesRoot, { recursive: true, force: true });
+    db.close();
+  }
+});
+
+test('scanLegacyFiles detects workspace triggers.json and recipe-instances', () => {
+  const db = open();
+  const globalDir = mkTmp('legacy-g2');
+  const projectDir = mkTmp('legacy-p2');
+  const workspacesRoot = mkTmp('legacy-w2');
+  try {
+    // project legacy file
+    mkdirSync(join(projectDir, '.clawdevbox', 'recipe-instances'), { recursive: true });
+    writeFileSync(join(projectDir, '.clawdevbox', 'triggers.json'), '[]');
+    writeFileSync(join(projectDir, '.clawdevbox', 'recipe-instances', 'foo.json'), '{}');
+    // a workspace under the root
+    const wsDir = join(workspacesRoot, 'ws-a');
+    mkdirSync(join(wsDir, '.clawdevbox'), { recursive: true });
+    writeFileSync(join(wsDir, '.clawdevbox', 'triggers.json'), '[]');
+    const cfg = {
+      projectDir,
+      globalDir,
+      workspacesRoot,
+      configSource: 'defaults',
+      configPath: null,
+      tunnel: {},
+      http: { host: '127.0.0.1', port: 0 },
+      notifications: { enabled: false },
+    };
+    scanLegacyFiles(cfg, db);
+    const rows = db
+      .prepare("SELECT key FROM kv WHERE key LIKE 'legacy_file_seen:%'")
+      .all();
+    assert.equal(rows.length, 3);
+  } finally {
+    rmSync(globalDir, { recursive: true, force: true });
+    rmSync(projectDir, { recursive: true, force: true });
+    rmSync(workspacesRoot, { recursive: true, force: true });
+    db.close();
+  }
+});
