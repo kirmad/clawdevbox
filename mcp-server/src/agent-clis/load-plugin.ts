@@ -28,13 +28,13 @@ function shapeOk(obj: unknown): obj is AgentCliProvider {
   );
 }
 
-/** Walk every enabled plugin's `provides.agent_clis[]` and dynamic-import each. */
+/** Walk every enabled plugin's resolved agent_clis capability and dynamic-import each. */
 export async function loadPluginProviders(ws: Workspace): Promise<void> {
   // Sort plugins for deterministic collision precedence (first-loaded wins).
   const sorted = [...ws.plugins.values()].sort((a, b) => a.id.localeCompare(b.id));
   for (const plugin of sorted) {
     if (plugin.status !== 'enabled') continue;
-    const entries = plugin.manifest.clawdevbox?.agent_clis ?? [];
+    const entries = plugin.capabilities.agentClis ?? [];
     for (const entry of entries) {
       await loadOne(ws, plugin.id, plugin.dir, entry);
     }

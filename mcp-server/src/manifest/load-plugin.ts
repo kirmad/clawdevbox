@@ -33,8 +33,23 @@ import type {
   AgencyJson,
   McpServerConfig,
   PluginStatus,
+  PluginProvideEntry,
+  ClawdevboxToolEntry,
 } from './types.ts';
 import type { PluginTriggerType, PluginAgentCliEntry } from '../workspace.ts';
+
+/**
+ * Type-guard: a `clawdevbox.*` polymorphic field that is an array of objects
+ * (Tier 3 of the spec: explicit entries). Returns false for strings,
+ * string[], and undefined.
+ */
+function isEntryArray<E>(value: unknown): value is E[] {
+  return (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.every((v) => typeof v === 'object' && v !== null && !Array.isArray(v))
+  );
+}
 
 // ============================================================================
 // Public types
@@ -213,20 +228,29 @@ export async function loadPluginFromDir(pluginDir: string): Promise<LoadedPlugin
   const hooks = await resolveHooks(pluginDir, manifest.hooks, loadErrors);
 
   // clawdevbox extensions — pass-through (file existence is a runtime concern).
+  // NOTE: the polymorphic `string | string[] | Entry[]` shapes are fully
+  // resolved by the auto-discovery code path added later. For now we treat
+  // only the explicit Entry[] case (Tier 3) and leave the other shapes as
+  // empty until that lands.
   const cdb = manifest.clawdevbox;
-  const recipes: ResolvedRecipe[] = (cdb?.recipes ?? []).map((r) => ({
+  const recipesIn = isEntryArray<PluginProvideEntry>(cdb?.recipes) ? cdb!.recipes as PluginProvideEntry[] : [];
+  const toolsIn = isEntryArray<ClawdevboxToolEntry>(cdb?.tools) ? cdb!.tools as ClawdevboxToolEntry[] : [];
+  const triggerTypesIn = isEntryArray<PluginTriggerType>(cdb?.trigger_types) ? cdb!.trigger_types as PluginTriggerType[] : [];
+  const agentClisIn = isEntryArray<PluginAgentCliEntry>(cdb?.agent_clis) ? cdb!.agent_clis as PluginAgentCliEntry[] : [];
+
+  const recipes: ResolvedRecipe[] = recipesIn.map((r) => ({
     id: r.id,
     file: r.file,
     absoluteFile: resolve(pluginDir, r.file),
   }));
-  const tools: ResolvedTool[] = (cdb?.tools ?? []).map((t) => ({
+  const tools: ResolvedTool[] = toolsIn.map((t) => ({
     id: t.id,
     file: t.file,
     absoluteFile: resolve(pluginDir, t.file),
     runtime: t.runtime,
   }));
-  const triggerTypes: PluginTriggerType[] = [...(cdb?.trigger_types ?? [])];
-  const agentClis: PluginAgentCliEntry[] = [...(cdb?.agent_clis ?? [])];
+  const triggerTypes: PluginTriggerType[] = [...triggerTypesIn];
+  const agentClis: PluginAgentCliEntry[] = [...agentClisIn];
 
   const capabilities: ResolvedCapabilities = {
     skills,

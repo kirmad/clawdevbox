@@ -51,15 +51,35 @@ export interface ClawdevboxToolEntry {
 }
 
 /**
+ * `clawdevbox.renderers[]` entry: a `.mjs` artifact renderer module shipped
+ * by a plugin. `type` matches the `artifact.type` field at resolution time.
+ */
+export interface PluginRendererEntry {
+  type: string;
+  module: string;
+  description?: string;
+}
+
+/**
  * The `clawdevbox` extension subtree (§3.5). Carries every capability that
  * isn't part of Claude Code's vocabulary. Claude Code ignores unknown keys,
  * so one manifest can target both runtimes.
+ *
+ * Each field is polymorphic, matching Claude Code's `skills` / `agents` /
+ * `commands` pattern:
+ *   - `undefined` ⇒ auto-discover from the convention directory.
+ *   - `string`    ⇒ scan the given relative directory.
+ *   - `string[]`  ⇒ scan/include each entry (directory or single file).
+ *   - `Entry[]`   ⇒ explicit list; no auto-discovery.
+ *
+ * See `docs/specs/2026-05-15-plugin-capability-autodiscovery-design.md`.
  */
 export interface ClawdevboxExtensions {
-  recipes?: PluginProvideEntry[];
-  tools?: ClawdevboxToolEntry[];
-  trigger_types?: PluginTriggerType[];
-  agent_clis?: PluginAgentCliEntry[];
+  recipes?: string | string[] | PluginProvideEntry[];
+  tools?: string | string[] | ClawdevboxToolEntry[];
+  trigger_types?: string | string[] | PluginTriggerType[];
+  agent_clis?: string | string[] | PluginAgentCliEntry[];
+  renderers?: string | string[] | PluginRendererEntry[];
 }
 
 /**
