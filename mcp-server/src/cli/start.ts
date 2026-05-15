@@ -613,10 +613,28 @@ export async function runStart(flags: Flags): Promise<void> {
   // handler internally; request dispatch is composed above).
   await startTerminalServer({ workspace: ws, sharedServer: httpServer });
 
-  await new Promise<void>((resolve, reject) => {
-    httpServer.once('error', reject);
-    httpServer.listen(cfg.http.port, cfg.http.host, () => resolve());
-  });
+  const listenResult = await listenOrConfirmExisting(
+    httpServer,
+    cfg.http.host,
+    cfg.http.port,
+    expectedToken,
+  );
+  if (listenResult === 'already-running') {
+    logger.info(
+      { port: cfg.http.port },
+      'clawdevbox HTTP service already running — exiting cleanly',
+    );
+    closeDatabase();
+    process.exit(0);
+  }
+  if (listenResult === 'conflict') {
+    logger.error(
+      { port: cfg.http.port },
+      `port ${cfg.http.port} is in use by something else — exiting`,
+    );
+    closeDatabase();
+    process.exit(1);
+  }
 
   const addr = httpServer.address();
   const boundPort =
@@ -1417,9 +1435,62 @@ function handleSse(req: IncomingMessage, res: ServerResponse): void {
   res.on('close', cleanup);
 }
 
-// ============================================================================
-// Service install path (`clawdevbox start --service`)
-// ============================================================================
+/**
+ * Wrap `server.listen(port, host)` so a second `clawdevbox start` against
+ * the same port either:
+ *   - returns `'already-running'`  if the existing listener responds to
+ *                                  `GET /api/cron/status` with the expected
+ *                                  token AND a body shaped like our own
+ *                                  status payload, OR
+ *   - returns `'conflict'`         if EADDRINUSE but the probe doesn't
+ *                                  confirm a clawdevbox instance.
+ * The plain success case returns `'listening'`.
+ *
+ * Exported so `tests/mcp-bootstrap.test.mjs` can exercise it without
+ * needing a full `runStart` boot.
+ */
+export async function listenOrConfirmExisting(
+  server: import('node:http').Server,
+  host: string,
+  port: number,
+  token: string,
+): Promise<'listening' | 'already-running' | 'conflict'> {
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const onError = (err: unknown) => reject(err);
+      server.once('error', onError);
+      server.listen(port, host, () => {
+        server.off('error', onError);
+        resolve();
+      });
+    });
+    return 'listening';
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== 'EADDRINUSE') throw err;
+    // Probe to see if it's our own service.
+    let probe: Response | null = null;
+    try {
+      probe = await fetch(`http://${host}:${port}/api/cron/status`, {
+        headers: { authorization: `Bearer ${token}` },
+        signal: AbortSignal.timeout(2000),
+      });
+    } catch {
+      return 'conflict';
+    }
+    if (!probe || !probe.ok) return 'conflict';
+    let body: unknown = null;
+    try {
+      body = await probe.json();
+    } catch {
+      return 'conflict';
+    }
+    const b = body as { db?: unknown; scheduler?: unknown; dispatcher?: unknown } | null;
+    if (b && b.db && b.scheduler && b.dispatcher) return 'already-running';
+    return 'conflict';
+  }
+}
+
 
 /**
  * Spawn the foreground `clawdevbox start` as a detached background process,

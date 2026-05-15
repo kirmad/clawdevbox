@@ -22,7 +22,7 @@
     "web:build": "npm --prefix web run build",
     "web:install": "npm --prefix web install",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test tests/smoke.test.mjs tests/hosted-tools.test.mjs tests/workspace.test.mjs tests/external-plugins.test.mjs tests/cfv-converter.test.mjs tests/service.test.mjs tests/inbox-persistence.test.mjs tests/validators.test.mjs tests/db-migrations.test.mjs tests/db-stores.test.mjs tests/scheduler.test.mjs tests/dispatcher.test.mjs tests/recipe-step-tools.test.mjs tests/cron-api.test.mjs tests/callback-api.test.mjs",
+    "test": "node --import tsx --test tests/smoke.test.mjs tests/hosted-tools.test.mjs tests/workspace.test.mjs tests/external-plugins.test.mjs tests/cfv-converter.test.mjs tests/service.test.mjs tests/inbox-persistence.test.mjs tests/validators.test.mjs tests/db-migrations.test.mjs tests/db-stores.test.mjs tests/scheduler.test.mjs tests/dispatcher.test.mjs tests/recipe-step-tools.test.mjs tests/cron-api.test.mjs tests/callback-api.test.mjs tests/mcp-bootstrap.test.mjs",
     "test:e2e": "playwright test"
   },
   "engines": {
