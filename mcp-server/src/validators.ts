@@ -26,6 +26,9 @@ export type ValidationResult =
 // ============================================================================
 
 const ID_PATTERN = /^[a-z][a-z0-9-]*$/;
+const STEP_ID_PATTERN = /^[a-z0-9][a-z0-9._-]*$/i;
+const STEP_PARAM_NAME_PATTERN = /^[a-z][a-z0-9_]*$/i;
+const STEP_PARAM_TYPES = new Set(['string', 'integer', 'number', 'boolean', 'array', 'object']);
 /**
  * Hostable-tool ids are namespaced: <plugin>.<verb>. Both halves use snake_case
  * (underscores allowed) — a deliberate divergence from the kebab-case ID_PATTERN
@@ -112,40 +115,187 @@ export function validateRecipeParsed(parsed: unknown): ValidationResult {
     if (!Array.isArray(r.steps)) {
       errors.push({ path: 'steps', code: 'TYPE', message: 'steps must be an array.' });
     } else {
-      const seenIds = new Set<number>();
-      const declaredIds = new Set<number>();
+      // First pass: resolve every step's id to a string (coercing integer ids)
+      // so we can build the declared-id set used by depends[] resolution.
+      const declaredIds = new Set<string>();
       r.steps.forEach((step) => {
-        if (isPlainObject(step) && typeof step.id === 'number') declaredIds.add(step.id);
+        if (!isPlainObject(step)) return;
+        if (typeof step.id === 'number' && Number.isInteger(step.id)) {
+          step.id = String(step.id);
+        }
+        if (typeof step.id === 'string') declaredIds.add(step.id);
       });
+
+      const seenIds = new Set<string>();
       r.steps.forEach((step, i) => {
         const pathPrefix = `steps[${i}]`;
         if (!isPlainObject(step)) {
           errors.push({ path: pathPrefix, code: 'TYPE', message: 'step must be an object.' });
           return;
         }
-        if (typeof step.id !== 'number' || !Number.isInteger(step.id)) {
-          errors.push({ path: `${pathPrefix}.id`, code: 'REQUIRED', message: 'step.id is required and must be an integer.' });
+        // id — accept string matching STEP_ID_PATTERN, OR an integer which
+        // was already coerced to its string form in the first pass.
+        if (typeof step.id !== 'string' || step.id.length === 0) {
+          errors.push({ path: `${pathPrefix}.id`, code: 'REQUIRED', message: 'step.id is required and must be a string or integer.' });
+        } else if (!STEP_ID_PATTERN.test(step.id)) {
+          errors.push({ path: `${pathPrefix}.id`, code: 'PATTERN', message: `step.id must match ${STEP_ID_PATTERN}.` });
+        } else if (seenIds.has(step.id)) {
+          errors.push({ path: `${pathPrefix}.id`, code: 'DUPLICATE', message: `step id ${JSON.stringify(step.id)} duplicated.` });
         } else {
-          if (seenIds.has(step.id)) {
-            errors.push({ path: `${pathPrefix}.id`, code: 'DUPLICATE', message: `step id ${step.id} duplicated.` });
-          } else {
-            seenIds.add(step.id);
+          seenIds.add(step.id);
+        }
+
+        // name — optional, but when present must be a non-empty string ≤ 200 chars.
+        if (step.name !== undefined) {
+          if (typeof step.name !== 'string') {
+            errors.push({ path: `${pathPrefix}.name`, code: 'TYPE', message: 'step.name must be a string.' });
+          } else if (step.name.length === 0) {
+            errors.push({ path: `${pathPrefix}.name`, code: 'INVALID_VALUE', message: 'step.name must not be empty.' });
+          } else if (step.name.length > 200) {
+            errors.push({ path: `${pathPrefix}.name`, code: 'INVALID_VALUE', message: 'step.name must be ≤ 200 characters.' });
           }
         }
+
         if (!isNonEmptyString(step.goal)) {
           errors.push({ path: `${pathPrefix}.goal`, code: 'REQUIRED', message: 'step.goal is required and must be a non-empty string.' });
         }
+
+        // depends — accept array of strings or integers (integers coerced in place).
         if (step.depends !== undefined) {
-          if (!Array.isArray(step.depends) || !step.depends.every((d) => Number.isInteger(d))) {
-            errors.push({ path: `${pathPrefix}.depends`, code: 'TYPE', message: 'step.depends must be an array of integers.' });
+          if (!Array.isArray(step.depends)) {
+            errors.push({ path: `${pathPrefix}.depends`, code: 'TYPE', message: 'step.depends must be an array of step ids.' });
           } else {
-            (step.depends as number[]).forEach((d, j) => {
-              if (!declaredIds.has(d)) {
+            const coerced: string[] = [];
+            let bad = false;
+            step.depends.forEach((d, j) => {
+              if (typeof d === 'number' && Number.isInteger(d)) {
+                coerced.push(String(d));
+              } else if (typeof d === 'string' && d.length > 0) {
+                coerced.push(d);
+              } else {
+                bad = true;
+                errors.push({ path: `${pathPrefix}.depends[${j}]`, code: 'TYPE', message: 'step.depends entries must be strings or integers.' });
+              }
+            });
+            if (!bad) {
+              step.depends = coerced;
+              coerced.forEach((d, j) => {
+                if (!declaredIds.has(d)) {
+                  errors.push({
+                    path: `${pathPrefix}.depends[${j}]`,
+                    code: 'UNRESOLVED_REF',
+                    message: `depends[] references step id ${JSON.stringify(d)}, which is not declared.`,
+                  });
+                }
+              });
+            }
+          }
+        }
+
+        // params — optional array of {name, type, required?, default?, description?}.
+        if (step.params !== undefined) {
+          if (!Array.isArray(step.params)) {
+            errors.push({ path: `${pathPrefix}.params`, code: 'TYPE', message: 'step.params must be an array.' });
+          } else {
+            step.params.forEach((p, j) => {
+              const pp = `${pathPrefix}.params[${j}]`;
+              if (!isPlainObject(p)) {
+                errors.push({ path: pp, code: 'TYPE', message: 'param must be an object.' });
+                return;
+              }
+              if (!isNonEmptyString(p.name)) {
+                errors.push({ path: `${pp}.name`, code: 'REQUIRED', message: 'param.name is required and must be a non-empty string.' });
+              } else if (!STEP_PARAM_NAME_PATTERN.test(p.name)) {
+                errors.push({ path: `${pp}.name`, code: 'PATTERN', message: `param.name must match ${STEP_PARAM_NAME_PATTERN}.` });
+              }
+              if (!isNonEmptyString(p.type) || !STEP_PARAM_TYPES.has(p.type)) {
                 errors.push({
-                  path: `${pathPrefix}.depends[${j}]`,
-                  code: 'UNRESOLVED_REF',
-                  message: `depends[] references step id ${d}, which is not declared.`,
+                  path: `${pp}.type`,
+                  code: 'INVALID_VALUE',
+                  message: `param.type must be one of: ${[...STEP_PARAM_TYPES].join(', ')}.`,
                 });
+              }
+              if (p.required !== undefined && typeof p.required !== 'boolean') {
+                errors.push({ path: `${pp}.required`, code: 'TYPE', message: 'param.required must be a boolean.' });
+              }
+              if (p.description !== undefined && typeof p.description !== 'string') {
+                errors.push({ path: `${pp}.description`, code: 'TYPE', message: 'param.description must be a string.' });
+              }
+            });
+          }
+        }
+
+        // triggers — optional array of trigger declarations.
+        if (step.triggers !== undefined) {
+          if (!Array.isArray(step.triggers)) {
+            errors.push({ path: `${pathPrefix}.triggers`, code: 'TYPE', message: 'step.triggers must be an array.' });
+          } else {
+            step.triggers.forEach((t, j) => {
+              const tp = `${pathPrefix}.triggers[${j}]`;
+              if (!isPlainObject(t)) {
+                errors.push({ path: tp, code: 'TYPE', message: 'trigger declaration must be an object.' });
+                return;
+              }
+              if (!isNonEmptyString(t.type)) {
+                errors.push({ path: `${tp}.type`, code: 'REQUIRED', message: 'trigger.type is required and must be a non-empty string.' });
+              }
+              if (t.params !== undefined && !isPlainObject(t.params)) {
+                errors.push({ path: `${tp}.params`, code: 'TYPE', message: 'trigger.params must be an object.' });
+              }
+              if (t.cron !== undefined && t.cron !== null && t.cron !== false && typeof t.cron !== 'string') {
+                errors.push({ path: `${tp}.cron`, code: 'TYPE', message: 'trigger.cron must be a string, null, or false.' });
+              }
+              if (t.binds_callback_to !== undefined && t.binds_callback_to !== 'agent_session_resume') {
+                errors.push({
+                  path: `${tp}.binds_callback_to`,
+                  code: 'INVALID_VALUE',
+                  message: `trigger.binds_callback_to must be 'agent_session_resume'.`,
+                });
+              }
+              if (t.binds_callback_to_recipe !== undefined && !isNonEmptyString(t.binds_callback_to_recipe)) {
+                errors.push({ path: `${tp}.binds_callback_to_recipe`, code: 'TYPE', message: 'trigger.binds_callback_to_recipe must be a non-empty string.' });
+              }
+              if (t.once !== undefined && typeof t.once !== 'boolean') {
+                errors.push({ path: `${tp}.once`, code: 'TYPE', message: 'trigger.once must be a boolean.' });
+              }
+              if (t.expires_at !== undefined && (typeof t.expires_at !== 'number' || !Number.isFinite(t.expires_at))) {
+                errors.push({ path: `${tp}.expires_at`, code: 'TYPE', message: 'trigger.expires_at must be a number.' });
+              }
+              if (t.max_attempts !== undefined) {
+                if (!Number.isInteger(t.max_attempts) || (t.max_attempts as number) < 1) {
+                  errors.push({ path: `${tp}.max_attempts`, code: 'INVALID_VALUE', message: 'trigger.max_attempts must be an integer ≥ 1.' });
+                }
+              }
+              if (t.backoff_ms !== undefined) {
+                if (!Array.isArray(t.backoff_ms) || !t.backoff_ms.every((x) => Number.isInteger(x))) {
+                  errors.push({ path: `${tp}.backoff_ms`, code: 'TYPE', message: 'trigger.backoff_ms must be an array of integers.' });
+                }
+              }
+            });
+          }
+        }
+
+        // artifacts — optional array of {id, type, title?}.
+        if (step.artifacts !== undefined) {
+          if (!Array.isArray(step.artifacts)) {
+            errors.push({ path: `${pathPrefix}.artifacts`, code: 'TYPE', message: 'step.artifacts must be an array.' });
+          } else {
+            step.artifacts.forEach((a, j) => {
+              const ap = `${pathPrefix}.artifacts[${j}]`;
+              if (!isPlainObject(a)) {
+                errors.push({ path: ap, code: 'TYPE', message: 'artifact declaration must be an object.' });
+                return;
+              }
+              if (!isNonEmptyString(a.id)) {
+                errors.push({ path: `${ap}.id`, code: 'REQUIRED', message: 'artifact.id is required and must be a non-empty string.' });
+              } else if (!STEP_ID_PATTERN.test(a.id)) {
+                errors.push({ path: `${ap}.id`, code: 'PATTERN', message: `artifact.id must match ${STEP_ID_PATTERN}.` });
+              }
+              if (!isNonEmptyString(a.type)) {
+                errors.push({ path: `${ap}.type`, code: 'REQUIRED', message: 'artifact.type is required and must be a non-empty string.' });
+              }
+              if (a.title !== undefined && typeof a.title !== 'string') {
+                errors.push({ path: `${ap}.title`, code: 'TYPE', message: 'artifact.title must be a string.' });
               }
             });
           }
