@@ -31,4 +31,4 @@ export type {
   PluginCliBinding,
 } from './types.ts';
 
-export { cliPluginSync, parsePluginListOutput, parseMarketplaceListOutput, stripAnsi } from './shared.ts';
+export { cliPluginSync, cliPluginDiscover, parsePluginListOutput, parseMarketplaceListOutput, stripAnsi } from './shared.ts';

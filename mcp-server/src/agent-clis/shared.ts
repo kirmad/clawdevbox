@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
-import { dirname, resolve, relative } from 'node:path';
-import { mkdirSync } from 'node:fs';
+import { dirname, resolve, relative, join } from 'node:path';
+import { existsSync, mkdirSync } from 'node:fs';
 import * as pty from 'node-pty';
 import { writeFileAtomic } from '../fs-util.ts';
 import type { Workspace } from '../workspace.ts';
@@ -8,6 +8,7 @@ import type { ResolvedConfig } from '../config.ts';
 import { logger } from '../logger.ts';
 import type {
   DetectResult,
+  DiscoveredPlugin,
   MarketplaceRecord,
   PluginCliBinding,
   ProviderCtx,
@@ -354,6 +355,45 @@ export async function cliPluginSync(
   }
 
   return report;
+}
+
+export async function cliPluginDiscover(
+  _ctx: ProviderCtx,
+  binding: PluginCliBinding,
+): Promise<DiscoveredPlugin[]> {
+  const pList = await runCli(binding, ['plugin', 'list']);
+  if (pList.code !== 0) {
+    logger.warn(
+      { binary: binding.binary, code: pList.code, stderr: pList.stderr.slice(0, 200) },
+      'cliPluginDiscover: plugin list failed',
+    );
+    return [];
+  }
+  const rows = parsePluginListOutput(pList.stdout);
+  const out: DiscoveredPlugin[] = [];
+  for (const row of rows) {
+    const candidates = [
+      join(binding.pluginCacheDir, `${row.name}-${row.marketplace}`),
+      join(binding.pluginCacheDir, row.name),
+      // Claude's user-scope layout nests under `cache/<marketplace>/<name>`.
+      join(binding.pluginCacheDir, row.marketplace, row.name),
+    ];
+    const dir = candidates.find((p) => existsSync(p));
+    if (!dir) {
+      logger.warn(
+        { name: row.name, marketplace: row.marketplace, tried: candidates },
+        'cliPluginDiscover: could not locate plugin on disk',
+      );
+      continue;
+    }
+    out.push({
+      name: row.name,
+      absoluteDir: dir,
+      source: 'cli-marketplace',
+      marketplaceId: row.marketplace,
+    });
+  }
+  return out;
 }
 
 // Re-export so tests + callers can import marketplace record type from here.
