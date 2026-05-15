@@ -6,7 +6,15 @@ import { writeFileAtomic } from '../fs-util.ts';
 import type { Workspace } from '../workspace.ts';
 import type { ResolvedConfig } from '../config.ts';
 import { logger } from '../logger.ts';
-import type { DetectResult, ProviderCtx, PtySpawnOpts } from './types.ts';
+import type {
+  DetectResult,
+  MarketplaceRecord,
+  PluginCliBinding,
+  ProviderCtx,
+  PtySpawnOpts,
+  SyncPluginInventoryOpts,
+  SyncReport,
+} from './types.ts';
 
 /** Spawn the binary with `args` and capture exit. Used by provider.detect(). */
 export async function probeBinary(
@@ -96,3 +104,257 @@ export function buildProviderCtx(ws: Workspace, cfg: ResolvedConfig): ProviderCt
 export function reasonOf(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
+
+// ============================================================================
+// Bidirectional plugin sync helpers (spec §4)
+// ============================================================================
+
+const ANSI_RE = /\x1b\[[0-9;]*m/g;
+const PLUGIN_LINE_RE = /^\s*[•·◆*-]\s+([a-z0-9._-]+)@([a-z0-9._-]+)\s+\(v([^)]+)\)/i;
+const MARKETPLACE_LINE_RE = /^\s*[•·◆*-]\s+([a-z0-9._-]+)\b/i;
+
+export function stripAnsi(s: string): string {
+  return s.replace(ANSI_RE, '');
+}
+
+export function parsePluginListOutput(
+  stdout: string,
+): Array<{ name: string; marketplace: string; version: string }> {
+  const out: Array<{ name: string; marketplace: string; version: string }> = [];
+  for (const rawLine of stripAnsi(stdout).split(/\r?\n/)) {
+    const m = PLUGIN_LINE_RE.exec(rawLine);
+    if (m) out.push({ name: m[1]!, marketplace: m[2]!, version: m[3]! });
+  }
+  return out;
+}
+
+export function parseMarketplaceListOutput(stdout: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const rawLine of stripAnsi(stdout).split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    // Skip headers / footers ('Registered marketplaces:', 'Included with ...')
+    if (/^[A-Z][A-Za-z ]+:\s*$/.test(line)) continue;
+    const m = MARKETPLACE_LINE_RE.exec(rawLine);
+    if (m && !seen.has(m[1]!)) {
+      seen.add(m[1]!);
+      out.push(m[1]!);
+    }
+  }
+  return out;
+}
+
+interface RunCliResult {
+  stdout: string;
+  stderr: string;
+  code: number;
+}
+
+async function runCli(
+  binding: PluginCliBinding,
+  args: string[],
+  opts: { timeoutMs?: number; env?: Record<string, string> } = {},
+): Promise<RunCliResult> {
+  const fullArgs = [
+    ...(binding.argsPrefix ?? []),
+    ...(binding.subcommandPrefix ?? []),
+    ...args,
+  ];
+  return new Promise((resolveRun) => {
+    let stdout = '';
+    let stderr = '';
+    let proc;
+    try {
+      proc = spawn(binding.binary, fullArgs, {
+        windowsHide: true,
+        shell: false,
+        env: { ...process.env, ...(opts.env ?? {}) },
+      });
+    } catch (err) {
+      resolveRun({ stdout: '', stderr: err instanceof Error ? err.message : String(err), code: -1 });
+      return;
+    }
+    const timer = setTimeout(() => {
+      try {
+        proc.kill('SIGKILL');
+      } catch {
+        /* ignore */
+      }
+    }, opts.timeoutMs ?? 30_000);
+    proc.stdout?.on('data', (b: Buffer) => {
+      stdout += b.toString('utf8');
+    });
+    proc.stderr?.on('data', (b: Buffer) => {
+      stderr += b.toString('utf8');
+    });
+    proc.on('error', (err) => {
+      clearTimeout(timer);
+      resolveRun({ stdout, stderr: stderr + (err.message ?? ''), code: -1 });
+    });
+    proc.on('exit', (code) => {
+      clearTimeout(timer);
+      resolveRun({ stdout, stderr, code: code ?? 0 });
+    });
+  });
+}
+
+/**
+ * Decide what source string to pass to `<binary> plugin install` for a given
+ * clawdevbox-installed plugin. Prefers `<name>@<marketplace>` when the plugin's
+ * `clawdevbox-plugin` marketplace ref matches one of the known marketplaces;
+ * otherwise falls back to the plugin's `homepage` / `repository` git URL or
+ * the bare plugin name.
+ */
+function resolveInstallSource(
+  plugin: {
+    id: string;
+    manifest: { name: string; homepage?: unknown; repository?: unknown };
+  },
+  marketplaceIds: Set<string>,
+): { source: string; isMarketplaceRef: boolean; marketplaceId: string | null } {
+  // Prefer `<name>@<marketplace>` form when at least one marketplace is known
+  // (most clawdevbox plugins are installed via `marketplace add` -> `plugin
+  // install`). When multiple are known, pick the first deterministically.
+  const sorted = [...marketplaceIds].sort();
+  if (sorted.length > 0) {
+    const mid = sorted[0]!;
+    return { source: `${plugin.manifest.name}@${mid}`, isMarketplaceRef: true, marketplaceId: mid };
+  }
+  const repo = (plugin.manifest as { repository?: { url?: string } | string }).repository;
+  if (typeof repo === 'string' && repo) return { source: repo, isMarketplaceRef: false, marketplaceId: null };
+  if (repo && typeof repo === 'object' && typeof repo.url === 'string' && repo.url) {
+    return { source: repo.url, isMarketplaceRef: false, marketplaceId: null };
+  }
+  const home = (plugin.manifest as { homepage?: string }).homepage;
+  if (typeof home === 'string' && home) return { source: home, isMarketplaceRef: false, marketplaceId: null };
+  return { source: plugin.manifest.name, isMarketplaceRef: false, marketplaceId: null };
+}
+
+export async function cliPluginSync(
+  _ctx: ProviderCtx,
+  opts: SyncPluginInventoryOpts,
+  binding: PluginCliBinding,
+): Promise<SyncReport> {
+  const report: SyncReport = {
+    marketplacesAdded: [],
+    marketplacesPresent: [],
+    pluginsInstalled: [],
+    pluginsPresent: [],
+    pluginsUninstalled: [],
+    failed: [],
+    method: 'cli-command',
+  };
+
+  // -- marketplace step ----------------------------------------------------
+  const mpList = await runCli(binding, ['plugin', 'marketplace', 'list']);
+  const knownMarketplaces = new Set<string>();
+  if (mpList.code === 0) {
+    for (const id of parseMarketplaceListOutput(mpList.stdout)) knownMarketplaces.add(id);
+  } else {
+    logger.warn(
+      { binary: binding.binary, code: mpList.code, stderr: mpList.stderr.slice(0, 200) },
+      'cliPluginSync: marketplace list failed; assuming empty',
+    );
+  }
+
+  for (const m of opts.marketplaces) {
+    if (knownMarketplaces.has(m.id)) {
+      report.marketplacesPresent.push(m.id);
+      continue;
+    }
+    if (opts.dryRun) {
+      report.marketplacesAdded.push(m.id);
+      continue;
+    }
+    const res = await runCli(binding, ['plugin', 'marketplace', 'add', m.source]);
+    if (res.code === 0) {
+      report.marketplacesAdded.push(m.id);
+      knownMarketplaces.add(m.id);
+    } else {
+      report.failed.push({
+        kind: 'marketplace',
+        id: m.id,
+        error: (res.stderr || res.stdout || `exit ${res.code}`).trim().slice(0, 500),
+      });
+    }
+  }
+
+  // -- plugin install step -------------------------------------------------
+  const pList = await runCli(binding, ['plugin', 'list']);
+  const installed = new Set<string>();
+  let installedRows: Array<{ name: string; marketplace: string }> = [];
+  if (pList.code === 0) {
+    installedRows = parsePluginListOutput(pList.stdout).map((r) => ({
+      name: r.name,
+      marketplace: r.marketplace,
+    }));
+    for (const r of installedRows) installed.add(`${r.name}@${r.marketplace}`);
+  } else {
+    logger.warn(
+      { binary: binding.binary, code: pList.code, stderr: pList.stderr.slice(0, 200) },
+      'cliPluginSync: plugin list failed; assuming empty',
+    );
+  }
+
+  const clawdevboxNames = new Set<string>();
+  for (const p of opts.plugins) {
+    clawdevboxNames.add(p.manifest.name);
+    const { source, isMarketplaceRef, marketplaceId } = resolveInstallSource(p, knownMarketplaces);
+    const key = isMarketplaceRef && marketplaceId
+      ? `${p.manifest.name}@${marketplaceId}`
+      : p.manifest.name;
+    const installedKey = isMarketplaceRef && marketplaceId
+      ? `${p.manifest.name}@${marketplaceId}`
+      : Array.from(installed).find((s) => s.startsWith(`${p.manifest.name}@`)) ?? '';
+    if (installed.has(installedKey)) {
+      report.pluginsPresent.push(key);
+      continue;
+    }
+    if (opts.dryRun) {
+      report.pluginsInstalled.push(source);
+      continue;
+    }
+    const res = await runCli(binding, ['plugin', 'install', source]);
+    if (res.code === 0) {
+      report.pluginsInstalled.push(source);
+    } else {
+      report.failed.push({
+        kind: 'plugin',
+        id: source,
+        error: (res.stderr || res.stdout || `exit ${res.code}`).trim().slice(0, 500),
+      });
+    }
+  }
+
+  // -- bidirectional uninstall step ---------------------------------------
+  const bidiUninstall = opts.bidirectionalUninstall !== false;
+  if (bidiUninstall) {
+    for (const row of installedRows) {
+      // Only auto-uninstall plugins that came from a clawdevbox-known
+      // marketplace AND whose name no longer appears in clawdevbox.
+      if (!knownMarketplaces.has(row.marketplace)) continue;
+      if (clawdevboxNames.has(row.name)) continue;
+      const id = `${row.name}@${row.marketplace}`;
+      if (opts.dryRun) {
+        report.pluginsUninstalled.push(id);
+        continue;
+      }
+      const res = await runCli(binding, ['plugin', 'uninstall', id]);
+      if (res.code === 0) {
+        report.pluginsUninstalled.push(id);
+      } else {
+        report.failed.push({
+          kind: 'plugin',
+          id,
+          error: (res.stderr || res.stdout || `exit ${res.code}`).trim().slice(0, 500),
+        });
+      }
+    }
+  }
+
+  return report;
+}
+
+// Re-export so tests + callers can import marketplace record type from here.
+export type { MarketplaceRecord };
