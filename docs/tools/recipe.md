@@ -10,21 +10,41 @@ the run as a `RecipeInstance` JSON row. The spawned agent calls `recipe.done`
 to mark itself complete; viewers attach to the pty through the terminal-server
 HTTP/WS surface.
 
-All ten tools are registered in `mcp-server/src/tools/recipe.ts` via
-`server.registerTool` (lines 68, 121, 151, 193, 216, 603, 679, 747, 799, 866):
+All twelve tools are registered in `mcp-server/src/tools/recipe.ts` via
+`server.registerTool`:
 
-| Tool                   | Purpose                                                                  |
-|------------------------|--------------------------------------------------------------------------|
-| `recipe.list`          | Enumerate recipes across scopes.                                         |
-| `recipe.read`          | Read one recipe by id, with project → plugin → global precedence.        |
-| `recipe.upsert`        | Write/replace a recipe in project or global scope (plugin scope is RO).  |
-| `recipe.delete`        | Remove a recipe from project or global scope.                            |
-| `recipe.run`           | Mint an instance, write `.mcp.json`, spawn an agent CLI inside a pty.    |
-| `recipe.done`          | Called *from inside* the spawn to mark the instance success/failure.     |
-| `recipe.instance_info` | Read an instance row by id, or via env vars from inside a spawn.         |
-| `recipe.view_url`      | Get a browser URL that attaches xterm.js to the live pty.                |
-| `recipe.kill`          | Terminate the pty and mark the instance cancelled.                       |
-| `recipe.list_running`  | List every pty currently registered with this MCP server.                |
+| Tool                          | Purpose                                                                  |
+|-------------------------------|--------------------------------------------------------------------------|
+| `recipe.list`                 | Enumerate recipes across scopes.                                         |
+| `recipe.read`                 | Read one recipe by id, with project → plugin → global precedence.        |
+| `recipe.upsert`               | Write/replace a recipe in project or global scope (YAML or JSON).        |
+| `recipe.delete`               | Remove a recipe from project or global scope.                            |
+| `recipe.run`                  | Mint an instance, write `.mcp.json`, spawn an agent CLI inside a pty.    |
+| `recipe.done`                 | Called *from inside* the spawn to mark the instance success/failure.     |
+| `recipe.instance_info`        | Read an instance row by id, or via env vars from inside a spawn.         |
+| `recipe.view_url`             | Get a browser URL that attaches xterm.js to the live pty.                |
+| `recipe.kill`                 | Terminate the pty and mark the instance cancelled.                       |
+| `recipe.list_running`         | List every pty currently registered with this MCP server.                |
+| `recipe.update_steps`         | Mutate the materialized step plan of a running instance (spec §10.5).    |
+| `recipe.steps.update_status`  | Transition one step through the monotonic status machine (spec §10.5).   |
+
+### Ambient environment variables
+
+When `recipe.run` spawns an agent CLI, the child process inherits a small
+ambient bag of identifiers in its environment. The new step tools
+(`recipe.update_steps`, `recipe.steps.update_status`) and `recipe.done`
+read these as defaults so the spawned agent can omit them as arguments:
+
+| Variable | Source | Tools that default from it |
+|---|---|---|
+| `CLAWDEVBOX_WORKSPACE_ID` | id of the workspace the recipe is running in | scope helpers; trigger registration |
+| `CLAWDEVBOX_RECIPE_INSTANCE_ID` | the spawned `RecipeInstance.id` | `recipe.update_steps`, `recipe.steps.update_status`, `recipe.done`, `recipe.instance_info` |
+| `CLAWDEVBOX_AGENT_SESSION_ID` | the agent CLI session id (`cdb_<base36>`) | step-event audit `agent_session_id` column |
+| `CLAWDEVBOX_RECIPE_STEP_ID` | the current `recipe_steps.id` when one is in flight | step-bound helpers; lets the agent omit `step_id` when only one step is active (subject to per-tool support) |
+
+If the env var is absent **and** the tool argument is also absent, the
+tool returns `RECIPE_INSTANCE_NOT_FOUND` (or analogous) so the failure mode
+is explicit rather than silent.
 
 ## Filesystem layout
 
@@ -183,12 +203,13 @@ the design rule is "copy to `project` to customize a plugin-shipped recipe"
 |----------|--------------------------------------------|----------|--------------------------------------------------------|
 | `id`     | string                                     | yes      | Must match `[a-z][a-z0-9-]*` and equal `body.id`.      |
 | `scope`  | `'project' \| 'global' \| 'plugin:<id>'`   | yes      | `plugin:<id>` returns `PLUGIN_SCOPE_READONLY`.         |
-| `source` | string                                     | yes      | Full YAML body.                                        |
+| `source` | string                                     | yes      | Full recipe body. Either YAML or JSON depending on `format`. |
+| `format` | `'yaml' \| 'json'`                         | no       | On-disk encoding. Default `'yaml'` → `<id>.yaml`; `'json'` → `<id>.json`. The sibling file in the other extension is atomically removed so a single recipe id always maps to exactly one file. |
 
 **Returns** `structuredContent`:
 
 ```ts
-{ id: string; scope: 'project' | 'global'; path: string; }
+{ id: string; scope: 'project' | 'global'; path: string; format: 'yaml' | 'json'; }
 ```
 
 **Errors:** `INVALID_ID`, `PLUGIN_SCOPE_READONLY`, `INVALID_SCOPE`,
@@ -448,6 +469,236 @@ returns `{ instanceId, workspaceId, exited }` per live entry, and joins each
 to a `view_url` if the terminal-server is running. Sessions linger in the
 registry for `EXIT_RETAIN_MS = 10_000` after exit so late-attaching viewers
 still see the final scrollback; those will show up here with `exited: true`.
+
+### `recipe.update_steps`
+
+Mutate the materialized step plan of a running recipe instance (spec §10.5).
+The three sub-operations run inside a **single DB transaction** — any
+failure rolls all of them back. `add` / `remove` / `update_meta` may be
+combined in one call; removals are applied first so a subsequent add can
+re-use a freed `step_id`.
+
+**Inputs:**
+
+| Name | Type | Required | Description |
+|---|---|---|---|
+| `recipe_instance_id` | string | no | Defaults to `$CLAWDEVBOX_RECIPE_INSTANCE_ID` when omitted. |
+| `add` | `Step[]` | no | New steps to materialize. See [Canonical Step schema](#canonical-step-schema). |
+| `remove` | `string[]` | no | `step_id`s to delete. Only `pending`, `done`, `failed`, or `skipped` steps may be removed; `running` and `awaiting_user` are rejected with `CANNOT_REMOVE_RUNNING_STEP`. |
+| `update_meta` | `Array<Partial<Step> & { id: string }>` | no | Patch existing steps' meta (goal, depends, params, triggers, artifacts). Status fields are **not** patchable here — use `recipe.steps.update_status`. |
+
+**Returns** `structuredContent`:
+
+```ts
+{
+  recipe_instance_id: string;
+  added:   Array<{ id: string; step_id: string }>;
+  removed: string[];
+  updated: Array<{ id: string; step_id: string }>;
+  trigger_changes: Array<{
+    step_id: string;
+    added_triggers:   TriggerDecl[];
+    removed_triggers: TriggerDecl[];
+    registered_trigger_ids: string[];   // populated only when the step is already running
+    disabled_trigger_ids: string[];     // populated when an auto-declared trigger was removed
+  }>;
+}
+```
+
+**Trigger-registration side effects.** If `update_meta` adds triggers to a
+step that is already `running` or `awaiting_user`, the new declarations are
+materialized as auto-declared rows in the `triggers` table immediately
+(`auto_declared = 1`, `auto_registered_by_step_id` = the step's row id).
+Pending steps register their declarations later, when they transition to
+`running` (see `recipe.steps.update_status`). Removed declarations
+auto-disable the matching `triggers` rows that were registered by this
+step.
+
+A `step_added`, `step_removed`, `step_meta_updated`, `trigger_registered`,
+or `trigger_unregistered` row is appended to `step_events` for each
+mutation so the SPA timeline has a complete causal log.
+
+**Errors:**
+
+| Code | Trigger |
+|---|---|
+| `RECIPE_INSTANCE_NOT_FOUND` | No matching `recipe_instances` row, or neither arg nor env var was supplied. |
+| `STEP_NOT_FOUND` | A `remove[]` or `update_meta[].id` entry doesn't match any step in the instance. |
+| `CANNOT_REMOVE_RUNNING_STEP` | A `remove[]` entry targets a step in status `running` or `awaiting_user`. |
+| `INVALID_STEP_SCHEMA` | A step in `add[]` / `update_meta[]` failed shape validation. |
+| `INVALID_DEPENDENCY` | A step's `depends[]` references an unknown step id, or `update_meta` introduces an unknown dep. |
+| `CIRCULAR_DEPENDENCY` | The post-mutation dependency graph would contain a cycle. The whole transaction is rolled back. |
+
+Emits `emitChange('recipes')` on success.
+
+### `recipe.steps.update_status`
+
+Transition a single step through the monotonic status machine and record
+side effects (entry/exit hooks, attachments, audit events). The full
+transition matrix is:
+
+```
+pending → running | skipped
+running → done | failed | skipped | awaiting_user
+awaiting_user → running | done | failed | skipped
+done | failed | skipped: terminal (no further transitions)
+```
+
+Any transition that violates this matrix returns `INVALID_TRANSITION`.
+
+**Inputs:**
+
+| Name | Type | Required | Description |
+|---|---|---|---|
+| `recipe_instance_id` | string | no | Defaults to `$CLAWDEVBOX_RECIPE_INSTANCE_ID`. |
+| `step_id` | string | **yes** | Step's logical id (matches `Step.id`). |
+| `status` | `'running' \| 'done' \| 'failed' \| 'skipped' \| 'awaiting_user'` | no | New status. Omit to update state/attachments only. |
+| `message` | string | no | Free-form human note for the step row. |
+| `state` | `Record<string, unknown>` | no | Shallow-merged into the step's `state_json`. |
+| `state_replace` | `Record<string, unknown>` | no | **Replaces** `state_json` entirely. Mutually exclusive with `state`. |
+| `result` | string | no | Set on terminal transitions (`done` / `failed` / `skipped`). |
+| `error` | string | no | Typically paired with `status: 'failed'`. |
+| `attach_artifact_ids` | `string[]` | no | Append to the step's artifact attachment list (idempotent). |
+| `attach_inbox_item_ids` | `string[]` | no | Append to the step's inbox attachment list (idempotent). |
+| `request_user_input` | `{ message: string; options?: string[]; inbox_item?: { title?: string; labels?: string[] } }` | no | Shortcut that atomically (a) transitions the step to `awaiting_user`, (b) sets `awaiting_user_message`, and (c) creates a linked inbox item. Mutually exclusive with `status`. |
+
+**Entry hook (transition into `running`):** the step's declared
+`triggers[]` are materialized as `auto_declared = 1` rows in the
+`triggers` table. The dispatcher will pick them up on the next scheduler
+wake.
+
+**Exit hook (transition into `done` / `failed` / `skipped`):** every
+trigger with `auto_registered_by_step_id` = this step is flipped to
+`enabled = 0`. The dispatcher's overlap-skip logic and the kernel's TTL
+sweep treat disabled rows as inert. If *all* sibling steps of the
+instance are now terminal, the parent `recipe_instances.status` cascades
+to `done` (any-failed → `failed`).
+
+**Returns** `structuredContent`:
+
+```ts
+{
+  recipe_instance_id: string;
+  step: {
+    id: string;
+    step_id: string;
+    status: RecipeStepStatus;
+    started_at: number | null;
+    completed_at: number | null;
+    message: string | null;
+    awaiting_user_message: string | null;
+    state: Record<string, unknown>;
+  };
+  registered_trigger_ids: string[];     // auto-declared triggers materialized by an entry hook
+  disabled_trigger_ids:   string[];     // triggers disabled by an exit hook
+  attached_artifact_ids:  string[];
+  attached_inbox_item_ids: string[];
+  created_inbox_item_id:  string | null;  // populated when request_user_input fires
+  recipe_instance_status: 'running' | 'done' | 'failed' | string;
+  trigger_registration_errors: Array<{ trigger_type: string; reason: string }>;
+}
+```
+
+**Errors:**
+
+| Code | Trigger |
+|---|---|
+| `RECIPE_INSTANCE_NOT_FOUND` | No matching `recipe_instances` row. |
+| `STEP_NOT_FOUND` | Step with that `step_id` doesn't exist in this instance. |
+| `INVALID_TRANSITION` | The requested transition violates the monotonic matrix. The error detail includes `from` and `to`. |
+| `CONFLICTING_ARGS` | `state` and `state_replace` were both supplied, or `request_user_input` was combined with an explicit `status`. |
+| `INTERNAL_ERROR` | Unexpected exception inside the transaction. The transition does **not** apply — the DB transaction is rolled back. |
+
+Emits `emitChange('recipes')` on success; additionally emits
+`emitChange('inbox')` when `created_inbox_item_id` is non-null.
+
+## Recipe file formats
+
+Both YAML and JSON are first-class on-disk encodings. `js-yaml` parses
+both transparently — JSON is a strict subset of YAML — so the reader
+(`recipe.read`, `recipe.list`, the scope walker) never branches on
+extension. Only `recipe.upsert` needs to pick a writer; it honors the
+`format` arg (default `'yaml'`).
+
+The directory scanner accepts `<id>.yaml`, `<id>.yml`, and `<id>.json`.
+`recipe.upsert` removes the sibling files in the other extension after a
+successful write so a recipe id maps to exactly one file. This avoids the
+"is `foo.yaml` or `foo.json` canonical?" ambiguity.
+
+Plugins may ship either format (`provides.recipes[].file` in
+`plugin.yaml`); the scope chain resolves through the manifest, so the
+file extension is opaque to the resolver.
+
+## Canonical Step schema
+
+`Step` is the shape consumed by `recipe.update_steps` (`add[]` and
+`update_meta[]`) and emitted by `materializeSteps` when `recipe.run`
+inflates a recipe's `steps[]` block into rows. The TypeScript declaration
+lives in `db/recipe-steps-store.ts`.
+
+```ts
+interface Step {
+  id: string;              // logical step id, unique within the instance
+  name?: string;           // short human label
+  goal: string;            // required prose goal
+  depends?: string[];      // other Step.ids that must complete first
+  params?: StepParamDecl[];        // declared params (validated when step starts)
+  triggers?: TriggerDecl[];        // auto-declared on entry, disabled on exit
+  artifacts?: ArtifactDecl[];      // expected outputs
+}
+
+interface StepParamDecl {
+  name: string;
+  type: string;            // primitive type name; matches validators.ts
+  required?: boolean;
+  default?: unknown;
+  description?: string;
+}
+
+interface TriggerDecl {
+  type: string;            // registered trigger TYPE id
+  params?: Record<string, unknown>;
+  cron?: string | null | false;   // three-state, same as trigger.register
+  binds_callback_to?: string;             // e.g. 'thread_resume'
+  binds_callback_to_recipe?: string;      // recipe id to invoke on fire
+  once?: boolean;
+  expires_at?: number;
+  max_attempts?: number;          // per-trigger override; default 3
+  backoff_ms?: number[];          // per-trigger override; default [30000, 120000, 600000]
+}
+
+interface ArtifactDecl {
+  id: string;
+  type: string;
+  title?: string;
+}
+```
+
+**Example.** A step that watches a PR and posts back a review:
+
+```yaml
+- id: collect-pr-events
+  name: Watch the target PR for new comments
+  goal: |
+    Subscribe to GitHub PR comment + review events so the next step
+    has a complete event stream to summarise.
+  depends: [open-pr]
+  params:
+    - name: pr_number
+      type: integer
+      required: true
+  triggers:
+    - type: github.pr_comment
+      params: { repo: '$repo', pr_number: '$pr_number' }
+      cron: false
+      binds_callback_to_recipe: handle-new-pr-comment
+      max_attempts: 5
+      backoff_ms: [10000, 60000, 300000, 600000, 1800000]
+  artifacts:
+    - id: pr-summary
+      type: pr-review-summary
+      title: 'PR review summary'
+```
 
 ## Story: from `recipe.upsert` to `recipe.done`
 

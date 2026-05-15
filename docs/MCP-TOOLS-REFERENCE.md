@@ -8,9 +8,11 @@
 
 Clawdevbox is a developer-buddy runtime that the [Model Context Protocol
 (MCP)](https://modelcontextprotocol.io) exposes to coding agents through a
-single Node.js server (`mcp-server/`). This document covers all **12 tool
-families** that ship today — 63 tools in total — and the storage, scope, and
-event-bus model that holds them together. The rough mental model is:
+single Node.js server (`mcp-server/`). This document covers all **12 MCP
+tool families** that ship today — 65 tools in total — plus the **Cron
+HTTP control plane** that drives the trigger kernel, and the storage,
+scope, and event-bus model that holds them together. The rough mental
+model is:
 
 - A **workspace** is a directory with a `.clawdevbox/` subtree. Workspaces hold
   project-scope recipes, skills, registered triggers, recipe-instances, and
@@ -36,9 +38,10 @@ issues and inconsistencies uncovered while composing this reference.
 - [Configuration & paths](#configuration--paths)
 - [Workspace](#workspace) — `workspace.*` (4 tools)
 - [Plugin](#plugin) — `plugin.*` (7 tools)
-- [Recipe](#recipe) — `recipe.*` (10 tools)
+- [Recipe](#recipe) — `recipe.*` (12 tools)
 - [Skill](#skill) — `skill.*` (4 tools)
 - [Trigger](#trigger) — `trigger.*` (13 tools)
+- [Cron](#cron) — HTTP only
 - [Artifact](#artifact) — `artifact.*` (4 tools)
 - [Renderer](#renderer) — `renderer.*` (4 tools)
 - [Inbox](#inbox) — `inbox.*` (6 tools)
@@ -1115,7 +1118,7 @@ reload immediately; only out-of-process consumers need to restart).
 
 ## Recipe
 
-_10 tools — CRUD for recipe YAML, plus spawning agent CLIs inside hidden ptys._
+_12 tools — CRUD for recipe YAML/JSON, plus spawning agent CLIs and mutating live step plans._
 
 Recipes are short YAML documents (`id`, `name`, `description`, optional `steps[]`,
 `mcp_servers[]`, `kind`, `default_client`, `timeout_minutes`) that describe a unit
@@ -1127,21 +1130,41 @@ the run as a `RecipeInstance` JSON row. The spawned agent calls `recipe.done`
 to mark itself complete; viewers attach to the pty through the terminal-server
 HTTP/WS surface.
 
-All ten tools are registered in `mcp-server/src/tools/recipe.ts` via
-`server.registerTool` (lines 68, 121, 151, 193, 216, 603, 679, 747, 799, 866):
+All twelve tools are registered in `mcp-server/src/tools/recipe.ts` via
+`server.registerTool`:
 
-| Tool                   | Purpose                                                                  |
-|------------------------|--------------------------------------------------------------------------|
-| `recipe.list`          | Enumerate recipes across scopes.                                         |
-| `recipe.read`          | Read one recipe by id, with project → plugin → global precedence.        |
-| `recipe.upsert`        | Write/replace a recipe in project or global scope (plugin scope is RO).  |
-| `recipe.delete`        | Remove a recipe from project or global scope.                            |
-| `recipe.run`           | Mint an instance, write `.mcp.json`, spawn an agent CLI inside a pty.    |
-| `recipe.done`          | Called *from inside* the spawn to mark the instance success/failure.     |
-| `recipe.instance_info` | Read an instance row by id, or via env vars from inside a spawn.         |
-| `recipe.view_url`      | Get a browser URL that attaches xterm.js to the live pty.                |
-| `recipe.kill`          | Terminate the pty and mark the instance cancelled.                       |
-| `recipe.list_running`  | List every pty currently registered with this MCP server.                |
+| Tool                          | Purpose                                                                  |
+|-------------------------------|--------------------------------------------------------------------------|
+| `recipe.list`                 | Enumerate recipes across scopes.                                         |
+| `recipe.read`                 | Read one recipe by id, with project → plugin → global precedence.        |
+| `recipe.upsert`               | Write/replace a recipe in project or global scope (YAML or JSON).        |
+| `recipe.delete`               | Remove a recipe from project or global scope.                            |
+| `recipe.run`                  | Mint an instance, write `.mcp.json`, spawn an agent CLI inside a pty.    |
+| `recipe.done`                 | Called *from inside* the spawn to mark the instance success/failure.     |
+| `recipe.instance_info`        | Read an instance row by id, or via env vars from inside a spawn.         |
+| `recipe.view_url`             | Get a browser URL that attaches xterm.js to the live pty.                |
+| `recipe.kill`                 | Terminate the pty and mark the instance cancelled.                       |
+| `recipe.list_running`         | List every pty currently registered with this MCP server.                |
+| `recipe.update_steps`         | Mutate the materialized step plan of a running instance (spec §10.5).    |
+| `recipe.steps.update_status`  | Transition one step through the monotonic status machine (spec §10.5).   |
+
+#### Ambient environment variables
+
+When `recipe.run` spawns an agent CLI, the child process inherits a small
+ambient bag of identifiers in its environment. The new step tools
+(`recipe.update_steps`, `recipe.steps.update_status`) and `recipe.done`
+read these as defaults so the spawned agent can omit them as arguments:
+
+| Variable | Source | Tools that default from it |
+|---|---|---|
+| `CLAWDEVBOX_WORKSPACE_ID` | id of the workspace the recipe is running in | scope helpers; trigger registration |
+| `CLAWDEVBOX_RECIPE_INSTANCE_ID` | the spawned `RecipeInstance.id` | `recipe.update_steps`, `recipe.steps.update_status`, `recipe.done`, `recipe.instance_info` |
+| `CLAWDEVBOX_AGENT_SESSION_ID` | the agent CLI session id (`cdb_<base36>`) | step-event audit `agent_session_id` column |
+| `CLAWDEVBOX_RECIPE_STEP_ID` | the current `recipe_steps.id` when one is in flight | step-bound helpers; lets the agent omit `step_id` when only one step is active (subject to per-tool support) |
+
+If the env var is absent **and** the tool argument is also absent, the
+tool returns `RECIPE_INSTANCE_NOT_FOUND` (or analogous) so the failure mode
+is explicit rather than silent.
 
 ### Filesystem layout
 
@@ -1300,12 +1323,13 @@ the design rule is "copy to `project` to customize a plugin-shipped recipe"
 |----------|--------------------------------------------|----------|--------------------------------------------------------|
 | `id`     | string                                     | yes      | Must match `[a-z][a-z0-9-]*` and equal `body.id`.      |
 | `scope`  | `'project' \| 'global' \| 'plugin:<id>'`   | yes      | `plugin:<id>` returns `PLUGIN_SCOPE_READONLY`.         |
-| `source` | string                                     | yes      | Full YAML body.                                        |
+| `source` | string                                     | yes      | Full recipe body. Either YAML or JSON depending on `format`. |
+| `format` | `'yaml' \| 'json'`                         | no       | On-disk encoding. Default `'yaml'` → `<id>.yaml`; `'json'` → `<id>.json`. The sibling file in the other extension is atomically removed so a single recipe id always maps to exactly one file. |
 
 **Returns** `structuredContent`:
 
 ```ts
-{ id: string; scope: 'project' | 'global'; path: string; }
+{ id: string; scope: 'project' | 'global'; path: string; format: 'yaml' | 'json'; }
 ```
 
 **Errors:** `INVALID_ID`, `PLUGIN_SCOPE_READONLY`, `INVALID_SCOPE`,
@@ -1565,6 +1589,236 @@ returns `{ instanceId, workspaceId, exited }` per live entry, and joins each
 to a `view_url` if the terminal-server is running. Sessions linger in the
 registry for `EXIT_RETAIN_MS = 10_000` after exit so late-attaching viewers
 still see the final scrollback; those will show up here with `exited: true`.
+
+#### `recipe.update_steps`
+
+Mutate the materialized step plan of a running recipe instance (spec §10.5).
+The three sub-operations run inside a **single DB transaction** — any
+failure rolls all of them back. `add` / `remove` / `update_meta` may be
+combined in one call; removals are applied first so a subsequent add can
+re-use a freed `step_id`.
+
+**Inputs:**
+
+| Name | Type | Required | Description |
+|---|---|---|---|
+| `recipe_instance_id` | string | no | Defaults to `$CLAWDEVBOX_RECIPE_INSTANCE_ID` when omitted. |
+| `add` | `Step[]` | no | New steps to materialize. See [Canonical Step schema](#canonical-step-schema). |
+| `remove` | `string[]` | no | `step_id`s to delete. Only `pending`, `done`, `failed`, or `skipped` steps may be removed; `running` and `awaiting_user` are rejected with `CANNOT_REMOVE_RUNNING_STEP`. |
+| `update_meta` | `Array<Partial<Step> & { id: string }>` | no | Patch existing steps' meta (goal, depends, params, triggers, artifacts). Status fields are **not** patchable here — use `recipe.steps.update_status`. |
+
+**Returns** `structuredContent`:
+
+```ts
+{
+  recipe_instance_id: string;
+  added:   Array<{ id: string; step_id: string }>;
+  removed: string[];
+  updated: Array<{ id: string; step_id: string }>;
+  trigger_changes: Array<{
+    step_id: string;
+    added_triggers:   TriggerDecl[];
+    removed_triggers: TriggerDecl[];
+    registered_trigger_ids: string[];   // populated only when the step is already running
+    disabled_trigger_ids: string[];     // populated when an auto-declared trigger was removed
+  }>;
+}
+```
+
+**Trigger-registration side effects.** If `update_meta` adds triggers to a
+step that is already `running` or `awaiting_user`, the new declarations are
+materialized as auto-declared rows in the `triggers` table immediately
+(`auto_declared = 1`, `auto_registered_by_step_id` = the step's row id).
+Pending steps register their declarations later, when they transition to
+`running` (see `recipe.steps.update_status`). Removed declarations
+auto-disable the matching `triggers` rows that were registered by this
+step.
+
+A `step_added`, `step_removed`, `step_meta_updated`, `trigger_registered`,
+or `trigger_unregistered` row is appended to `step_events` for each
+mutation so the SPA timeline has a complete causal log.
+
+**Errors:**
+
+| Code | Trigger |
+|---|---|
+| `RECIPE_INSTANCE_NOT_FOUND` | No matching `recipe_instances` row, or neither arg nor env var was supplied. |
+| `STEP_NOT_FOUND` | A `remove[]` or `update_meta[].id` entry doesn't match any step in the instance. |
+| `CANNOT_REMOVE_RUNNING_STEP` | A `remove[]` entry targets a step in status `running` or `awaiting_user`. |
+| `INVALID_STEP_SCHEMA` | A step in `add[]` / `update_meta[]` failed shape validation. |
+| `INVALID_DEPENDENCY` | A step's `depends[]` references an unknown step id, or `update_meta` introduces an unknown dep. |
+| `CIRCULAR_DEPENDENCY` | The post-mutation dependency graph would contain a cycle. The whole transaction is rolled back. |
+
+Emits `emitChange('recipes')` on success.
+
+#### `recipe.steps.update_status`
+
+Transition a single step through the monotonic status machine and record
+side effects (entry/exit hooks, attachments, audit events). The full
+transition matrix is:
+
+```
+pending → running | skipped
+running → done | failed | skipped | awaiting_user
+awaiting_user → running | done | failed | skipped
+done | failed | skipped: terminal (no further transitions)
+```
+
+Any transition that violates this matrix returns `INVALID_TRANSITION`.
+
+**Inputs:**
+
+| Name | Type | Required | Description |
+|---|---|---|---|
+| `recipe_instance_id` | string | no | Defaults to `$CLAWDEVBOX_RECIPE_INSTANCE_ID`. |
+| `step_id` | string | **yes** | Step's logical id (matches `Step.id`). |
+| `status` | `'running' \| 'done' \| 'failed' \| 'skipped' \| 'awaiting_user'` | no | New status. Omit to update state/attachments only. |
+| `message` | string | no | Free-form human note for the step row. |
+| `state` | `Record<string, unknown>` | no | Shallow-merged into the step's `state_json`. |
+| `state_replace` | `Record<string, unknown>` | no | **Replaces** `state_json` entirely. Mutually exclusive with `state`. |
+| `result` | string | no | Set on terminal transitions (`done` / `failed` / `skipped`). |
+| `error` | string | no | Typically paired with `status: 'failed'`. |
+| `attach_artifact_ids` | `string[]` | no | Append to the step's artifact attachment list (idempotent). |
+| `attach_inbox_item_ids` | `string[]` | no | Append to the step's inbox attachment list (idempotent). |
+| `request_user_input` | `{ message: string; options?: string[]; inbox_item?: { title?: string; labels?: string[] } }` | no | Shortcut that atomically (a) transitions the step to `awaiting_user`, (b) sets `awaiting_user_message`, and (c) creates a linked inbox item. Mutually exclusive with `status`. |
+
+**Entry hook (transition into `running`):** the step's declared
+`triggers[]` are materialized as `auto_declared = 1` rows in the
+`triggers` table. The dispatcher will pick them up on the next scheduler
+wake.
+
+**Exit hook (transition into `done` / `failed` / `skipped`):** every
+trigger with `auto_registered_by_step_id` = this step is flipped to
+`enabled = 0`. The dispatcher's overlap-skip logic and the kernel's TTL
+sweep treat disabled rows as inert. If *all* sibling steps of the
+instance are now terminal, the parent `recipe_instances.status` cascades
+to `done` (any-failed → `failed`).
+
+**Returns** `structuredContent`:
+
+```ts
+{
+  recipe_instance_id: string;
+  step: {
+    id: string;
+    step_id: string;
+    status: RecipeStepStatus;
+    started_at: number | null;
+    completed_at: number | null;
+    message: string | null;
+    awaiting_user_message: string | null;
+    state: Record<string, unknown>;
+  };
+  registered_trigger_ids: string[];     // auto-declared triggers materialized by an entry hook
+  disabled_trigger_ids:   string[];     // triggers disabled by an exit hook
+  attached_artifact_ids:  string[];
+  attached_inbox_item_ids: string[];
+  created_inbox_item_id:  string | null;  // populated when request_user_input fires
+  recipe_instance_status: 'running' | 'done' | 'failed' | string;
+  trigger_registration_errors: Array<{ trigger_type: string; reason: string }>;
+}
+```
+
+**Errors:**
+
+| Code | Trigger |
+|---|---|
+| `RECIPE_INSTANCE_NOT_FOUND` | No matching `recipe_instances` row. |
+| `STEP_NOT_FOUND` | Step with that `step_id` doesn't exist in this instance. |
+| `INVALID_TRANSITION` | The requested transition violates the monotonic matrix. The error detail includes `from` and `to`. |
+| `CONFLICTING_ARGS` | `state` and `state_replace` were both supplied, or `request_user_input` was combined with an explicit `status`. |
+| `INTERNAL_ERROR` | Unexpected exception inside the transaction. The transition does **not** apply — the DB transaction is rolled back. |
+
+Emits `emitChange('recipes')` on success; additionally emits
+`emitChange('inbox')` when `created_inbox_item_id` is non-null.
+
+### Recipe file formats
+
+Both YAML and JSON are first-class on-disk encodings. `js-yaml` parses
+both transparently — JSON is a strict subset of YAML — so the reader
+(`recipe.read`, `recipe.list`, the scope walker) never branches on
+extension. Only `recipe.upsert` needs to pick a writer; it honors the
+`format` arg (default `'yaml'`).
+
+The directory scanner accepts `<id>.yaml`, `<id>.yml`, and `<id>.json`.
+`recipe.upsert` removes the sibling files in the other extension after a
+successful write so a recipe id maps to exactly one file. This avoids the
+"is `foo.yaml` or `foo.json` canonical?" ambiguity.
+
+Plugins may ship either format (`provides.recipes[].file` in
+`plugin.yaml`); the scope chain resolves through the manifest, so the
+file extension is opaque to the resolver.
+
+### Canonical Step schema
+
+`Step` is the shape consumed by `recipe.update_steps` (`add[]` and
+`update_meta[]`) and emitted by `materializeSteps` when `recipe.run`
+inflates a recipe's `steps[]` block into rows. The TypeScript declaration
+lives in `db/recipe-steps-store.ts`.
+
+```ts
+interface Step {
+  id: string;              // logical step id, unique within the instance
+  name?: string;           // short human label
+  goal: string;            // required prose goal
+  depends?: string[];      // other Step.ids that must complete first
+  params?: StepParamDecl[];        // declared params (validated when step starts)
+  triggers?: TriggerDecl[];        // auto-declared on entry, disabled on exit
+  artifacts?: ArtifactDecl[];      // expected outputs
+}
+
+interface StepParamDecl {
+  name: string;
+  type: string;            // primitive type name; matches validators.ts
+  required?: boolean;
+  default?: unknown;
+  description?: string;
+}
+
+interface TriggerDecl {
+  type: string;            // registered trigger TYPE id
+  params?: Record<string, unknown>;
+  cron?: string | null | false;   // three-state, same as trigger.register
+  binds_callback_to?: string;             // e.g. 'thread_resume'
+  binds_callback_to_recipe?: string;      // recipe id to invoke on fire
+  once?: boolean;
+  expires_at?: number;
+  max_attempts?: number;          // per-trigger override; default 3
+  backoff_ms?: number[];          // per-trigger override; default [30000, 120000, 600000]
+}
+
+interface ArtifactDecl {
+  id: string;
+  type: string;
+  title?: string;
+}
+```
+
+**Example.** A step that watches a PR and posts back a review:
+
+```yaml
+- id: collect-pr-events
+  name: Watch the target PR for new comments
+  goal: |
+    Subscribe to GitHub PR comment + review events so the next step
+    has a complete event stream to summarise.
+  depends: [open-pr]
+  params:
+    - name: pr_number
+      type: integer
+      required: true
+  triggers:
+    - type: github.pr_comment
+      params: { repo: '$repo', pr_number: '$pr_number' }
+      cron: false
+      binds_callback_to_recipe: handle-new-pr-comment
+      max_attempts: 5
+      backoff_ms: [10000, 60000, 300000, 600000, 1800000]
+  artifacts:
+    - id: pr-summary
+      type: pr-review-summary
+      title: 'PR review summary'
+```
 
 ### Story: from `recipe.upsert` to `recipe.done`
 
@@ -2405,13 +2659,13 @@ _13 tools — Plugin-declared trigger types, agent-authored templates, registere
 
 The trigger surface is the kernel that turns plugin-declared and
 agent-authored **capabilities** (trigger TYPES) into concrete, addressable
-**registered instances** (`<type_id>#<key>`) that an external scheduler can
-later fire. The MCP tools here mostly read and mutate metadata — with one
-exception (`trigger.test`) they never spawn cron tickers, post webhooks, or
-run scripts in production paths. The cron daemon that drives `trigger.fire`
-is still a stub; today only `trigger.test` actually executes a script (via
-`trigger-runner.ts`). See [Edge cases & gotchas](#edge-cases--gotchas) for
-the long list.
+**registered instances** (`<type_id>#<key>`) that the in-process scheduler
++ dispatcher fire on cron, manual fires, and Mode-B callbacks. As of the
+trigger-kernel work, `trigger.fire` is **no longer a metadata stub** — it
+enqueues a real row into the `fires` table, the dispatcher claims it, and
+outputs land on disk under `<workspace>/.clawdevbox/fires/<fire_id>/`. See
+[`cron.md`](#cron) for the kernel control plane (`/api/cron/*`,
+`/api/fires/*`, `/callback/<fire_id>`) and the fire lifecycle diagram.
 
 The surface is now **thirteen** MCP tools — the eight original metadata
 tools plus five added in Phases 3-5 for agent-authored templates and
@@ -2605,7 +2859,7 @@ projected list. Errors: none — there are no failure modes.
 
 #### `trigger.list_registered`
 
-Lists registered instances from `triggers.json`, with cron inheritance
+Lists registered instances from the `triggers` table, with cron inheritance
 resolved.
 
 **Signature**
@@ -2623,12 +2877,23 @@ resolved.
   registered: Array<RegisteredTrigger & {
     resolved_cron: string | false | null;
     type_exists: boolean;
+    // recipe-lineage columns (populated when the trigger was auto-declared
+    // by a recipe step — see recipe.steps.update_status):
+    recipe_instance_id: string | null;
+    recipe_step_id: string | null;
+    binds_callback_to: string | null;
+    binds_callback_to_recipe: string | null;
+    auto_declared: boolean;             // true iff the row was inserted by a step entry hook
+    auto_registered_by_step_id: string | null;  // recipe_steps.id of the declaring step
+    // kernel retry policy (per-trigger overrides; spec §6.2):
+    max_attempts: number;               // default 3
+    backoff_ms: number[];               // default [30000, 120000, 600000]
   }>;
   count: number;
 }
 ```
 
-**What it does.** Reads the on-disk `triggers.json`, projects each row through
+**What it does.** Reads the `triggers` table, projects each row through
 `projectRegistered(reg, ws)` (which resolves `cron === null` against the TYPE's
 `default_cron`), and applies the optional filters.
 
@@ -2637,6 +2902,13 @@ resolved.
 when the TYPE has been uninstalled out from under the registration — that's
 the cue for the agent to either `unregister` or reinstall the plugin. Errors:
 none — corrupt files return an empty list.
+
+The `auto_declared` / `auto_registered_by_step_id` / `recipe_instance_id` /
+`recipe_step_id` columns are populated when a recipe step's `triggers[]`
+declaration was materialized at step-entry time (see
+[`recipe.steps.update_status`](#recipe#recipestepsupdate_status)). They
+let the dispatcher cascade-disable a step's triggers when the step
+transitions to a terminal state.
 
 #### `trigger.register`
 
@@ -2671,6 +2943,8 @@ For the one-off paths, `cron` defaults to `false` (manual/webhook only),
 | `subscriber_thread_id` | `string` (min length 1) | no | Hot-trigger thread binding. For one-offs, also flips the auto-template's `binds_callback_to` to `'thread_resume'`. |
 | `expires_at` | `number` (unix-ms) | no | Auto-delete after this timestamp. |
 | `once` | `boolean` | no | Self-delete after the first successful run. Defaults to `true` for one-off registrations, `false` otherwise. |
+| `max_attempts` | `integer` (1..100) | no | Override the kernel default of **3** attempts before a fire is moved to `dead`. Per-trigger; the value is stored on the registration row and read by the dispatcher when scheduling retries (spec §6.2). |
+| `backoff_ms` | `number[]` (non-empty; each `0..86400000`) | no | Override the kernel default retry ladder of `[30000, 120000, 600000]` ms (30 s → 2 min → 10 min). The dispatcher reads `backoff_ms[attempt - 1]`; if `attempt` exceeds the array length the last entry is reused. |
 
 **Returns** `structuredContent`:
 
@@ -2764,6 +3038,8 @@ remitting the id — even when the change touches an identity param.
 | `id` | `string` (min length 1) | **yes** | Registered-instance id. |
 | `params` | `Record<string, unknown>` | no | **Replaces** params entirely; re-validated. |
 | `cron` | `string \| null \| false \| ''` | no | Replaces cron; same three-state semantics as `register`. |
+| `max_attempts` | `integer` (1..100) | no | Replace the per-trigger retry cap. Validated by `validateMaxAttempts`. |
+| `backoff_ms` | `number[]` (non-empty; each `0..86400000`) | no | Replace the per-trigger retry ladder. Validated by `validateBackoffMs`. |
 
 **Returns** `{ id, registered: <projected row> }`.
 
@@ -2772,9 +3048,11 @@ remitting the id — even when the change touches an identity param.
 | Code | Trigger |
 |---|---|
 | `NOT_FOUND` | No row with that id. |
-| `NO_CHANGES` | Neither `params` nor `cron` was supplied. |
+| `NO_CHANGES` | None of `params`, `cron`, `max_attempts`, or `backoff_ms` were supplied. |
 | `TRIGGER_TYPE_NOT_FOUND` | Can't re-validate `params` because the TYPE has been uninstalled. (Only fires if `params` is supplied; cron-only updates are fine on orphaned rows.) |
 | `PARAM_VALIDATION` | `params` failed schema validation, or `cron` is invalid. |
+| `INVALID_MAX_ATTEMPTS` | `max_attempts` failed the integer / range check (`1..100`). |
+| `INVALID_BACKOFF_MS` | `backoff_ms` failed the array / per-entry range check (non-empty, integers in `[0, 86400000]`). |
 
 **How it does it.** Find the row by id. Reject `NO_CHANGES` if both fields are
 absent. If `params` is supplied, re-run `validateTriggerParams` against the
@@ -2807,34 +3085,43 @@ them, but `trigger.fire` ignores the flag (manual fires always work).
 
 #### `trigger.fire`
 
-Manually queues a fire. **Today this only writes a log line.**
+Manually enqueues a fire for a registered trigger. **DB-backed**: a row is
+inserted into the `fires` table with `source = 'manual'` and is picked up
+by the dispatcher on the next `pickUp()` cycle. Honors `enabled = false`
+the same as cron — manual fires always run.
 
 **Signature**
 
 | Param | Type | Required | Description |
 |---|---|---|---|
 | `id` | `string` (min length 1) | **yes** | Registered-instance id. |
-| `payload` | `unknown` | no | Free-form data forwarded to the eventual webhook POST. |
+| `payload` | `unknown` | no | Free-form data forwarded into the trigger script's stdin envelope (Mode A) and re-presented in the `/callback/<fire_id>` URL contract (Mode B). |
 
-**Returns** `{ id, type, run_id, status: 'queued' }`, where `run_id` is minted
-via `mintId('run')` (`run_<rand36>`).
+**Returns** `structuredContent`:
+
+```ts
+{
+  id: string;            // registered trigger id (echoed)
+  type: string;          // resolved TYPE id
+  trigger_id: string;    // alias of id (for forward-compat with fire-list responses)
+  fire_id: string;       // newly minted fire row id; the lookup key for /api/fires/:id
+  status: 'queued';
+}
+```
 
 **Error codes**
 
 | Code | Trigger |
 |---|---|
-| `NOT_FOUND` | No row with that id. |
+| `NOT_FOUND` | No registered trigger with that id. |
 
-**What it does.** Looks up the registration, mints a `run_id`, calls
-`logger.info({ triggerId, triggerType, runId, payload }, 'trigger.fire queued')`,
-and returns. **No webhook is dispatched, no script is executed, no state is
-mutated, no `last_run_*` field is updated.** That work is reserved for the
-not-yet-implemented in-process cron daemon. The `status: 'queued'` response is
-forward-compatible with the eventual implementation.
-
-> **Want to actually run a script today?** Use [`trigger.test`](#triggertest).
-> It's currently the only path that spawns a script (via `trigger-runner.ts`).
-> When the cron daemon ships, `trigger.fire` will reuse the same runner.
+**What it does.** Resolves the registration, calls
+`enqueueFire(db, { workspace_id, trigger_id, source: 'manual', scheduled_at:
+Date.now(), max_attempts: reg.max_attempts ?? 3, payload })`, logs the
+intent, and returns. The dispatcher's bus subscription on `'fires'` wakes
+within ~50 ms; outputs are persisted under
+`<workspace>/.clawdevbox/fires/<fire_id>/attempt-N/`. To follow the fire to
+completion, poll `GET /api/fires/<fire_id>` (see [`cron.md`](#cron)).
 
 #### `trigger.create_template`
 
@@ -3227,24 +3514,31 @@ RFC 8785) is documented as a future upgrade in `mintRegisteredId`'s docstring;
 for the MVP every shipped TYPE either declares `identity_param` or has flat
 params.
 
-#### Cron daemon is **not yet implemented**
+#### Cron daemon now exists (kernel landed)
 
-This is the big one. None of the following exist today:
+This gotcha used to say "none of the cron daemon exists." That is no
+longer true as of the trigger-kernel work:
 
-- An in-process timer that wakes on cron boundaries and POSTs to webhooks.
-- An external scheduler subscribing to `emitChange('triggers')`.
-- Any code path that writes back to `last_run_at` / `last_run_status` /
-  `last_run_error`.
-- Any code path that actually loads `file_abs` and executes the trigger
-  script.
-- TTL enforcement for `expires_at`.
-- Self-delete after success for `once: true`.
-- Hot-trigger wake-up via `subscriber_thread_id`.
+- An in-process **scheduler** (`scheduler.ts`) wakes on cron boundaries and
+  enqueues fires; bursty inserts coalesce into a 50 ms debounce.
+- A concurrency-capped **dispatcher** (`dispatcher.ts`) claims fires (with
+  the §6.3 overlap-skip protocol), runs trigger scripts via
+  `trigger-runner.ts`, and writes outputs to
+  `<workspace>/.clawdevbox/fires/<fire_id>/attempt-N/`.
+- The dispatcher writes back `last_run_at` / `last_run_status` /
+  `last_run_error` on completion; `success` fires with `once: true`
+  self-disable; failures retry through the per-trigger `backoff_ms`
+  ladder and dead-letter to the inbox after `max_attempts`.
+- TTL enforcement: `expires_at` is honored by the scheduler when it
+  scans the `triggers` table.
+- Mode-B callbacks land at `POST /callback/<fire_id>` (see
+  [`cron.md`](#cron)); hot-trigger thread resume is wired through
+  `binds_callback_to: 'thread_resume'`.
 
-`trigger.fire` produces a `run_id` and a log line — that's it. Consumers
-treating `status: 'queued'` as "the work is now in flight" will be
-disappointed. The shape of `RegisteredTrigger` is deliberately forward-
-compatible so the eventual daemon can land without breaking the wire format.
+`trigger.fire` returns a real `fire_id` you can follow via
+`GET /api/fires/<fire_id>` — the row transitions through
+`queued → running → success | failed → retrying | dead | skipped` as
+described in [`cron.md`](#cron).
 
 #### Type uninstall leaves orphan registrations
 
@@ -3277,6 +3571,325 @@ agent has no way to tell the difference between "nothing is registered" and
 "the file was just truncated by a process crash." Atomic writes
 (`writeFileAtomic`) keep this from happening in practice; the safety net is
 there for editor crashes and disk-full conditions.
+
+---
+
+## Cron
+
+_HTTP control plane for the trigger kernel — scheduler, dispatcher, fire log, and the Mode-B callback receiver. (Not an MCP family — HTTP only.)_
+
+The trigger kernel is the in-process subsystem that turns registered triggers
+into fires, dispatches them through a concurrency-capped runner, persists
+their outputs, and retries failures on an exponential backoff. It runs
+**cron triggers** (`cron_expression` rows in the `triggers` table), **manual
+fires** (`trigger.fire` and `POST /api/fires/:id/retry`), and **trigger
+scripts** (the script runtime resolved from the trigger TYPE's manifest).
+
+Unlike the rest of the MCP surface, the kernel control plane is **HTTP**,
+not MCP. The endpoints below are mounted by `cli/start.ts` inside the same
+HTTP server that hosts `/healthz`, `/api/events`, and the SPA. The
+implementation lives in `mcp-server/src/cli/cron-api.ts`.
+
+The kernel boots automatically when `clawdevbox start` runs (Phase 8). When
+`clawdevbox mcp` is invoked without a running service, it auto-bootstraps
+the HTTP service via `ensureHttpServiceRunning` (`cli/mcp.ts`), so agents
+never have to start it explicitly.
+
+The constituent components are:
+
+| Component | File | Responsibility |
+|---|---|---|
+| **Scheduler** | `scheduler.ts` | Single `setTimeout` that wakes when the next cron tick is due, enqueues fires, and promotes retrying rows. |
+| **Dispatcher** | `dispatcher.ts` | Claims queued fires (capped at `maxConcurrent`, default 4), runs them through the trigger-runner, writes outputs to disk, and routes outcomes. |
+| **Fires store** | `db/fires-store.ts` | `fires` table CRUD + the atomic `claimNextFire` that enforces the §6.3 overlap-skip protocol. |
+| **Trigger runner** | `trigger-runner.ts` | Spawns trigger scripts with the stdin envelope, the per-fire callback secret, and `attempt-N/stdout.txt`/`stderr.txt` redirection. |
+
+### Fire lifecycle
+
+```
+                  ┌────────────────────┐
+                  │  scheduler wake    │
+                  │  or trigger.fire   │
+                  └─────────┬──────────┘
+                            │ insert row
+                            ▼
+                       ┌─────────┐
+                       │ queued  │
+                       └────┬────┘
+                            │ dispatcher.pickUp()
+                            ▼
+                       ┌─────────┐
+       overlap with    │ running │
+       same-trigger ◀──┤         │
+       running fire    └────┬────┘
+            │               ├─ success ─────▶ ┌─────────┐
+            ▼               │                 │ success │
+       ┌─────────┐          │                 └─────────┘
+       │ skipped │          │
+       └─────────┘          │ failure
+                            ▼
+                   attempts < max?
+                  ┌──── yes ────┐    ┌──── no ────┐
+                  ▼             │    ▼            │
+            ┌──────────┐        │ ┌──────┐        │
+            │retrying  │        │ │ dead │ + dead │
+            │next_retry│        │ │      │ letter │
+            │   _at    │        │ └──────┘ inbox  │
+            └────┬─────┘        │                 │
+                 │ next wake    │                 │
+                 ▼              │                 │
+            ┌─────────┐         │                 │
+            │ queued  │ ────────┘                 │
+            └─────────┘                           │
+                                                  │
+        ┌────── POST /api/fires/:id/retry ─────────┤
+        │  failed | dead | skipped → queued       │
+        └─────────────────────────────────────────┘
+```
+
+| Status | Terminal? | Description |
+|---|---|---|
+| `queued` | no | Row waiting for a dispatcher pick-up. |
+| `running` | no | Dispatcher has claimed it; trigger script (or recipe/resume binding) is executing. |
+| `success` | yes | Binding returned cleanly. `last_run_*` audit fields are updated on the trigger. |
+| `failed` | no | Last attempt failed but attempts remain. `retrying` row, `next_retry_at` set. |
+| `retrying` | no | Synonym surfaced in API filters; storage-level status is `failed` with a future `next_retry_at`. |
+| `dead` | yes | All `max_attempts` exhausted. A dead-letter inbox row is created. |
+| `skipped` | yes | Overlap-skip: another fire for the same trigger was already running when this one was claimed. |
+
+The retry ladder defaults to `[30000, 120000, 600000]` ms (30 s / 2 min / 10
+min) and is per-trigger via `trigger.register`'s `backoff_ms` / `max_attempts`.
+
+### Filesystem layout
+
+Every fire produces a directory under the workspace:
+
+```
+<workspace>/.clawdevbox/fires/<fire_id>/
+├── attempt-1/
+│   ├── stdout.txt        ← trigger-runner stdout capture
+│   ├── stderr.txt        ← trigger-runner stderr capture
+│   └── callbacks.json    ← appended by POST /callback/<fire_id> (Mode B)
+├── attempt-2/
+│   └── ...
+```
+
+`attempts_available` in the fire-detail response enumerates the attempts on
+disk. The default response shape returns the latest attempt; `?attempt=N`
+picks a specific one.
+
+### Authentication
+
+| Surface | Auth | Source |
+|---|---|---|
+| `GET /healthz` | none | — |
+| `GET /api/cron/*`, `GET /api/fires*`, `POST /api/cron/*`, `POST /api/fires/*/retry` | `Authorization: Bearer <token>` | `cfg.http.token` (the service-wide token from `config.json` or `CLAWDEVBOX_TOKEN`). |
+| `POST /callback/:fire_id` | `Authorization: Bearer <secret>` | A **per-fire** secret minted by the dispatcher when it launches a script binding. The secret is injected into the script process as `CLAWDEVBOX_MCP_SECRET` and is only valid while the fire is in flight. |
+
+Bearer comparisons are constant-time. Missing/wrong tokens return `401`
+with `WWW-Authenticate: Bearer realm="clawdevbox"`.
+
+---
+
+### Endpoints
+
+#### `GET /api/cron/status`
+
+**Auth:** Bearer required.
+
+Returns the singleton service descriptor, the scheduler/dispatcher live
+counters, and the DB metadata. Used by `clawdevbox start` to verify an
+already-bound port belongs to *our* service (spec §8.5), by the MCP
+bootstrap probe, and by the SPA admin pane.
+
+**Response (200):**
+
+```json
+{
+  "service": {
+    "pid": 18452,
+    "port": 5200,
+    "started_at": 1715534812000,
+    "version": "0.1.0"
+  },
+  "scheduler": {
+    "next_wake_at": 1715534870000,
+    "last_wake_at": 1715534810000,
+    "total_wakes": 17
+  },
+  "dispatcher": {
+    "in_flight": 1,
+    "max_concurrent": 4,
+    "queued_count": 0,
+    "retrying_count": 2,
+    "dead_count": 0
+  },
+  "db": {
+    "path": "C:\\Users\\me\\.clawdevbox\\clawdevbox.db",
+    "schema_version": 1
+  }
+}
+```
+
+`scheduler.next_wake_at` may be `null` when no triggers are armed.
+
+**Errors:** `401` (missing/invalid bearer).
+
+#### `GET /api/fires`
+
+**Auth:** Bearer required.
+
+List fires across workspaces. Default `limit=50`, max `500`. Results are
+ordered by `scheduled_at DESC, fire_id DESC`.
+
+**Query parameters:**
+
+| Name | Type | Description |
+|---|---|---|
+| `status` | comma-separated list | Filter by status; e.g. `status=queued,running`. |
+| `workspace_id` | string | Restrict to one workspace. |
+| `trigger_id` | string | Restrict to one trigger. |
+| `limit` | int (1..500) | Page size. Default 50. |
+| `before` | unix-ms | Pagination cursor; returns rows with `scheduled_at < before`. |
+
+**Response (200):**
+
+```json
+{
+  "fires": [
+    {
+      "fire_id": "fire_abc",
+      "workspace_id": "ws_…",
+      "trigger_id": "demo.x#alpha",
+      "source": "manual",
+      "status": "success",
+      "attempt": 1,
+      "max_attempts": 3,
+      "scheduled_at": 1715534800000,
+      "started_at": 1715534801000,
+      "finished_at": 1715534803000,
+      "next_retry_at": null,
+      "error": null,
+      "output_dir": "…/.clawdevbox/fires/fire_abc"
+    }
+  ],
+  "count": 1,
+  "next_offset": null
+}
+```
+
+`next_offset` is the `scheduled_at` of the last row when more pages exist,
+else `null`.
+
+**Errors:** `401`.
+
+#### `GET /api/fires/:fire_id`
+
+**Auth:** Bearer required.
+
+Return the full fire row plus `stdout`, `stderr`, and any Mode-B
+`callbacks.json` content from the requested attempt directory.
+
+**Query parameters:**
+
+| Name | Type | Description |
+|---|---|---|
+| `attempt` | int ≥ 1 | Which attempt's output to read. Defaults to the latest. |
+
+**Response (200):**
+
+```json
+{
+  "fire": { "fire_id": "fire_abc", "status": "success", "...": "..." },
+  "stdout": "hello stdout",
+  "stderr": "",
+  "callbacks": [
+    { "mode": "B", "body": { "result": "ok" }, "received_at": 1715534803000 }
+  ],
+  "attempts_available": [1, 2],
+  "attempt": 2,
+  "truncated": false
+}
+```
+
+`stdout`/`stderr` are truncated at 1 MiB; the `truncated` flag flips when
+either was clipped.
+
+**Errors:** `401`; `404` (`{ error: 'fire not found', fire_id }`).
+
+#### `POST /api/fires/:fire_id/retry`
+
+**Auth:** Bearer required.
+
+Manual requeue of a terminal fire. Resets the row to `queued`, leaves
+`attempt` untouched (the dispatcher bumps it when it picks the fire up),
+and triggers a scheduler reschedule.
+
+**Body:** none.
+
+**Response (200):**
+
+```json
+{ "fire_id": "fire_abc", "status": "queued" }
+```
+
+**Errors:**
+
+| Code | Trigger |
+|---|---|
+| `401` | Bearer missing/invalid. |
+| `404` | `{ error: 'fire not found', fire_id }`. |
+| `409` | `{ error: "fire status is '<s>'; only failed/dead/skipped fires can be retried", fire_id }`. Returned when the fire is currently `queued`, `running`, or already `success`. |
+
+#### `POST /api/cron/diagnose`
+
+**Auth:** Bearer required.
+
+Force the scheduler to recompute its next wake. Useful when a trigger has
+been registered out-of-band (direct DB write) or when wall-clock skew is
+suspected. Returns the post-reschedule scheduler status.
+
+**Body:** none.
+
+**Response (200):** same shape as `scheduler` in `/api/cron/status`.
+
+**Errors:** `401`; `500` (`{ error: <message> }`) if the reschedule throws.
+
+#### `POST /callback/:fire_id`
+
+**Auth:** `Authorization: Bearer <per-fire-secret>`. The secret is the
+`CLAWDEVBOX_MCP_SECRET` value injected into the trigger script process by
+the dispatcher when it spawned this fire. It is **not** the global
+`cfg.http.token`.
+
+Used by trigger scripts running in **Mode B** to post their result back to
+the kernel asynchronously (for long-running webhook-style work). The body
+is appended to `attempt-N/callbacks.json` and stored verbatim — the
+dispatcher does not interpret it.
+
+**Body:** any JSON. 1 MiB max.
+
+**Response (200):**
+
+```json
+{ "ok": true, "received_at": 1715534803000 }
+```
+
+**Errors:**
+
+| Code | Trigger |
+|---|---|
+| `401` | Bearer missing or doesn't match the per-fire secret (also returned once the fire is no longer in flight). |
+| `404` | `{ error: 'fire not found or not in flight', fire_id }`. |
+| `405` | Method other than POST. |
+
+---
+
+### See also
+
+- [`trigger.*`](#trigger) — MCP tools that register/fire triggers.
+- [`recipe.*`](#recipe) — recipe instances spawn through the same kernel pipeline when a trigger has `binds_callback_to_recipe`.
+- Spec §5, §6, §8, §9 in `docs/specs/2026-05-14-trigger-kernel-design.md`.
 
 ---
 

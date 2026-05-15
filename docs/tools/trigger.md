@@ -2,13 +2,13 @@
 
 The trigger surface is the kernel that turns plugin-declared and
 agent-authored **capabilities** (trigger TYPES) into concrete, addressable
-**registered instances** (`<type_id>#<key>`) that an external scheduler can
-later fire. The MCP tools here mostly read and mutate metadata — with one
-exception (`trigger.test`) they never spawn cron tickers, post webhooks, or
-run scripts in production paths. The cron daemon that drives `trigger.fire`
-is still a stub; today only `trigger.test` actually executes a script (via
-`trigger-runner.ts`). See [Edge cases & gotchas](#edge-cases--gotchas) for
-the long list.
+**registered instances** (`<type_id>#<key>`) that the in-process scheduler
++ dispatcher fire on cron, manual fires, and Mode-B callbacks. As of the
+trigger-kernel work, `trigger.fire` is **no longer a metadata stub** — it
+enqueues a real row into the `fires` table, the dispatcher claims it, and
+outputs land on disk under `<workspace>/.clawdevbox/fires/<fire_id>/`. See
+[`cron.md`](./cron.md) for the kernel control plane (`/api/cron/*`,
+`/api/fires/*`, `/callback/<fire_id>`) and the fire lifecycle diagram.
 
 The surface is now **thirteen** MCP tools — the eight original metadata
 tools plus five added in Phases 3-5 for agent-authored templates and
@@ -202,7 +202,7 @@ projected list. Errors: none — there are no failure modes.
 
 ### `trigger.list_registered`
 
-Lists registered instances from `triggers.json`, with cron inheritance
+Lists registered instances from the `triggers` table, with cron inheritance
 resolved.
 
 **Signature**
@@ -220,12 +220,23 @@ resolved.
   registered: Array<RegisteredTrigger & {
     resolved_cron: string | false | null;
     type_exists: boolean;
+    // recipe-lineage columns (populated when the trigger was auto-declared
+    // by a recipe step — see recipe.steps.update_status):
+    recipe_instance_id: string | null;
+    recipe_step_id: string | null;
+    binds_callback_to: string | null;
+    binds_callback_to_recipe: string | null;
+    auto_declared: boolean;             // true iff the row was inserted by a step entry hook
+    auto_registered_by_step_id: string | null;  // recipe_steps.id of the declaring step
+    // kernel retry policy (per-trigger overrides; spec §6.2):
+    max_attempts: number;               // default 3
+    backoff_ms: number[];               // default [30000, 120000, 600000]
   }>;
   count: number;
 }
 ```
 
-**What it does.** Reads the on-disk `triggers.json`, projects each row through
+**What it does.** Reads the `triggers` table, projects each row through
 `projectRegistered(reg, ws)` (which resolves `cron === null` against the TYPE's
 `default_cron`), and applies the optional filters.
 
@@ -234,6 +245,13 @@ resolved.
 when the TYPE has been uninstalled out from under the registration — that's
 the cue for the agent to either `unregister` or reinstall the plugin. Errors:
 none — corrupt files return an empty list.
+
+The `auto_declared` / `auto_registered_by_step_id` / `recipe_instance_id` /
+`recipe_step_id` columns are populated when a recipe step's `triggers[]`
+declaration was materialized at step-entry time (see
+[`recipe.steps.update_status`](./recipe.md#recipestepsupdate_status)). They
+let the dispatcher cascade-disable a step's triggers when the step
+transitions to a terminal state.
 
 ### `trigger.register`
 
@@ -268,6 +286,8 @@ For the one-off paths, `cron` defaults to `false` (manual/webhook only),
 | `subscriber_thread_id` | `string` (min length 1) | no | Hot-trigger thread binding. For one-offs, also flips the auto-template's `binds_callback_to` to `'thread_resume'`. |
 | `expires_at` | `number` (unix-ms) | no | Auto-delete after this timestamp. |
 | `once` | `boolean` | no | Self-delete after the first successful run. Defaults to `true` for one-off registrations, `false` otherwise. |
+| `max_attempts` | `integer` (1..100) | no | Override the kernel default of **3** attempts before a fire is moved to `dead`. Per-trigger; the value is stored on the registration row and read by the dispatcher when scheduling retries (spec §6.2). |
+| `backoff_ms` | `number[]` (non-empty; each `0..86400000`) | no | Override the kernel default retry ladder of `[30000, 120000, 600000]` ms (30 s → 2 min → 10 min). The dispatcher reads `backoff_ms[attempt - 1]`; if `attempt` exceeds the array length the last entry is reused. |
 
 **Returns** `structuredContent`:
 
@@ -361,6 +381,8 @@ remitting the id — even when the change touches an identity param.
 | `id` | `string` (min length 1) | **yes** | Registered-instance id. |
 | `params` | `Record<string, unknown>` | no | **Replaces** params entirely; re-validated. |
 | `cron` | `string \| null \| false \| ''` | no | Replaces cron; same three-state semantics as `register`. |
+| `max_attempts` | `integer` (1..100) | no | Replace the per-trigger retry cap. Validated by `validateMaxAttempts`. |
+| `backoff_ms` | `number[]` (non-empty; each `0..86400000`) | no | Replace the per-trigger retry ladder. Validated by `validateBackoffMs`. |
 
 **Returns** `{ id, registered: <projected row> }`.
 
@@ -369,9 +391,11 @@ remitting the id — even when the change touches an identity param.
 | Code | Trigger |
 |---|---|
 | `NOT_FOUND` | No row with that id. |
-| `NO_CHANGES` | Neither `params` nor `cron` was supplied. |
+| `NO_CHANGES` | None of `params`, `cron`, `max_attempts`, or `backoff_ms` were supplied. |
 | `TRIGGER_TYPE_NOT_FOUND` | Can't re-validate `params` because the TYPE has been uninstalled. (Only fires if `params` is supplied; cron-only updates are fine on orphaned rows.) |
 | `PARAM_VALIDATION` | `params` failed schema validation, or `cron` is invalid. |
+| `INVALID_MAX_ATTEMPTS` | `max_attempts` failed the integer / range check (`1..100`). |
+| `INVALID_BACKOFF_MS` | `backoff_ms` failed the array / per-entry range check (non-empty, integers in `[0, 86400000]`). |
 
 **How it does it.** Find the row by id. Reject `NO_CHANGES` if both fields are
 absent. If `params` is supplied, re-run `validateTriggerParams` against the
@@ -404,34 +428,43 @@ them, but `trigger.fire` ignores the flag (manual fires always work).
 
 ### `trigger.fire`
 
-Manually queues a fire. **Today this only writes a log line.**
+Manually enqueues a fire for a registered trigger. **DB-backed**: a row is
+inserted into the `fires` table with `source = 'manual'` and is picked up
+by the dispatcher on the next `pickUp()` cycle. Honors `enabled = false`
+the same as cron — manual fires always run.
 
 **Signature**
 
 | Param | Type | Required | Description |
 |---|---|---|---|
 | `id` | `string` (min length 1) | **yes** | Registered-instance id. |
-| `payload` | `unknown` | no | Free-form data forwarded to the eventual webhook POST. |
+| `payload` | `unknown` | no | Free-form data forwarded into the trigger script's stdin envelope (Mode A) and re-presented in the `/callback/<fire_id>` URL contract (Mode B). |
 
-**Returns** `{ id, type, run_id, status: 'queued' }`, where `run_id` is minted
-via `mintId('run')` (`run_<rand36>`).
+**Returns** `structuredContent`:
+
+```ts
+{
+  id: string;            // registered trigger id (echoed)
+  type: string;          // resolved TYPE id
+  trigger_id: string;    // alias of id (for forward-compat with fire-list responses)
+  fire_id: string;       // newly minted fire row id; the lookup key for /api/fires/:id
+  status: 'queued';
+}
+```
 
 **Error codes**
 
 | Code | Trigger |
 |---|---|
-| `NOT_FOUND` | No row with that id. |
+| `NOT_FOUND` | No registered trigger with that id. |
 
-**What it does.** Looks up the registration, mints a `run_id`, calls
-`logger.info({ triggerId, triggerType, runId, payload }, 'trigger.fire queued')`,
-and returns. **No webhook is dispatched, no script is executed, no state is
-mutated, no `last_run_*` field is updated.** That work is reserved for the
-not-yet-implemented in-process cron daemon. The `status: 'queued'` response is
-forward-compatible with the eventual implementation.
-
-> **Want to actually run a script today?** Use [`trigger.test`](#triggertest).
-> It's currently the only path that spawns a script (via `trigger-runner.ts`).
-> When the cron daemon ships, `trigger.fire` will reuse the same runner.
+**What it does.** Resolves the registration, calls
+`enqueueFire(db, { workspace_id, trigger_id, source: 'manual', scheduled_at:
+Date.now(), max_attempts: reg.max_attempts ?? 3, payload })`, logs the
+intent, and returns. The dispatcher's bus subscription on `'fires'` wakes
+within ~50 ms; outputs are persisted under
+`<workspace>/.clawdevbox/fires/<fire_id>/attempt-N/`. To follow the fire to
+completion, poll `GET /api/fires/<fire_id>` (see [`cron.md`](./cron.md)).
 
 ### `trigger.create_template`
 
@@ -824,24 +857,31 @@ RFC 8785) is documented as a future upgrade in `mintRegisteredId`'s docstring;
 for the MVP every shipped TYPE either declares `identity_param` or has flat
 params.
 
-### Cron daemon is **not yet implemented**
+### Cron daemon now exists (kernel landed)
 
-This is the big one. None of the following exist today:
+This gotcha used to say "none of the cron daemon exists." That is no
+longer true as of the trigger-kernel work:
 
-- An in-process timer that wakes on cron boundaries and POSTs to webhooks.
-- An external scheduler subscribing to `emitChange('triggers')`.
-- Any code path that writes back to `last_run_at` / `last_run_status` /
-  `last_run_error`.
-- Any code path that actually loads `file_abs` and executes the trigger
-  script.
-- TTL enforcement for `expires_at`.
-- Self-delete after success for `once: true`.
-- Hot-trigger wake-up via `subscriber_thread_id`.
+- An in-process **scheduler** (`scheduler.ts`) wakes on cron boundaries and
+  enqueues fires; bursty inserts coalesce into a 50 ms debounce.
+- A concurrency-capped **dispatcher** (`dispatcher.ts`) claims fires (with
+  the §6.3 overlap-skip protocol), runs trigger scripts via
+  `trigger-runner.ts`, and writes outputs to
+  `<workspace>/.clawdevbox/fires/<fire_id>/attempt-N/`.
+- The dispatcher writes back `last_run_at` / `last_run_status` /
+  `last_run_error` on completion; `success` fires with `once: true`
+  self-disable; failures retry through the per-trigger `backoff_ms`
+  ladder and dead-letter to the inbox after `max_attempts`.
+- TTL enforcement: `expires_at` is honored by the scheduler when it
+  scans the `triggers` table.
+- Mode-B callbacks land at `POST /callback/<fire_id>` (see
+  [`cron.md`](./cron.md)); hot-trigger thread resume is wired through
+  `binds_callback_to: 'thread_resume'`.
 
-`trigger.fire` produces a `run_id` and a log line — that's it. Consumers
-treating `status: 'queued'` as "the work is now in flight" will be
-disappointed. The shape of `RegisteredTrigger` is deliberately forward-
-compatible so the eventual daemon can land without breaking the wire format.
+`trigger.fire` returns a real `fire_id` you can follow via
+`GET /api/fires/<fire_id>` — the row transitions through
+`queued → running → success | failed → retrying | dead | skipped` as
+described in [`cron.md`](./cron.md).
 
 ### Type uninstall leaves orphan registrations
 

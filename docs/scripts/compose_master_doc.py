@@ -17,9 +17,10 @@ OUT_PATH = r"C:\git\clawdevbox\docs\MCP-TOOLS-REFERENCE.md"
 FAMILIES = [
     ("workspace", "Workspace", 4, "Manage Clawdevbox workspaces — the registry + on-disk `.clawdevbox/` tree."),
     ("plugin",    "Plugin",    7, "Install, list, and toggle global plugins under `<globalDir>/plugins/`."),
-    ("recipe",    "Recipe",   10, "CRUD for recipe YAML, plus spawning agent CLIs inside hidden ptys."),
+    ("recipe",    "Recipe",   12, "CRUD for recipe YAML/JSON, plus spawning agent CLIs and mutating live step plans."),
     ("skill",     "Skill",     4, "CRUD for markdown+frontmatter skill files."),
     ("trigger",   "Trigger",   13, "Plugin-declared trigger types, agent-authored templates, registered instances, and `trigger.test`."),
+    ("cron",      "Cron",       0, "HTTP control plane for the trigger kernel — scheduler, dispatcher, fire log, and the Mode-B callback receiver. (Not an MCP family — HTTP only.)"),
     ("artifact",  "Artifact",  4, "Renderable bundles produced by agents."),
     ("renderer",  "Renderer",  4, "Workspace-shadowable `.mjs` renderers for artifact `type`s."),
     ("inbox",     "Inbox",     6, "Persistent notification center the user reviews from desktop or phone."),
@@ -39,9 +40,11 @@ INTRO = """# Clawdevbox MCP Tools — Complete Reference
 
 Clawdevbox is a developer-buddy runtime that the [Model Context Protocol
 (MCP)](https://modelcontextprotocol.io) exposes to coding agents through a
-single Node.js server (`mcp-server/`). This document covers all **12 tool
-families** that ship today — 63 tools in total — and the storage, scope, and
-event-bus model that holds them together. The rough mental model is:
+single Node.js server (`mcp-server/`). This document covers all **12 MCP
+tool families** that ship today — 65 tools in total — plus the **Cron
+HTTP control plane** that drives the trigger kernel, and the storage,
+scope, and event-bus model that holds them together. The rough mental
+model is:
 
 - A **workspace** is a directory with a `.clawdevbox/` subtree. Workspaces hold
   project-scope recipes, skills, registered triggers, recipe-instances, and
@@ -72,7 +75,10 @@ def make_toc():
     lines = []
     for slug, name, count, _desc in FAMILIES:
         anchor = name.lower()
-        lines.append(f"- [{name}](#{anchor}) — `{slug}.*` ({count} tool{'s' if count != 1 else ''})")
+        if count == 0:
+            lines.append(f"- [{name}](#{anchor}) — HTTP only")
+        else:
+            lines.append(f"- [{name}](#{anchor}) — `{slug}.*` ({count} tool{'s' if count != 1 else ''})")
     lines.append("- [Glossary](#glossary)")
     return "\n".join(lines)
 
@@ -276,7 +282,10 @@ def main():
     out.append(CONFIG_SECTION)
     for slug, name, count, desc in FAMILIES:
         out.append(f"## {name}\n\n")
-        out.append(f"_{count} tool{'s' if count != 1 else ''} — {desc}_\n\n")
+        if count == 0:
+            out.append(f"_{desc}_\n\n")
+        else:
+            out.append(f"_{count} tool{'s' if count != 1 else ''} — {desc}_\n\n")
         out.append(transform_family(slug))
         out.append("\n---\n\n")
     out.append(GLOSSARY)
