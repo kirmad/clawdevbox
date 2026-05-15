@@ -26,6 +26,7 @@ import { homedir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
 import { load as yamlLoad } from 'js-yaml';
 import { validatePluginManifest } from './validators.ts';
+import { listAgentAuthoredTemplates, toRegisteredType } from './template-store.ts';
 
 // ============================================================================
 // Types
@@ -196,7 +197,7 @@ export function loadWorkspaceFromEnv(env: NodeJS.ProcessEnv = process.env): Work
     triggerTypes: new Map(),
     triggerTypeErrors: [],
   };
-  reloadPluginRegistry(ws);
+  reloadTypeRegistries(ws);
   warnIfLegacyProjectPlugins(ws);
   return ws;
 }
@@ -338,7 +339,7 @@ export function stateJsonPath(ws: Workspace): string {
 // ============================================================================
 
 /** Rescan <globalDir>/plugins/* and rebuild ws.plugins. */
-export function reloadPluginRegistry(ws: Workspace): void {
+export function reloadTypeRegistries(ws: Workspace): void {
   ws.plugins.clear();
   ws.triggerTypes.clear();
   ws.triggerTypeErrors.length = 0;
@@ -465,7 +466,38 @@ export function reloadPluginRegistry(ws: Workspace): void {
       });
     }
   }
+
+  // ---- Global agent-authored templates (mid precedence — overrides plugins) ----
+  for (const loaded of listAgentAuthoredTemplates(ws, 'global')) {
+    const id = loaded.manifest.id;
+    const prior = ws.triggerTypes.get(id);
+    if (prior) {
+      ws.triggerTypeErrors.push({
+        plugin_id: prior.source_plugin_id || '<global>',
+        type_id: id,
+        error: `trigger_type id ${id} from ${prior.scope} is shadowed by a global agent-authored template`,
+      });
+    }
+    ws.triggerTypes.set(id, toRegisteredType(loaded));
+  }
+
+  // ---- Project agent-authored templates (highest precedence) ----
+  for (const loaded of listAgentAuthoredTemplates(ws, 'project')) {
+    const id = loaded.manifest.id;
+    const prior = ws.triggerTypes.get(id);
+    if (prior) {
+      ws.triggerTypeErrors.push({
+        plugin_id: prior.source_plugin_id || '<project>',
+        type_id: id,
+        error: `trigger_type id ${id} from ${prior.scope} is shadowed by a project agent-authored template`,
+      });
+    }
+    ws.triggerTypes.set(id, toRegisteredType(loaded));
+  }
 }
+
+/** @deprecated — use reloadTypeRegistries. Kept for back-compat with plugin.ts callers. */
+export const reloadPluginRegistry = reloadTypeRegistries;
 
 interface StateFlags {
   [pluginId: string]: { enabled?: boolean };
