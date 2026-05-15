@@ -162,6 +162,13 @@ Usage:
   clawdevbox uninstall-service
       Stop the background service AND remove the OS auto-start registration.
 
+  clawdevbox config set <key> <value> [--global|--project]
+      Mutate a single field of the project- or global-scope config.json.
+      Currently supported keys:
+        default_agent_cli  Provider id used by the main agent and recipe.run
+                           when no explicit agent_cli is supplied. Validated
+                           against the live provider registry.
+
   clawdevbox --help
       Show this message.
 
@@ -218,6 +225,18 @@ async function main(): Promise<void> {
       const { runUninstallService } = await import('./uninstall-service.ts');
       await runUninstallService(parsed.flags);
       return;
+    }
+    case 'config': {
+      const { runConfigSet } = await import('./config-set.ts');
+      // Pass the raw subcommand args (positional list begins after `config`),
+      // preserving the trailing --global / --project tokens parseArgv consumed
+      // into the flags map.
+      const sub: string[] = [...parsed.positional];
+      if (parsed.flags.global === true) sub.push('--global');
+      if (parsed.flags.project === true) sub.push('--project');
+      // parseArgv strips the leading subcommand from positional; re-add it so
+      // runConfigSet sees ['set', '<key>', '<value>', ...].
+      process.exit(await runConfigSet(sub));
     }
     default:
       process.stderr.write(`unknown command: ${parsed.command}\n\n`);
