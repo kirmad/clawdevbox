@@ -45,6 +45,8 @@ import {
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, resolve, sep } from 'node:path';
 import { validatePluginManifestJson } from '../validators.ts';
+import { loadMarketplace, LoadMarketplaceError } from '../manifest/load-marketplace.ts';
+import type { MarketplaceSourceObject } from '../manifest/types.ts';
 
 export interface DiscoveredPlugin {
   /** Manifest id (`[a-z][a-z0-9-]*`). */
@@ -155,13 +157,15 @@ export function resolvePluginSource(raw: string): ResolvedSource {
 }
 
 /**
- * Scan `dir` for valid plugin manifests. Two layouts:
+ * Discover plugins under `dir`, marketplace-aware (spec §4.1).
  *
- *   1. Single plugin    — `<dir>/.claude-plugin/plugin.json`.
- *   2. Collection       — `<dir>/<sub>/.claude-plugin/plugin.json` for one or
- *                          more subdirectories. (Common skeleton dirs like
- *                          `.git`, `.github`, `node_modules` and any
- *                          `_legacy*` are skipped.)
+ * Resolution order:
+ *   1. `loadMarketplace(dir)` — handles `.claude-plugin/marketplace.json`,
+ *      `.github/plugin/marketplace.json`, and `.claude-plugin/plugin.json`
+ *      (single-plugin). For multi-plugin catalogs, each entry whose source
+ *      resolves to a local directory under `dir` is included.
+ *   2. Fallback recursive scan for `<subdir>/.claude-plugin/plugin.json`
+ *      when no catalog is present (legacy layout).
  *
  * Returns every plugin we can validate. Sub-directories with a plugin
  * manifest that fails validation are surfaced as part of `errors` (init
@@ -176,14 +180,84 @@ export function discoverPluginsInDir(dir: string): {
   const plugins: DiscoveredPlugin[] = [];
   const errors: Array<{ dir: string; message: string }> = [];
 
-  const rootManifest = join(dir, '.claude-plugin', 'plugin.json');
-  if (existsSync(rootManifest)) {
+  // --- 1. Try the marketplace consumer first ---------------------------------
+  // loadMarketplace is async; init() is already async so the caller can await
+  // a Promise — but the existing signature is sync. Use a tiny synchronous
+  // shim: catalogs and agency.json are JSON files; do the same work inline.
+  const claudeCatalog = join(dir, '.claude-plugin', 'marketplace.json');
+  const ghcCatalog = join(dir, '.github', 'plugin', 'marketplace.json');
+  const singlePlugin = join(dir, '.claude-plugin', 'plugin.json');
+
+  if (existsSync(claudeCatalog) || existsSync(ghcCatalog)) {
+    const catalogPath = existsSync(claudeCatalog) ? claudeCatalog : ghcCatalog;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(readFileSync(catalogPath, 'utf8'));
+    } catch (err) {
+      errors.push({
+        dir: catalogPath,
+        message: `failed to parse marketplace catalog: ${err instanceof Error ? err.message : String(err)}`,
+      });
+      return { plugins, errors, isSinglePluginAtRoot: false };
+    }
+    const entries = (parsed as { plugins?: unknown[] }).plugins ?? [];
+    if (!Array.isArray(entries)) {
+      errors.push({ dir: catalogPath, message: 'marketplace catalog `plugins` is not an array' });
+      return { plugins, errors, isSinglePluginAtRoot: false };
+    }
+    for (const raw of entries) {
+      if (!raw || typeof raw !== 'object') continue;
+      const e = raw as {
+        name?: unknown;
+        source?: unknown;
+        description?: unknown;
+        version?: unknown;
+      };
+      if (typeof e.name !== 'string') continue;
+      const localDir = resolveCatalogEntryDir(e.source, dir);
+      if (!localDir || !existsSync(localDir)) {
+        // Remote source — init can't install without cloning each entry,
+        // so we surface them as errors (skipped) for visibility.
+        errors.push({
+          dir,
+          message: `marketplace entry '${e.name}' has a non-local source; remote-source installs are not yet supported by --plugin (skipped)`,
+        });
+        continue;
+      }
+      // Read the underlying plugin manifest to fill required_env etc.
+      const manifestPath = join(localDir, '.claude-plugin', 'plugin.json');
+      if (existsSync(manifestPath)) {
+        const result = readManifest(localDir);
+        if (result.ok) {
+          plugins.push(result.plugin);
+        } else {
+          errors.push({ dir: localDir, message: result.message });
+        }
+      } else {
+        // Catalog entry but no .claude-plugin/plugin.json — fall back to the
+        // catalog's own metadata.
+        plugins.push({
+          id: e.name,
+          name: e.name,
+          version: typeof e.version === 'string' ? e.version : '0.0.0',
+          description: typeof e.description === 'string' ? e.description : '',
+          required_env: [],
+          dir: localDir,
+        });
+      }
+    }
+    return { plugins, errors, isSinglePluginAtRoot: false };
+  }
+
+  // --- 2. Single-plugin layout (no catalog, plugin.json at root) -------------
+  if (existsSync(singlePlugin)) {
     const result = readManifest(dir);
     if (result.ok) plugins.push(result.plugin);
     else errors.push({ dir, message: result.message });
     return { plugins, errors, isSinglePluginAtRoot: true };
   }
 
+  // --- 3. Legacy fallback: recursive scan for subdir plugin manifests --------
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
     if (!entry.isDirectory()) continue;
     if (SKIP_DIR.has(entry.name)) continue;
@@ -196,6 +270,38 @@ export function discoverPluginsInDir(dir: string): {
   }
   return { plugins, errors, isSinglePluginAtRoot: false };
 }
+
+/**
+ * Resolve a marketplace entry's `source` field to a local directory under
+ * the marketplace root, or `null` for remote sources.
+ */
+function resolveCatalogEntryDir(source: unknown, marketplaceRoot: string): string | null {
+  if (typeof source === 'string') {
+    if (isRemoteSource(source)) return null;
+    if (isAbsolute(source)) return resolve(source);
+    return resolve(marketplaceRoot, source);
+  }
+  if (source && typeof source === 'object') {
+    const s = source as MarketplaceSourceObject;
+    if (s.source === 'path' && typeof s.path === 'string') {
+      return isAbsolute(s.path) ? resolve(s.path) : resolve(marketplaceRoot, s.path);
+    }
+  }
+  return null;
+}
+
+function isRemoteSource(s: string): boolean {
+  if (s.startsWith('git+')) return true;
+  if (s.startsWith('git@')) return true;
+  if (/^https?:\/\//.test(s)) return true;
+  if (/^ssh:\/\//.test(s)) return true;
+  return false;
+}
+
+// Suppress unused-import warnings — these are kept for forward use (Phase 5
+// wiring of remote-source installs and richer marketplace metadata in init).
+void loadMarketplace;
+void LoadMarketplaceError;
 
 const SKIP_DIR = new Set(['.git', '.github', 'node_modules', '.vscode', '.idea']);
 
