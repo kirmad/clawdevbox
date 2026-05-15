@@ -55,6 +55,9 @@ import {
   writeTriggersFile,
   type RegisteredTrigger,
 } from '../triggers-store.ts';
+import { enqueueFire } from '../db/fires-store.ts';
+import { getDatabase } from '../db/index.ts';
+import { ensureWorkspace } from '../db/workspaces-store.ts';
 import {
   deleteOneOffTemplate,
   deleteTemplate,
@@ -515,14 +518,29 @@ export function registerTriggerTools(server: McpServer, ws: Workspace): void {
       const file = readTriggersFile(path);
       const reg = file.registered.find((r) => r.id === args.id);
       if (!reg) return notFound('registered_trigger', args.id);
-      const runId = mintId('run');
+      const db = getDatabase();
+      const workspace = ensureWorkspace(db, { path: ws.projectDir });
+      const fire = enqueueFire(db, {
+        workspace_id: workspace.id,
+        trigger_id: reg.id,
+        source: 'manual',
+        scheduled_at: Date.now(),
+        max_attempts: reg.max_attempts ?? 3,
+        payload: args.payload,
+      });
       logger.info(
-        { triggerId: reg.id, triggerType: reg.type, runId, payload: args.payload ?? null },
-        'trigger.fire queued',
+        { triggerId: reg.id, triggerType: reg.type, fireId: fire.fire_id, payload: args.payload ?? null },
+        'trigger.fire enqueued',
       );
       return {
-        content: [{ type: 'text', text: `Queued trigger ${reg.id} (run_id=${runId}).` }],
-        structuredContent: { id: reg.id, type: reg.type, run_id: runId, status: 'queued' },
+        content: [{ type: 'text', text: `Queued trigger ${reg.id} (fire_id=${fire.fire_id}).` }],
+        structuredContent: {
+          id: reg.id,
+          type: reg.type,
+          fire_id: fire.fire_id,
+          trigger_id: reg.id,
+          status: fire.status,
+        },
       };
     },
   );

@@ -548,4 +548,49 @@ test('clawdevbox MCP server smoke', async (t) => {
     assert.equal(res.structuredContent?.registered?.resolved_cron, false);
     await h.call('trigger.unregister', { id: res.structuredContent.id });
   });
+
+  await t.test('trigger.fire enqueues a DB-backed manual fire row', async () => {
+    // Register a trigger with a disabled cron so it only fires when we call.
+    const reg = await h.call('trigger.register', {
+      type_id: 'ado.new-pr-watcher',
+      params: { repo: 'fire-svc' },
+      cron: false,
+    });
+    assert.ok(!reg.isError, JSON.stringify(reg));
+    const triggerId = reg.structuredContent.id;
+
+    const fire = await h.call('trigger.fire', {
+      id: triggerId,
+      payload: { hello: 'world', n: 42 },
+    });
+    assert.ok(!fire.isError, JSON.stringify(fire));
+    assert.equal(fire.structuredContent?.trigger_id, triggerId);
+    assert.equal(fire.structuredContent?.status, 'queued');
+    assert.match(String(fire.structuredContent?.fire_id ?? ''), /^fire_/);
+
+    // Verify the row appears in the kernel DB. The dispatcher may have
+    // already moved it past 'queued' by the time we query — just confirm
+    // existence + source + payload + trigger linkage.
+    const BetterSqlite3 = (await import('better-sqlite3')).default;
+    const dbPath = join(h.globalDir, 'clawdevbox.db');
+    const db = new BetterSqlite3(dbPath, { readonly: true });
+    const rows = db
+      .prepare('SELECT * FROM fires WHERE trigger_id = ? AND source = ?')
+      .all(triggerId, 'manual');
+    db.close();
+    assert.equal(rows.length, 1, `expected one manual fire row; got ${rows.length}`);
+    assert.equal(rows[0].fire_id, fire.structuredContent.fire_id);
+    assert.ok(rows[0].payload_json, 'payload_json should be populated');
+    const payload = JSON.parse(rows[0].payload_json);
+    assert.equal(payload.hello, 'world');
+    assert.equal(payload.n, 42);
+
+    await h.call('trigger.unregister', { id: triggerId });
+  });
+
+  await t.test('trigger.fire returns NOT_FOUND for unknown id', async () => {
+    const res = await h.call('trigger.fire', { id: 'ado.new-pr-watcher#does-not-exist' });
+    assert.equal(res.isError, true);
+    assert.equal(res.structuredContent?.code, 'NOT_FOUND');
+  });
 });
