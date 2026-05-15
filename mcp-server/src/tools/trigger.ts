@@ -44,6 +44,8 @@ import { logger } from '../logger.ts';
 import {
   isValidCronExpression,
   validateAgentAuthoredTemplate,
+  validateBackoffMs,
+  validateMaxAttempts,
   validateRuntime,
   validateTriggerParams,
   type TriggerRuntime,
@@ -277,6 +279,10 @@ export function registerTriggerTools(server: McpServer, ws: Workspace): void {
         subscriber_thread_id: z.string().min(1).optional(),
         expires_at: z.number().optional(),
         once: z.boolean().optional(),
+        max_attempts: z.number().int().optional()
+          .describe('Override the default of 3. Integer in [1, 100].'),
+        backoff_ms: z.array(z.number().int()).optional()
+          .describe('Override the default of [30000, 120000, 600000]. Non-empty array of integers in [0, 86400000].'),
       },
     },
     async (args) => {
@@ -344,6 +350,29 @@ export function registerTriggerTools(server: McpServer, ws: Workspace): void {
         return paramValidationError([{ path: 'cron', code: 'CRON_INVALID', message: cronCheck.message }]);
       }
 
+      let maxAttemptsValue: number | undefined;
+      if (args.max_attempts !== undefined) {
+        const ma = validateMaxAttempts(args.max_attempts);
+        if (!ma.ok) {
+          if (isAdhoc && oneoffTemplateId) deleteOneOffTemplate(ws, oneoffTemplateId);
+          return paramValidationError([
+            { path: 'max_attempts', code: 'INVALID_MAX_ATTEMPTS', message: ma.message },
+          ]);
+        }
+        maxAttemptsValue = ma.value;
+      }
+      let backoffMsValue: number[] | undefined;
+      if (args.backoff_ms !== undefined) {
+        const bo = validateBackoffMs(args.backoff_ms);
+        if (!bo.ok) {
+          if (isAdhoc && oneoffTemplateId) deleteOneOffTemplate(ws, oneoffTemplateId);
+          return paramValidationError([
+            { path: 'backoff_ms', code: 'INVALID_BACKOFF_MS', message: bo.message },
+          ]);
+        }
+        backoffMsValue = bo.value;
+      }
+
       const id = mintRegisteredId(type.id, paramsCheck.params, type.identity_param);
       const path = triggersJsonPath(ws);
       const file = readTriggersFile(path);
@@ -367,6 +396,8 @@ export function registerTriggerTools(server: McpServer, ws: Workspace): void {
         state: initialState,
         last_run_at: null, last_run_status: null, last_run_error: null,
       };
+      if (maxAttemptsValue !== undefined) row.max_attempts = maxAttemptsValue;
+      if (backoffMsValue !== undefined) row.backoff_ms = backoffMsValue;
       file.registered = [...file.registered, row];
       writeTriggersFile(path, file);
 
@@ -425,6 +456,10 @@ export function registerTriggerTools(server: McpServer, ws: Workspace): void {
           .union([z.string(), z.null(), z.literal(false), z.literal('')])
           .optional()
           .describe('When present, replaces the cron field. Pass null to inherit; false/"" to disable.'),
+        max_attempts: z.number().int().optional()
+          .describe('Override the trigger\'s max_attempts. Integer in [1, 100].'),
+        backoff_ms: z.array(z.number().int()).optional()
+          .describe('Override the trigger\'s backoff_ms ladder. Non-empty array of integers in [0, 86400000].'),
       },
     },
     async (args) => {
@@ -434,10 +469,15 @@ export function registerTriggerTools(server: McpServer, ws: Workspace): void {
       if (idx < 0) return notFound('registered_trigger', args.id);
       const row = file.registered[idx];
 
-      if (args.params === undefined && args.cron === undefined) {
+      if (
+        args.params === undefined &&
+        args.cron === undefined &&
+        args.max_attempts === undefined &&
+        args.backoff_ms === undefined
+      ) {
         return structuredError(
           'NO_CHANGES',
-          'trigger.update_params requires at least one of `params` or `cron`.',
+          'trigger.update_params requires at least one of `params`, `cron`, `max_attempts`, or `backoff_ms`.',
           { id: args.id },
         );
       }
@@ -466,7 +506,35 @@ export function registerTriggerTools(server: McpServer, ws: Workspace): void {
         nextCron = cronCheck.cron;
       }
 
-      const updated: RegisteredTrigger = { ...row, params: nextParams, cron: nextCron };
+      let nextMaxAttempts = row.max_attempts;
+      if (args.max_attempts !== undefined) {
+        const ma = validateMaxAttempts(args.max_attempts);
+        if (!ma.ok) {
+          return paramValidationError([
+            { path: 'max_attempts', code: 'INVALID_MAX_ATTEMPTS', message: ma.message },
+          ]);
+        }
+        nextMaxAttempts = ma.value;
+      }
+
+      let nextBackoffMs = row.backoff_ms;
+      if (args.backoff_ms !== undefined) {
+        const bo = validateBackoffMs(args.backoff_ms);
+        if (!bo.ok) {
+          return paramValidationError([
+            { path: 'backoff_ms', code: 'INVALID_BACKOFF_MS', message: bo.message },
+          ]);
+        }
+        nextBackoffMs = bo.value;
+      }
+
+      const updated: RegisteredTrigger = {
+        ...row,
+        params: nextParams,
+        cron: nextCron,
+        max_attempts: nextMaxAttempts,
+        backoff_ms: nextBackoffMs,
+      };
       file.registered[idx] = updated;
       writeTriggersFile(path, file);
       return {

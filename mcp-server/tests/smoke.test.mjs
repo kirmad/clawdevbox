@@ -593,4 +593,79 @@ test('clawdevbox MCP server smoke', async (t) => {
     assert.equal(res.isError, true);
     assert.equal(res.structuredContent?.code, 'NOT_FOUND');
   });
+
+  await t.test('trigger.register persists max_attempts + backoff_ms', async () => {
+    const reg = await h.call('trigger.register', {
+      type_id: 'ado.new-pr-watcher',
+      params: { repo: 'retry-svc' },
+      cron: false,
+      max_attempts: 5,
+      backoff_ms: [1000, 5000, 10000],
+    });
+    assert.ok(!reg.isError, JSON.stringify(reg));
+    assert.equal(reg.structuredContent?.registered?.max_attempts, 5);
+    assert.deepEqual(reg.structuredContent?.registered?.backoff_ms, [1000, 5000, 10000]);
+
+    // Verify on disk via the DB.
+    const BetterSqlite3 = (await import('better-sqlite3')).default;
+    const db = new BetterSqlite3(join(h.globalDir, 'clawdevbox.db'), { readonly: true });
+    const row = db
+      .prepare('SELECT max_attempts, backoff_ms_json FROM triggers WHERE id = ?')
+      .get(reg.structuredContent.id);
+    db.close();
+    assert.equal(row.max_attempts, 5);
+    assert.deepEqual(JSON.parse(row.backoff_ms_json), [1000, 5000, 10000]);
+
+    await h.call('trigger.unregister', { id: reg.structuredContent.id });
+  });
+
+  await t.test('trigger.register rejects max_attempts=0', async () => {
+    const res = await h.call('trigger.register', {
+      type_id: 'ado.new-pr-watcher',
+      params: { repo: 'reject-ma' },
+      max_attempts: 0,
+    });
+    assert.equal(res.isError, true);
+    assert.equal(res.structuredContent?.code, 'PARAM_VALIDATION');
+    const paths = (res.structuredContent?.errors ?? []).map((e) => e.path);
+    assert.ok(paths.includes('max_attempts'));
+  });
+
+  await t.test('trigger.register rejects empty backoff_ms array', async () => {
+    const res = await h.call('trigger.register', {
+      type_id: 'ado.new-pr-watcher',
+      params: { repo: 'reject-bo' },
+      backoff_ms: [],
+    });
+    assert.equal(res.isError, true);
+    assert.equal(res.structuredContent?.code, 'PARAM_VALIDATION');
+    const paths = (res.structuredContent?.errors ?? []).map((e) => e.path);
+    assert.ok(paths.includes('backoff_ms'));
+  });
+
+  await t.test('trigger.update_params honors max_attempts + backoff_ms', async () => {
+    const reg = await h.call('trigger.register', {
+      type_id: 'ado.new-pr-watcher',
+      params: { repo: 'upd-svc' },
+      cron: false,
+    });
+    assert.ok(!reg.isError, JSON.stringify(reg));
+    const id = reg.structuredContent.id;
+
+    const upd = await h.call('trigger.update_params', {
+      id,
+      max_attempts: 7,
+      backoff_ms: [2000, 4000],
+    });
+    assert.ok(!upd.isError, JSON.stringify(upd));
+    assert.equal(upd.structuredContent?.registered?.max_attempts, 7);
+    assert.deepEqual(upd.structuredContent?.registered?.backoff_ms, [2000, 4000]);
+
+    // Invalid update should fail.
+    const bad = await h.call('trigger.update_params', { id, max_attempts: -1 });
+    assert.equal(bad.isError, true);
+    assert.equal(bad.structuredContent?.code, 'PARAM_VALIDATION');
+
+    await h.call('trigger.unregister', { id });
+  });
 });

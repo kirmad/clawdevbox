@@ -290,3 +290,34 @@ test('validateRecipeSource accepts JSON source via the sniff', () => {
   const res = validateRecipeSource(json);
   assert.equal(res.ok, true, res.ok ? '' : JSON.stringify(res.errors));
 });
+
+
+import { validateMaxAttempts, validateBackoffMs } from '../src/validators.ts';
+
+test('validateMaxAttempts accepts positive integers up to 100', () => {
+  for (const v of [1, 3, 50, 100]) {
+    const r = validateMaxAttempts(v);
+    assert.equal(r.ok, true);
+    if (r.ok) assert.equal(r.value, v);
+  }
+});
+
+test('validateMaxAttempts rejects zero negatives non-integers and over 100', () => {
+  for (const v of [0, -1, 1.5, 101, 'three', null, [], {}]) {
+    const r = validateMaxAttempts(v);
+    assert.equal(r.ok, false);
+  }
+});
+
+test('validateBackoffMs accepts non-empty integer arrays in range', () => {
+  const r = validateBackoffMs([0, 30000, 86400000]);
+  assert.equal(r.ok, true);
+  if (r.ok) assert.deepEqual(r.value, [0, 30000, 86400000]);
+});
+
+test('validateBackoffMs rejects empty non-array negative non-integer and out-of-range', () => {
+  for (const v of [[], 'no', [1, -1], [1.5], [86400001], null]) {
+    const r = validateBackoffMs(v);
+    assert.equal(r.ok, false);
+  }
+});

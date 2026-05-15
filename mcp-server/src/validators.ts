@@ -522,6 +522,46 @@ export function isValidCronExpression(s: string): boolean {
   return fields.every((f) => CRON_FIELD.test(f));
 }
 
+/**
+ * Validate a `max_attempts` value for a registered trigger (spec §6.2).
+ * Must be a positive integer; capped at 100 to keep dead-letter loops bounded.
+ */
+export function validateMaxAttempts(
+  v: unknown,
+): { ok: true; value: number } | { ok: false; message: string } {
+  if (typeof v !== 'number' || !Number.isInteger(v)) {
+    return { ok: false, message: 'max_attempts must be an integer.' };
+  }
+  if (v < 1) return { ok: false, message: 'max_attempts must be >= 1.' };
+  if (v > 100) return { ok: false, message: 'max_attempts must be <= 100.' };
+  return { ok: true, value: v };
+}
+
+/**
+ * Validate a `backoff_ms` value for a registered trigger (spec §6.2).
+ * Must be a non-empty array of non-negative integers; each value capped at
+ * 24h (86_400_000 ms) to prevent runaway retry windows.
+ */
+export function validateBackoffMs(
+  v: unknown,
+): { ok: true; value: number[] } | { ok: false; message: string } {
+  if (!Array.isArray(v)) return { ok: false, message: 'backoff_ms must be an array.' };
+  if (v.length === 0) return { ok: false, message: 'backoff_ms must be non-empty.' };
+  const out: number[] = [];
+  for (let i = 0; i < v.length; i++) {
+    const n = v[i];
+    if (typeof n !== 'number' || !Number.isInteger(n)) {
+      return { ok: false, message: `backoff_ms[${i}] must be an integer.` };
+    }
+    if (n < 0) return { ok: false, message: `backoff_ms[${i}] must be >= 0.` };
+    if (n > 86_400_000) {
+      return { ok: false, message: `backoff_ms[${i}] must be <= 86400000 (24h).` };
+    }
+    out.push(n);
+  }
+  return { ok: true, value: out };
+}
+
 function validateTriggerTypeEntry(entry: unknown, p: string): ValidationError[] {
   const errors: ValidationError[] = [];
   if (!isPlainObject(entry)) {
