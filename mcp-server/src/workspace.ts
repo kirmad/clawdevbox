@@ -29,6 +29,7 @@ import { validatePluginManifest } from './validators.ts';
 import { listAgentAuthoredTemplates, toRegisteredType } from './template-store.ts';
 import type { AgentCliProvider, AgentCliProviderError } from './agent-clis/types.ts';
 import { registerBuiltinProviders } from './agent-clis/index.ts';
+import { loadPluginProviders } from './agent-clis/load-plugin.ts';
 
 // ============================================================================
 // Types
@@ -521,6 +522,11 @@ export async function reloadTypeRegistries(ws: Workspace): Promise<void> {
     }
     ws.triggerTypes.set(id, toRegisteredType(loaded));
   }
+
+  // ---- Plugin-provided AgentCliProviders (spec §4) ----
+  // Runs AFTER `ws.plugins` is populated and AFTER `registerBuiltinProviders`
+  // so built-ins always win id collisions with plugin-provided providers.
+  await loadPluginProviders(ws);
 }
 
 /** @deprecated — use reloadTypeRegistries. Kept for back-compat with plugin.ts callers. */
