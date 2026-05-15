@@ -1,5 +1,15 @@
-import { writeMcpJson, probeBinary } from './shared.ts';
-import type { AgentCliProvider, AgentHandle, ProviderCtx, SpawnSessionOpts } from './types.ts';
+import { join } from 'node:path';
+import os from 'node:os';
+import { writeMcpJson, probeBinary, cliPluginSync, cliPluginDiscover } from './shared.ts';
+import type {
+  AgentCliProvider,
+  AgentHandle,
+  DiscoveredPlugin,
+  ProviderCtx,
+  SpawnSessionOpts,
+  SyncPluginInventoryOpts,
+  SyncReport,
+} from './types.ts';
 
 function resolveBinary(): { file: string; argsPrefix: string[] } {
   const env = process.env.CLAWDEVBOX_CLAUDE_PATH;
@@ -7,6 +17,8 @@ function resolveBinary(): { file: string; argsPrefix: string[] } {
   if (process.platform === 'win32') return { file: 'cmd.exe', argsPrefix: ['/d', '/s', '/c', 'claude'] };
   return { file: 'claude', argsPrefix: [] };
 }
+
+const CLAUDE_PLUGIN_CACHE = join(os.homedir(), '.claude', 'plugins', 'cache');
 
 export const claudeProvider: AgentCliProvider = {
   id: 'claude',
@@ -46,5 +58,23 @@ export const claudeProvider: AgentCliProvider = {
       exited: new Promise((resolveExit) => pty.onExit(({ exitCode, signal }) =>
         resolveExit({ exitCode, signal: signal != null ? String(signal) : undefined }))),
     };
+  },
+
+  async syncPluginInventory(ctx: ProviderCtx, opts: SyncPluginInventoryOpts): Promise<SyncReport> {
+    const { file, argsPrefix } = resolveBinary();
+    return cliPluginSync(ctx, opts, {
+      binary: file,
+      argsPrefix,
+      pluginCacheDir: CLAUDE_PLUGIN_CACHE,
+    });
+  },
+
+  async discoverInstalledPlugins(ctx: ProviderCtx): Promise<DiscoveredPlugin[]> {
+    const { file, argsPrefix } = resolveBinary();
+    return cliPluginDiscover(ctx, {
+      binary: file,
+      argsPrefix,
+      pluginCacheDir: CLAUDE_PLUGIN_CACHE,
+    });
   },
 };
