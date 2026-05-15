@@ -443,6 +443,46 @@ test('workspace + recipe.run surface', async (t) => {
     assert.ok(Array.isArray(res.structuredContent?.available));
   });
 
+  await t.test('recipe.run rejects recipes whose default_client is not a registered provider', async () => {
+    const adhocSource = [
+      'id: adhoc-bad-client',
+      'name: bad-client',
+      'description: references a provider that does not exist.',
+      'default_client: not-installed-provider',
+    ].join('\n') + '\n';
+    const res = await h.call('recipe.run', {
+      source: adhocSource,
+      prompt: 'x',
+      agent_cli: 'echo-stub',
+    });
+    assert.equal(res.isError, true);
+    assert.equal(res.structuredContent?.code, 'UNKNOWN_AGENT_CLI');
+    assert.equal(res.structuredContent?.default_client, 'not-installed-provider');
+  });
+
+  await t.test('recipe.upsert warns (does NOT fail) when default_client is not yet installed', async () => {
+    const source = [
+      'id: future-plugin-recipe',
+      'name: Future',
+      'description: References a plugin not yet installed.',
+      'default_client: future-plugin',
+    ].join('\n') + '\n';
+    const res = await h.call('recipe.upsert', {
+      id: 'future-plugin-recipe',
+      scope: 'project',
+      source,
+    });
+    assert.ok(!res.isError, JSON.stringify(res));
+    const warnings = res.structuredContent?.warnings ?? [];
+    assert.ok(Array.isArray(warnings));
+    assert.ok(
+      warnings.some(
+        (w) => w.code === 'UNKNOWN_AGENT_CLI' && w.field === 'default_client' && w.value === 'future-plugin',
+      ),
+      `expected UNKNOWN_AGENT_CLI warning, got: ${JSON.stringify(warnings)}`,
+    );
+  });
+
   await t.test('recipe.done outside a recipe-run session is rejected', async () => {
     // The harness's MCP server has NO CLAWDEVBOX_RECIPE_INSTANCE_ID env var,
     // so calling recipe.done on it should fail with NOT_IN_RECIPE_INSTANCE.

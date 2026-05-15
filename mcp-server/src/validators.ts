@@ -118,12 +118,18 @@ export function validateRecipeParsed(parsed: unknown): ValidationResult {
       });
     }
   }
-  if (r.default_client !== undefined && r.default_client !== 'claude' && r.default_client !== 'copilot') {
-    errors.push({
-      path: 'default_client',
-      code: 'ENUM',
-      message: `default_client must be 'claude' or 'copilot'.`,
-    });
+  if (r.default_client !== undefined) {
+    if (
+      typeof r.default_client !== 'string' ||
+      r.default_client.length === 0 ||
+      !/^[a-z0-9][a-z0-9._-]*$/i.test(r.default_client)
+    ) {
+      errors.push({
+        path: 'default_client',
+        code: 'INVALID_VALUE',
+        message: `default_client must be a non-empty provider id (e.g. 'copilot', 'claude', 'agency').`,
+      });
+    }
   }
   if (r.mcp_servers !== undefined) {
     if (!Array.isArray(r.mcp_servers) || !r.mcp_servers.every((s) => typeof s === 'string')) {

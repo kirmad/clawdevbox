@@ -215,6 +215,23 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
         }
       }
 
+      // Lenient default_client check (spec §7.5): upsert tolerates references
+      // to providers that aren't installed yet (e.g. a plugin scheduled for
+      // later install). We surface a warning but don't fail the write.
+      const warnings: Array<{ code: string; message: string; field: string; value: unknown }> = [];
+      const declaredClient = parsed && typeof parsed.default_client === 'string' ? parsed.default_client : null;
+      if (declaredClient && !ws.agentCliProviders.has(declaredClient)) {
+        const available = [...ws.agentCliProviders.entries()]
+          .filter(([, p]) => !p.internal)
+          .map(([id]) => id);
+        warnings.push({
+          code: 'UNKNOWN_AGENT_CLI',
+          field: 'default_client',
+          value: declaredClient,
+          message: `default_client '${declaredClient}' is not currently registered (available: ${available.join(', ') || '<none>'}). The recipe was written; install the provider before running it.`,
+        });
+      }
+
       return {
         content: [{ type: 'text', text: `Wrote recipe ${args.id} to ${args.scope} scope (${format}).` }],
         structuredContent: {
@@ -223,6 +240,7 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
           path: target,
           format,
           removed_siblings: removedPaths,
+          warnings,
         },
       };
     },
@@ -335,6 +353,7 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
       let recipeId: string;
       let recipeSnapshot: string;
       let isAdhoc: boolean;
+      let parsedRecipe: Record<string, unknown> | null = null;
       if (hasId) {
         const idCheck = validateId(args.id!);
         if (!idCheck.ok) return structuredError('INVALID_ID', idCheck.message!);
@@ -343,15 +362,42 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
         recipeId = args.id!;
         recipeSnapshot = hit.source;
         isAdhoc = false;
+        try {
+          const p = parseRecipeSource(hit.source);
+          if (p && typeof p === 'object' && !Array.isArray(p)) {
+            parsedRecipe = p as Record<string, unknown>;
+          }
+        } catch {
+          // saved recipe failed to parse — leave parsedRecipe null; spawn
+          // path will surface its own failure.
+        }
       } else {
         const validation = validateRecipeSource(args.source!);
         if (!validation.ok) {
           return validationError(validation.errors);
         }
-        const parsed = parseRecipeSource(args.source!) as { id: string };
+        const parsed = parseRecipeSource(args.source!) as { id: string } & Record<string, unknown>;
         recipeId = parsed.id;
         recipeSnapshot = args.source!;
         isAdhoc = true;
+        parsedRecipe = parsed;
+      }
+
+      // Strict default_client check (spec §7.5): recipe.run is about to spawn,
+      // so a missing provider must fail loudly rather than warn.
+      const declaredClient =
+        parsedRecipe && typeof parsedRecipe.default_client === 'string'
+          ? (parsedRecipe.default_client as string)
+          : null;
+      if (declaredClient && !ws.agentCliProviders.has(declaredClient)) {
+        const available = [...ws.agentCliProviders.entries()]
+          .filter(([, p]) => !p.internal)
+          .map(([id]) => id);
+        return structuredError(
+          'UNKNOWN_AGENT_CLI',
+          `recipe default_client '${declaredClient}' is not registered (available: ${available.join(', ') || '<none>'})`,
+          { default_client: declaredClient, available },
+        );
       }
 
       // 2. Resolve / create the workspace.

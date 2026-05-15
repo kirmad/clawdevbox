@@ -293,6 +293,30 @@ test('validateRecipeSource accepts JSON source via the sniff', () => {
   assert.equal(res.ok, true, res.ok ? '' : JSON.stringify(res.errors));
 });
 
+test('default_client accepts any provider-id-shaped string (no enum gate)', () => {
+  const base = { id: 'r', name: 'R', description: 'd' };
+  // Built-ins still work.
+  assert.equal(validateRecipeParsed({ ...base, default_client: 'copilot' }).ok, true);
+  assert.equal(validateRecipeParsed({ ...base, default_client: 'claude' }).ok, true);
+  // Plugin-provided ids that wouldn't have passed the old enum are now OK.
+  assert.equal(validateRecipeParsed({ ...base, default_client: 'agency' }).ok, true);
+  assert.equal(validateRecipeParsed({ ...base, default_client: 'my.plugin-cli_v2' }).ok, true);
+});
+
+test('default_client rejects empty / wrong-type / bad-shape values', () => {
+  const base = { id: 'r', name: 'R', description: 'd' };
+  for (const bad of ['', '-leading-dash', 'has space', 123, true, {}]) {
+    const r = validateRecipeParsed({ ...base, default_client: bad });
+    assert.equal(r.ok, false, `expected rejection for ${JSON.stringify(bad)}`);
+    if (!r.ok) {
+      assert.ok(
+        r.errors.some((e) => e.path === 'default_client' && e.code === 'INVALID_VALUE'),
+        `missing default_client/INVALID_VALUE for ${JSON.stringify(bad)}`,
+      );
+    }
+  }
+});
+
 
 import { validateMaxAttempts, validateBackoffMs } from '../src/validators.ts';
 
