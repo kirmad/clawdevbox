@@ -1,17 +1,23 @@
 /**
  * workspace.ts
  *
- * Resolves filesystem paths for the three scopes Conductor recognizes
+ * Resolves filesystem paths for the three scopes Clawdevbox recognizes
  * (project / plugin:<id> / global, spec §10.4) and maintains an in-memory
  * registry of installed plugins discovered under
- * `<project_dir>/.conductor/plugins/*\/plugin.yaml`.
+ * `<global_dir>/plugins/*\/plugin.yaml`.
+ *
+ * Plugins are *globally* installed under `<globalDir>/plugins/<id>/`. An
+ * entry is either a real directory (built-in copy / git clone) or a
+ * symlink/junction back to the user-provided absolute folder for local
+ * installs. `statSync()` follows the link, so the rest of discovery works
+ * uniformly.
  *
  * No process state, no caches beyond the plugin registry — every file read
  * goes straight to disk. The registry is rebuilt on demand
  * (`reloadPluginRegistry()`) by the plugin.* tools after install/uninstall.
  *
- * CONDUCTOR_PROJECT_DIR is mandatory; the server refuses to start without it.
- * CONDUCTOR_GLOBAL_DIR is optional (defaults to `~/.conductor`) — useful when
+ * CLAWDEVBOX_PROJECT_DIR is mandatory; the server refuses to start without it.
+ * CLAWDEVBOX_GLOBAL_DIR is optional (defaults to `~/.clawdevbox`) — useful when
  * tests want to redirect "global" away from the real user home.
  */
 
@@ -51,7 +57,7 @@ export interface TriggerTypeParameter {
  * A trigger TYPE declared by a plugin (spec §8.2). The capability — script
  * file, parameter schema, default cron, callback binding. Distinct from a
  * REGISTERED trigger (a concrete instance bound to specific param values),
- * which is held by the conductor sidecar in `.conductor/triggers.json`.
+ * which is held by the clawdevbox sidecar in `.clawdevbox/triggers.json`.
  */
 export interface PluginTriggerType {
   /** Globally-unique type id, e.g. `ado.new-pr-watcher`. */
@@ -62,7 +68,7 @@ export interface PluginTriggerType {
   description?: string;
   /**
    * Recipe id the callback should run (mutually exclusive with `binds_callback_to`).
-   * Conductor mints `/callback/recipes/<recipe_id>/run` (or `.../run/<inbox_item_id>`)
+   * Clawdevbox mints `/callback/recipes/<recipe_id>/run` (or `.../run/<inbox_item_id>`)
    * when an instance of this type is registered.
    */
   binds_callback_to_recipe?: string;
@@ -84,6 +90,8 @@ export interface PluginTriggerType {
   identity_param?: string;
   /** Parameter schema — these become the initial `state` on first fire. */
   parameters?: TriggerTypeParameter[];
+  /** Script runtime — drives the spawn command. Plugin-shipped types omit this and default to 'tsx' for backward compatibility. Required on agent-authored templates. */
+  runtime?: 'node' | 'tsx' | 'python' | 'bash';
 }
 
 export interface PluginManifest {
@@ -100,7 +108,7 @@ export interface PluginManifest {
     /**
      * Trigger TYPES — capabilities, not instances (spec §8.1 / §10.2). To
      * activate a type, the agent calls `trigger.register({ type_id, params })`
-     * which appends a row to `.conductor/triggers.json` `registered[]`.
+     * which appends a row to `.clawdevbox/triggers.json` `registered[]`.
      */
     trigger_types?: PluginTriggerType[];
     /** Hostable tools (spec §10.3) — single-file scripts hosted in-process. */
@@ -108,7 +116,7 @@ export interface PluginManifest {
     mcp_servers?: PluginProvideEntry[];
   };
   requires?: {
-    conductor_version?: string;
+    clawdevbox_version?: string;
     env?: string[];
   };
 }
@@ -167,20 +175,20 @@ export interface Workspace {
   triggerTypeErrors: Array<{ plugin_id: string; type_id: string; error: string }>;
 }
 
-/** Read CONDUCTOR_PROJECT_DIR (required) + CONDUCTOR_GLOBAL_DIR (optional). */
+/** Read CLAWDEVBOX_PROJECT_DIR (required) + CLAWDEVBOX_GLOBAL_DIR (optional). */
 export function loadWorkspaceFromEnv(env: NodeJS.ProcessEnv = process.env): Workspace {
-  const projectDir = env.CONDUCTOR_PROJECT_DIR;
+  const projectDir = env.CLAWDEVBOX_PROJECT_DIR;
   if (!projectDir || projectDir.trim() === '') {
     throw new WorkspaceConfigError(
-      'CONDUCTOR_PROJECT_DIR env var is required (path to the workspace root).',
+      'CLAWDEVBOX_PROJECT_DIR env var is required (path to the workspace root).',
     );
   }
   if (!existsSync(projectDir)) {
     throw new WorkspaceConfigError(
-      `CONDUCTOR_PROJECT_DIR does not exist: ${projectDir}`,
+      `CLAWDEVBOX_PROJECT_DIR does not exist: ${projectDir}`,
     );
   }
-  const globalDir = env.CONDUCTOR_GLOBAL_DIR ?? join(homedir(), '.conductor');
+  const globalDir = env.CLAWDEVBOX_GLOBAL_DIR ?? join(homedir(), '.clawdevbox');
   const ws: Workspace = {
     projectDir: resolve(projectDir),
     globalDir: resolve(globalDir),
@@ -189,7 +197,34 @@ export function loadWorkspaceFromEnv(env: NodeJS.ProcessEnv = process.env): Work
     triggerTypeErrors: [],
   };
   reloadPluginRegistry(ws);
+  warnIfLegacyProjectPlugins(ws);
   return ws;
+}
+
+/**
+ * One-shot warning at server boot if the legacy `<projectDir>/.clawdevbox/plugins/`
+ * tree still has plugins inside. Under the new global-store model those are
+ * silently ignored; users need to reinstall into the global store to get them
+ * back. Errors here are swallowed (logging is best-effort).
+ */
+function warnIfLegacyProjectPlugins(ws: Workspace): void {
+  const legacy = join(ws.projectDir, '.clawdevbox', 'plugins');
+  if (!existsSync(legacy)) return;
+  let entries: string[];
+  try {
+    entries = readdirSync(legacy).filter((n) => !n.startsWith('.'));
+  } catch {
+    return;
+  }
+  if (entries.length === 0) return;
+  // eslint-disable-next-line no-console
+  console.warn(
+    `[clawdevbox] Legacy project-scope plugins detected at ${legacy} (${entries.join(
+      ', ',
+    )}). These are no longer scanned — plugins now live under ${globalPluginsDir(
+      ws,
+    )}. Reinstall via 'plugin.install' to migrate.`,
+  );
 }
 
 // ============================================================================
@@ -212,13 +247,13 @@ export function validateId(id: string): { ok: boolean; message?: string } {
 
 /** Where a recipe lives for a given (writable) scope. */
 export function recipePath(ws: Workspace, scope: WritableScope, id: string): string {
-  if (scope === 'project') return join(ws.projectDir, '.conductor', 'recipes', `${id}${RECIPE_EXT}`);
+  if (scope === 'project') return join(ws.projectDir, '.clawdevbox', 'recipes', `${id}${RECIPE_EXT}`);
   return join(ws.globalDir, 'recipes', `${id}${RECIPE_EXT}`);
 }
 
 /** Where a skill lives for a given (writable) scope. */
 export function skillPath(ws: Workspace, scope: WritableScope, id: string): string {
-  if (scope === 'project') return join(ws.projectDir, '.conductor', 'skills', `${id}${SKILL_EXT}`);
+  if (scope === 'project') return join(ws.projectDir, '.clawdevbox', 'skills', `${id}${SKILL_EXT}`);
   return join(ws.globalDir, 'skills', `${id}${SKILL_EXT}`);
 }
 
@@ -228,17 +263,63 @@ export function skillPath(ws: Workspace, scope: WritableScope, id: string): stri
  *   { "registered": [ { id, type, params, cron, enabled, ... }, ... ] }
  */
 export function triggersJsonPath(ws: Workspace): string {
-  return join(ws.projectDir, '.conductor', 'triggers.json');
+  return join(ws.projectDir, '.clawdevbox', 'triggers.json');
 }
 
-/** Where a plugin lives on disk. */
+/** Where project-scope agent-authored trigger TYPES live. */
+export function projectTriggerTypesDir(ws: Workspace): string {
+  return join(ws.projectDir, '.clawdevbox', 'trigger-types');
+}
+
+/** Where global-scope agent-authored trigger TYPES live. */
+export function globalTriggerTypesDir(ws: Workspace): string {
+  return join(ws.globalDir, 'trigger-types');
+}
+
+/** Reserved subdirectory for one-off auto-templates created by trigger.register. */
+export function oneoffTemplatesDir(ws: Workspace): string {
+  return join(projectTriggerTypesDir(ws), '_oneoff');
+}
+
+/** Where a plugin lives on disk. Always under the global plugin store. */
 export function pluginDir(ws: Workspace, id: string): string {
-  return join(ws.projectDir, '.conductor', 'plugins', id);
+  return join(ws.globalDir, 'plugins', id);
 }
 
-/** Per-plugin file lookup — given a plugin and a `provides[].file`, return absolute path. */
+/** Root of the global plugin store. */
+export function globalPluginsDir(ws: Workspace): string {
+  return join(ws.globalDir, 'plugins');
+}
+
+/**
+ * Sidecar install-record path. We deliberately keep this *outside* the
+ * plugin directory so junction-installed local plugins don't get extra
+ * files written into the user's source folder.
+ */
+export function pluginInstallRecordPath(ws: Workspace, id: string): string {
+  return join(ws.globalDir, 'plugins', `${id}.install.json`);
+}
+
+/**
+ * Junction path that points at clawdevbox's own `node_modules` so plugin
+ * hostable tools can resolve `import 'zod'` (and friends) via Node's
+ * walk-up algorithm. Real-dir plugins (built-in copy, git clone) under
+ * `<globalDir>/plugins/<id>/tools/foo.ts` walk up and find this.
+ *
+ * Local-junction plugins additionally get a best-effort junction at the
+ * user's folder root so realpath-based resolution finds host deps there.
+ */
+export function globalNodeModulesLinkPath(ws: Workspace): string {
+  return join(ws.globalDir, 'node_modules');
+}
+
+/** Per-plugin file lookup — given a plugin's installed dir and a `provides[].file`, return absolute path. */
 export function pluginFileAbs(ws: Workspace, pluginId: string, relFile: string): string | null {
-  const root = pluginDir(ws, pluginId);
+  const plugin = ws.plugins.get(pluginId);
+  // Prefer the registry entry's resolved dir (handles future relocations);
+  // fall back to the canonical global path when called before registry
+  // load (defensive — every real caller waits until reloadPluginRegistry).
+  const root = plugin?.dir ?? pluginDir(ws, pluginId);
   const abs = resolve(root, relFile);
   // Path-escape guard — refuse to follow `..` outside the plugin root.
   if (!abs.startsWith(root + sep) && abs !== root) {
@@ -256,12 +337,12 @@ export function stateJsonPath(ws: Workspace): string {
 // Plugin registry
 // ============================================================================
 
-/** Rescan <project_dir>/.conductor/plugins/* and rebuild ws.plugins. */
+/** Rescan <globalDir>/plugins/* and rebuild ws.plugins. */
 export function reloadPluginRegistry(ws: Workspace): void {
   ws.plugins.clear();
   ws.triggerTypes.clear();
   ws.triggerTypeErrors.length = 0;
-  const pluginsRoot = join(ws.projectDir, '.conductor', 'plugins');
+  const pluginsRoot = globalPluginsDir(ws);
   if (!existsSync(pluginsRoot)) return;
 
   let entries: string[];
@@ -274,6 +355,10 @@ export function reloadPluginRegistry(ws: Workspace): void {
   const stateFlags = readStateFlags(ws);
 
   for (const entry of entries) {
+    // Skip dotfiles / atomic-install temp dirs / sibling sidecar files
+    // (`<id>.install.json`) — only directories (real or symlinks resolved
+    // to dirs) are plugin candidates.
+    if (entry.startsWith('.')) continue;
     const dir = join(pluginsRoot, entry);
     let isDir = false;
     try {
@@ -310,6 +395,20 @@ export function reloadPluginRegistry(ws: Workspace): void {
         manifest: { id: entry, name: entry, version: '0.0.0', description: '' },
         status: 'error',
         error: `failed to parse plugin.yaml: ${msg}`,
+      });
+      continue;
+    }
+
+    // Manifest id must match directory name. A junctioned local plugin
+    // whose author renames `id:` would otherwise silently double-register
+    // or shadow itself; we'd rather surface the mismatch.
+    if (manifest.id !== entry) {
+      ws.plugins.set(entry, {
+        id: entry,
+        dir,
+        manifest,
+        status: 'error',
+        error: `manifest.id ("${manifest.id}") does not match plugin directory name ("${entry}"). Rename one to match.`,
       });
       continue;
     }
