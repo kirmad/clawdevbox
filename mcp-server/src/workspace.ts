@@ -344,126 +344,126 @@ export function reloadTypeRegistries(ws: Workspace): void {
   ws.triggerTypes.clear();
   ws.triggerTypeErrors.length = 0;
   const pluginsRoot = globalPluginsDir(ws);
-  if (!existsSync(pluginsRoot)) return;
-
-  let entries: string[];
-  try {
-    entries = readdirSync(pluginsRoot);
-  } catch {
-    return;
-  }
-
-  const stateFlags = readStateFlags(ws);
-
-  for (const entry of entries) {
-    // Skip dotfiles / atomic-install temp dirs / sibling sidecar files
-    // (`<id>.install.json`) — only directories (real or symlinks resolved
-    // to dirs) are plugin candidates.
-    if (entry.startsWith('.')) continue;
-    const dir = join(pluginsRoot, entry);
-    let isDir = false;
+  if (existsSync(pluginsRoot)) {
+    let entries: string[] = [];
     try {
-      isDir = statSync(dir).isDirectory();
+      entries = readdirSync(pluginsRoot);
     } catch {
-      continue;
+      entries = [];
     }
-    if (!isDir) continue;
 
-    const manifestPath = join(dir, 'plugin.yaml');
-    if (!existsSync(manifestPath)) continue;
+    const stateFlags = readStateFlags(ws);
 
-    let manifest: PluginManifest;
-    try {
-      const raw = readFileSync(manifestPath, 'utf8');
-      const parsed = yamlLoad(raw);
-      const validation = validatePluginManifest(parsed);
-      if (!validation.ok) {
+    for (const entry of entries) {
+      // Skip dotfiles / atomic-install temp dirs / sibling sidecar files
+      // (`<id>.install.json`) — only directories (real or symlinks resolved
+      // to dirs) are plugin candidates.
+      if (entry.startsWith('.')) continue;
+      const dir = join(pluginsRoot, entry);
+      let isDir = false;
+      try {
+        isDir = statSync(dir).isDirectory();
+      } catch {
+        continue;
+      }
+      if (!isDir) continue;
+
+      const manifestPath = join(dir, 'plugin.yaml');
+      if (!existsSync(manifestPath)) continue;
+
+      let manifest: PluginManifest;
+      try {
+        const raw = readFileSync(manifestPath, 'utf8');
+        const parsed = yamlLoad(raw);
+        const validation = validatePluginManifest(parsed);
+        if (!validation.ok) {
+          ws.plugins.set(entry, {
+            id: entry,
+            dir,
+            manifest: { id: entry, name: entry, version: '0.0.0', description: '' },
+            status: 'error',
+            error: validation.errors.map((e) => `${e.path}: ${e.message}`).join('; '),
+          });
+          continue;
+        }
+        manifest = parsed as PluginManifest;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
         ws.plugins.set(entry, {
           id: entry,
           dir,
           manifest: { id: entry, name: entry, version: '0.0.0', description: '' },
           status: 'error',
-          error: validation.errors.map((e) => `${e.path}: ${e.message}`).join('; '),
+          error: `failed to parse plugin.yaml: ${msg}`,
         });
         continue;
       }
-      manifest = parsed as PluginManifest;
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      ws.plugins.set(entry, {
-        id: entry,
-        dir,
-        manifest: { id: entry, name: entry, version: '0.0.0', description: '' },
-        status: 'error',
-        error: `failed to parse plugin.yaml: ${msg}`,
-      });
-      continue;
-    }
 
-    // Manifest id must match directory name. A junctioned local plugin
-    // whose author renames `id:` would otherwise silently double-register
-    // or shadow itself; we'd rather surface the mismatch.
-    if (manifest.id !== entry) {
-      ws.plugins.set(entry, {
-        id: entry,
+      // Manifest id must match directory name. A junctioned local plugin
+      // whose author renames `id:` would otherwise silently double-register
+      // or shadow itself; we'd rather surface the mismatch.
+      if (manifest.id !== entry) {
+        ws.plugins.set(entry, {
+          id: entry,
+          dir,
+          manifest,
+          status: 'error',
+          error: `manifest.id ("${manifest.id}") does not match plugin directory name ("${entry}"). Rename one to match.`,
+        });
+        continue;
+      }
+
+      const enabled = stateFlags[manifest.id]?.enabled !== false; // default true
+      ws.plugins.set(manifest.id, {
+        id: manifest.id,
         dir,
         manifest,
-        status: 'error',
-        error: `manifest.id ("${manifest.id}") does not match plugin directory name ("${entry}"). Rename one to match.`,
+        status: enabled ? 'enabled' : 'disabled',
       });
-      continue;
     }
 
-    const enabled = stateFlags[manifest.id]?.enabled !== false; // default true
-    ws.plugins.set(manifest.id, {
-      id: manifest.id,
-      dir,
-      manifest,
-      status: enabled ? 'enabled' : 'disabled',
-    });
-  }
-
-  // Second pass — build the trigger-type registry. We do this after the
-  // plugin map is fully populated so collision detection can deterministically
-  // pick a winner by plugin-id sort order (matches the recipe shadowing rule).
-  const pluginIds = [...ws.plugins.keys()].sort();
-  for (const pid of pluginIds) {
-    const plugin = ws.plugins.get(pid)!;
-    if (plugin.status !== 'enabled') continue;
-    const types = plugin.manifest.provides?.trigger_types ?? [];
-    for (const t of types) {
-      if (typeof t.id !== 'string' || t.id.length === 0) {
-        ws.triggerTypeErrors.push({
-          plugin_id: pid,
-          type_id: String(t.id),
-          error: 'trigger_type.id is required',
+    // Second pass — build the trigger-type registry. We do this after the
+    // plugin map is fully populated so collision detection can deterministically
+    // pick a winner by plugin-id sort order (matches the recipe shadowing rule).
+    const pluginIds = [...ws.plugins.keys()].sort();
+    for (const pid of pluginIds) {
+      const plugin = ws.plugins.get(pid)!;
+      if (plugin.status !== 'enabled') continue;
+      const types = plugin.manifest.provides?.trigger_types ?? [];
+      for (const t of types) {
+        if (typeof t.id !== 'string' || t.id.length === 0) {
+          ws.triggerTypeErrors.push({
+            plugin_id: pid,
+            type_id: String(t.id),
+            error: 'trigger_type.id is required',
+          });
+          continue;
+        }
+        const existing = ws.triggerTypes.get(t.id);
+        if (existing) {
+          ws.triggerTypeErrors.push({
+            plugin_id: pid,
+            type_id: t.id,
+            error: `trigger_type id ${t.id} already declared by plugin ${existing.source_plugin_id}; first declaration wins`,
+          });
+          continue;
+        }
+        const fileAbs = pluginFileAbs(ws, pid, t.file);
+        if (!fileAbs) {
+          ws.triggerTypeErrors.push({
+            plugin_id: pid,
+            type_id: t.id,
+            error: `trigger_type.file path escapes plugin directory: ${t.file}`,
+          });
+          continue;
+        }
+        ws.triggerTypes.set(t.id, {
+          ...t,
+          source_plugin_id: pid,
+          scope: `plugin:${pid}`,
+          file_abs: fileAbs,
         });
-        continue;
       }
-      const existing = ws.triggerTypes.get(t.id);
-      if (existing) {
-        ws.triggerTypeErrors.push({
-          plugin_id: pid,
-          type_id: t.id,
-          error: `trigger_type id ${t.id} already declared by plugin ${existing.source_plugin_id}; first declaration wins`,
-        });
-        continue;
-      }
-      const fileAbs = pluginFileAbs(ws, pid, t.file);
-      if (!fileAbs) {
-        ws.triggerTypeErrors.push({
-          plugin_id: pid,
-          type_id: t.id,
-          error: `trigger_type.file path escapes plugin directory: ${t.file}`,
-        });
-        continue;
-      }
-      ws.triggerTypes.set(t.id, {
-        ...t,
-        source_plugin_id: pid,
-        scope: `plugin:${pid}`,
-        file_abs: fileAbs,
-      });
     }
   }
 
