@@ -175,12 +175,18 @@ The `clawdevbox` top-level key carries every capability that isn't part
 of Claude's vocabulary. Claude Code ignores unknown keys, so adding this
 block doesn't break Claude-only consumers.
 
+Every clawdevbox field is **polymorphic** — it accepts the same
+`undefined | string | string[] | Entry[]` shape Claude Code uses for
+`skills`/`agents`/`commands`. See **Auto-discovery for clawdevbox
+extensions** below for the resolution rules.
+
 ```ts
 clawdevbox?: {
-  recipes?:       Array<{ id: string; file: string }>;
-  tools?:         Array<{ id: string; file: string; runtime?: 'node'|'tsx'|'python'|'bash' }>;
-  trigger_types?: PluginTriggerType[];
-  agent_clis?:    PluginAgentCliEntry[];
+  recipes?:       string | string[] | Array<{ id: string; file: string }>;
+  tools?:         string | string[] | Array<{ id: string; file: string; runtime?: 'node'|'tsx'|'python'|'bash' }>;
+  trigger_types?: string | string[] | PluginTriggerType[];
+  agent_clis?:    string | string[] | PluginAgentCliEntry[];
+  renderers?:     string | string[] | Array<{ type: string; module: string; description?: string }>;
 };
 ```
 
@@ -253,6 +259,23 @@ shadowed. See [`docs/agent-clis.md`](./agent-clis.md) for the full
 provider interface, `ProviderCtx` helpers, spawn modes, and a complete
 `.mjs` example.
 
+#### `clawdevbox.renderers[]`
+
+Artifact renderer modules (`.mjs`) served to the terminal browser. The
+`type` field matches the `artifact.type` at resolution time.
+
+```json
+{ "clawdevbox": { "renderers": [
+  { "type": "pr-review", "module": "renderers/pr-review.mjs", "description": "Custom PR review card" }
+] } }
+```
+
+Built-in renderer types (`markdown`, `pr-review`, `walkthrough`) cannot
+be shadowed by a plugin — collisions are recorded as
+`BUILTIN_COLLISION`. Cross-plugin collisions on the same `type` are
+resolved deterministically (first plugin by sorted id wins; losers land
+in `ws.rendererErrors` as `PLUGIN_COLLISION`).
+
 ### `requires`
 
 ```json
@@ -285,6 +308,61 @@ Auto-discovery is forgiving: missing convention directories are fine.
 A skill whose frontmatter `name` doesn't match its directory id is
 recorded as `SKILL_NAME_MISMATCH` in the plugin's load errors and the
 skill is **not** registered, but the rest of the plugin still loads.
+
+## Auto-discovery for clawdevbox extensions
+
+Every `clawdevbox.*` field uses the same three-tier resolution Claude
+Code applies to its component-path fields:
+
+| Manifest value | Behaviour |
+|---|---|
+| `undefined` (field absent) | Auto-discover from the convention directory. |
+| `"some/path"` (single path) | Treat as a directory and scan it instead of the convention. |
+| `["a", "b/file.ts"]` (path list) | Each entry is a path. Directory entries are scanned; file entries are registered directly. |
+| `[{...}, ...]` (explicit objects) | Use the array as-is; no auto-discovery for this capability. |
+
+Per-capability conventions:
+
+| Capability        | Default dir   | File pattern                        | Id derivation                     | Notes |
+|-------------------|---------------|-------------------------------------|-----------------------------------|-------|
+| `recipes`         | `recipes/`    | `<id>.{yaml,yml,json}`              | filename stem                     | files prefixed with `_` or `.` are skipped |
+| `tools`           | `tools/`      | `<id>.{ts,js,py,sh}`                | `<pluginName>.<stem>`             | runtime inferred from extension (`.ts`→`tsx`, `.js`→`node`, `.py`→`python`, `.sh`→`bash`); `_`-prefixed helpers skipped |
+| `trigger_types`   | `triggers/`   | `<id>.{ts,js,py,sh}` + `<id>.trigger.yaml` sidecar | `<pluginName>.<stem>` | sidecar carries `description`, `default_cron`, `binds_callback_to_recipe`, etc.; missing sidecar → `LoadError` scope=`trigger_types`; orphan sidecar (no script) → `LoadError` |
+| `agent_clis`      | `agent-clis/` | `<id>.{mjs,js}`                     | filename stem (not namespaced)    | the `.mjs` module's `default export` supplies `displayName`, `description`, etc. |
+| `renderers`       | `renderers/`  | `<type>.{mjs,js}`                   | filename stem (= `artifact.type`) | built-in renderer types cannot be shadowed; cross-plugin collisions resolved by sorted plugin id |
+
+Example trigger sidecar (`triggers/watch.trigger.yaml`):
+
+```yaml
+description: Watches a query for new pull requests.
+default_cron: "*/5 * * * *"
+binds_callback_to_recipe: review-pr
+identity_param: query
+accepts_webhook: false
+parameters:
+  - { name: query, type: string, required: true, description: "ADO query id" }
+  - { name: max_results, type: integer, required: false, default: 10 }
+```
+
+Example minimal plugin (`{name, version}` only) that ships every
+capability via convention dirs:
+
+```
+my-plugin/
+├── .claude-plugin/plugin.json    ← { "name": "my-plugin", "version": "1.0.0" }
+├── recipes/triage.yaml
+├── tools/fetch.ts                ← becomes my-plugin.fetch (runtime tsx)
+├── tools/_helpers.ts             ← skipped (underscore prefix)
+├── triggers/watch.ts
+├── triggers/watch.trigger.yaml
+├── agent-clis/myprov.mjs
+└── renderers/triage-card.mjs
+```
+
+Explicit `Entry[]` arrays continue to work for plugins that need full
+control over ids, runtimes, or alternate file layouts. The four sample
+plugins under `clawdevbox-plugins/` and the agency-provider plugin use
+this Tier 3 form and load unchanged.
 
 ## Skill directory structure
 
