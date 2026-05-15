@@ -39,7 +39,10 @@ import {
 } from './db/fires-store.ts';
 import { runTriggerScript } from './trigger-runner.ts';
 import type { TriggerRuntime } from './validators.ts';
-import type { RegisteredTriggerType, Workspace } from './workspace.ts';
+import { recipePath, type RegisteredTriggerType, type Workspace } from './workspace.ts';
+import { resolveRead } from './scope.ts';
+import { runRecipe } from './recipe-runner.ts';
+import { resolveWorkspacesRoot } from './workspaces-store.ts';
 
 interface TriggerRow {
   id: string;
@@ -330,10 +333,6 @@ export class Dispatcher {
     wsRow: WorkspaceRowLite,
     recipeId: string,
   ): Promise<{ recipe_instance_id: string; agent_session_id?: string; exit_code: number }> {
-    if (!this.runRecipeFn) {
-      // Phase 6.1 stub — the real recipe-runner wiring lands in Phase 6.2.
-      throw new Error('recipe_binding_not_wired');
-    }
     const params = {
       ...(JSON.parse(trigger.params_json) as Record<string, unknown>),
       ...((fire.payload_json ? JSON.parse(fire.payload_json) : {}) as Record<string, unknown>),
@@ -341,17 +340,57 @@ export class Dispatcher {
     };
     const payload = fire.payload_json ? JSON.parse(fire.payload_json) : null;
     const prompt = `Triggered by ${trigger.id} at ${new Date(fire.scheduled_at).toISOString()}.\nPayload: ${JSON.stringify(payload)}`;
-    const out = await this.runRecipeFn({
+
+    if (this.runRecipeFn) {
+      const out = await this.runRecipeFn({
+        recipeId,
+        prompt,
+        params,
+        workspaceInfo: { id: wsRow.id, path: wsRow.path },
+        triggerId: trigger.id,
+        fireId: fire.fire_id,
+      });
+      return {
+        recipe_instance_id: out.recipe_instance_id,
+        agent_session_id: out.agent_session_id,
+        exit_code: 0,
+      };
+    }
+
+    // Production path — resolve the recipe via the scope chain and call
+    // the real recipe-runner. The agent CLI is detached (pty.spawn): we
+    // return as soon as the spawn returns a pid, while the agent runs to
+    // completion in the background. The fire row carries the
+    // recipe_instance_id forward so the SPA can stitch the lineage.
+    const hit = resolveRead(this.ws, 'all', 'recipe', recipeId, recipePath);
+    if (!hit) throw new Error(`recipe not found: ${recipeId}`);
+    const workspacesRoot = resolveWorkspacesRoot();
+    const out = await runRecipe({
       recipeId,
+      recipeSnapshot: hit.source,
+      isAdhoc: false,
       prompt,
       params,
       workspaceInfo: { id: wsRow.id, path: wsRow.path },
       triggerId: trigger.id,
       fireId: fire.fire_id,
+      workspacesRoot,
     });
+    if (out.spawn_error) {
+      throw new Error(`${out.spawn_error.code}: ${out.spawn_error.message}`);
+    }
+
+    // Find the auto-created agent_session row so we can record it on the fire.
+    const session = this.db
+      .prepare(
+        `SELECT id FROM agent_sessions WHERE recipe_instance_id = ?
+         ORDER BY started_at DESC LIMIT 1`,
+      )
+      .get(out.recipe_instance_id) as { id: string } | undefined;
+
     return {
       recipe_instance_id: out.recipe_instance_id,
-      agent_session_id: out.agent_session_id,
+      agent_session_id: session?.id,
       exit_code: 0,
     };
   }
