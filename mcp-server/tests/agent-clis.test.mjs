@@ -187,3 +187,127 @@ for (const row of MATRIX) {
   });
 }
 
+
+// ============================================================================
+// Plugin loader — fake plugin fixtures (spec §4, §14)
+// ============================================================================
+
+import { cpSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname } from 'node:path';
+import { loadPluginProviders } from '../src/agent-clis/load-plugin.ts';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const FIXTURE_ROOT = join(__dirname, 'fixtures', 'cli-plugins');
+
+/** Copy each named fixture dir into <globalDir>/plugins/<id>/ and return paths. */
+function setupTmpWorkspace(fixturePlugins) {
+  const tmp = mkdtempSync(join(tmpdir(), 'cdb-cli-load-'));
+  const project = tmp;
+  mkdirSync(join(project, '.clawdevbox'), { recursive: true });
+  const globalDir = join(tmp, '.global');
+  mkdirSync(join(globalDir, 'plugins'), { recursive: true });
+  for (const p of fixturePlugins) {
+    cpSync(join(FIXTURE_ROOT, p), join(globalDir, 'plugins', p), { recursive: true });
+  }
+  return { project, globalDir };
+}
+
+test('plugin loader: happy path — registers test-cli with source plugin:test-cli', async () => {
+  const { project, globalDir } = setupTmpWorkspace(['test-cli']);
+  const ws = await loadWorkspaceFromEnv({
+    CLAWDEVBOX_PROJECT_DIR: project,
+    CLAWDEVBOX_GLOBAL_DIR: globalDir,
+  });
+  assert.deepEqual(ws.agentCliProviderErrors, []);
+  assert.ok(ws.agentCliProviders.has('test-cli'));
+  const p = ws.agentCliProviders.get('test-cli');
+  assert.equal(p.source, 'plugin:test-cli');
+  assert.equal(p.displayName, 'Test CLI Provider');
+  assert.equal(p.description, 'Returns a fake handle.');
+  assert.equal(typeof p.spawnSession, 'function');
+  // Built-ins still present.
+  assert.ok(ws.agentCliProviders.has('copilot'));
+  assert.equal(ws.agentCliProviders.get('copilot').source, 'builtin');
+});
+
+test('plugin loader: bad shape — records INVALID_PROVIDER_SHAPE', async () => {
+  const { project, globalDir } = setupTmpWorkspace(['bad-shape']);
+  const ws = await loadWorkspaceFromEnv({
+    CLAWDEVBOX_PROJECT_DIR: project,
+    CLAWDEVBOX_GLOBAL_DIR: globalDir,
+  });
+  assert.ok(!ws.agentCliProviders.has('bad-shape'));
+  const err = ws.agentCliProviderErrors.find(
+    (e) => e.plugin_id === 'bad-shape' && e.code === 'INVALID_PROVIDER_SHAPE',
+  );
+  assert.ok(err, `expected INVALID_PROVIDER_SHAPE error, got ${JSON.stringify(ws.agentCliProviderErrors)}`);
+});
+
+test('plugin loader: path traversal — records MODULE_PATH_TRAVERSAL (defense in depth)', async () => {
+  // Manifest validator already rejects ".." segments — manifest-level rejection
+  // would short-circuit before the loader runs. To exercise the loader's
+  // defense-in-depth traversal check, construct a workspace with a synthetic
+  // plugin entry whose manifest carries a traversal module path.
+  const { project, globalDir } = setupTmpWorkspace([]);
+  const ws = await loadWorkspaceFromEnv({
+    CLAWDEVBOX_PROJECT_DIR: project,
+    CLAWDEVBOX_GLOBAL_DIR: globalDir,
+  });
+  // Synthetic plugin: bypass manifest validation.
+  const pluginDir = join(globalDir, 'plugins', 'traversal');
+  mkdirSync(pluginDir, { recursive: true });
+  ws.plugins.set('traversal', {
+    id: 'traversal',
+    dir: pluginDir,
+    manifest: {
+      id: 'traversal',
+      name: 'Path Traversal',
+      version: '0.1.0',
+      description: 'synthetic',
+      provides: {
+        agent_clis: [{ id: 'traversal', module: '../../../etc/evil.js' }],
+      },
+    },
+    status: 'enabled',
+  });
+  await loadPluginProviders(ws);
+  assert.ok(!ws.agentCliProviders.has('traversal'));
+  const err = ws.agentCliProviderErrors.find(
+    (e) => e.plugin_id === 'traversal' && e.code === 'MODULE_PATH_TRAVERSAL',
+  );
+  assert.ok(err, `expected MODULE_PATH_TRAVERSAL error, got ${JSON.stringify(ws.agentCliProviderErrors)}`);
+});
+
+test('plugin loader: built-in collision — BUILTIN_COLLISION, built-in wins', async () => {
+  const { project, globalDir } = setupTmpWorkspace(['conflict-copilot']);
+  const ws = await loadWorkspaceFromEnv({
+    CLAWDEVBOX_PROJECT_DIR: project,
+    CLAWDEVBOX_GLOBAL_DIR: globalDir,
+  });
+  // Built-in copilot still wins.
+  const copilot = ws.agentCliProviders.get('copilot');
+  assert.ok(copilot);
+  assert.equal(copilot.source, 'builtin');
+  const err = ws.agentCliProviderErrors.find(
+    (e) => e.plugin_id === 'conflict-copilot' && e.code === 'BUILTIN_COLLISION',
+  );
+  assert.ok(err, `expected BUILTIN_COLLISION error, got ${JSON.stringify(ws.agentCliProviderErrors)}`);
+});
+
+test('plugin loader: plugin-vs-plugin collision — first-by-plugin-id wins, loser records PLUGIN_COLLISION', async () => {
+  const { project, globalDir } = setupTmpWorkspace(['twin-a', 'twin-b']);
+  const ws = await loadWorkspaceFromEnv({
+    CLAWDEVBOX_PROJECT_DIR: project,
+    CLAWDEVBOX_GLOBAL_DIR: globalDir,
+  });
+  const twin = ws.agentCliProviders.get('twin');
+  assert.ok(twin);
+  assert.equal(twin.source, 'plugin:twin-a');
+  assert.equal(twin.displayName, 'Twin A');
+  const err = ws.agentCliProviderErrors.find(
+    (e) => e.plugin_id === 'twin-b' && e.code === 'PLUGIN_COLLISION',
+  );
+  assert.ok(err, `expected PLUGIN_COLLISION error for twin-b, got ${JSON.stringify(ws.agentCliProviderErrors)}`);
+});

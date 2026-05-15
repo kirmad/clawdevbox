@@ -1,0 +1,10 @@
+id: test-cli
+name: Test CLI
+version: 0.1.0
+description: Fixture plugin for the AgentCliProvider loader tests.
+provides:
+  agent_clis:
+    - id: test-cli
+      module: test-provider.mjs
+      display_name: "Test CLI Provider"
+      description: "Returns a fake handle."
