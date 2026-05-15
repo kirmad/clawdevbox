@@ -127,7 +127,7 @@ export function validateRecipeParsed(parsed: unknown): ValidationResult {
       errors.push({
         path: 'default_client',
         code: 'INVALID_VALUE',
-        message: `default_client must be a non-empty provider id (e.g. 'copilot', 'claude', 'agency').`,
+        message: `default_client must be a non-empty provider id (e.g. 'copilot', 'claude').`,
       });
     }
   }
