@@ -502,3 +502,65 @@ test('listSessionsForStep / listSessionsForInstance', () => {
   assert.equal(listSessionsForInstance(db, 'ri_as5').length, 2);
   db.close();
 });
+
+// ---------------------------------------------------------------- artifacts
+import {
+  getArtifact,
+  linkArtifactToStep,
+  listArtifactsForStep,
+  listArtifactsForWorkspace,
+  mintArtifactId,
+  registerArtifact,
+} from '../src/db/artifacts-db-store.ts';
+
+test('registerArtifact returns row with mint id and metadata', () => {
+  const db = open();
+  const ws = ensureWorkspace(db, { path: 'C:\\tmp\\art1' });
+  const art = registerArtifact(db, {
+    workspace_id: ws.id,
+    type: 'pr_walkthrough',
+    title: 'PR #42',
+    dir_path: 'C:\\tmp\\art1\\.clawdevbox\\artifacts\\x',
+    metadata: { branch: 'main' },
+  });
+  assert.match(art.id, /^art_[a-z0-9]+_[0-9a-f]{4}$/);
+  assert.equal(art.type, 'pr_walkthrough');
+  assert.equal(JSON.parse(art.metadata_json).branch, 'main');
+  db.close();
+});
+
+test('linkArtifactToStep updates recipe_step_id', () => {
+  const db = open();
+  const ws = ensureWorkspace(db, { path: 'C:\\tmp\\art2' });
+  db.prepare(
+    `INSERT INTO recipe_instances (id, workspace_id, workspace_path, started_at, status)
+     VALUES ('ri_art', ?, ?, ?, 'running')`,
+  ).run(ws.id, ws.path, Date.now());
+  db.prepare(
+    `INSERT INTO recipe_steps (id, recipe_instance_id, step_index, step_id, goal, status)
+     VALUES ('rs_art', 'ri_art', 0, 'one', 'g', 'pending')`,
+  ).run();
+  const art = registerArtifact(db, {
+    workspace_id: ws.id,
+    type: 'doc',
+    dir_path: 'C:\\tmp\\art2\\.clawdevbox\\artifacts\\y',
+  });
+  linkArtifactToStep(db, art.id, 'rs_art');
+  const row = getArtifact(db, art.id);
+  assert.equal(row.recipe_step_id, 'rs_art');
+  assert.equal(listArtifactsForStep(db, 'rs_art').length, 1);
+  db.close();
+});
+
+test('listArtifactsForWorkspace returns rows', () => {
+  const db = open();
+  const ws = ensureWorkspace(db, { path: 'C:\\tmp\\art3' });
+  registerArtifact(db, { workspace_id: ws.id, type: 'a', dir_path: 'd1' });
+  registerArtifact(db, { workspace_id: ws.id, type: 'b', dir_path: 'd2' });
+  assert.equal(listArtifactsForWorkspace(db, ws.id).length, 2);
+  db.close();
+});
+
+test('mintArtifactId shape', () => {
+  assert.match(mintArtifactId(), /^art_[a-z0-9]+_[0-9a-f]{4}$/);
+});
