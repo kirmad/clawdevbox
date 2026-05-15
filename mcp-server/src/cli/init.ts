@@ -34,13 +34,17 @@ import {
   globalConfigPath,
   readConfig,
   readGlobalConfig,
+  resolveConfig,
   writeConfig,
   writeGlobalConfig,
+  type ResolvedConfig,
   type TunnelKind,
 } from '../config.ts';
 import { DEFAULT_VAPID_SUBJECT, generateVapidKeys } from '../notifications.ts';
 import { deriveTunnelName } from '../tunnel.ts';
-import { loadWorkspaceFromEnv } from '../workspace.ts';
+import { loadWorkspaceFromEnv, type Workspace } from '../workspace.ts';
+import { buildProviderCtx } from '../agent-clis/shared.ts';
+import type { DetectResult } from '../agent-clis/types.ts';
 import type { Flags } from './index.ts';
 import {
   discoverPluginsInDir,
@@ -494,22 +498,31 @@ export async function runInit(flags: Flags): Promise<void> {
       ensureGlobalNodeModulesLink(globalDir);
     }
 
-    // ---- Workspace reload -------------------------------------------------
+    // ---- Workspace reload + agent-CLI chooser -----------------------------
     // Plugins were just installed; load a workspace so reloadTypeRegistries
-    // picks up their provides.agent_clis[] entries. Subsequent phases (the
-    // CLI chooser) read `ws.agentCliProviders` off this. Failure is
-    // non-fatal — the user can fix and rerun.
+    // picks up their provides.agent_clis[] entries, then ask the user which
+    // provider should be the default for this install. Failure here is
+    // non-fatal — the user can fix and rerun, or set default_agent_cli later
+    // via `clawdevbox config set`.
+    let chosenProviderId: string | null = null;
+    let chosenProviderLabel: string | null = null;
     try {
       const tmpEnv = {
         ...process.env,
         CLAWDEVBOX_PROJECT_DIR: projectDir,
         CLAWDEVBOX_GLOBAL_DIR: globalDir,
       };
-      await loadWorkspaceFromEnv(tmpEnv);
+      const ws = await loadWorkspaceFromEnv(tmpEnv);
+      const tmpCfg = resolveConfig({ projectDir, globalDir });
+      chosenProviderId = await runAgentCliChooser(ws, tmpCfg, installScope);
+      if (chosenProviderId) {
+        chosenProviderLabel =
+          ws.agentCliProviders.get(chosenProviderId)?.displayName ?? chosenProviderId;
+      }
     } catch (err) {
       // eslint-disable-next-line no-console
       console.warn(
-        `[clawdevbox] post-install workspace load failed: ${err instanceof Error ? err.message : String(err)}`,
+        `[clawdevbox] skipping agent-CLI chooser: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
 
@@ -531,6 +544,7 @@ export async function runInit(flags: Flags): Promise<void> {
             }
           : { kind: 'none' },
       notifications: notificationsConfig,
+      ...(chosenProviderId ? { default_agent_cli: chosenProviderId } : {}),
     };
 
     const written =
@@ -604,6 +618,9 @@ export async function runInit(flags: Flags): Promise<void> {
         `HTTP:        ${DEFAULT_HTTP_HOST}:${port}  (bearer token saved to config)`,
         tunnelLine,
         notificationsLine,
+        chosenProviderLabel
+          ? `Agent CLI:   ${chosenProviderLabel}`
+          : `Agent CLI:   not selected (runtime fallback: copilot)`,
         ...(pluginLines.length ? ['', ...pluginLines] : []),
         ...(envLines.length ? ['', ...envLines] : []),
         '',
@@ -699,6 +716,103 @@ export async function runInit(flags: Flags): Promise<void> {
   } finally {
     for (const s of resolvedSources) s.cleanup();
   }
+}
+
+// ============================================================================
+// Agent-CLI chooser
+// ============================================================================
+
+/**
+ * Prompt the user to pick the default agent-CLI provider for this install,
+ * running each provider's `detect()` in parallel (with a 5s timeout) so the
+ * options carry an "available / not installed" hint. If the picked provider
+ * exposes a `setup()` hook, it's invoked with the requested scope; setup
+ * failures are logged but non-fatal.
+ *
+ * Returns the chosen provider id, or `null` when the user picks `__skip`.
+ *
+ * Exported (rather than inlined) so tests can supply a fake `prompt` instead
+ * of driving the real `@clack/prompts.select` TTY UI.
+ */
+export type AgentCliChooserPrompt = (args: {
+  message: string;
+  options: Array<{ value: string; label: string; hint?: string }>;
+  initialValue: string;
+}) => Promise<string | symbol>;
+
+export async function runAgentCliChooser(
+  ws: Workspace,
+  cfg: ResolvedConfig,
+  installScope: 'project' | 'global',
+  prompt: AgentCliChooserPrompt = (args) =>
+    select<Array<{ value: string; label: string; hint?: string }>, string>(args) as Promise<
+      string | symbol
+    >,
+): Promise<string | null> {
+  const visibleProviders = [...ws.agentCliProviders.values()].filter((p) => !p.internal);
+
+  // Run detect() in parallel; cap each at 5s so a stuck binary can't hang init.
+  const detectResults = await Promise.all(
+    visibleProviders.map(async (p) => {
+      if (!p.detect) {
+        return { provider: p, detect: { available: true } as DetectResult };
+      }
+      try {
+        const ctx = buildProviderCtx(ws, cfg);
+        const result = await Promise.race<DetectResult>([
+          p.detect(ctx),
+          new Promise<DetectResult>((r) =>
+            setTimeout(() => r({ available: false, reason: 'detect timed out' }), 5000),
+          ),
+        ]);
+        return { provider: p, detect: result };
+      } catch (err) {
+        return {
+          provider: p,
+          detect: {
+            available: false,
+            reason: err instanceof Error ? err.message : String(err),
+          } as DetectResult,
+        };
+      }
+    }),
+  );
+
+  const defaultProvider = detectResults.find((r) => r.detect.available)?.provider.id;
+
+  const cliPick = abortIfCancel(
+    await prompt({
+      message: 'Which agent CLI should this workspace use by default?',
+      options: [
+        ...detectResults.map(({ provider, detect }) => ({
+          value: provider.id,
+          label: provider.displayName,
+          hint: detect.available
+            ? `✓ ${detect.binary ?? provider.id}${detect.version ? ` ${detect.version}` : ''}`
+            : `✗ ${detect.reason ?? 'not installed'}`,
+        })),
+        { value: '__skip', label: '[skip — pick later via `clawdevbox config set`]', hint: '' },
+      ],
+      initialValue: defaultProvider ?? '__skip',
+    }),
+  );
+
+  if (cliPick === '__skip') return null;
+
+  const chosenProviderId = cliPick as string;
+  const provider = ws.agentCliProviders.get(chosenProviderId);
+  if (provider?.setup) {
+    try {
+      await provider.setup(buildProviderCtx(ws, cfg), { scope: installScope });
+    } catch (err) {
+      // Setup failures are non-fatal; the user can fix and rerun.
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[clawdevbox] provider.setup failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+  return chosenProviderId;
 }
 
 /**
