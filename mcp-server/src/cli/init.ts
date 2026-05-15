@@ -353,7 +353,8 @@ export async function runInit(flags: Flags): Promise<void> {
 
   // ----- External plugin sources (--plugin <git-url-or-folder>) --------
   // Each --plugin source is resolved (git clone or local path), scanned
-  // for plugin.yaml manifests, and the user is asked which discovered
+  // for `.claude-plugin/plugin.json` manifests (single plugin or
+  // marketplace catalog), and the user is asked which discovered
   // plugins to install. Sources are processed sequentially so prompts
   // are ordered. Resolved sources are kept open until the install pass
   // below — git clones live in a temp dir we copy from, then clean up.
@@ -385,7 +386,7 @@ export async function runInit(flags: Flags): Promise<void> {
       }
       if (plugins.length === 0) {
         sourceDiagnostics.push(
-          `--plugin ${raw}: no plugin.yaml found at the root or any subdirectory.`,
+          `--plugin ${raw}: no .claude-plugin/plugin.json found at the root or any subdirectory.`,
         );
         continue;
       }

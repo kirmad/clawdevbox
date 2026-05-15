@@ -29,9 +29,12 @@ try {
  *   --token <s>           HTTP bearer token for `start` (default: from config)
  *   --plugin <src>        (init only, repeatable) git url or absolute folder
  *                         to discover plugins from. Each --plugin source is
- *                         scanned for a single plugin (root plugin.yaml) or
- *                         a collection (subdirs with plugin.yaml); init then
- *                         prompts to pick which discovered plugins to install.
+ *                         scanned for a single plugin (root
+ *                         `.claude-plugin/plugin.json`), a marketplace
+ *                         catalog (`.claude-plugin/marketplace.json`),
+ *                         or a collection (subdirs with manifests); init
+ *                         then prompts to pick which discovered plugins
+ *                         to install.
  */
 
 import { logger } from '../logger.ts';
@@ -128,8 +131,10 @@ Usage:
                       https://github.com/ic3-microsoft/clawdevbox-plugins.git
                       or git+ssh://...) or an absolute folder path
                       (e.g. C:\\git\\clawdevbox-plugins). The folder/repo
-                      can be either a single plugin (plugin.yaml at root)
-                      or a collection (subdirs with plugin.yaml). init
+                      can be either a single plugin
+                      (.claude-plugin/plugin.json at root), a marketplace
+                      catalog (.claude-plugin/marketplace.json at root),
+                      or a collection (subdirs with manifests). init
                       discovers the plugins and asks which to install.
 
   clawdevbox mcp [--project <dir>] [--global <dir>]

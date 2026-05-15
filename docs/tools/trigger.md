@@ -49,7 +49,7 @@ The implementation lives in:
 
 ```
 <projectDir>/.clawdevbox/triggers.json     ← registered instances (this file)
-<globalDir>/plugins/<plugin_id>/plugin.yaml ← TYPE declarations live here
+<globalDir>/plugins/<plugin_id>/.claude-plugin/plugin.json ← TYPE declarations live here
 ```
 
 `triggers.json` has exactly one top-level key:
@@ -96,7 +96,7 @@ template/plugin mutation. Precedence is **lowest → highest**:
 
 | Precedence | Source | Layout | `scope` field |
 |---|---|---|---|
-| 1 (lowest) | Plugin-shipped | `<globalDir>/plugins/<plugin_id>/plugin.yaml`'s `provides.trigger_types[]` | `plugin:<id>` |
+| 1 (lowest) | Plugin-shipped | `<globalDir>/plugins/<plugin_id>/.claude-plugin/plugin.json`'s `clawdevbox.trigger_types[]` | `plugin:<id>` |
 | 2 | Global agent-authored | `<globalDir>/trigger-types/<id>/template.yaml` + `trigger.<ext>` | `global` |
 | 3 (highest) | Project agent-authored | `<projectDir>/.clawdevbox/trigger-types/<id>/template.yaml` + `trigger.<ext>` | `project` |
 
@@ -121,10 +121,10 @@ exist only to back the matching registered row.
 
 Loading happens in two phases:
 
-1. Walk `<globalDir>/plugins/*/plugin.yaml`, validate, and populate
+1. Walk `<globalDir>/plugins/*/.claude-plugin/plugin.json`, validate, and populate
    `ws.plugins`.
 2. For every **enabled** plugin (sorted by id, deterministic), append each
-   `provides.trigger_types[]` entry into `ws.triggerTypes`. Then layer the
+   `clawdevbox.trigger_types[]` entry into `ws.triggerTypes`. Then layer the
    global, then project, agent-authored templates on top. ID collisions
    across plugins go to `ws.triggerTypeErrors[]` — **first plugin wins**,
    the rest are dropped and surfaced through `trigger.list_types`'
@@ -756,17 +756,22 @@ surface deliberately returns the raw `resolved_cron` and leaves humanization
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│ 1. Plugin author declares a TYPE in plugin.yaml                     │
+│ 1. Plugin author declares a TYPE in .claude-plugin/plugin.json      │
 │                                                                     │
-│    provides:                                                        │
-│      trigger_types:                                                 │
-│        - id: ado.new-pr-watcher                                     │
-│          file: triggers/new-pr-watcher.ts                           │
-│          default_cron: "*/5 * * * *"                                │
-│          identity_param: repo                                       │
-│          binds_callback_to_recipe: handle-new-pr                    │
-│          parameters:                                                │
-│            - { name: repo, type: string, required: true }           │
+│    "clawdevbox": {                                                  │
+│      "trigger_types": [                                             │
+│        {                                                            │
+│          "id": "ado.new-pr-watcher",                                │
+│          "file": "triggers/new-pr-watcher.ts",                      │
+│          "default_cron": "*/5 * * * *",                             │
+│          "identity_param": "repo",                                  │
+│          "binds_callback_to_recipe": "handle-new-pr",               │
+│          "parameters": [                                            │
+│            { "name": "repo", "type": "string", "required": true }   │
+│          ]                                                          │
+│        }                                                            │
+│      ]                                                              │
+│    }                                                                │
 └─────────────────────────────────────────────────────────────────────┘
                                   │
                                   │  plugin.install copies plugin
@@ -775,7 +780,7 @@ surface deliberately returns the raw `resolved_cron` and leaves humanization
 ┌─────────────────────────────────────────────────────────────────────┐
 │ 2. Workspace boot — reloadPluginRegistry() in workspace.ts          │
 │                                                                     │
-│    Phase 1: ws.plugins from <globalDir>/plugins/*/plugin.yaml       │
+│    Phase 1: ws.plugins from <globalDir>/plugins/*/.claude-plugin/plugin.json │
 │    Phase 2: ws.triggerTypes from the enabled plugins (alphabetical) │
 │                                                                     │
 │    Collisions go to ws.triggerTypeErrors[]; first plugin wins.      │

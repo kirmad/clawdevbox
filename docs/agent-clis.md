@@ -3,7 +3,8 @@
 Clawdevbox spawns AI coding CLIs through a **pluggable provider** layer.
 Built-ins ship in the OSS tree (`copilot`, `claude`, plus an internal
 `echo-stub` used by tests); additional providers arrive as plugins that
-declare `provides.agent_clis[]` in their `plugin.yaml`. Every spawn —
+declare `clawdevbox.agent_clis[]` in their `.claude-plugin/plugin.json`.
+Every spawn —
 whether it's the main-agent terminal you see in `clawdevbox start`, a
 headless `recipe.run` from MCP, or a paused-step "Resume" click in the
 SPA — funnels through a single `provider.spawnSession(ctx, opts)` call.
@@ -143,25 +144,33 @@ equals `opts.init.session_id` every time.
 
 ## Authoring a plugin
 
-A provider plugin is an ordinary Clawdevbox plugin (see
-[`docs/tools/plugin.md`](./tools/plugin.md)) with a `provides.agent_clis[]`
-entry in its `plugin.yaml`. Steps:
+A provider plugin is an ordinary clawdevbox plugin (see
+[`docs/plugins.md`](./plugins.md)) with a `clawdevbox.agent_clis[]`
+entry in its `.claude-plugin/plugin.json` manifest. Steps:
 
 ### 1. Plugin manifest
 
-```yaml
-# plugin.yaml
-id: my-cli
-name: My CLI plugin
-version: 1.0.0
-description: Registers the my-cli agent provider.
-provides:
-  agent_clis:
-    - id: my-cli                          # /^[a-z0-9][a-z0-9._-]*$/i
-      module: dist/my-provider.mjs        # relative to plugin root; no `..`
-      display_name: "My CLI"              # falls back to id if absent
-      description: "Spawns my-cli with project-specific context."
+```json
+{
+  "name": "my-cli",
+  "version": "1.0.0",
+  "description": "Registers the my-cli agent provider.",
+  "clawdevbox": {
+    "agent_clis": [
+      {
+        "id": "my-cli",
+        "module": "dist/my-provider.mjs",
+        "display_name": "My CLI",
+        "description": "Spawns my-cli with project-specific context."
+      }
+    ]
+  }
+}
 ```
+
+The provider entry's `id` must match `/^[a-z0-9][a-z0-9._-]*$/i`. The
+`module` path is relative to the plugin root and rejects `..`
+traversal. `display_name` falls back to `id` when omitted.
 
 ### 2. Provider module
 

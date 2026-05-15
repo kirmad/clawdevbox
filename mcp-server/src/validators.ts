@@ -414,7 +414,7 @@ export function validateSkillSource(source: string): ValidationResult {
 export function validatePluginManifest(parsed: unknown): ValidationResult {
   const errors: ValidationError[] = [];
   if (!isPlainObject(parsed)) {
-    return { ok: false, errors: [{ path: '$', code: 'NOT_OBJECT', message: 'plugin.yaml must be a YAML map.' }] };
+    return { ok: false, errors: [{ path: '$', code: 'NOT_OBJECT', message: 'plugin manifest must be an object.' }] };
   }
   const m = parsed as Record<string, unknown>;
 

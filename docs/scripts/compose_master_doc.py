@@ -256,7 +256,7 @@ GLOSSARY = """## Glossary
 | **`<projectDir>`** | The `CLAWDEVBOX_PROJECT_DIR` the MCP server was booted with. Read-only context loaded by `loadWorkspaceFromEnv`. Distinct from a registered workspace — it may or may not be one. |
 | **`<globalDir>`** | The account-wide config root (`CLAWDEVBOX_GLOBAL_DIR`, default `~/.clawdevbox`). Holds the plugin store, global recipes/skills, inbox, push subscriptions, VAPID keys, and the per-plugin enabled flag. |
 | **`<workspacesRoot>`** | Parent dir for minted workspaces; defaults to `<globalDir>/workspaces`. The registry `index.json` lives here. |
-| **Plugin** | A directory under `<globalDir>/plugins/<id>/` with a `plugin.yaml` manifest declaring `provides.{recipes,skills,trigger_types,tools,mcp_servers}`. Global to the account. |
+| **Plugin** | A directory under `<globalDir>/plugins/<id>/` with a `.claude-plugin/plugin.json` manifest (Claude-aligned). Claude fields auto-discover skills/agents/commands/MCP; clawdevbox-specific capabilities live under the manifest's `clawdevbox` extension key (`recipes`, `tools`, `trigger_types`, `agent_clis`). Global to the account. |
 | **Plugin install record** | A sidecar `<globalDir>/plugins/<id>.install.json` written next to (not inside) the plugin dir. Records `kind` (`git` / `local` / `builtin` / `manual`), source spec, optional `ref`, and `installed_at`. |
 | **Scope** | One of `'project'`, `'plugin:<id>'`, `'global'`, `'all'`. Resolution order on `'all'`: project → plugin (sorted by id) → global. Writes accept only `project` and `global`. |
 | **Scope chain** | The walk used by `resolveRead` and `listAllInScope` to look up a recipe/skill/trigger across scopes, taking the first hit. |

@@ -13,7 +13,7 @@
  *                            up temp clones via `cleanup()` once it has
  *                            either committed or rejected the install.
  *   discoverPluginsInDir() — scan a resolved directory for valid
- *                            plugin.yaml manifests (root OR subdirs).
+ *                            `.claude-plugin/plugin.json` manifests (root OR subdirs).
  *   installPluginFromDir() — install a single discovered plugin into the
  *                            global plugin store. For a single-plugin git
  *                            clone, the entire temp clone is *moved* in
@@ -59,7 +59,7 @@ export interface DiscoveredPlugin {
   description: string;
   /** Required env vars declared under `requires.env`, if any. */
   required_env: string[];
-  /** Absolute path to the plugin directory (containing plugin.yaml). */
+  /** Absolute path to the plugin directory (containing .claude-plugin/plugin.json). */
   dir: string;
 }
 

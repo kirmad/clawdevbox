@@ -329,7 +329,8 @@ practice both paths fail safely.
   `provides.skills[]` may point at any path inside the plugin tree; the
   filename does *not* have to be `<id>.md`. Conversely, a `.md` file
   sitting in a plugin folder is invisible to `skill.*` if it isn't listed
-  in `plugin.yaml`. `listAllInScope` (`scope.ts:235-249`) iterates the
+  in the plugin manifest (Claude `skills` field or auto-discovered
+  `skills/<id>/SKILL.md`). `listAllInScope` (`scope.ts:235-249`) iterates the
   manifest, not `readdir`.
 - **Plugin-scope writes are always rejected.** Even if the manifest path
   points back into `<globalDir>/plugins/<id>/skills/<id>.md`, you cannot

@@ -4,7 +4,7 @@
  * Resolves filesystem paths for the three scopes Clawdevbox recognizes
  * (project / plugin:<id> / global, spec §10.4) and maintains an in-memory
  * registry of installed plugins discovered under
- * `<global_dir>/plugins/*\/plugin.yaml`.
+ * `<global_dir>/plugins/*\/.claude-plugin/plugin.json`.
  *
  * Plugins are *globally* installed under `<globalDir>/plugins/<id>/`. An
  * entry is either a real directory (built-in copy / git clone) or a
@@ -410,7 +410,7 @@ export async function reloadTypeRegistries(ws: Workspace): Promise<void> {
         if (err instanceof LoadPluginError) {
           if (err.code === 'MISSING_MANIFEST') {
             // No manifest at all — silently skip; could be a stray junction
-            // or a legacy plugin.yaml left behind during migration.
+            // or a legacy plugin directory left behind during migration.
             continue;
           }
           ws.plugins.set(entry, {

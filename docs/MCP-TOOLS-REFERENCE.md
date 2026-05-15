@@ -664,11 +664,16 @@ workspace as soon as their plugin registry reloads.
 <globalDir>/                       ← default: ~/.clawdevbox
 ├── plugins/
 │   ├── <id>/                      ← plugin directory (real dir OR junction)
-│   │   ├── plugin.yaml            ← manifest (id, name, version, provides[...])
-│   │   ├── tools/                 ← hostable tool .ts/.js/.mjs files
-│   │   ├── recipes/               ← recipe .yaml files
-│   │   ├── skills/                ← skill .md files
-│   │   ├── triggers/              ← trigger-type .ts callbacks
+│   │   ├── .claude-plugin/
+│   │   │   └── plugin.json        ← canonical manifest (Claude-aligned)
+│   │   ├── agency.json            ← optional Microsoft engines/category sidecar
+│   │   ├── tools/                 ← hostable tool .ts/.js/.mjs files (clawdevbox.tools)
+│   │   ├── recipes/               ← recipe .yaml files (clawdevbox.recipes)
+│   │   ├── skills/<id>/SKILL.md   ← Claude-shape skill directories
+│   │   ├── agents/<id>.agent.md   ← Claude subagent markdown
+│   │   ├── commands/<id>.md       ← Claude slash-command markdown
+│   │   ├── .mcp.json              ← Claude MCP server config
+│   │   ├── triggers/              ← trigger-type .ts callbacks (clawdevbox.trigger_types)
 │   │   └── .git/                  ← preserved for git installs only
 │   ├── <id>.install.json          ← sidecar install record (NEVER inside the plugin dir)
 │   └── .tmp-install-<rand>/       ← atomic-publish scratch dir
@@ -760,7 +765,7 @@ arrays.
   dir: string;                                // resolved on-disk path
   status: "enabled" | "disabled" | "error";
   error?: string;
-  manifest: PluginManifest;                   // full parsed plugin.yaml
+  manifest: PluginManifest;                   // full parsed .claude-plugin/plugin.json
   origin: InstallRecord | null;               // sidecar contents, or null
 }
 ```
@@ -804,9 +809,14 @@ Branches on `from`:
    - `spawnSync("git", ["clone", ...(ref ? ["--branch", ref] : []), gitUrl, tmp])`.
      A full clone — no `--depth 1` — because `plugin.update` needs to
      `git fetch && git reset --hard` across arbitrary refs later.
-   - Read `<tmp>/plugin.yaml`, parse YAML, run
-     `validatePluginManifest`.
-   - Refuse if `<globalDir>/plugins/<manifest.id>/` already exists
+   - Detect whether the clone is a single plugin (root
+     `.claude-plugin/plugin.json`) or a marketplace catalog (root
+     `.claude-plugin/marketplace.json` or `.github/plugin/marketplace.json`).
+     See [§ Marketplace sources](#marketplace-sources) below for the
+     catalog branch.
+   - For a single plugin: read `<tmp>/.claude-plugin/plugin.json`,
+     `loadPluginFromDir` it, which validates the manifest shape.
+   - Refuse if `<globalDir>/plugins/<manifest.name>/` already exists
      (`PLUGIN_ALREADY_INSTALLED`).
    - `renameSync(tmp, destDir)` — atomic publish.
    - Write `<id>.install.json` with `kind: "git", from, ref, installed_at`.
@@ -815,7 +825,10 @@ Branches on `from`:
 
 2. **`isAbsolute(from) && existsSync(from) && stat.isDirectory()`** →
    `installFromLocalFolder(ws, from)`:
-   - Validate the manifest at `<from>/plugin.yaml`.
+   - Detect single plugin vs marketplace catalog (same files as the
+     git branch).
+   - For a single plugin: validate the manifest at
+     `<from>/.claude-plugin/plugin.json`.
    - `createPluginLink(absoluteSource, destDir)` → `symlinkSync(target,
      destDir, "junction" | "dir")`. The user's folder is **never
      copied, never modified**.
@@ -840,14 +853,45 @@ Branches on `from`:
 | `UNSUPPORTED_FROM`         | `from` is not `git+…` and not an absolute existing directory                          |
 | `INVALID_SOURCE`           | `from` is a path that exists but is a file, not a directory                           |
 | `GIT_CLONE_FAILED`         | `git clone` returned non-zero (stderr forwarded in `message`)                         |
-| `MANIFEST_MISSING`         | `plugin.yaml` not found at the source root                                            |
-| `MANIFEST_PARSE_ERROR`     | YAML parse exception                                                                  |
-| `VALIDATION_FAILED`        | `validatePluginManifest` returned errors (see below); `errors[]` carries per-field detail |
+| `MANIFEST_MISSING`         | Neither `.claude-plugin/plugin.json` nor a marketplace catalog found at the source root |
+| `MANIFEST_PARSE_ERROR`     | JSON parse exception on `plugin.json`                                                 |
+| `VALIDATION_FAILED`        | `validatePluginManifestJson` returned errors; `errors[]` carries per-field detail     |
+| `ENGINE_MISMATCH`          | The source's `agency.json` `engines` filter excludes the current engine identity      |
 | `PLUGIN_ALREADY_INSTALLED` | `<globalDir>/plugins/<manifest.id>/` already exists                                   |
 | `LINK_FAILED`              | `symlinkSync` failed for a local-folder install (usually permissions on POSIX)        |
 
 On any failure during the git path the temp clone is `rmSync`'d in a
 `finally` block — no leftover `.tmp-install-…` directories survive.
+
+##### Marketplace sources
+
+`plugin.install`'s `from` accepts marketplace catalogs as well as
+single plugins. The source resolution looks for files **in this order**:
+
+1. `<source-root>/.claude-plugin/marketplace.json` — Claude-native catalog.
+2. `<source-root>/.github/plugin/marketplace.json` — GitHub-Copilot mirror; consumed identically.
+3. `<source-root>/.claude-plugin/plugin.json` — single-plugin install.
+
+If (1) or (2) matches, the install walks every entry in `plugins[]`
+and installs each one into `<globalDir>/plugins/<name>/`. Each plugin's
+own `<plugin-root>/agency.json` (if present) is consulted before
+install: a plugin whose `engines` filter excludes the current engine
+identity is silently skipped (with a one-line diagnostic in the tool's
+text output).
+
+The catalog's `marketplace-config.json` overlay (if present) only
+adjusts the catalog's top-level metadata (name, description, owner);
+individual plugin entries are not affected by it.
+
+The marketplace branch never writes a `<globalDir>/marketplaces/<id>/`
+record — that's owned by `clawdevbox marketplace add`. The plugins
+installed via the marketplace branch get standard
+`<globalDir>/plugins/<name>.install.json` sidecars with `kind: "git"`
+(if the marketplace was a git URL) recording the **catalog's**
+provenance plus the plugin's `source` from the catalog entry.
+
+If neither a marketplace catalog nor a plugin.json is present at the
+source root, `plugin.install` returns `MANIFEST_MISSING`.
 
 #### `plugin.update`
 
@@ -883,9 +927,9 @@ Behavior:
      `resetTarget = "origin/<ref>"`; otherwise (tag, sha)
      `resetTarget = "<ref>"` verbatim.
 7. `git reset --hard <resetTarget>`. Failure → `GIT_RESET_FAILED`.
-8. Re-check that `plugin.yaml` still exists after the reset →
-   `MANIFEST_MISSING` if not (catches the case where the upstream
-   renamed/deleted the manifest).
+8. Re-check that `.claude-plugin/plugin.json` still exists after the
+   reset → `MANIFEST_MISSING` if not (catches the case where the
+   upstream renamed/deleted the manifest).
 9. `reloadPluginRegistry(ws)` so any manifest changes (new tools,
    altered triggers) take effect immediately.
 
@@ -984,19 +1028,23 @@ A typical end-to-end install of `git+https://github.com/example/clawdevbox-foo.g
    `plugin.update` later needs the full history to resolve tags / SHAs
    / branch upstreams. Failure → `GIT_CLONE_FAILED` with the git
    stderr verbatim, then the `finally` block `rmSync`s the temp dir.
-5. **Manifest parse.** Read `<tmp>/plugin.yaml`, `yamlLoad` it. Parse
-   errors → `MANIFEST_PARSE_ERROR`. Missing file →
-   `MANIFEST_MISSING` (the hint mentions `clawdevbox init --plugin
-   <url>` as the route for multi-plugin repos).
-6. **Manifest validation.** `validatePluginManifest(parsed)` checks:
-   - `id` present, matches `[a-z][a-z0-9-]*`.
-   - `name`, `description` present.
-   - `version` is a valid semver.
-   - `provides.{skills,recipes,tools,mcp_servers}[]` each have an
-     `id` matching the appropriate pattern (tools use the namespaced
-     `TOOL_ID_PATTERN`), a `file` that doesn't contain `..`, and for
-     tools specifically a `.ts`/`.js`/`.mjs` extension.
-   - `provides.trigger_types[]` pass `validateTriggerTypeEntry` (id,
+5. **Manifest parse.** Read `<tmp>/.claude-plugin/plugin.json`,
+   `JSON.parse` it. Parse errors → `MANIFEST_PARSE_ERROR`. Missing file
+   (and no marketplace catalog) → `MANIFEST_MISSING`.
+6. **Manifest validation.** `validatePluginManifestJson(parsed)` checks:
+   - `name` present, matches `[a-z][a-z0-9-]*`.
+   - Optional Claude metadata (`version`, `description`, `author`, …)
+     has the right types.
+   - Component path fields (`skills`, `agents`, `commands`, `mcpServers`,
+     `hooks`) are strings, arrays of strings, or inline objects; no
+     `..` traversal.
+   - `status` (when present) has `testedWith: string` (required) and
+     optional `experimental: boolean` and `notes: string`.
+   - `clawdevbox.{recipes,tools,trigger_types,agent_clis}[]` each have
+     an `id` matching the appropriate pattern (tools use the namespaced
+     `TOOL_ID_PATTERN`), a `file` / `module` that doesn't contain `..`,
+     and for tools specifically a `.ts`/`.js`/`.mjs` extension.
+   - `clawdevbox.trigger_types[]` pass `validateTriggerTypeEntry` (id,
      callback module, parameters[] shape, optional cron field).
    - Duplicate ids within a family are rejected.
 
@@ -1018,11 +1066,11 @@ A typical end-to-end install of `git+https://github.com/example/clawdevbox-foo.g
 10. **Registry rebuild.** `reloadPluginRegistry(ws)`:
     - Clears `ws.plugins`, `ws.triggerTypes`, `ws.triggerTypeErrors`.
     - `readdirSync` the plugins root; for each directory entry:
-      parse `plugin.yaml`, validate it (again — this is the defense
-      against on-disk tampering between install and use), confirm
-      `manifest.id === entry` (the **directory-name security check**;
-      a malicious manifest can't declare `id: "ado"` to shadow another
-      plugin if its containing dir is named differently).
+      parse `.claude-plugin/plugin.json`, validate it (again — this is
+      the defense against on-disk tampering between install and use),
+      confirm `manifest.name === entry` (the **directory-name security
+      check**; a malicious manifest can't declare `name: "ado"` to
+      shadow another plugin if its containing dir is named differently).
     - Build the trigger-type registry from `enabled` plugins, sorted
       by id for deterministic collision resolution.
 11. **Response.** `{ content: [{ type: "text", text: "Installed plugin
@@ -1061,13 +1109,15 @@ reload immediately; only out-of-process consumers need to restart).
   `plugin.install` avoids this by cloning *directly* into the plugins
   root.
 
-- **Multi-plugin repos aren't supported by `plugin.install`.** The
-  tool insists on `plugin.yaml` at the repo root. Repos like
-  `clawdevbox-plugins` (one git repo containing many plugins under
-  subdirs) have to go through `clawdevbox init --plugin <url>`, which
-  uses `discoverPluginsInDir` and the `installPluginFromDir` helper.
-  Those subdir installs end up with `kind: "manual"` records, which
-  `plugin.update` then refuses to refresh.
+- **Multi-plugin repos go through the marketplace branch.** A repo
+  with `.claude-plugin/marketplace.json` (or `.github/plugin/marketplace.json`)
+  at the root is treated as a catalog: every listed plugin is resolved
+  and installed (filtered through `agency.json.engines`). A repo with
+  only `.claude-plugin/plugin.json` at the root installs as a single
+  plugin. Legacy `clawdevbox init --plugin <url>` discovery of subdir
+  plugins still works for repos with no catalog; those subdir installs
+  end up with `kind: "manual"` records, which `plugin.update` then
+  refuses to refresh.
 
 - **Local install + manifest id rename.** Because the junction's
   directory name is fixed to `manifest.id` at install time, if a user
@@ -1433,7 +1483,7 @@ in `ws.agentCliProviders`), `SPAWN_FAILED`.
 The `agent_cli` argument accepts **any registered provider id**, not
 just the OSS built-ins. Built-ins are `copilot`, `claude`, and
 `echo-stub`; plugin-supplied providers register through
-`provides.agent_clis[]` in `plugin.yaml`. The current list is
+`clawdevbox.agent_clis[]` in `.claude-plugin/plugin.json`. The current list is
 discoverable via `GET /api/agent-clis`. See
 [`docs/agent-clis.md`](./agent-clis.md) for authoring details.
 
@@ -1767,8 +1817,8 @@ The directory scanner accepts `<id>.yaml`, `<id>.yml`, and `<id>.json`.
 successful write so a recipe id maps to exactly one file. This avoids the
 "is `foo.yaml` or `foo.json` canonical?" ambiguity.
 
-Plugins may ship either format (`provides.recipes[].file` in
-`plugin.yaml`); the scope chain resolves through the manifest, so the
+Plugins may ship either format (`clawdevbox.recipes[].file` in
+`.claude-plugin/plugin.json`); the scope chain resolves through the manifest, so the
 file extension is opaque to the resolver.
 
 ### Canonical Step schema
@@ -2643,7 +2693,8 @@ practice both paths fail safely.
   `provides.skills[]` may point at any path inside the plugin tree; the
   filename does *not* have to be `<id>.md`. Conversely, a `.md` file
   sitting in a plugin folder is invisible to `skill.*` if it isn't listed
-  in `plugin.yaml`. `listAllInScope` (`scope.ts:235-249`) iterates the
+  in the plugin manifest (Claude `skills` field or auto-discovered
+  `skills/<id>/SKILL.md`). `listAllInScope` (`scope.ts:235-249`) iterates the
   manifest, not `readdir`.
 - **Plugin-scope writes are always rejected.** Even if the manifest path
   points back into `<globalDir>/plugins/<id>/skills/<id>.md`, you cannot
@@ -2728,7 +2779,7 @@ The implementation lives in:
 
 ```
 <projectDir>/.clawdevbox/triggers.json     ← registered instances (this file)
-<globalDir>/plugins/<plugin_id>/plugin.yaml ← TYPE declarations live here
+<globalDir>/plugins/<plugin_id>/.claude-plugin/plugin.json ← TYPE declarations live here
 ```
 
 `triggers.json` has exactly one top-level key:
@@ -2775,7 +2826,7 @@ template/plugin mutation. Precedence is **lowest → highest**:
 
 | Precedence | Source | Layout | `scope` field |
 |---|---|---|---|
-| 1 (lowest) | Plugin-shipped | `<globalDir>/plugins/<plugin_id>/plugin.yaml`'s `provides.trigger_types[]` | `plugin:<id>` |
+| 1 (lowest) | Plugin-shipped | `<globalDir>/plugins/<plugin_id>/.claude-plugin/plugin.json`'s `clawdevbox.trigger_types[]` | `plugin:<id>` |
 | 2 | Global agent-authored | `<globalDir>/trigger-types/<id>/template.yaml` + `trigger.<ext>` | `global` |
 | 3 (highest) | Project agent-authored | `<projectDir>/.clawdevbox/trigger-types/<id>/template.yaml` + `trigger.<ext>` | `project` |
 
@@ -2800,10 +2851,10 @@ exist only to back the matching registered row.
 
 Loading happens in two phases:
 
-1. Walk `<globalDir>/plugins/*/plugin.yaml`, validate, and populate
+1. Walk `<globalDir>/plugins/*/.claude-plugin/plugin.json`, validate, and populate
    `ws.plugins`.
 2. For every **enabled** plugin (sorted by id, deterministic), append each
-   `provides.trigger_types[]` entry into `ws.triggerTypes`. Then layer the
+   `clawdevbox.trigger_types[]` entry into `ws.triggerTypes`. Then layer the
    global, then project, agent-authored templates on top. ID collisions
    across plugins go to `ws.triggerTypeErrors[]` — **first plugin wins**,
    the rest are dropped and surfaced through `trigger.list_types`'
@@ -3435,17 +3486,22 @@ surface deliberately returns the raw `resolved_cron` and leaves humanization
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│ 1. Plugin author declares a TYPE in plugin.yaml                     │
+│ 1. Plugin author declares a TYPE in .claude-plugin/plugin.json      │
 │                                                                     │
-│    provides:                                                        │
-│      trigger_types:                                                 │
-│        - id: ado.new-pr-watcher                                     │
-│          file: triggers/new-pr-watcher.ts                           │
-│          default_cron: "*/5 * * * *"                                │
-│          identity_param: repo                                       │
-│          binds_callback_to_recipe: handle-new-pr                    │
-│          parameters:                                                │
-│            - { name: repo, type: string, required: true }           │
+│    "clawdevbox": {                                                  │
+│      "trigger_types": [                                             │
+│        {                                                            │
+│          "id": "ado.new-pr-watcher",                                │
+│          "file": "triggers/new-pr-watcher.ts",                      │
+│          "default_cron": "*/5 * * * *",                             │
+│          "identity_param": "repo",                                  │
+│          "binds_callback_to_recipe": "handle-new-pr",               │
+│          "parameters": [                                            │
+│            { "name": "repo", "type": "string", "required": true }   │
+│          ]                                                          │
+│        }                                                            │
+│      ]                                                              │
+│    }                                                                │
 └─────────────────────────────────────────────────────────────────────┘
                                   │
                                   │  plugin.install copies plugin
@@ -3454,7 +3510,7 @@ surface deliberately returns the raw `resolved_cron` and leaves humanization
 ┌─────────────────────────────────────────────────────────────────────┐
 │ 2. Workspace boot — reloadPluginRegistry() in workspace.ts          │
 │                                                                     │
-│    Phase 1: ws.plugins from <globalDir>/plugins/*/plugin.yaml       │
+│    Phase 1: ws.plugins from <globalDir>/plugins/*/.claude-plugin/plugin.json │
 │    Phase 2: ws.triggerTypes from the enabled plugins (alphabetical) │
 │                                                                     │
 │    Collisions go to ws.triggerTypeErrors[]; first plugin wins.      │
@@ -6773,7 +6829,7 @@ having to know any of that happened.
 | **`<projectDir>`** | The `CLAWDEVBOX_PROJECT_DIR` the MCP server was booted with. Read-only context loaded by `loadWorkspaceFromEnv`. Distinct from a registered workspace — it may or may not be one. |
 | **`<globalDir>`** | The account-wide config root (`CLAWDEVBOX_GLOBAL_DIR`, default `~/.clawdevbox`). Holds the plugin store, global recipes/skills, inbox, push subscriptions, VAPID keys, and the per-plugin enabled flag. |
 | **`<workspacesRoot>`** | Parent dir for minted workspaces; defaults to `<globalDir>/workspaces`. The registry `index.json` lives here. |
-| **Plugin** | A directory under `<globalDir>/plugins/<id>/` with a `plugin.yaml` manifest declaring `provides.{recipes,skills,trigger_types,tools,mcp_servers}`. Global to the account. |
+| **Plugin** | A directory under `<globalDir>/plugins/<id>/` with a `.claude-plugin/plugin.json` manifest (Claude-aligned). Claude fields auto-discover skills/agents/commands/MCP; clawdevbox-specific capabilities live under the manifest's `clawdevbox` extension key (`recipes`, `tools`, `trigger_types`, `agent_clis`). Global to the account. |
 | **Plugin install record** | A sidecar `<globalDir>/plugins/<id>.install.json` written next to (not inside) the plugin dir. Records `kind` (`git` / `local` / `builtin` / `manual`), source spec, optional `ref`, and `installed_at`. |
 | **Scope** | One of `'project'`, `'plugin:<id>'`, `'global'`, `'all'`. Resolution order on `'all'`: project → plugin (sorted by id) → global. Writes accept only `project` and `global`. |
 | **Scope chain** | The walk used by `resolveRead` and `listAllInScope` to look up a recipe/skill/trigger across scopes, taking the first hit. |

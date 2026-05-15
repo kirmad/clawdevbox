@@ -313,7 +313,7 @@ in `ws.agentCliProviders`), `SPAWN_FAILED`.
 The `agent_cli` argument accepts **any registered provider id**, not
 just the OSS built-ins. Built-ins are `copilot`, `claude`, and
 `echo-stub`; plugin-supplied providers register through
-`provides.agent_clis[]` in `plugin.yaml`. The current list is
+`clawdevbox.agent_clis[]` in `.claude-plugin/plugin.json`. The current list is
 discoverable via `GET /api/agent-clis`. See
 [`docs/agent-clis.md`](../agent-clis.md) for authoring details.
 
@@ -647,8 +647,8 @@ The directory scanner accepts `<id>.yaml`, `<id>.yml`, and `<id>.json`.
 successful write so a recipe id maps to exactly one file. This avoids the
 "is `foo.yaml` or `foo.json` canonical?" ambiguity.
 
-Plugins may ship either format (`provides.recipes[].file` in
-`plugin.yaml`); the scope chain resolves through the manifest, so the
+Plugins may ship either format (`clawdevbox.recipes[].file` in
+`.claude-plugin/plugin.json`); the scope chain resolves through the manifest, so the
 file extension is opaque to the resolver.
 
 ## Canonical Step schema

@@ -7,8 +7,9 @@
  * `<globalDir>/plugins/<id>/` (atomic — temp dir then rename).
  *
  * Adding a new built-in: drop a plugin directory under
- * `samples/plugins/<id>/` with the standard layout (plugin.yaml +
- * tools/ + recipes/ + skills/ + triggers/) and add an entry below.
+ * `samples/plugins/<id>/` with the standard layout
+ * (`.claude-plugin/plugin.json` + tools/ + recipes/ + skills/ + triggers/)
+ * and add an entry below.
  *
  * The historical built-ins for IcM / Geneva Metrics / DGrep / CFV have
  * been moved out of this repo into the standalone `clawdevbox-plugins`
