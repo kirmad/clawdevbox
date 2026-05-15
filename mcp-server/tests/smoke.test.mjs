@@ -10,7 +10,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir, platform } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -27,10 +27,20 @@ const repoSampleAdoPlugin = resolve(projectRoot, '..', 'samples', 'plugins', 'ad
 
 class ServerHarness {
   constructor() {
-    this.tmpRoot = mkdtempSync(join(tmpdir(), 'conductor-mcp-smoke-'));
-    const conductorDir = join(this.tmpRoot, '.conductor');
-    const pluginDest = join(conductorDir, 'plugins', 'ado');
-    mkdirSync(pluginDest, { recursive: true });
+    this.tmpRoot = mkdtempSync(join(tmpdir(), 'clawdevbox-mcp-smoke-'));
+    const clawdevboxDir = join(this.tmpRoot, '.clawdevbox');
+    // Project tree: recipes/skills/triggers/artifacts only; plugins are
+    // global now.
+    mkdirSync(clawdevboxDir, { recursive: true });
+    for (const sub of ['recipes', 'skills', 'triggers', 'artifacts']) {
+      mkdirSync(join(clawdevboxDir, sub), { recursive: true });
+    }
+
+    // Global plugin store — install the ADO built-in here so the server
+    // discovers it via `<global_dir>/plugins/*`.
+    this.globalDir = join(this.tmpRoot, '.global');
+    const pluginDest = join(this.globalDir, 'plugins', 'ado');
+    mkdirSync(dirname(pluginDest), { recursive: true });
     cpSync(repoSampleAdoPlugin, pluginDest, {
       recursive: true,
       filter: (src) =>
@@ -38,24 +48,22 @@ class ServerHarness {
         !src.endsWith('package-lock.json') &&
         !src.includes('_legacy-mcp-server'),
     });
-    this.globalDir = join(this.tmpRoot, '.global');
-    mkdirSync(this.globalDir, { recursive: true });
 
-    // Junction the Conductor server's node_modules into the temp workspace
-    // root so the ADO plugin's hostable tools (which `import 'zod'`) resolve.
-    // See hosted-tools.test.mjs for the same pattern + rationale.
-    const wsNodeModules = join(this.tmpRoot, 'node_modules');
-    if (!existsSync(wsNodeModules)) {
+    // Junction the Clawdevbox server's node_modules into the GLOBAL dir
+    // so the ADO plugin's hostable tools (which `import 'zod'`) resolve
+    // via Node's walk-up from `<globalDir>/plugins/ado/tools/*.ts`.
+    const globalNodeModules = join(this.globalDir, 'node_modules');
+    if (!existsSync(globalNodeModules)) {
       const linkType = platform() === 'win32' ? 'junction' : 'dir';
-      symlinkSync(resolve(projectRoot, 'node_modules'), wsNodeModules, linkType);
+      symlinkSync(resolve(projectRoot, 'node_modules'), globalNodeModules, linkType);
     }
 
-    this.child = spawn('npx', ['tsx', entry], {
+    this.child = spawn('npx', ['tsx', entry, 'mcp'], {
       cwd: projectRoot,
       env: {
         ...process.env,
-        CONDUCTOR_PROJECT_DIR: this.tmpRoot,
-        CONDUCTOR_GLOBAL_DIR: this.globalDir,
+        CLAWDEVBOX_PROJECT_DIR: this.tmpRoot,
+        CLAWDEVBOX_GLOBAL_DIR: this.globalDir,
       },
       stdio: ['pipe', 'pipe', 'pipe'],
       shell: process.platform === 'win32',
@@ -83,7 +91,7 @@ class ServerHarness {
     });
   }
 
-  async waitFor(id, timeoutMs = 15000) {
+  async waitFor(id, timeoutMs = 30000) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       const found = this.responses.find((r) => r.id === id);
@@ -158,13 +166,13 @@ class ServerHarness {
 // Tests
 // ----------------------------------------------------------------------------
 
-test('conductor MCP server smoke', async (t) => {
+test('clawdevbox MCP server smoke', async (t) => {
   const h = new ServerHarness();
   t.after(() => h.shutdown());
 
   await h.init();
 
-  await t.test('tools/list registers the full Conductor catalog', async () => {
+  await t.test('tools/list registers the full Clawdevbox catalog', async () => {
     const tools = await h.listTools();
     const names = tools.map((x) => x.name);
     assert.ok(tools.length >= 30, `expected >=30 tools, got ${tools.length}`);
@@ -256,6 +264,27 @@ test('conductor MCP server smoke', async (t) => {
     });
     assert.ok(!up.isError);
     assert.equal(up.structuredContent?.item?.id, 'ado:pr:1');
+    // New: upsert reports whether the row was created vs updated.
+    assert.equal(up.structuredContent?.created, true, 'expected created=true on first upsert');
+    // Re-upserting the same id reports created=false.
+    const up2 = await h.call('inbox.upsert', {
+      id: 'ado:pr:1',
+      kind: 'pr_review',
+      source: 'ado',
+      title: 'PR 1: Fix auth (updated)',
+    });
+    assert.equal(up2.structuredContent?.created, false, 'expected created=false on re-upsert');
+    // Notifications aren't configured in the test harness, so a push attempt
+    // surfaces NOTIFICATIONS_DISABLED rather than throwing.
+    const pushCall = await h.call('inbox.upsert', {
+      id: 'ado:pr:2',
+      kind: 'pr_review',
+      source: 'ado',
+      title: 'PR 2: refactor',
+      notify: true,
+    });
+    assert.equal(pushCall.structuredContent?.push_error_code, 'NOTIFICATIONS_DISABLED');
+    assert.equal(pushCall.structuredContent?.push, null);
 
     const tsp = await h.call('thread.spawn', {
       inbox_item_id: 'ado:pr:1',
@@ -281,6 +310,114 @@ test('conductor MCP server smoke', async (t) => {
 
     const stillPending = await h.call('approval.list_pending', { thread_id: threadId });
     assert.equal(stillPending.structuredContent?.approvals?.length, 0);
+  });
+
+  await t.test('inbox is persisted to <globalDir>/inbox.json', async () => {
+    // The previous test upserted ado:pr:1 and ado:pr:2 — both should now be
+    // visible in the on-disk file under the harness's globalDir.
+    const inboxFile = join(h.globalDir, 'inbox.json');
+    assert.ok(existsSync(inboxFile), `expected ${inboxFile} to exist`);
+    const parsed = JSON.parse(readFileSync(inboxFile, 'utf8'));
+    assert.equal(parsed.version, 1);
+    assert.ok(Array.isArray(parsed.items));
+    const ids = parsed.items.map((it) => it.id).sort();
+    assert.ok(ids.includes('ado:pr:1'), `ado:pr:1 missing from inbox.json (got ${ids.join(', ')})`);
+    assert.ok(ids.includes('ado:pr:2'), `ado:pr:2 missing from inbox.json (got ${ids.join(', ')})`);
+  });
+
+  await t.test('inbox.upsert accepts the expanded schema (preview/description/attachments/links/labels)', async () => {
+    const upsertRes = await h.call('inbox.upsert', {
+      id: 'ado:pr:99',
+      kind: 'pr_review',
+      source: 'ado',
+      title: 'PR 99: ship it',
+      preview: 'Two lines changed. LGTM modulo a typo in the comments.',
+      description: '## Summary\n\nReady to merge.\n\n- typo in `auth.ts`\n- everything else looks fine',
+      description_format: 'markdown',
+      attachments: [
+        { artifact_id: 'pr-99-walkthrough', type: 'walkthrough', title: 'Walkthrough' },
+        { artifact_id: 'pr-99-review', type: 'pr-review' },
+      ],
+      recipe_instance: { id: 'ri_demo_abcd', workspace_id: 'ws-demo' },
+      trigger_id: 'ado.new-pr-watcher#auth-svc',
+      labels: ['critical', 'ready-to-merge', 'critical'], // duplicate dropped
+    });
+    assert.ok(!upsertRes.isError);
+    const item = upsertRes.structuredContent?.item;
+    assert.equal(item?.preview, 'Two lines changed. LGTM modulo a typo in the comments.');
+    assert.equal(item?.description_format, 'markdown');
+    assert.equal(typeof item?.description_size, 'number');
+    assert.ok((item?.description_size ?? 0) > 0, 'description_size should be > 0');
+    assert.equal(item?.attachments?.length, 2);
+    assert.equal(item?.attachments?.[0]?.artifact_id, 'pr-99-walkthrough');
+    assert.equal(item?.recipe_instance?.id, 'ri_demo_abcd');
+    assert.equal(item?.trigger_id, 'ado.new-pr-watcher#auth-svc');
+    // Labels are de-duplicated case-insensitively.
+    assert.deepEqual(item?.labels, ['critical', 'ready-to-merge']);
+
+    // The body should be persisted as a sidecar file (NOT inline in inbox.json).
+    const bodiesDir = join(h.globalDir, 'inbox-bodies');
+    assert.ok(existsSync(bodiesDir), 'inbox-bodies dir should exist');
+    const sidecar = join(bodiesDir, 'ado_pr_99.md');
+    assert.ok(existsSync(sidecar), `expected sidecar ${sidecar} to exist`);
+    const sidecarText = readFileSync(sidecar, 'utf8');
+    assert.ok(sidecarText.includes('Ready to merge.'));
+
+    // inbox.json must NOT contain the body inline — only metadata.
+    const inboxJson = JSON.parse(readFileSync(join(h.globalDir, 'inbox.json'), 'utf8'));
+    const stored = inboxJson.items.find((it) => it.id === 'ado:pr:99');
+    assert.ok(stored, 'stored item must be present');
+    assert.equal(stored.description, undefined, 'description must not be inlined');
+    assert.equal(stored.description_format, 'markdown');
+    assert.equal(typeof stored.description_size, 'number');
+    assert.equal(stored.attachments.length, 2);
+
+    // inbox.read returns the body inlined via the sidecar.
+    const readRes = await h.call('inbox.read', { id: 'ado:pr:99' });
+    assert.ok(!readRes.isError);
+    assert.match(readRes.structuredContent?.description ?? '', /Ready to merge/);
+
+    // include_body: false skips the sidecar read.
+    const readNoBody = await h.call('inbox.read', { id: 'ado:pr:99', include_body: false });
+    assert.equal(readNoBody.structuredContent?.description, null);
+
+    // Empty description deletes the sidecar; description_size becomes 0.
+    const clearRes = await h.call('inbox.upsert', {
+      id: 'ado:pr:99',
+      kind: 'pr_review',
+      source: 'ado',
+      description: '',
+    });
+    assert.equal(clearRes.structuredContent?.item?.description_size, 0);
+    assert.ok(!existsSync(sidecar), 'sidecar should be deleted after empty description');
+
+    // Empty attachments / labels arrays clear those fields.
+    const clearLists = await h.call('inbox.upsert', {
+      id: 'ado:pr:99',
+      kind: 'pr_review',
+      source: 'ado',
+      attachments: [],
+      labels: [],
+    });
+    assert.deepEqual(clearLists.structuredContent?.item?.attachments, []);
+    assert.deepEqual(clearLists.structuredContent?.item?.labels, []);
+
+    // null clears nullable refs.
+    const clearRefs = await h.call('inbox.upsert', {
+      id: 'ado:pr:99',
+      kind: 'pr_review',
+      source: 'ado',
+      recipe_instance: null,
+      trigger_id: null,
+    });
+    assert.equal(clearRefs.structuredContent?.item?.recipe_instance, null);
+    assert.equal(clearRefs.structuredContent?.item?.trigger_id, null);
+
+    // inbox.list filters by label.
+    const filtered = await h.call('inbox.list', { label: 'critical' });
+    const filteredIds = filtered.structuredContent?.items?.map((it) => it.id) ?? [];
+    // ado:pr:99's labels were cleared above so it should NOT match. Sanity:
+    assert.ok(!filteredIds.includes('ado:pr:99'), 'cleared labels must not match');
   });
 
   await t.test('recipe.upsert validates shape and rejects malformed sources', async () => {

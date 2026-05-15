@@ -1,7 +1,7 @@
 #!/usr/bin/env pwsh
 <#
 .SYNOPSIS
-  Set up real Azure DevOps test fixtures for the Conductor trigger harness.
+  Set up real Azure DevOps test fixtures for the Clawdevbox trigger harness.
 
 .DESCRIPTION
   Mirror of setup-ado.sh for Windows / PowerShell users.
@@ -169,7 +169,7 @@ if ($prRepo -and $prRepo -ne $AdoRepo) {
 
 # --- Step 7: post a test comment ---
 $Timestamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-$CommentText = "Test comment from Conductor trigger harness at $Timestamp"
+$CommentText = "Test comment from Clawdevbox trigger harness at $Timestamp"
 Write-Info "posting test comment to PR $AdoPrId..."
 
 $bodyObj = @{

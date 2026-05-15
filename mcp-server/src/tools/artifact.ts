@@ -15,9 +15,9 @@
  * on recipe state.
  *
  * Renderer dispatch (extensible plugin model):
- *   1. <workspace>/.conductor/renderers/<type>.mjs   (agent-authored)
+ *   1. <workspace>/.clawdevbox/renderers/<type>.mjs   (agent-authored)
  *   2. <plugin_dir>/renderers/<type>.mjs             (plugin-shipped)
- *   3. <conductor-mcp-server>/src/renderers/<type>.mjs (built-in)
+ *   3. <clawdevbox-mcp-server>/src/renderers/<type>.mjs (built-in)
  * First match wins. See renderer.* tools for inspecting / authoring.
  */
 
@@ -56,7 +56,7 @@ function resolveTargetWorkspace(
   | { ok: true; workspaceId: string; workspacePath: string }
   | { ok: false; error: ReturnType<typeof structuredError> } {
   const root = resolveWorkspacesRoot();
-  const explicitId = argsWorkspaceId ?? process.env.CONDUCTOR_WORKSPACE_ID;
+  const explicitId = argsWorkspaceId ?? process.env.CLAWDEVBOX_WORKSPACE_ID;
   if (explicitId) {
     const info = getWorkspace(root, explicitId);
     if (!info) {
@@ -79,7 +79,7 @@ function resolveTargetWorkspace(
     ok: false,
     error: structuredError(
       'NO_TARGET_WORKSPACE',
-      'No workspace_id provided, CONDUCTOR_WORKSPACE_ID env not set, and CONDUCTOR_PROJECT_DIR is not a registered workspace.',
+      'No workspace_id provided, CLAWDEVBOX_WORKSPACE_ID env not set, and CLAWDEVBOX_PROJECT_DIR is not a registered workspace.',
     ),
   };
 }
@@ -122,14 +122,14 @@ export function registerArtifactTools(server: McpServer, ws: Workspace): void {
           .min(1)
           .optional()
           .describe(
-            'Target workspace id. Falls back to CONDUCTOR_WORKSPACE_ID env, then CONDUCTOR_PROJECT_DIR resolution.',
+            'Target workspace id. Falls back to CLAWDEVBOX_WORKSPACE_ID env, then CLAWDEVBOX_PROJECT_DIR resolution.',
           ),
         recipe_instance_id: z
           .string()
           .min(1)
           .optional()
           .describe(
-            'Optional UI link to a recipe instance. Falls back to CONDUCTOR_RECIPE_INSTANCE_ID env if not provided.',
+            'Optional UI link to a recipe instance. Falls back to CLAWDEVBOX_RECIPE_INSTANCE_ID env if not provided.',
           ),
         step_id: z
           .string()
@@ -184,7 +184,7 @@ export function registerArtifactTools(server: McpServer, ws: Workspace): void {
         title: args.title,
         workspace_id: target.workspaceId,
         recipe_instance_id:
-          args.recipe_instance_id ?? process.env.CONDUCTOR_RECIPE_INSTANCE_ID ?? null,
+          args.recipe_instance_id ?? process.env.CLAWDEVBOX_RECIPE_INSTANCE_ID ?? null,
         step_id: args.step_id ?? null,
         created_at: existing?.manifest.created_at ?? Date.now(),
         meta: args.meta ?? undefined,

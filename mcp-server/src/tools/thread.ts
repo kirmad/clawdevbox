@@ -7,7 +7,7 @@
  *
  * `thread.wake` records the wake intent and flips state to 'running'. The
  * agent process is re-spawned by whichever component owns the CLI lifecycle
- * (Conductor desktop app's shell-command IPC, or a future scheduler tool).
+ * (Clawdevbox desktop app's shell-command IPC, or a future scheduler tool).
  */
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -158,7 +158,7 @@ export function registerThreadTools(server: McpServer): void {
     'thread.wake',
     {
       description:
-        'Wake a suspended thread: record a `wake_requested` message and flip the thread state to `running`. The host (Conductor desktop app or external scheduler) is responsible for re-spawning the underlying CLI process — this tool only updates the kernel state and emits the intent so any subscriber can act.',
+        'Wake a suspended thread: record a `wake_requested` message and flip the thread state to `running`. The host (Clawdevbox desktop app or external scheduler) is responsible for re-spawning the underlying CLI process — this tool only updates the kernel state and emits the intent so any subscriber can act.',
       inputSchema: { thread_id: z.string().min(1) },
     },
     async (args) => {

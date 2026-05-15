@@ -17,11 +17,11 @@
  *   - Non-2xx HTTP throws an Error tagged with `code: 'ADO_HTTP_ERROR'` and the
  *     status / url / body attached for debuggability.
  *
- * The Conductor host catches thrown errors and surfaces them as MCP tool
+ * The Clawdevbox host catches thrown errors and surfaces them as MCP tool
  * errors with structured `{ code, message }` (see `tools/hosted.ts`).
  */
 
-import type { ToolContext } from '@conductor/sdk';
+import type { ToolContext } from '@clawdevbox/sdk';
 
 export const API_VERSION = '7.1-preview.1';
 
@@ -54,7 +54,7 @@ export function authHeader(ctx: ToolContext): string {
   if (bearer && bearer.length > 0) return `Bearer ${bearer}`;
   if (pat && pat.length > 0) return `Basic ${Buffer.from(`:${pat}`).toString('base64')}`;
   throw new AdoConfigError(
-    'ADO auth missing. Set ADO_BEARER_TOKEN (AAD) or ADO_PAT (basic auth) in the Conductor server env.',
+    'ADO auth missing. Set ADO_BEARER_TOKEN (AAD) or ADO_PAT (basic auth) in the Clawdevbox server env.',
   );
 }
 

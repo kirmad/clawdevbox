@@ -3,7 +3,7 @@
  *
  * The trigger MCP surface (spec §6.1 + §8) — split cleanly into TYPES
  * (capabilities shipped by plugins) and REGISTERED instances (concrete
- * bindings persisted in `.conductor/triggers.json`).
+ * bindings persisted in `.clawdevbox/triggers.json`).
  *
  * Seven tools:
  *
@@ -184,7 +184,7 @@ export function registerTriggerTools(server: McpServer, ws: Workspace): void {
     'trigger.list_registered',
     {
       description:
-        'List REGISTERED trigger instances from `.conductor/triggers.json` (spec §8.3). Each entry shows the bound params, cron resolution (inherited/overridden/disabled), and last-run status. Use trigger.list_types to see available capabilities.',
+        'List REGISTERED trigger instances from `.clawdevbox/triggers.json` (spec §8.3). Each entry shows the bound params, cron resolution (inherited/overridden/disabled), and last-run status. Use trigger.list_types to see available capabilities.',
       inputSchema: {
         enabled: z.boolean().optional(),
         type_id: z.string().min(1).optional().describe('Filter to a single trigger type id.'),
@@ -219,7 +219,7 @@ export function registerTriggerTools(server: McpServer, ws: Workspace): void {
     'trigger.register',
     {
       description:
-        'Register a concrete instance of a trigger type with bound params (spec §8.3). Validates `params` against the type\'s `parameters[]` schema, mints a unique id (using `identity_param` if declared, else hashing all params), and appends to `.conductor/triggers.json`. Returns the new registered-instance id.',
+        'Register a concrete instance of a trigger type with bound params (spec §8.3). Validates `params` against the type\'s `parameters[]` schema, mints a unique id (using `identity_param` if declared, else hashing all params), and appends to `.clawdevbox/triggers.json`. Returns the new registered-instance id.',
       inputSchema: {
         type_id: z.string().min(1).describe('Trigger TYPE id (e.g. "ado.new-pr-watcher"). See trigger.list_types.'),
         params: z

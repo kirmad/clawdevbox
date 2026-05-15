@@ -29,7 +29,7 @@ import {
 // Structured-error helpers
 // ============================================================================
 
-export interface ConductorErrorPayload {
+export interface ClawdevboxErrorPayload {
   code: string;
   message: string;
   [k: string]: unknown;
@@ -219,8 +219,8 @@ export function listAllInScope(
   if (wantProject) {
     const dir =
       kind === 'recipe'
-        ? join(ws.projectDir, '.conductor', 'recipes')
-        : join(ws.projectDir, '.conductor', 'skills');
+        ? join(ws.projectDir, '.clawdevbox', 'recipes')
+        : join(ws.projectDir, '.clawdevbox', 'skills');
     scanDir(dir, 'project');
   }
 

@@ -7,7 +7,7 @@
  *                         plugin, builtin) with the active winner flagged
  *   - renderer.read     — return the .mjs source code for a type
  *   - renderer.write    — write an agent-authored renderer into
- *                         `<workspace>/.conductor/renderers/<type>.mjs`
+ *                         `<workspace>/.clawdevbox/renderers/<type>.mjs`
  *                         (shadows plugin / builtin of the same type)
  *   - renderer.delete   — remove a workspace-level renderer
  *
@@ -109,7 +109,7 @@ export function registerRendererTools(server: McpServer, ws: Workspace): void {
     'renderer.write',
     {
       description:
-        "Write or overwrite a workspace-level renderer at `<workspace>/.conductor/renderers/<type>.mjs`. The file MUST be a valid ES module with `export default { render(rootElement, ctx) }`. ctx exposes: { manifest, artifactId, fetchFile(name): Promise<string>, fetchFileJson(name): Promise<any>, listFiles(): Promise<string[]> }. A workspace renderer shadows any plugin / builtin renderer of the same type.",
+        "Write or overwrite a workspace-level renderer at `<workspace>/.clawdevbox/renderers/<type>.mjs`. The file MUST be a valid ES module with `export default { render(rootElement, ctx) }`. ctx exposes: { manifest, artifactId, fetchFile(name): Promise<string>, fetchFileJson(name): Promise<any>, listFiles(): Promise<string[]> }. A workspace renderer shadows any plugin / builtin renderer of the same type.",
       inputSchema: {
         type: z.string().min(1),
         code: z.string().min(1).describe('Full .mjs source code.'),

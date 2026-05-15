@@ -789,7 +789,7 @@ export default {
     if (files.length) await loadFile(files[0].path);
 
     // Public API.
-    window.__conductorPrReview = {
+    window.__clawdevboxPrReview = {
       pr, comments, files,
       gotoFile: loadFile,
       gotoComment: jumpToComment,

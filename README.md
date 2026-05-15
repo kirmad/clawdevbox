@@ -6,7 +6,7 @@
 
 ## What it gives you
 
-- **Hidden agent runs.** Spawn `agency copilot`, `claude`, or any TTY-driven CLI inside a `node-pty` (ConPTY on Windows) — no console window flashes. Each run gets an isolated workspace under `~/.conductor/workspaces/<id>/`.
+- **Hidden agent runs.** Spawn `agency copilot`, `claude`, or any TTY-driven CLI inside a `node-pty` (ConPTY on Windows) — no console window flashes. Each run gets an isolated workspace under `~/.clawdevbox/workspaces/<id>/`.
 - **Live browser viewer for any running agent.** An HTTP/WebSocket server attached to the MCP layer exposes `view_url`s. Open in any browser, see the live xterm, type input, kill the session.
 - **Renderable artifacts.** Agents call `artifact.add(id, type, ...)` to publish a folder of files (design docs, PR reviews, walkthroughs). The viewer dynamic-imports a `.mjs` renderer matched on `type`. Three built-in renderers ship: `markdown`, `pr-review`, `walkthrough`. Renderers are extensible by plugins or by the agent itself (workspace → plugin → built-in resolution chain).
 - **MCP-first surface.** Recipes (YAML task templates), skills (prompt snippets), triggers (cron / webhook-fired scripts), plugins, workspaces, inbox / threads / approvals — every verb is an MCP tool, so the same surface works from a side-terminal CLI, an external agent, or the eventual desktop app.
@@ -39,6 +39,44 @@ cd clawdevbox/mcp-server
 npm install
 npx playwright install chromium
 ```
+
+### Install and run
+
+`clawdevbox init` is the single setup command. It asks for an **install scope**:
+
+- **Global (recommended)** — writes account-wide config to
+  `<globalDir>/config.json` (defaults to `~/.clawdevbox/config.json`).
+  Plugins also live globally under `<globalDir>/plugins/`. One install per
+  user; every project sees the same MCP server, tunnel, and plugin set.
+- **Project-specific** — legacy per-project config under
+  `<projectDir>/.clawdevbox/config.json`. Useful when you want a separate
+  port / token / tunnel per project.
+
+```bash
+clawdevbox init                          # interactive
+clawdevbox init --scope global --plugin git+https://example.com/some-plugin.git
+```
+
+After `init`, three ways to run the MCP server:
+
+```bash
+# Stdio MCP — wired up by your agent (Claude Code, agency copilot, ...).
+clawdevbox mcp
+
+# HTTP MCP foreground — runs until you Ctrl+C.
+clawdevbox start
+
+# HTTP MCP background — detaches, registers OS auto-start at login.
+clawdevbox start --service        # install + start now (idempotent)
+clawdevbox status                 # is it running? auto-start installed?
+clawdevbox stop                   # halt; auto-start remains registered
+clawdevbox uninstall-service      # stop + remove auto-start
+```
+
+The service uses Windows Task Scheduler (`schtasks`), macOS LaunchAgents
+(`launchctl`), or Linux systemd-user (`systemctl --user`) for "always
+running across reboots" semantics. PID + port are recorded in
+`<globalDir>/service.json` so `stop` always finds the running instance.
 
 Three demos you can run immediately (each opens a headed Chromium):
 
@@ -73,18 +111,18 @@ npx tsx verify-artifacts.mjs
 
 | Concept | Backing store | Lifecycle |
 |---|---|---|
-| **Recipe** | `.conductor/recipes/<id>.yaml` | Author-time. Templates a multi-step agent run. |
-| **Recipe instance** | `<workspace>/.conductor/recipe-instances/<id>.json` | Per `recipe.run`. Tracks status / result / pid / log path. |
-| **Skill** | `.conductor/skills/<id>.md` | Author-time. Prompt snippet the agent can include. |
-| **Trigger** | `.conductor/triggers.json` + `.conductor/triggers/<id>.ts\|py\|sh` | Cron / webhook / manual. POSTs to a callback URL when something fires. |
-| **Workspace** | `<workspaces_root>/<id>/` | Per recipe run or long-lived. Holds `.conductor/` state + `artifacts/`. |
+| **Recipe** | `.clawdevbox/recipes/<id>.yaml` | Author-time. Templates a multi-step agent run. |
+| **Recipe instance** | `<workspace>/.clawdevbox/recipe-instances/<id>.json` | Per `recipe.run`. Tracks status / result / pid / log path. |
+| **Skill** | `.clawdevbox/skills/<id>.md` | Author-time. Prompt snippet the agent can include. |
+| **Trigger** | `.clawdevbox/triggers.json` + `.clawdevbox/triggers/<id>.ts\|py\|sh` | Cron / webhook / manual. POSTs to a callback URL when something fires. |
+| **Workspace** | `<workspaces_root>/<id>/` | Per recipe run or long-lived. Holds `.clawdevbox/` state + `artifacts/`. |
 | **Artifact** | `<workspace>/artifacts/<id>/` | Folder with `manifest.json` + content files. Renderer dispatch on `manifest.type`. |
-| **Plugin** | `<plugin_dir>/plugin.yaml` + provides tree | Ships recipes, skills, triggers, hostable tools, renderers. |
+| **Plugin** | `<global_dir>/plugins/<id>/` (real dir for git/built-in, junction for local-folder installs) + sibling `<id>.install.json` | Shared across all projects on the account. Ships recipes, skills, triggers, hostable tools, renderers. |
 | **PTY session** | In-memory registry (terminal-server.ts) | Per `recipe.run`. Browser viewers subscribe over WebSocket. |
 
 ## Internal codename
 
-This codebase uses **`conductor`** as the internal namespace — env vars (`CONDUCTOR_*`), on-disk paths (`.conductor/`), npm package names (`@conductor/mcp-server`). The branding is **ClawDevbox**; the engine that runs underneath is the **Conductor MCP server**. Don't refactor the internals — the name is load-bearing and stable across the spec and the samples.
+This codebase uses **`conductor`** as the internal namespace — env vars (`CLAWDEVBOX_*`), on-disk paths (`.clawdevbox/`), npm package names (`clawdevbox`). The branding is **ClawDevbox**; the engine that runs underneath is the **Conductor MCP server**. Don't refactor the internals — the name is load-bearing and stable across the spec and the samples.
 
 ## Design spec
 

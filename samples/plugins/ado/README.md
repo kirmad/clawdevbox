@@ -1,8 +1,8 @@
-# Conductor Plugin — Azure DevOps
+# Clawdevbox Plugin — Azure DevOps
 
-Recipes, skills, triggers, and **hostable tools** for working with Azure DevOps pull requests in Conductor. Reference implementation of the plugin model defined in [spec §10](../../2026-05-09-conductor-simplified-design.md#10-plugins), including the hostable-tool contract from [§10.3](../../2026-05-09-conductor-simplified-design.md#103-hostable-tools).
+Recipes, skills, triggers, and **hostable tools** for working with Azure DevOps pull requests in Clawdevbox. Reference implementation of the plugin model defined in [spec §10](../../2026-05-09-clawdevbox-simplified-design.md#10-plugins), including the hostable-tool contract from [§10.3](../../2026-05-09-clawdevbox-simplified-design.md#103-hostable-tools).
 
-> **Tools are hostable lightweight scripts.** Each ADO operation (`ado.get_pr`, `ado.list_pr_comments`, ...) is a single TypeScript file under `tools/` that Conductor's MCP server discovers, dynamic-imports at boot, and registers as an MCP tool — no separate MCP server process required. See `tools/get_pr.ts` for an example.
+> **Tools are hostable lightweight scripts.** Each ADO operation (`ado.get_pr`, `ado.list_pr_comments`, ...) is a single TypeScript file under `tools/` that Clawdevbox's MCP server discovers, dynamic-imports at boot, and registers as an MCP tool — no separate MCP server process required. See `tools/get_pr.ts` for an example.
 
 ## What's in this plugin
 
@@ -30,12 +30,12 @@ _legacy-mcp-server/                  # reference: heavyweight separate-process M
                                      # (kept as documentation; manifest no longer references it)
 ```
 
-The `id` is `ado` — once installed, Conductor exposes:
+The `id` is `ado` — once installed, Clawdevbox exposes:
 
 - `recipe.read({ id: 'pr-review' })` and `recipe.read({ id: 'respond-to-pr-comment' })`
 - `skill.read({ id: 'analyze-pr-comment' })` and `skill.read({ id: 'summarize-pr-changes' })`
 - Three trigger TYPES — `ado.new-pr-watcher`, `ado.comment-watcher`, `ado.pr-pulse-watcher` — visible via `trigger.list_types({ scope: 'plugin:ado' })`. None fire until an agent calls `trigger.register({ type_id, params })`.
-- The five `ado.*` hostable tools registered on Conductor's MCP server, ready to call from any agent client wired to Conductor
+- The five `ado.*` hostable tools registered on Clawdevbox's MCP server, ready to call from any agent client wired to Clawdevbox
 
 All of the above resolve at `scope: 'plugin:ado'` by default.
 
@@ -46,7 +46,7 @@ Each file in `tools/` exports four things — three named, one default:
 ```ts
 // tools/get_pr.ts
 import { z } from 'zod';
-import type { ToolContext } from '@conductor/sdk';
+import type { ToolContext } from '@clawdevbox/sdk';
 import { adoFetch, API_VERSION, resolveScope, urlBase } from './_auth.ts';
 
 export const id = 'ado.get_pr';
@@ -69,13 +69,13 @@ export default async function execute(
 }
 ```
 
-`ctx` is a `ToolContext` with `env`, `workspace`, `fetch`, `logger`, `signal`. Conductor catches thrown errors and surfaces them as MCP tool errors with a structured `{ code, message }`. See `_auth.ts` for the helpers shared across the five tool files.
+`ctx` is a `ToolContext` with `env`, `workspace`, `fetch`, `logger`, `signal`. Clawdevbox catches thrown errors and surfaces them as MCP tool errors with a structured `{ code, message }`. See `_auth.ts` for the helpers shared across the five tool files.
 
 ## Why hostable, not a separate MCP server?
 
 Compared to declaring `provides.mcp_servers[]` (which spawns a child process per server):
 
-- **One process** instead of N — the Conductor MCP server hosts every plugin's tools in-process.
+- **One process** instead of N — the Clawdevbox MCP server hosts every plugin's tools in-process.
 - **No `npx` cold-start** per server.
 - **Shared cache / fetch agent** across calls.
 - **Single-file authoring** — you don't write a server harness, just a function.
@@ -90,19 +90,19 @@ Three options.
 ### 1. From git (the supported MVP path)
 
 ```ts
-plugin.install({ from: 'git+https://github.com/conductor/plugin-ado.git' })
+plugin.install({ from: 'git+https://github.com/clawdevbox/plugin-ado.git' })
 ```
 
 Optional ref pin (recommended for production):
 
 ```ts
 plugin.install({
-  from: 'git+https://github.com/conductor/plugin-ado.git',
+  from: 'git+https://github.com/clawdevbox/plugin-ado.git',
   ref:  'v1.0.0',
 })
 ```
 
-Conductor clones into `.conductor/plugins/ado/`, validates the manifest,
+Clawdevbox clones into `.clawdevbox/plugins/ado/`, validates the manifest,
 and reloads.
 
 ### 2. As a git submodule
@@ -110,27 +110,27 @@ and reloads.
 For workspaces that want the plugin's contents tracked in their own repo:
 
 ```bash
-git submodule add https://github.com/conductor/plugin-ado.git .conductor/plugins/ado
+git submodule add https://github.com/clawdevbox/plugin-ado.git .clawdevbox/plugins/ado
 ```
 
-Conductor's file watcher notices the new `plugin.yaml` and loads it. No
+Clawdevbox's file watcher notices the new `plugin.yaml` and loads it. No
 extra command needed.
 
 ### 3. Local development path
 
 While iterating on the plugin itself, install from an absolute local
-path. Conductor copies (does not symlink) the directory:
+path. Clawdevbox copies (does not symlink) the directory:
 
 ```ts
-plugin.install({ from: 'C:\\src\\conductor-plugin-ado' })
+plugin.install({ from: 'C:\\src\\clawdevbox-plugin-ado' })
 ```
 
 Reinstall after each iteration, or just edit the files in
-`.conductor/plugins/ado/` directly — the watcher reloads on save.
+`.clawdevbox/plugins/ado/` directly — the watcher reloads on save.
 
 ## Required environment
 
-The trigger scripts and the `@conductor/mcp-ado` MCP server (referenced
+The trigger scripts and the `@clawdevbox/mcp-ado` MCP server (referenced
 by `mcp/ado.json`) require:
 
 | Env var | Purpose |
@@ -188,14 +188,14 @@ Same pattern with `skill.upsert` and `skill.delete`.
 ### Customize a trigger type or registration
 
 Triggers split into TYPES (shipped by this plugin) and REGISTERED instances
-(persisted by Conductor in `.conductor/triggers.json` after the agent calls
+(persisted by Clawdevbox in `.clawdevbox/triggers.json` after the agent calls
 `trigger.register`):
 
 1. **Change a registered instance's params or cron:**
    `trigger.update_params({ id: 'ado.new-pr-watcher#auth-svc', cron: '*/2 * * * *' })`.
    Or `trigger.unregister({ id })` followed by a fresh `trigger.register`.
 2. **Customize the TYPE itself (script body, defaults, param schema):**
-   Copy `triggers/ado-new-pr-watcher.ts` to `.conductor/triggers/ado-new-pr-watcher.ts`
+   Copy `triggers/ado-new-pr-watcher.ts` to `.clawdevbox/triggers/ado-new-pr-watcher.ts`
    in project scope and edit there. The plugin's version stays untouched.
 3. **Disable a TYPE entirely:** disable the whole plugin via
    `plugin.disable({ id: 'ado' })`; the plugin's `provides.trigger_types[]`
@@ -208,7 +208,7 @@ plugin.update({ id: 'ado' })
 ```
 
 If installed from git, this runs `git pull` (or `git checkout <ref>`).
-Conductor re-validates the manifest and reloads. Project-scope
+Clawdevbox re-validates the manifest and reloads. Project-scope
 overrides survive untouched.
 
 ## Uninstall
@@ -217,13 +217,13 @@ overrides survive untouched.
 plugin.uninstall({ id: 'ado' })
 ```
 
-Removes `.conductor/plugins/ado/`. Project-scope copies survive — they
+Removes `.clawdevbox/plugins/ado/`. Project-scope copies survive — they
 just stop having the `ado` MCP server available, so any recipe that
 references `mcp_servers: [ado]` fails clearly at run time.
 
 ## See also
 
-- Spec [§10 Plugins](../../2026-05-09-conductor-simplified-design.md#10-plugins) — the design contract this plugin implements.
-- Spec [§7 Templates](../../2026-05-09-conductor-simplified-design.md#7-templates--taskdock-style-starting-points) — the recipe (template) schema.
-- Spec [§8 Triggers](../../2026-05-09-conductor-simplified-design.md#8-triggers--http-webhook-handlers) — the trigger protocol the scripts implement.
+- Spec [§10 Plugins](../../2026-05-09-clawdevbox-simplified-design.md#10-plugins) — the design contract this plugin implements.
+- Spec [§7 Templates](../../2026-05-09-clawdevbox-simplified-design.md#7-templates--taskdock-style-starting-points) — the recipe (template) schema.
+- Spec [§8 Triggers](../../2026-05-09-clawdevbox-simplified-design.md#8-triggers--http-webhook-handlers) — the trigger protocol the scripts implement.
 - `samples/triggers/README.md` — original trigger samples; this plugin's `triggers/*.ts` are copies of those for self-containment.

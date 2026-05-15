@@ -7,13 +7,13 @@
  *   2. Dynamic-importing each tool file (`file://...` ESM import).
  *   3. Validating the module's exported shape — `id`, `description`,
  *      `parameters` (zod), default `execute(args, ctx)`.
- *   4. Registering each as an MCP tool on the Conductor server, with the
+ *   4. Registering each as an MCP tool on the Clawdevbox server, with the
  *      tool's zod schema doubling as the inputSchema (the MCP SDK accepts
  *      a zod schema directly and converts to JSON Schema for tools/list).
  *   5. At call-time, building a `ToolContext` and routing the request through
  *      the tool's `execute(args, ctx)`. Throws become structured tool errors.
  *
- * The Conductor MCP server runs under `tsx` in dev/sample setups, so dynamic
+ * The Clawdevbox MCP server runs under `tsx` in dev/sample setups, so dynamic
  * imports of `.ts` files resolve directly. Production builds compile the
  * tool files to `.js` first; the same import path works.
  *
@@ -37,8 +37,8 @@ import type { Workspace } from '../workspace.ts';
 // ============================================================================
 
 /**
- * Mirrors `@conductor/sdk`'s ToolContext. Defined here too because the
- * server is the producer; `@conductor/sdk` is the consumer-facing types-only
+ * Mirrors `@clawdevbox/sdk`'s ToolContext. Defined here too because the
+ * server is the producer; `@clawdevbox/sdk` is the consumer-facing types-only
  * package plugin authors import. Keeping the two in sync is a manual
  * discipline (the shape is small and stable).
  */
@@ -290,8 +290,15 @@ interface BuildToolContextArgs {
 }
 
 export function buildToolContext(args: BuildToolContextArgs): ToolContext {
-  const pluginDir = join(args.ws.projectDir, '.conductor', 'plugins', args.pluginId);
-  const pluginDataDir = join(args.ws.projectDir, '.conductor', 'data', args.pluginId);
+  // Use the registry entry's dir (resolves junctioned local plugins
+  // correctly) and fall back to the canonical global path for tests
+  // that build contexts without going through discovery.
+  const registryEntry = args.ws.plugins.get(args.pluginId);
+  const pluginDirPath =
+    registryEntry?.dir ?? join(args.ws.globalDir, 'plugins', args.pluginId);
+  // Per-plugin scratch data stays per-project: each workspace gets its
+  // own data file even though the plugin code is shared globally.
+  const pluginDataDir = join(args.ws.projectDir, '.clawdevbox', 'data', args.pluginId);
   // Lazy create — many tools never write under here, but if they do the dir exists.
   try {
     mkdirSync(pluginDataDir, { recursive: true });
@@ -303,7 +310,7 @@ export function buildToolContext(args: BuildToolContextArgs): ToolContext {
     env: { ...process.env } as Readonly<Record<string, string | undefined>>,
     workspace: {
       project_dir: args.ws.projectDir,
-      plugin_dir: pluginDir,
+      plugin_dir: pluginDirPath,
       plugin_data_dir: pluginDataDir,
     },
     fetch: globalThis.fetch,

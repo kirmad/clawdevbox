@@ -1,4 +1,4 @@
-# Conductor template (TaskDock-shape). See spec §7.2 for the schema.
+# Clawdevbox template (TaskDock-shape). See spec §7.2 for the schema.
 #
 # This is the parent recipe for reviewing an Azure DevOps PR. It owns:
 #   1. fetching the PR + iteration
@@ -21,7 +21,7 @@ kind: pr_review
 default_client: claude
 mcp_servers:
   - ado
-  - conductor
+  - clawdevbox
 timeout_minutes: 0          # no host-imposed timeout; user cancels via thread.cancel
 
 steps:

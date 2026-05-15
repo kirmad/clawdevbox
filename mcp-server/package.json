@@ -1,33 +1,48 @@
 {
-  "name": "@conductor/mcp-server",
-  "version": "1.0.0",
-  "description": "Conductor's central MCP server — exposes recipes, skills, triggers, plugins, inbox, threads, approvals, and stub surfaces for artifacts/views/search/signals to the side-terminal CLI and external agents. Wraps the local <project_dir>/.conductor/ workspace; reads + writes recipe/skill/trigger/plugin files and keeps inbox/thread/approval state in-memory in this stub (real Conductor uses better-sqlite3). See docs/superpowers/specs/2026-05-09-conductor-simplified-design.md §6.1 for the tool catalog and §10.4 for scope semantics.",
+  "name": "clawdevbox",
+  "version": "0.1.0",
+  "description": "ClawDevbox — a toolkit for running AI coding agents headlessly. MCP server (stdio + Streamable HTTP), interactive CLI for project init, hidden-pty agent runs, browser-based terminal viewer, recipes/skills/plugins/triggers, and an extensible artifact renderer chain.",
   "type": "module",
   "bin": {
-    "conductor-mcp-server": "./src/index.ts"
-  },
-  "main": "./src/index.ts",
-  "exports": {
-    ".": "./src/index.ts"
+    "clawdevbox": "./dist/cli.js"
   },
   "files": [
+    "dist",
     "src",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
-    "start": "tsx src/index.ts",
+    "build": "node scripts/build.mjs",
+    "prepublishOnly": "npm run build",
+    "mcp": "tsx src/cli/index.ts mcp",
+    "start": "tsx src/cli/index.ts start",
+    "init": "tsx src/cli/index.ts init",
+    "web:dev": "npm --prefix web run dev",
+    "web:build": "npm --prefix web run build",
+    "web:install": "npm --prefix web install",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test tests/smoke.test.mjs tests/hosted-tools.test.mjs tests/workspace.test.mjs"
+    "test": "node --import tsx --test tests/smoke.test.mjs tests/hosted-tools.test.mjs tests/workspace.test.mjs tests/external-plugins.test.mjs tests/cfv-converter.test.mjs tests/service.test.mjs tests/inbox-persistence.test.mjs",
+    "test:e2e": "playwright test"
   },
   "engines": {
     "node": ">=20.0.0"
   },
   "dependencies": {
+    "@clack/prompts": "^0.7.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "@toon-format/toon": "^2.1.0",
+    "@types/qrcode-terminal": "^0.12.2",
     "@types/ws": "^8.18.1",
+    "cron-parser": "^4.9.0",
+    "cronstrue": "^2.59.0",
     "js-yaml": "^4.1.0",
     "node-pty": "^1.1.0",
     "pino": "^10.3.1",
+    "playwright-core": "^1.60.0",
+    "qrcode-terminal": "^0.12.0",
+    "tsx": "^4.0.0",
+    "web-push": "^3.6.7",
     "ws": "^8.20.0",
     "zod": "^4.0.0"
   },
@@ -35,16 +50,25 @@
     "@playwright/test": "^1.59.1",
     "@types/js-yaml": "^4.0.9",
     "@types/node": "^20.0.0",
+    "@types/web-push": "^3.6.4",
+    "esbuild": "^0.24.0",
     "playwright": "^1.59.1",
-    "tsx": "^4.0.0",
     "typescript": "^5.4.0"
   },
   "license": "MIT",
+  "homepage": "https://github.com/kirmadi/clawdevbox",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kirmadi/clawdevbox.git"
+  },
   "keywords": [
     "mcp",
-    "conductor",
+    "model-context-protocol",
+    "ai-agents",
+    "coding-agents",
     "recipes",
     "plugins",
-    "agent"
+    "agent",
+    "headless"
   ]
 }

@@ -527,7 +527,7 @@ export default {
     overlay.focus({ preventScroll: true });
 
     // Public API for Playwright + future embedders.
-    window.__conductorWalkthrough = {
+    window.__clawdevboxWalkthrough = {
       totalSteps: steps.length,
       goto: show,
       currentStep: () => active + 1,

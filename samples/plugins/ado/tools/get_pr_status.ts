@@ -6,7 +6,7 @@
  */
 
 import { z } from 'zod';
-import type { ToolContext } from '@conductor/sdk';
+import type { ToolContext } from '@clawdevbox/sdk';
 import {
   adoFetch,
   API_VERSION,

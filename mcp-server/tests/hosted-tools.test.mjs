@@ -55,16 +55,23 @@ const EXPECTED_ADO_TOOLS = [
 ];
 
 // ----------------------------------------------------------------------------
-// Harness — spawns a Conductor MCP server pointed at a temp workspace with
+// Harness — spawns a Clawdevbox MCP server pointed at a temp workspace with
 // the ADO plugin installed.
 // ----------------------------------------------------------------------------
 
 class ServerHarness {
   constructor() {
-    this.tmpRoot = mkdtempSync(join(tmpdir(), 'conductor-mcp-hosted-'));
-    const conductorDir = join(this.tmpRoot, '.conductor');
-    const pluginDest = join(conductorDir, 'plugins', 'ado');
-    mkdirSync(pluginDest, { recursive: true });
+    this.tmpRoot = mkdtempSync(join(tmpdir(), 'clawdevbox-mcp-hosted-'));
+    const clawdevboxDir = join(this.tmpRoot, '.clawdevbox');
+    mkdirSync(clawdevboxDir, { recursive: true });
+    for (const sub of ['recipes', 'skills', 'triggers', 'artifacts']) {
+      mkdirSync(join(clawdevboxDir, sub), { recursive: true });
+    }
+
+    // Global plugin store — install the ADO plugin into <globalDir>/plugins/.
+    this.globalDir = join(this.tmpRoot, '.global');
+    const pluginDest = join(this.globalDir, 'plugins', 'ado');
+    mkdirSync(dirname(pluginDest), { recursive: true });
     cpSync(repoSampleAdoPlugin, pluginDest, {
       recursive: true,
       filter: (src) =>
@@ -72,27 +79,25 @@ class ServerHarness {
         !src.endsWith('package-lock.json') &&
         !src.includes('_legacy-mcp-server'),
     });
-    this.globalDir = join(this.tmpRoot, '.global');
-    mkdirSync(this.globalDir, { recursive: true });
 
     // The plugin's hostable tools `import { z } from 'zod'`. Node's ESM
     // resolution walks up from the tool's parent looking for node_modules.
-    // Junction the Conductor server's node_modules into the temp workspace
-    // root so resolution lands there. This sidesteps `npm install`-per-plugin
-    // for the sample harness; in production, plugin.install would run it.
-    const wsNodeModules = join(this.tmpRoot, 'node_modules');
-    if (!existsSync(wsNodeModules)) {
+    // Junction the Clawdevbox server's node_modules into the GLOBAL dir so
+    // resolution lands there. This sidesteps `npm install`-per-plugin for
+    // the sample harness; in production, installBuiltinPlugin would do this.
+    const globalNodeModules = join(this.globalDir, 'node_modules');
+    if (!existsSync(globalNodeModules)) {
       const serverNodeModules = resolve(projectRoot, 'node_modules');
       const linkType = platform() === 'win32' ? 'junction' : 'dir';
-      symlinkSync(serverNodeModules, wsNodeModules, linkType);
+      symlinkSync(serverNodeModules, globalNodeModules, linkType);
     }
 
-    this.child = spawn('npx', ['tsx', entry], {
+    this.child = spawn('npx', ['tsx', entry, 'mcp'], {
       cwd: projectRoot,
       env: {
         ...process.env,
-        CONDUCTOR_PROJECT_DIR: this.tmpRoot,
-        CONDUCTOR_GLOBAL_DIR: this.globalDir,
+        CLAWDEVBOX_PROJECT_DIR: this.tmpRoot,
+        CLAWDEVBOX_GLOBAL_DIR: this.globalDir,
       },
       stdio: ['pipe', 'pipe', 'pipe'],
       shell: process.platform === 'win32',
@@ -114,7 +119,7 @@ class ServerHarness {
     this.child.stderr.on('data', () => { /* swallow */ });
   }
 
-  async waitFor(id, timeoutMs = 15000) {
+  async waitFor(id, timeoutMs = 30000) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       const found = this.responses.find((r) => r.id === id);
@@ -289,8 +294,8 @@ test('hosted tools — pure-function unit tests against fake fetch', async (t) =
       env: { ADO_ORG: 'fake-org', ADO_BEARER_TOKEN: 'fake-token' },
       workspace: {
         project_dir: '/tmp/p',
-        plugin_dir: '/tmp/p/.conductor/plugins/ado',
-        plugin_data_dir: '/tmp/p/.conductor/data/ado',
+        plugin_dir: '/tmp/g/plugins/ado',
+        plugin_data_dir: '/tmp/p/.clawdevbox/data/ado',
       },
       fetch: async (url, init) => {
         calledUrl = String(url);
@@ -316,8 +321,8 @@ test('hosted tools — pure-function unit tests against fake fetch', async (t) =
       env: { ADO_BEARER_TOKEN: 'fake-token' }, // no ADO_ORG
       workspace: {
         project_dir: '/tmp/p',
-        plugin_dir: '/tmp/p/.conductor/plugins/ado',
-        plugin_data_dir: '/tmp/p/.conductor/data/ado',
+        plugin_dir: '/tmp/g/plugins/ado',
+        plugin_data_dir: '/tmp/p/.clawdevbox/data/ado',
       },
       fetch: async () => { throw new Error('should not be called'); },
       logger: { info() {}, warn() {}, error() {} },

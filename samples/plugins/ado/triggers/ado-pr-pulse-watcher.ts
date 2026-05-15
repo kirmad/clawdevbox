@@ -17,7 +17,7 @@
  *     a single Mode A `callback` object on stdout (singular — the spec allows
  *     at most one). The script's exit is the natural handoff point.
  *
- * Conductor's callback fan-out treats both modes identically, so the agent
+ * Clawdevbox's callback fan-out treats both modes identically, so the agent
  * on the receiving end sees one homogeneous stream of `{ prompt, context }`
  * pings.
  *
@@ -41,8 +41,8 @@
  *   ADO_BEARER_TOKEN — preferred (AAD access token).
  *   ADO_PAT          — fallback (basic auth).
  *
- * Mode B requires CONDUCTOR_MCP_SECRET for the Authorization header on
- * direct callback POSTs. (Mode A doesn't — Conductor authenticates its own
+ * Mode B requires CLAWDEVBOX_MCP_SECRET for the Authorization header on
+ * direct callback POSTs. (Mode A doesn't — Clawdevbox authenticates its own
  * internal fan-out.)
  *
  * Zero dependencies beyond Node 20+ built-ins.
@@ -65,7 +65,7 @@ interface TriggerEnvelope {
   trigger_data_dir: string;
   subscriber_thread_id: string | null;
   /** Pre-bound callback URL. Used in BOTH Mode B (direct POSTs during loop)
-   *  AND Mode A (Conductor delivers the on-exit summary entry to this URL). */
+   *  AND Mode A (Clawdevbox delivers the on-exit summary entry to this URL). */
   callback_url: string;
   state: WatcherState;
   payload: unknown;
@@ -157,7 +157,7 @@ const ADO_PAT = process.env.ADO_PAT ?? '';
 const ADO_BEARER_TOKEN = process.env.ADO_BEARER_TOKEN ?? '';
 
 /** Mode B requires this for the Authorization header on direct callback POSTs. */
-const CONDUCTOR_MCP_SECRET = process.env.CONDUCTOR_MCP_SECRET ?? '';
+const CLAWDEVBOX_MCP_SECRET = process.env.CLAWDEVBOX_MCP_SECRET ?? '';
 
 function adoAuthHeader(): string {
   if (ADO_BEARER_TOKEN) return `Bearer ${ADO_BEARER_TOKEN}`;
@@ -275,14 +275,14 @@ function iterationToPrompt(prId: number, iter: AdoIteration): string {
 // ============================================================================
 
 async function postLiveCallback(callbackUrl: string, body: CallbackBody): Promise<void> {
-  if (!CONDUCTOR_MCP_SECRET) {
-    throw new Error('CONDUCTOR_MCP_SECRET env var required for Mode B callback POSTs');
+  if (!CLAWDEVBOX_MCP_SECRET) {
+    throw new Error('CLAWDEVBOX_MCP_SECRET env var required for Mode B callback POSTs');
   }
   const res = await fetch(callbackUrl, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      Authorization: `Bearer ${CONDUCTOR_MCP_SECRET}`,
+      Authorization: `Bearer ${CLAWDEVBOX_MCP_SECRET}`,
     },
     body: JSON.stringify(body),
   });

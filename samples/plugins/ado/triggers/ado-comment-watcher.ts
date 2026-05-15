@@ -11,7 +11,7 @@
  *
  *   Mode A (NOT used here): respond via stdout.
  *     Build a single `callback: { body: {...} }` object on the JSON response
- *     and write it on stdout. Conductor delivers that one entry to the
+ *     and write it on stdout. Clawdevbox delivers that one entry to the
  *     trigger's pre-bound `env.callback_url`. The script makes zero HTTP calls.
  *     Mode A's `callback` is SINGULAR — at most one delivery per run, suitable
  *     for one-shot triggers or final/summary actions.
@@ -24,7 +24,7 @@
  *
  *   No-op: just `{ "state": <unchanged> }` and exit 0. No HTTP calls.
  *
- * The script does NOT think about routing. Conductor pre-bound
+ * The script does NOT think about routing. Clawdevbox pre-bound
  * `env.callback_url` to the right action when this trigger was registered
  * (in this case: append + wake the subscriber thread). The URL itself
  * carries the routing context; the script just delivers the prompt.
@@ -53,10 +53,10 @@ interface TriggerEnvelope {
   project_dir: string;
   /**
    * Per-trigger scratch directory at
-   *   <project_dir>/.conductor/triggers/<trigger_id>/data/
+   *   <project_dir>/.clawdevbox/triggers/<trigger_id>/data/
    * The script can write/read any files here to maintain data across runs
    * (caches, downloaded artifacts, anything too large for `state`).
-   * Conductor creates it on first run and cleans it up when the trigger is
+   * Clawdevbox creates it on first run and cleans it up when the trigger is
    * deleted (for hot triggers, when the subscriber thread terminates).
    */
   trigger_data_dir: string;
@@ -147,7 +147,7 @@ const ADO_PAT = process.env.ADO_PAT ?? '';
 const ADO_BEARER_TOKEN = process.env.ADO_BEARER_TOKEN ?? '';
 
 /** Mode B requires this for the Authorization header on direct callback POSTs. */
-const CONDUCTOR_MCP_SECRET = process.env.CONDUCTOR_MCP_SECRET ?? '';
+const CLAWDEVBOX_MCP_SECRET = process.env.CLAWDEVBOX_MCP_SECRET ?? '';
 
 function adoAuthHeader(): string {
   if (ADO_BEARER_TOKEN) return `Bearer ${ADO_BEARER_TOKEN}`;
@@ -218,14 +218,14 @@ function commentToPrompt(prId: number, comment: AdoComment): string {
 // ============================================================================
 
 async function postCallback(callbackUrl: string, body: CallbackBody): Promise<void> {
-  if (!CONDUCTOR_MCP_SECRET) {
-    throw new Error('CONDUCTOR_MCP_SECRET env var required for Mode B callback POSTs');
+  if (!CLAWDEVBOX_MCP_SECRET) {
+    throw new Error('CLAWDEVBOX_MCP_SECRET env var required for Mode B callback POSTs');
   }
   const res = await fetch(callbackUrl, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      Authorization: `Bearer ${CONDUCTOR_MCP_SECRET}`,
+      Authorization: `Bearer ${CLAWDEVBOX_MCP_SECRET}`,
     },
     body: JSON.stringify(body),
   });
@@ -274,7 +274,7 @@ async function main(): Promise<void> {
   }
 
   // Note: env.trigger_data_dir is available as a per-trigger scratch directory
-  // at `<project_dir>/.conductor/triggers/<trigger_id>/data/`. This script
+  // at `<project_dir>/.clawdevbox/triggers/<trigger_id>/data/`. This script
   // doesn't need it (lastCommentId fits in `state`), but a richer trigger
   // could write blobs there, e.g.:
   //   import { writeFile, mkdir } from 'node:fs/promises';

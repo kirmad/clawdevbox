@@ -32,7 +32,7 @@
 
 import { createReadStream, existsSync, readFileSync, statSync } from 'node:fs';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { extname } from 'node:path';
+import { extname, join } from 'node:path';
 import { WebSocketServer, type WebSocket } from 'ws';
 import {
   artifactDir,
@@ -79,6 +79,13 @@ export async function startTerminalServer(opts: {
   host?: string;
   /** Workspace context (used for renderer resolution & artifact lookup). */
   workspace?: Workspace;
+  /**
+   * If provided, mount terminal routes onto this server instead of creating
+   * a new one. Useful when sharing a port with the HTTP MCP transport.
+   * When set, `port` / `host` are ignored and `handle.port()` reads from the
+   * supplied server's `.address()`.
+   */
+  sharedServer?: Server;
 } = {}): Promise<TerminalServerHandle> {
   if (httpServer) {
     throw new Error('terminal server already running');
@@ -86,10 +93,28 @@ export async function startTerminalServer(opts: {
 
   activeWorkspace = opts.workspace ?? null;
   boundHost = opts.host ?? '127.0.0.1';
-  const desiredPort =
-    opts.port ?? Number.parseInt(process.env.CONDUCTOR_TERMINAL_PORT ?? '0', 10);
 
-  httpServer = createServer((req, res) => handleHttpRequest(req, res));
+  if (opts.sharedServer) {
+    // Caller (HTTP CLI) owns request dispatch. We only attach the WS
+    // upgrade handler below; the caller routes /mcp to the MCP transport
+    // and delegates everything else by invoking `dispatchTerminalRequest`.
+    httpServer = opts.sharedServer;
+  } else {
+    const desiredPort =
+      opts.port ?? Number.parseInt(process.env.CLAWDEVBOX_TERMINAL_PORT ?? '0', 10);
+    httpServer = createServer((req, res) => handleHttpRequest(req, res));
+    await new Promise<void>((resolve, reject) => {
+      httpServer!.once('error', reject);
+      httpServer!.listen(desiredPort, boundHost, () => {
+        const addr = httpServer!.address();
+        if (addr && typeof addr === 'object') {
+          boundPort = addr.port;
+        }
+        resolve();
+      });
+    });
+  }
+
   wsServer = new WebSocketServer({ noServer: true });
 
   httpServer.on('upgrade', (req, socket, head) => {
@@ -105,16 +130,12 @@ export async function startTerminalServer(opts: {
     });
   });
 
-  await new Promise<void>((resolve, reject) => {
-    httpServer!.once('error', reject);
-    httpServer!.listen(desiredPort, boundHost, () => {
-      const addr = httpServer!.address();
-      if (addr && typeof addr === 'object') {
-        boundPort = addr.port;
-      }
-      resolve();
-    });
-  });
+  if (opts.sharedServer) {
+    const addr = httpServer.address();
+    if (addr && typeof addr === 'object') {
+      boundPort = addr.port;
+    }
+  }
 
   activeHandle = {
     url: (instanceId: string) =>
@@ -138,6 +159,20 @@ export async function startTerminalServer(opts: {
 // ============================================================================
 // HTTP handler
 // ============================================================================
+
+/**
+ * Dispatch a request through the terminal/artifact routes.
+ *
+ * Exported so the HTTP CLI can compose this with the MCP transport on the
+ * same server — the CLI routes `/mcp*` to the MCP handler and falls through
+ * here for everything else.
+ */
+export function dispatchTerminalRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+): void {
+  handleHttpRequest(req, res);
+}
 
 function handleHttpRequest(req: IncomingMessage, res: ServerResponse): void {
   const url = new URL(req.url ?? '/', `http://${boundHost}`);
@@ -210,8 +245,19 @@ interface FoundArtifact {
   manifest: NonNullable<ReturnType<typeof readArtifact>>['manifest'];
 }
 
-/** Locate an artifact across every registered workspace. */
+/** Locate an artifact across the project dir + every registered workspace. */
 function findArtifact(id: string): FoundArtifact | null {
+  // The project dir itself is treated as a workspace with id 'project' so
+  // artifacts written under <projectDir>/artifacts/<id>/ are discoverable
+  // without the user explicitly registering a workspace. This matches the
+  // /api/inbox enrichment helper in cli/start.ts.
+  const projectDir = process.env.CLAWDEVBOX_PROJECT_DIR;
+  if (projectDir) {
+    const rec = readArtifact(projectDir, id);
+    if (rec) {
+      return { workspacePath: projectDir, workspaceId: 'project', manifest: rec.manifest };
+    }
+  }
   const root = resolveWorkspacesRoot();
   for (const w of listWorkspaces(root)) {
     const rec = readArtifact(w.path, id);
@@ -376,7 +422,7 @@ function renderArtifactHostHtml(id: string, type: string, title: string): string
 </head>
 <body>
   <header>
-    <b>Conductor</b>
+    <b>Clawdevbox</b>
     <span>artifact <code id="iid">${safeId}</code></span>
     <span class="pill type">type: ${safeType}</span>
     <span class="pill" id="title-pill">${safeTitle}</span>
@@ -414,7 +460,7 @@ function renderArtifactHostHtml(id: string, type: string, title: string): string
         throw new Error(\`renderer for "\${type}" has no .render(root, ctx) function\`);
       }
       await renderer.render(root, ctx);
-      window.__conductorArtifact = { id, type, manifest, files: filesList };
+      window.__clawdevboxArtifact = { id, type, manifest, files: filesList };
     } catch (err) {
       root.innerHTML = '';
       const pre = document.createElement('div');
@@ -438,7 +484,7 @@ function renderTerminalHtml(instanceId: string): string {
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Conductor recipe terminal · ${safeId}</title>
+  <title>Clawdevbox recipe terminal · ${safeId}</title>
   <link rel="stylesheet" href="https://esm.sh/@xterm/xterm@5.5.0/css/xterm.css" />
   <style>
     html, body { margin: 0; padding: 0; height: 100%; background: #1e1e1e; color: #d4d4d4; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
@@ -455,7 +501,7 @@ function renderTerminalHtml(instanceId: string): string {
 </head>
 <body>
   <header>
-    <b>Conductor</b>
+    <b>Clawdevbox</b>
     <span>recipe instance <code id="iid">${safeId}</code></span>
     <span class="status" id="status">connecting…</span>
     <button id="killBtn" title="SIGTERM the pty">Kill</button>
@@ -535,7 +581,7 @@ function renderTerminalHtml(instanceId: string): string {
       }
     });
 
-    window.__conductorTerm = term;
+    window.__clawdevboxTerm = term;
   </script>
 </body>
 </html>`;
@@ -547,10 +593,24 @@ function renderTerminalHtml(instanceId: string): string {
 
 function attachWebsocket(ws: WebSocket, instanceId: string): void {
   if (!hasSession(instanceId)) {
+    // Pty has exited and been garbage-collected from the registry.
+    // Fall back to the on-disk log so the viewer at least shows what
+    // the agent did during the live session. Searches the project dir
+    // and every registered workspace.
+    const snapshot = readArchivedTerminalLog(instanceId);
     try {
-      ws.send(JSON.stringify({ type: 'exit', exitCode: -1 }));
+      ws.send(JSON.stringify({
+        type: 'snapshot',
+        content: snapshot ?? '[clawdevbox] this session has exited and its log was not captured.\r\n',
+        cols: 120,
+        rows: 30,
+        exited: true,
+        exitCode: 0,
+        archived: true,
+      }));
+      ws.send(JSON.stringify({ type: 'exit', exitCode: 0 }));
     } catch { /* ignore */ }
-    try { ws.close(1011, 'unknown instance'); } catch { /* ignore */ }
+    try { ws.close(1000, 'session archived'); } catch { /* ignore */ }
     return;
   }
 
@@ -585,4 +645,41 @@ function attachWebsocket(ws: WebSocket, instanceId: string): void {
 
   ws.on('close', () => unsubscribe());
   ws.on('error', () => unsubscribe());
+}
+
+/**
+ * Search the project dir + every registered workspace for the
+ * `.clawdevbox/recipe-instances/<instanceId>.log` file written by the
+ * recipe-run pty handler. Returns the file content (or null if no log
+ * exists). Used as a fallback when the pty has exited and the registry
+ * has dropped the session.
+ */
+function readArchivedTerminalLog(instanceId: string): string | null {
+  const candidates: string[] = [];
+  const projectDir = process.env.CLAWDEVBOX_PROJECT_DIR;
+  if (projectDir) {
+    candidates.push(
+      join(projectDir, '.clawdevbox', 'recipe-instances', `${instanceId}.log`),
+    );
+  }
+  try {
+    const root = resolveWorkspacesRoot();
+    for (const w of listWorkspaces(root)) {
+      candidates.push(
+        join(w.path, '.clawdevbox', 'recipe-instances', `${instanceId}.log`),
+      );
+    }
+  } catch {
+    /* ignore */
+  }
+  for (const p of candidates) {
+    if (existsSync(p)) {
+      try {
+        return readFileSync(p, 'utf8');
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+  return null;
 }

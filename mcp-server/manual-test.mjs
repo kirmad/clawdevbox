@@ -1,8 +1,8 @@
 /**
- * One-shot manual test of the @conductor/mcp-server stub.
+ * One-shot manual test of the clawdevbox stub.
  *
  *   - Creates a temp workspace, copies samples/plugins/ado into it
- *   - Spawns the server over stdio with CONDUCTOR_PROJECT_DIR pointing there
+ *   - Spawns the server over stdio with CLAWDEVBOX_PROJECT_DIR pointing there
  *   - Runs 10 representative tool calls (see steps below)
  *   - Tears down the workspace
  *
@@ -37,9 +37,9 @@ const __dirname = dirname(__filename);
 const entry = resolve(__dirname, 'src/index.ts');
 const repoSampleAdoPlugin = resolve(__dirname, '..', 'samples', 'plugins', 'ado');
 
-const tmpRoot = mkdtempSync(join(tmpdir(), 'conductor-mcp-stub-'));
-const conductorDir = join(tmpRoot, '.conductor');
-const pluginDest = join(conductorDir, 'plugins', 'ado');
+const tmpRoot = mkdtempSync(join(tmpdir(), 'clawdevbox-mcp-stub-'));
+const clawdevboxDir = join(tmpRoot, '.clawdevbox');
+const pluginDest = join(clawdevboxDir, 'plugins', 'ado');
 mkdirSync(pluginDest, { recursive: true });
 // Copy the ADO plugin in (minus node_modules / lockfiles to keep it fast).
 cpSync(repoSampleAdoPlugin, pluginDest, {
@@ -56,7 +56,7 @@ const workspacesRoot = join(tmpRoot, '.workspaces');
 mkdirSync(workspacesRoot, { recursive: true });
 const repoSampleSimplePromptRecipe = resolve(__dirname, '..', 'samples', 'recipes', 'simple-prompt.yaml');
 
-// Junction the Conductor server's node_modules into the temp workspace root
+// Junction the Clawdevbox server's node_modules into the temp workspace root
 // so the ADO plugin's hostable tools (which `import 'zod'`) resolve via Node's
 // default ESM module-resolution walk-up. In a real install, plugin.install
 // would `npm install` inside the plugin directory; for this manual harness
@@ -89,9 +89,9 @@ function recordAssertion(label, ok, detail) {
 
 const env = {
   ...process.env,
-  CONDUCTOR_PROJECT_DIR: tmpRoot,
-  CONDUCTOR_GLOBAL_DIR: globalDir,
-  CONDUCTOR_WORKSPACES_ROOT: workspacesRoot,
+  CLAWDEVBOX_PROJECT_DIR: tmpRoot,
+  CLAWDEVBOX_GLOBAL_DIR: globalDir,
+  CLAWDEVBOX_WORKSPACES_ROOT: workspacesRoot,
   // Hostable tools read these via ctx.env. The test-config has the
   // composite "<org>/<urlencoded project>" form for ADO_ORG.
   ...(adoTestConfig
@@ -227,7 +227,7 @@ async function main() {
     'default_client: claude',
     'mcp_servers:',
     '  - ado',
-    '  - conductor',
+    '  - clawdevbox',
     'timeout_minutes: 0',
     'steps:',
     '  - id: 1',
@@ -300,7 +300,7 @@ async function main() {
   );
 
   // Step 9: tools/list — must surface the ADO plugin's hostable tools alongside
-  // the built-in conductor.* surface (recipe.*, skill.*, trigger.*, etc.).
+  // the built-in clawdevbox.* surface (recipe.*, skill.*, trigger.*, etc.).
   header(9, 'tools/list — should now include the hosted ado.* tools');
   send({ jsonrpc: '2.0', id: 11, method: 'tools/list', params: {} });
   const r9 = await waitForResponse(11);
@@ -494,7 +494,7 @@ async function main() {
 
   // Step 21: Drop simple-prompt.yaml into the test workspace's project scope
   header(21, 'install simple-prompt recipe into project scope');
-  const projectRecipesDir = join(tmpRoot, '.conductor', 'recipes');
+  const projectRecipesDir = join(tmpRoot, '.clawdevbox', 'recipes');
   mkdirSync(projectRecipesDir, { recursive: true });
   cpSync(repoSampleSimplePromptRecipe, join(projectRecipesDir, 'simple-prompt.yaml'));
   recordAssertion(
@@ -504,16 +504,16 @@ async function main() {
   );
 
   // Step 22: workspace.create — scaffold a fresh workspace
-  header(22, "workspace.create { name: 'test-ws' } — verify .conductor tree + registry");
+  header(22, "workspace.create { name: 'test-ws' } — verify .clawdevbox tree + registry");
   const r22 = await call(23, 'workspace.create', { name: 'test-ws', inherit_plugins: false });
   process.stdout.write(`<<< workspace.create result:\n${JSON.stringify(r22.result, null, 2)}\n`);
   const ws22 = r22.result?.structuredContent;
   const expectedSubdirs = ['recipes', 'skills', 'plugins', 'recipe-instances'];
   const allSubdirsExist =
     ws22?.path &&
-    expectedSubdirs.every((s) => existsSync(join(ws22.path, '.conductor', s))) &&
-    existsSync(join(ws22.path, '.conductor', 'triggers.json')) &&
-    existsSync(join(ws22.path, '.conductor', 'workspace.json'));
+    expectedSubdirs.every((s) => existsSync(join(ws22.path, '.clawdevbox', s))) &&
+    existsSync(join(ws22.path, '.clawdevbox', 'triggers.json')) &&
+    existsSync(join(ws22.path, '.clawdevbox', 'workspace.json'));
   const indexExists = existsSync(join(workspacesRoot, 'index.json'));
   recordAssertion(
     "step 22: workspace.create scaffolds dirs and registers in index",
@@ -560,18 +560,18 @@ async function main() {
   if (mcpJsonExists) {
     try {
       const cfg = JSON.parse(readFileSync(join(run25.workspace_path, '.mcp.json'), 'utf8'));
-      const e = cfg.mcpServers?.conductor?.env;
+      const e = cfg.mcpServers?.clawdevbox?.env;
       mcpJsonValid =
-        e?.CONDUCTOR_PROJECT_DIR === run25.workspace_path &&
-        e?.CONDUCTOR_RECIPE_INSTANCE_ID === run25.recipe_instance_id &&
-        e?.CONDUCTOR_WORKSPACE_ID === run25.workspace_id;
+        e?.CLAWDEVBOX_PROJECT_DIR === run25.workspace_path &&
+        e?.CLAWDEVBOX_RECIPE_INSTANCE_ID === run25.recipe_instance_id &&
+        e?.CLAWDEVBOX_WORKSPACE_ID === run25.workspace_id;
     } catch {
       mcpJsonValid = false;
     }
   }
   const instancePath25 =
     run25?.workspace_path &&
-    join(run25.workspace_path, '.conductor', 'recipe-instances', `${run25.recipe_instance_id}.json`);
+    join(run25.workspace_path, '.clawdevbox', 'recipe-instances', `${run25.recipe_instance_id}.json`);
   let instanceValid = false;
   if (instancePath25 && existsSync(instancePath25)) {
     try {
@@ -618,11 +618,11 @@ async function main() {
     cwd: __dirname,
     env: {
       ...process.env,
-      CONDUCTOR_PROJECT_DIR: run25?.workspace_path,
-      CONDUCTOR_GLOBAL_DIR: globalDir,
-      CONDUCTOR_WORKSPACES_ROOT: workspacesRoot,
-      CONDUCTOR_RECIPE_INSTANCE_ID: run25?.recipe_instance_id,
-      CONDUCTOR_WORKSPACE_ID: run25?.workspace_id,
+      CLAWDEVBOX_PROJECT_DIR: run25?.workspace_path,
+      CLAWDEVBOX_GLOBAL_DIR: globalDir,
+      CLAWDEVBOX_WORKSPACES_ROOT: workspacesRoot,
+      CLAWDEVBOX_RECIPE_INSTANCE_ID: run25?.recipe_instance_id,
+      CLAWDEVBOX_WORKSPACE_ID: run25?.workspace_id,
     },
     stdio: ['pipe', 'pipe', 'pipe'],
     shell: process.platform === 'win32',

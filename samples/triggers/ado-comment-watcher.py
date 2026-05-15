@@ -4,9 +4,9 @@ ado-comment-watcher.py
 
 Same trigger as ado-comment-watcher.ts, written in Python.
 
-Demonstrates that the Conductor trigger protocol is language-agnostic:
+Demonstrates that the Clawdevbox trigger protocol is language-agnostic:
   - stdin:  one JSON envelope
-  - env:    CONDUCTOR_MCP_URL, CONDUCTOR_MCP_SECRET (required for Mode B POSTs),
+  - env:    CLAWDEVBOX_MCP_URL, CLAWDEVBOX_MCP_SECRET (required for Mode B POSTs),
             ADO_ORG, ADO_BEARER_TOKEN (preferred) or ADO_PAT (fallback)
   - stdout: { state, systemMessage } JSON  (no `callback` field — Mode B)
   - exit:   0 ok, 2 blocking error, other non-blocking error
@@ -15,7 +15,7 @@ Two execution modes are supported by the protocol — this script uses Mode B.
 
   Mode A (NOT used here): respond via stdout.
     Set a single `callback: { body: {...} }` object on the JSON response.
-    Conductor delivers that one entry to env["callback_url"]. Mode A's
+    Clawdevbox delivers that one entry to env["callback_url"]. Mode A's
     `callback` is SINGULAR (at most one delivery per run).
 
   Mode B (USED HERE): script POSTs to env["callback_url"] directly during
@@ -23,8 +23,8 @@ Two execution modes are supported by the protocol — this script uses Mode B.
     to deliver more than one event. The stdout response carries only
     `{ state, systemMessage }` — no `callback`.
 
-To use, register this trigger in .conductor/triggers.json with:
-  "command": "python3 $CONDUCTOR_PROJECT_DIR/.conductor/triggers/ado-comment-watcher.py"
+To use, register this trigger in .clawdevbox/triggers.json with:
+  "command": "python3 $CLAWDEVBOX_PROJECT_DIR/.clawdevbox/triggers/ado-comment-watcher.py"
 
 Standard library only — no `requests`, no `httpx`, no SDK. Just `urllib`,
 `json`, `os`, `sys`, `base64`. Runs on any Python 3.8+.
@@ -52,7 +52,7 @@ ADO_PAT = os.environ.get("ADO_PAT", "")
 ADO_BEARER_TOKEN = os.environ.get("ADO_BEARER_TOKEN", "")
 
 # Mode B requires this for the Authorization header on direct callback POSTs.
-CONDUCTOR_MCP_SECRET = os.environ.get("CONDUCTOR_MCP_SECRET", "")
+CLAWDEVBOX_MCP_SECRET = os.environ.get("CLAWDEVBOX_MCP_SECRET", "")
 
 
 def ado_auth_header() -> str:
@@ -160,9 +160,9 @@ def comment_to_prompt(pr_id: int, comment: dict[str, Any]) -> str:
 # ============================================================================
 
 def post_callback(callback_url: str, body: dict[str, Any]) -> None:
-    if not CONDUCTOR_MCP_SECRET:
+    if not CLAWDEVBOX_MCP_SECRET:
         raise RuntimeError(
-            "CONDUCTOR_MCP_SECRET environment variable required for Mode B callback POSTs"
+            "CLAWDEVBOX_MCP_SECRET environment variable required for Mode B callback POSTs"
         )
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
@@ -171,7 +171,7 @@ def post_callback(callback_url: str, body: dict[str, Any]) -> None:
         method="POST",
         headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {CONDUCTOR_MCP_SECRET}",
+            "Authorization": f"Bearer {CLAWDEVBOX_MCP_SECRET}",
         },
     )
     try:
@@ -227,7 +227,7 @@ def main() -> None:
         blocking_error("env.callback_url missing — required for Mode B live POSTs")
 
     # Note: env["trigger_data_dir"] is available as a per-trigger scratch dir at
-    # <project_dir>/.conductor/triggers/<trigger_id>/data/. This script doesn't
+    # <project_dir>/.clawdevbox/triggers/<trigger_id>/data/. This script doesn't
     # need it (lastCommentId fits in state), but a richer trigger could write
     # blobs there, e.g.:
     #   import pathlib

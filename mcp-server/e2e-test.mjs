@@ -14,29 +14,29 @@ const here = dirname(fileURLToPath(import.meta.url));
 const sampleRecipePath = resolve(here, '..', 'samples', 'recipes', 'simple-prompt.yaml');
 
 // 1) Set up an isolated workspace + WORKSPACES_ROOT
-const workspacesRoot = mkdtempSync(join(tmpdir(), 'conductor-e2e-'));
-const projectDir = mkdtempSync(join(tmpdir(), 'conductor-proj-'));
-mkdirSync(join(projectDir, '.conductor', 'recipes'), { recursive: true });
-copyFileSync(sampleRecipePath, join(projectDir, '.conductor', 'recipes', 'simple-prompt.yaml'));
+const workspacesRoot = mkdtempSync(join(tmpdir(), 'clawdevbox-e2e-'));
+const projectDir = mkdtempSync(join(tmpdir(), 'clawdevbox-proj-'));
+mkdirSync(join(projectDir, '.clawdevbox', 'recipes'), { recursive: true });
+copyFileSync(sampleRecipePath, join(projectDir, '.clawdevbox', 'recipes', 'simple-prompt.yaml'));
 
 console.log('workspaces root:', workspacesRoot);
 console.log('project dir:    ', projectDir);
 
-// 2) Boot the Conductor MCP server (the one we'll call via MCP)
+// 2) Boot the Clawdevbox MCP server (the one we'll call via MCP)
 const serverPath = resolve(here, 'src', 'index.ts');
 const transport = new StdioClientTransport({
   command: 'npx',
   args: ['-y', 'tsx', serverPath],
   env: {
     ...process.env,
-    CONDUCTOR_PROJECT_DIR: projectDir,
-    CONDUCTOR_WORKSPACES_ROOT: workspacesRoot,
+    CLAWDEVBOX_PROJECT_DIR: projectDir,
+    CLAWDEVBOX_WORKSPACES_ROOT: workspacesRoot,
     // ADO env passes through to the spawned copilot too (via spawnEnv copy)
   },
 });
 const client = new Client({ name: 'e2e', version: '1.0.0' }, { capabilities: {} });
 await client.connect(transport);
-console.log('connected to Conductor MCP');
+console.log('connected to Clawdevbox MCP');
 
 async function call(name, args = {}) {
   const res = await client.callTool({ name, arguments: args });
@@ -53,11 +53,11 @@ if (!found) throw new Error(`simple-prompt not visible: ${JSON.stringify(recipes
 console.log('simple-prompt visible in project scope');
 
 // 4) Fire recipe.run with real agency copilot
-const PROMPT = `You are testing the Conductor recipe pipeline. Do exactly two things in order:
-1. Call the MCP tool \`conductor.recipe.instance_info\` (no args). Take note of the recipe_instance_id you get back.
-2. Call \`conductor.recipe.done\` with status='success', message='hello from agency copilot', and result={"echoed": "PONG"}.
+const PROMPT = `You are testing the Clawdevbox recipe pipeline. Do exactly two things in order:
+1. Call the MCP tool \`clawdevbox.recipe.instance_info\` (no args). Take note of the recipe_instance_id you get back.
+2. Call \`clawdevbox.recipe.done\` with status='success', message='hello from agency copilot', and result={"echoed": "PONG"}.
 
-Output nothing else. The tools are available via the conductor MCP server.`;
+Output nothing else. The tools are available via the clawdevbox MCP server.`;
 
 const run = await call('recipe.run', {
   id: 'simple-prompt',
@@ -67,7 +67,7 @@ const run = await call('recipe.run', {
 console.log('recipe.run returned:', JSON.stringify(run, null, 2));
 
 // 5) Poll the instance file for status update — agency copilot takes ~30-60s
-const instanceFile = join(run.workspace_path, '.conductor', 'recipe-instances', `${run.recipe_instance_id}.json`);
+const instanceFile = join(run.workspace_path, '.clawdevbox', 'recipe-instances', `${run.recipe_instance_id}.json`);
 console.log('waiting for agent to call recipe.done...');
 console.log('instance file:', instanceFile);
 

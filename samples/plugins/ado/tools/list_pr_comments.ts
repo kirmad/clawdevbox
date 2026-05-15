@@ -7,7 +7,7 @@
  */
 
 import { z } from 'zod';
-import type { ToolContext } from '@conductor/sdk';
+import type { ToolContext } from '@clawdevbox/sdk';
 import { adoFetch, API_VERSION, resolveScope, urlBase } from './_auth.ts';
 
 export const id = 'ado.list_pr_comments';

@@ -5,13 +5,13 @@
  * owns stdout for protocol frames — anything written there would corrupt
  * the wire.
  *
- * Plain pino JSON output. Override the level via `CONDUCTOR_LOG_LEVEL`
+ * Plain pino JSON output. Override the level via `CLAWDEVBOX_LOG_LEVEL`
  * (`trace|debug|info|warn|error|fatal`).
  */
 
 import pino, { type Logger, type DestinationStream } from 'pino';
 
-const level = process.env.CONDUCTOR_LOG_LEVEL ?? 'info';
+const level = process.env.CLAWDEVBOX_LOG_LEVEL ?? 'info';
 
 // `sync: true` keeps the destination simple: every write is flushed
 // synchronously to stderr, so the process can exit cleanly without
@@ -21,6 +21,6 @@ const level = process.env.CONDUCTOR_LOG_LEVEL ?? 'info';
 const stderrDest: DestinationStream = pino.destination({ fd: 2, sync: true });
 
 export const logger: Logger = pino(
-  { level, base: { svc: 'conductor-mcp' } },
+  { level, base: { svc: 'clawdevbox' } },
   stderrDest,
 );

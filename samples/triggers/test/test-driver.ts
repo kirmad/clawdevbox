@@ -3,7 +3,7 @@
  * test-driver.ts
  *
  * Runs end-to-end scenarios against real Azure DevOps using the trigger
- * scripts (ado-comment-watcher.ts/.py) and the local mock-conductor.
+ * scripts (ado-comment-watcher.ts/.py) and the local mock-clawdevbox.
  *
  * Reads test-config.json (produced by setup-ado.sh) for the real PR id and
  * the test comment id we expect to see flow through the trigger.
@@ -30,7 +30,7 @@ import { ok, equal, deepStrictEqual } from 'node:assert';
 import { readFile, access } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { startMockConductor, type MockServerHandle, type TriggerConfig } from './mock-conductor.ts';
+import { startMockClawdevbox, type MockServerHandle, type TriggerConfig } from './mock-clawdevbox.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -75,7 +75,7 @@ function parseArgs(argv: string[]): Args {
 }
 
 const HELP_TEXT = `
-Conductor trigger harness — test driver
+Clawdevbox trigger harness — test driver
 ========================================
 
 Scenarios:
@@ -257,7 +257,7 @@ function tsTrigger(state: Record<string, unknown>, cfg: TestConfig): TriggerConf
 
 function pyTrigger(state: Record<string, unknown>, cfg: TestConfig): TriggerConfig {
   // Resolve python executable: prefer python3, fall back to python.
-  // On Windows shims, spawning with shell:true (mock-conductor handles that)
+  // On Windows shims, spawning with shell:true (mock-clawdevbox handles that)
   // means either name works if it's on PATH.
   const pyCmd = process.platform === 'win32' ? 'python' : 'python3';
   return {
@@ -529,7 +529,7 @@ async function scenarioE_malformedEnvelope(handle: MockServerHandle, cfg: TestCo
     ),
   );
 
-  // Send raw text. mock-conductor's /hooks handler validates JSON before
+  // Send raw text. mock-clawdevbox's /hooks handler validates JSON before
   // spawning the script, so we'll get a 400 here. To exercise the script's
   // own malformed-envelope path (exit 2 → 500), we need to bypass the
   // server's body parse — the cleanest way is to spawn the script directly.
@@ -560,7 +560,7 @@ async function scenarioE_malformedEnvelope(handle: MockServerHandle, cfg: TestCo
   // Second: confirm structurally-invalid JSON envelope hits the script's
   // exit-2 path and the server returns 5xx with stderr captured.
   // Override the trigger to a state-less config that the script cannot satisfy.
-  // The mock-conductor builds the envelope from cfg.state. We set state to
+  // The mock-clawdevbox builds the envelope from cfg.state. We set state to
   // {} (no prId/repo) — script must then exit 2 with the
   // "state.prId and state.repo must be set" message.
   handle.setTrigger({
@@ -767,8 +767,8 @@ async function main(): Promise<void> {
   }
 
   const cfg = await preflight();
-  const handle = await startMockConductor({ inheritStderr: false });
-  process.stdout.write(`mock-conductor on ${handle.url}\n`);
+  const handle = await startMockClawdevbox({ inheritStderr: false });
+  process.stdout.write(`mock-clawdevbox on ${handle.url}\n`);
   process.stdout.write(`PR=${cfg.org}/${cfg.repo} #${cfg.pr_id}, test_comment_id=${cfg.test_comment_id}\n\n`);
 
   type Scenario = { id: string; name: string; fn: (h: MockServerHandle, c: TestConfig) => Promise<void> };

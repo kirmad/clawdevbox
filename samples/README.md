@@ -4,7 +4,7 @@ Example content for ClawDevbox. The MCP server itself lives at `../mcp-server/`;
 
 ## `triggers/` — Trigger script samples
 
-How a trigger fires data back to the orchestrator. TypeScript + Python samples for an Azure DevOps PR-comment watcher. Includes a `mock-conductor.ts` test driver and `test-driver.ts` that exercises 7 scenarios (cron, external, manual, …).
+How a trigger fires data back to the orchestrator. TypeScript + Python samples for an Azure DevOps PR-comment watcher. Includes a `mock-clawdevbox.ts` test driver and `test-driver.ts` that exercises 7 scenarios (cron, external, manual, …).
 
 ```bash
 cd samples/triggers
@@ -22,7 +22,7 @@ Minimal `simple-prompt.yaml` showing the recipe shape. Used by `e2e-test.mjs` in
 
 ## Common conventions
 
-- **`@conductor/*` npm scope** — internal package names are still `@conductor/...` because the codebase uses `conductor` as its load-bearing internal name. The product brand is ClawDevbox; the engine is Conductor.
-- **`.conductor/`** — every workspace has one. Holds `recipes/`, `skills/`, `plugins/`, `triggers.json`, `workspace.json`, `recipe-instances/`, optional `renderers/`.
-- **`artifacts/`** — sibling of `.conductor/`, NOT inside it. Each artifact is a folder with `manifest.json` + content files.
-- **Env vars** — `CONDUCTOR_PROJECT_DIR` (required), `CONDUCTOR_WORKSPACES_ROOT`, `CONDUCTOR_TERMINAL_PORT`, `CONDUCTOR_RECIPE_INSTANCE_ID`, `CONDUCTOR_WORKSPACE_ID`, `CONDUCTOR_MCP_SECRET`. The spawned agent reads its instance / workspace ids from env so it can call `recipe.done` and `recipe.instance_info` back to the parent.
+- **`@clawdevbox/*` npm scope** — internal package names are still `@clawdevbox/...` because the codebase uses `clawdevbox` as its load-bearing internal name. The product brand is ClawDevbox; the engine is Clawdevbox.
+- **`.clawdevbox/`** — every workspace has one. Holds `recipes/`, `skills/`, `plugins/`, `triggers.json`, `workspace.json`, `recipe-instances/`, optional `renderers/`.
+- **`artifacts/`** — sibling of `.clawdevbox/`, NOT inside it. Each artifact is a folder with `manifest.json` + content files.
+- **Env vars** — `CLAWDEVBOX_PROJECT_DIR` (required), `CLAWDEVBOX_WORKSPACES_ROOT`, `CLAWDEVBOX_TERMINAL_PORT`, `CLAWDEVBOX_RECIPE_INSTANCE_ID`, `CLAWDEVBOX_WORKSPACE_ID`, `CLAWDEVBOX_MCP_SECRET`. The spawned agent reads its instance / workspace ids from env so it can call `recipe.done` and `recipe.instance_info` back to the parent.

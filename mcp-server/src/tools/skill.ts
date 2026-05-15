@@ -3,7 +3,7 @@
  *
  * skill.list / read / upsert / delete. Same pattern as recipe.ts, but skills
  * are markdown files with a YAML frontmatter block (see validators.ts ::
- * parseSkill). The frontmatter is the structured metadata Conductor displays
+ * parseSkill). The frontmatter is the structured metadata Clawdevbox displays
  * in the skills panel; the body is freeform prose the agent consults at
  * runtime.
  */

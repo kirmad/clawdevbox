@@ -1,0 +1,9 @@
+[mcps.servers.clawdevbox]
+type = "stdio"
+command = "npx"
+args = ["-y", "clawdevbox", "mcp"]
+tools = ["*"]
+
+[mcps.servers.clawdevbox.env]
+CLAWDEVBOX_PROJECT_DIR = "C:\\git\\clawdevbox\\mcp-server"
+CLAWDEVBOX_GLOBAL_DIR = "C:\\Users\\kirmadi\\.clawdevbox"

@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "clawdevbox": {
+      "type": "local",
+      "command": "npx",
+      "args": [
+        "-y",
+        "clawdevbox",
+        "mcp"
+      ],
+      "env": {
+        "CLAWDEVBOX_PROJECT_DIR": "C:\\git\\clawdevbox\\mcp-server",
+        "CLAWDEVBOX_GLOBAL_DIR": "C:\\Users\\kirmadi\\.clawdevbox"
+      },
+      "tools": [
+        "*"
+      ]
+    }
+  }
+}

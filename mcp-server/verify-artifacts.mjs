@@ -2,7 +2,7 @@
 //
 // End-to-end smoke test for the artifact viewer pipeline using REAL data:
 //
-//   1. Read three actual conductor source files from this repo
+//   1. Read three actual clawdevbox source files from this repo
 //      (pty-registry.ts, terminal-server.ts, renderers/markdown.mjs).
 //   2. Generate realistic sample artifacts that exactly match TaskDock's
 //      AIReviewComment + CodeWalkthrough shapes:
@@ -42,22 +42,22 @@ const readRepoFile = (rel) => readFileSync(join(HERE, rel), 'utf8');
 // Workspace setup
 // ---------------------------------------------------------------------------
 
-const tmp = mkdtempSync(join(tmpdir(), 'conductor-art-verify-'));
+const tmp = mkdtempSync(join(tmpdir(), 'clawdevbox-art-verify-'));
 const projectDir = join(tmp, 'project');
 mkdirSync(projectDir, { recursive: true });
 for (const sub of ['recipes', 'skills', 'plugins', 'recipe-instances']) {
-  mkdirSync(join(projectDir, '.conductor', sub), { recursive: true });
+  mkdirSync(join(projectDir, '.clawdevbox', sub), { recursive: true });
 }
 writeFileSync(
-  join(projectDir, '.conductor', 'workspace.json'),
+  join(projectDir, '.clawdevbox', 'workspace.json'),
   JSON.stringify({ schemaVersion: 1, id: 'verify-ws' }, null, 2),
 );
-writeFileSync(join(projectDir, '.conductor', 'triggers.json'), JSON.stringify({ registered: [] }, null, 2));
+writeFileSync(join(projectDir, '.clawdevbox', 'triggers.json'), JSON.stringify({ registered: [] }, null, 2));
 
 const workspacesRoot = join(tmp, 'workspaces');
 mkdirSync(workspacesRoot, { recursive: true });
-process.env.CONDUCTOR_PROJECT_DIR = projectDir;
-process.env.CONDUCTOR_WORKSPACES_ROOT = workspacesRoot;
+process.env.CLAWDEVBOX_PROJECT_DIR = projectDir;
+process.env.CLAWDEVBOX_WORKSPACES_ROOT = workspacesRoot;
 
 const ws = loadWorkspaceFromEnv();
 const wsRecord = createWorkspace(resolveWorkspacesRoot(), {
@@ -74,9 +74,9 @@ const safeName = (p) => p.replace(/[\\/]/g, '__');
 
 function authorMarkdown() {
   const id = 'design-doc';
-  const content = `# Conductor design
+  const content = `# Clawdevbox design
 
-A quick walkthrough of the simplified Conductor architecture.
+A quick walkthrough of the simplified Clawdevbox architecture.
 
 ## Pillars
 
@@ -102,13 +102,13 @@ export function welcome(name: string): string {
 }
 \`\`\`
 
-> Conductor stays small.`;
+> Clawdevbox stays small.`;
   writeArtifact({
     workspacePath,
     manifest: {
       id,
       type: 'markdown',
-      title: 'Conductor design',
+      title: 'Clawdevbox design',
       workspace_id: wsRecord.info.id,
       created_at: Date.now(),
     },
@@ -118,7 +118,7 @@ export function welcome(name: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Artifact #2 — PR review on real conductor files
+// Artifact #2 — PR review on real clawdevbox files
 // ---------------------------------------------------------------------------
 
 function authorPrReview() {
@@ -130,17 +130,17 @@ function authorPrReview() {
     title: 'Add hidden pty viewer + artifact renderer pipeline',
     description: [
       'Introduces a ConPTY-based hidden agent runner and an HTTP viewer',
-      'served by the Conductor MCP server. Also ships the artifact storage',
+      'served by the Clawdevbox MCP server. Also ships the artifact storage',
       'model and three built-in renderers (markdown, pr-review, walkthrough).',
       '',
       'Validated with `verify-artifacts.mjs` and `verify-agency-alignment.mjs`',
       'against headless Chromium.',
     ].join('\n'),
-    sourceBranch: 'feature/conductor-artifact-viewer',
+    sourceBranch: 'feature/clawdevbox-artifact-viewer',
     targetBranch: 'main',
     repository: 'taskdock',
     org: 'msft-eng',
-    project: 'Conductor',
+    project: 'Clawdevbox',
   };
 
   // PR files (with changeType). The renderer builds its hierarchical tree
@@ -161,7 +161,7 @@ function authorPrReview() {
   // realistic categories, a couple suggestedFix blobs, and one already-
   // fixed-by-AI to exercise the fixedByAI styling.
   // Line numbers anchor each comment to a real line in the modified file
-  // (verified against the actual conductor source we ship as modifiedContent).
+  // (verified against the actual clawdevbox source we ship as modifiedContent).
   const comments = [
     {
       id: 'c1', filePath: 'src/pty-registry.ts',
@@ -226,7 +226,7 @@ function authorPrReview() {
       severity: 'minor', category: 'compliance',
       title: 'Inline mermaid SVG IDs use Math.random()',
       content:
-        "Diagram IDs use `Math.random().toString(36)`. Safe but not cryptographically random — fine for a renderer, but Conductor's security policy (docs/superpowers/specs/2026-05-09-conductor-simplified-design.md §13) prefers `crypto.randomUUID()` for any identifier that crosses a process boundary. Either keep this and document the carve-out, or switch.",
+        "Diagram IDs use `Math.random().toString(36)`. Safe but not cryptographically random — fine for a renderer, but Clawdevbox's security policy (docs/superpowers/specs/2026-05-09-clawdevbox-simplified-design.md §13) prefers `crypto.randomUUID()` for any identifier that crosses a process boundary. Either keep this and document the carve-out, or switch.",
       confidence: 0.5,
       published: false,
     },
@@ -234,7 +234,7 @@ function authorPrReview() {
 
   // Build originalContent + modifiedContent for every file in the PR.
   // Strategy:
-  //   - "add" files: original is empty, modified is the real conductor source
+  //   - "add" files: original is empty, modified is the real clawdevbox source
   //     read from disk this session.
   //   - "edit" files: modified is the real source; original is the same file
   //     with the artifact-viewer additions removed (so the diff is meaningful).
@@ -307,8 +307,8 @@ function authorPrReview() {
       'Two changes land together: the hidden pty + viewer, and the artifact renderer pipeline. Open `pty-registry.ts` first to see the ring-buffer + broadcast pattern, then `terminal-server.ts` for the new HTTP routes, then `renderers/markdown.mjs` for the renderer contract.',
     architectureDiagram: [
       'flowchart LR',
-      '  Agent -- recipe.run --> Conductor',
-      '  Conductor -- node-pty/ConPTY --> Pty',
+      '  Agent -- recipe.run --> Clawdevbox',
+      '  Clawdevbox -- node-pty/ConPTY --> Pty',
       '  Browser -- WS --> TermServer',
       '  TermServer -- subscribe --> Pty',
       '  Agent -- artifact.add --> Disk',
@@ -351,7 +351,7 @@ function authorPrReview() {
 }
 
 // ---------------------------------------------------------------------------
-// Artifact #3 — walkthrough on real conductor source
+// Artifact #3 — walkthrough on real clawdevbox source
 // ---------------------------------------------------------------------------
 
 function authorWalkthrough() {
@@ -513,8 +513,8 @@ let failure = null;
 try {
   // ---------- markdown ----------
   {
-    const page = await open(mdId, '__conductorArtifact');
-    await page.locator('.markdown-body h1', { hasText: 'Conductor design' }).waitFor({ timeout: 5000 });
+    const page = await open(mdId, '__clawdevboxArtifact');
+    await page.locator('.markdown-body h1', { hasText: 'Clawdevbox design' }).waitFor({ timeout: 5000 });
     await page.locator('.mermaid-rendered svg').waitFor({ timeout: 8000 });
     await shot(page, 'artifacts-01-markdown.png');
     console.log('  ✅ markdown rendered');
@@ -523,7 +523,7 @@ try {
 
   // ---------- pr-review (hierarchical tree + full-file diff) ----------
   {
-    const page = await open(prId, '__conductorPrReview');
+    const page = await open(prId, '__clawdevboxPrReview');
     await page.locator('.pr-header .crumbs', { hasText: 'PR #5180686' }).waitFor({ timeout: 5000 });
     await page.locator('.pr-header h1', { hasText: 'hidden pty viewer' }).waitFor({ timeout: 5000 });
 
@@ -573,7 +573,7 @@ try {
 
   // ---------- walkthrough (overlay UI) ----------
   {
-    const page = await open(wtId, '__conductorWalkthrough');
+    const page = await open(wtId, '__clawdevboxWalkthrough');
     // Overlay is the primary chrome; code pane fills behind it.
     await page.locator('.wt-overlay .wt-name', { hasText: 'Artifact viewer pipeline' }).waitFor({ timeout: 5000 });
     await page.locator('.wt-overlay .wt-title', { hasText: 'Disk layout' }).waitFor({ timeout: 5000 });

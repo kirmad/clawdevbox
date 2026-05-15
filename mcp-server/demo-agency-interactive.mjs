@@ -23,10 +23,10 @@ const ROWS = 40;
 const INSTANCE_ID = 'agency-interactive';
 
 // Use a fresh tmp dir as cwd so we don't pollute anything.
-const cwd = mkdtempSync(join(tmpdir(), 'conductor-agency-demo-'));
+const cwd = mkdtempSync(join(tmpdir(), 'clawdevbox-agency-demo-'));
 
 // Spawn agency interactively. No `-p` → full TUI session.
-const agencyBin = process.env.CONDUCTOR_AGENCY_PATH
+const agencyBin = process.env.CLAWDEVBOX_AGENCY_PATH
   ?? (process.platform === 'win32' ? 'agency.exe' : 'agency');
 
 const srv = await startTerminalServer({});
@@ -50,7 +50,7 @@ registerPty({
 
 console.log('');
 console.log('================================================================');
-console.log(' Conductor — interactive agency copilot in hidden pty');
+console.log(' Clawdevbox — interactive agency copilot in hidden pty');
 console.log('================================================================');
 console.log(` View URL:  ${url}`);
 console.log(` cwd:       ${cwd}`);

@@ -2,7 +2,7 @@
 #
 # setup-ado.sh
 #
-# Set up real Azure DevOps test fixtures for the Conductor trigger harness.
+# Set up real Azure DevOps test fixtures for the Clawdevbox trigger harness.
 #
 # What it does:
 #   1. Verify az cli + azure-devops extension are installed.
@@ -99,7 +99,7 @@ fi
 # ---------------------------------------------------------------------------
 
 TIMESTAMP="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-COMMENT_TEXT="Test comment from Conductor trigger harness at ${TIMESTAMP}"
+COMMENT_TEXT="Test comment from Clawdevbox trigger harness at ${TIMESTAMP}"
 
 info "posting test comment to PR ${ADO_PR_ID}..."
 TEST_COMMENT_ID="$(post_pr_comment "${ORG_URL}" "${ADO_PROJECT}" "${ADO_REPO}" "${ADO_PR_ID}" "${COMMENT_TEXT}")"

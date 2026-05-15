@@ -21,9 +21,9 @@ const INSTANCE_ID = 'agency-verify';
 const outDir = resolve('./verify-screenshots');
 mkdirSync(outDir, { recursive: true });
 
-const cwd = mkdtempSync(join(tmpdir(), 'conductor-agency-verify-'));
+const cwd = mkdtempSync(join(tmpdir(), 'clawdevbox-agency-verify-'));
 
-const agencyBin = process.env.CONDUCTOR_AGENCY_PATH
+const agencyBin = process.env.CLAWDEVBOX_AGENCY_PATH
   ?? (process.platform === 'win32' ? 'agency.exe' : 'agency');
 
 const srv = await startTerminalServer({});
@@ -63,8 +63,8 @@ await page.locator('#status').waitFor({ state: 'visible' });
 await page.waitForTimeout(3000);
 await page.screenshot({ path: join(outDir, '00-early.png') });
 const earlyBuf = await page.evaluate(() => {
-  const t = window.__conductorTerm;
-  if (!t) return '<no __conductorTerm>';
+  const t = window.__clawdevboxTerm;
+  if (!t) return '<no __clawdevboxTerm>';
   const b = t.buffer.active;
   let s = '';
   for (let i = 0; i < b.length; i++) s += b.getLine(i)?.translateToString(true) + '\n';
@@ -77,7 +77,7 @@ console.log('--- end ---');
 // Helper: read current xterm buffer (visible content) for text-based assertions.
 async function buf() {
   return await page.evaluate(() => {
-    const t = window.__conductorTerm;
+    const t = window.__clawdevboxTerm;
     if (!t) return '';
     const b = t.buffer.active;
     let s = '';
@@ -94,7 +94,7 @@ async function shot(name) {
 
 async function dims() {
   return await page.evaluate(() => {
-    const t = window.__conductorTerm;
+    const t = window.__clawdevboxTerm;
     return t ? { cols: t.cols, rows: t.rows } : null;
   });
 }
@@ -102,7 +102,7 @@ async function dims() {
 console.log('\n[1/6] waiting for agency banner ("Describe a task" / "trusted folders")...');
 await page.waitForFunction(
   () => {
-    const t = window.__conductorTerm;
+    const t = window.__clawdevboxTerm;
     if (!t) return false;
     const b = t.buffer.active;
     let s = '';

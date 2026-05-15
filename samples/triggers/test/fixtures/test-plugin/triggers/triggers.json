@@ -4,7 +4,7 @@
     {
       "id": "heartbeat",
       "description": "Emit a single Mode B callback with prompt 'plugin heartbeat tick' each time the cron fires. Used by Scenario G of the trigger test harness.",
-      "command": "tsx $CONDUCTOR_PROJECT_DIR/.conductor/plugins/test-plugin/triggers/heartbeat.ts",
+      "command": "tsx $CLAWDEVBOX_PROJECT_DIR/.clawdevbox/plugins/test-plugin/triggers/heartbeat.ts",
       "cron": "*/30 * * * * *",
       "timeout_seconds": 30
     }

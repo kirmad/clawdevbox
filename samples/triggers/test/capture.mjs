@@ -1,10 +1,10 @@
 // capture.mjs — full end-to-end demo of the Mode B comment-watcher trigger
-// against real ADO. Spins up mock-conductor locally so the script has a real
+// against real ADO. Spins up mock-clawdevbox locally so the script has a real
 // /callback/* endpoint to POST to during the run, then prints:
 //   1. the STDIN envelope piped to the script
 //   2. the script's STDOUT and STDERR
 //   3. its exit code
-//   4. the live Mode B callbacks that mock-conductor captured during the run
+//   4. the live Mode B callbacks that mock-clawdevbox captured during the run
 import { readFileSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import { resolve, dirname, join } from 'node:path';
@@ -15,10 +15,10 @@ const here = dirname(fileURLToPath(import.meta.url));
 const cfg = JSON.parse(readFileSync(join(here, 'test-config.json'), 'utf8'));
 
 // ---------------------------------------------------------------------------
-// 1. Boot mock-conductor and wait for its READY banner.
+// 1. Boot mock-clawdevbox and wait for its READY banner.
 // ---------------------------------------------------------------------------
 
-const mockPath = join(here, 'mock-conductor.ts');
+const mockPath = join(here, 'mock-clawdevbox.ts');
 const mock = spawn('npx', ['--yes', 'tsx', mockPath], {
   cwd: here,
   env: { ...process.env },
@@ -50,19 +50,19 @@ process.on('exit', killMock);
 process.on('SIGINT', () => { killMock(); process.exit(130); });
 process.on('SIGTERM', () => { killMock(); process.exit(143); });
 
-// Wait up to 30s for "MOCK_CONDUCTOR_READY <port> <secret>" on stdout.
+// Wait up to 30s for "MOCK_CLAWDEVBOX_READY <port> <secret>" on stdout.
 const readyDeadline = Date.now() + 30_000;
 let port = '';
 let secret = '';
 while (Date.now() < readyDeadline) {
-  const m = mockStdoutBuf.match(/MOCK_CONDUCTOR_READY (\d+) (\S+)/);
+  const m = mockStdoutBuf.match(/MOCK_CLAWDEVBOX_READY (\d+) (\S+)/);
   if (m) {
     port = m[1];
     secret = m[2];
     break;
   }
   if (mock.exitCode !== null) {
-    console.error('mock-conductor exited before ready:');
+    console.error('mock-clawdevbox exited before ready:');
     console.error(mockStdoutBuf);
     console.error(mockStderrBuf);
     process.exit(1);
@@ -70,7 +70,7 @@ while (Date.now() < readyDeadline) {
   await delay(100);
 }
 if (!port || !secret) {
-  console.error('Timed out waiting for mock-conductor READY banner.');
+  console.error('Timed out waiting for mock-clawdevbox READY banner.');
   console.error('mock stdout:\n' + mockStdoutBuf);
   console.error('mock stderr:\n' + mockStderrBuf);
   killMock();
@@ -93,7 +93,7 @@ const envelope = {
   fired_at: Date.now(),
   cwd: here,
   project_dir: here,
-  trigger_data_dir: join(here, '.conductor/triggers/demo-capture/data'),
+  trigger_data_dir: join(here, '.clawdevbox/triggers/demo-capture/data'),
   subscriber_thread_id: 'thr_DEMO',
   callback_url: callbackUrl,
   state: {
@@ -118,8 +118,8 @@ const result = spawnSync('npx', ['--yes', 'tsx', triggerScript], {
     ...process.env,
     ADO_ORG: cfg.trigger_ado_org,
     ADO_BEARER_TOKEN: cfg.ado_bearer_token,
-    CONDUCTOR_MCP_URL: `${baseUrl}/mcp`,
-    CONDUCTOR_MCP_SECRET: secret,
+    CLAWDEVBOX_MCP_URL: `${baseUrl}/mcp`,
+    CLAWDEVBOX_MCP_SECRET: secret,
   },
   shell: true,
 });
@@ -150,7 +150,7 @@ console.log(result.status);
 // ---------------------------------------------------------------------------
 
 console.log('');
-console.log('================ Mode B live POSTs captured by mock-conductor ================');
+console.log('================ Mode B live POSTs captured by mock-clawdevbox ================');
 try {
   const res = await fetch(`${baseUrl}/test/received-callbacks`);
   if (!res.ok) {
@@ -180,7 +180,7 @@ try {
 }
 
 // ---------------------------------------------------------------------------
-// 4. Tear down mock-conductor.
+// 4. Tear down mock-clawdevbox.
 // ---------------------------------------------------------------------------
 killMock();
 process.exit(result.status ?? 0);

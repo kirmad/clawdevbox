@@ -1,8 +1,8 @@
-# Conductor Trigger Test Harness
+# Clawdevbox Trigger Test Harness
 
-End-to-end test for the Conductor trigger mechanism (spec §8) using the
+End-to-end test for the Clawdevbox trigger mechanism (spec §8) using the
 sample `ado-comment-watcher.ts` / `.py` scripts and **real Azure DevOps**.
-Only the Conductor side is mocked — the trigger script makes real HTTPS
+Only the Clawdevbox side is mocked — the trigger script makes real HTTPS
 calls to `dev.azure.com` and gets real comments back.
 
 ## What this proves
@@ -15,7 +15,7 @@ That a trigger script written to the documented contract:
 - Writes new state to stdout, exits 0 (or exit 2 on blocking error)
 
 works end-to-end against a live ADO repository — without needing a running
-Conductor sidecar, recipes, MCP, or any of the rest of the system.
+Clawdevbox sidecar, recipes, MCP, or any of the rest of the system.
 
 ## Architecture
 
@@ -43,7 +43,7 @@ Conductor sidecar, recipes, MCP, or any of the rest of the system.
                              |  /hooks/ |  /test/...    |
                              v          v               v
                        +-----------------------+  +-----------------------+
-                       | mock-conductor.ts     |  | trigger script        |
+                       | mock-clawdevbox.ts     |  | trigger script        |
                        | (in-process server,   |  | ado-comment-watcher   |
                        |  random free port)    |  |   .ts | .py           |
                        |                       |  |                       |
@@ -58,7 +58,7 @@ Conductor sidecar, recipes, MCP, or any of the rest of the system.
 ```
 
 Three artifacts in motion:
-1. **mock-conductor** — local HTTP server that pretends to be the Conductor sidecar. Receives webhook fires, spawns the trigger script, captures whatever the script POSTs back.
+1. **mock-clawdevbox** — local HTTP server that pretends to be the Clawdevbox sidecar. Receives webhook fires, spawns the trigger script, captures whatever the script POSTs back.
 2. **trigger script** — `ado-comment-watcher.ts` or `.py` from this directory. Run unmodified.
 3. **test-driver** — orchestrator. Boots mock, runs scenarios, asserts on captured callbacks.
 
@@ -66,7 +66,7 @@ Three artifacts in motion:
 
 | Tool | Purpose | Install |
 |------|---------|---------|
-| Node 20+ | mock-conductor + test-driver | https://nodejs.org |
+| Node 20+ | mock-clawdevbox + test-driver | https://nodejs.org |
 | `tsx` | run `.ts` files directly | `npm i -g tsx` (or via `npx tsx`) |
 | `python3` | Scenario D | https://python.org (or skip with `--skip-py`) |
 | `az` cli | post the test comment | https://learn.microsoft.com/cli/azure/install-azure-cli |
@@ -105,7 +105,7 @@ Three artifacts in motion:
    This:
    - Verifies `az` and the `azure-devops` extension
    - Verifies the PR exists
-   - Posts one test comment to the PR (`"Test comment from Conductor trigger harness at <ts>"`)
+   - Posts one test comment to the PR (`"Test comment from Clawdevbox trigger harness at <ts>"`)
    - Writes `test-config.json` next to itself
 
    What gets created in real ADO: **one new comment thread on the specified PR** with one comment from your `az login` user. That's it.
@@ -120,7 +120,7 @@ npm run test
 You should see (e.g.):
 
 ```
-mock-conductor on http://127.0.0.1:54321
+mock-clawdevbox on http://127.0.0.1:54321
 PR=microsoft/auth-svc #12345, test_comment_id=987654
 
 [A] Cron-fire / poll path (TS) ... PASS
@@ -188,13 +188,13 @@ handle.setTrigger({
 });
 ```
 
-The mock-conductor's catch-all callback handler captures any `/callback/*` path, so the assertion logic just checks `cb.path` matches.
+The mock-clawdevbox's catch-all callback handler captures any `/callback/*` path, so the assertion logic just checks `cb.path` matches.
 
 ## Files
 
 | Path | Role |
 |------|------|
-| `mock-conductor.ts` | The local HTTP server. Pure Node built-ins; no deps. Importable as a module or runnable as a CLI. |
+| `mock-clawdevbox.ts` | The local HTTP server. Pure Node built-ins; no deps. Importable as a module or runnable as a CLI. |
 | `setup-ado.sh` | Bash version of one-shot ADO fixture setup. Uses `az cli`. |
 | `setup-ado.ps1` | PowerShell mirror of `setup-ado.sh`. |
 | `test-driver.ts` | The actual test runner. |
@@ -222,6 +222,6 @@ https://dev.azure.com/<org>/_git/<repo>/pullrequest/<id>
 ## Constraints honored
 
 - **Real ADO.** No mock ADO. The trigger script's HTTP fetches go to `dev.azure.com`.
-- **Mock only the Conductor side** — webhook receiver and callback recorder.
+- **Mock only the Clawdevbox side** — webhook receiver and callback recorder.
 - **Zero external npm deps.** `node:http`, `node:child_process`, `node:crypto`, `node:fs`, etc. only.
 - **Trigger scripts unmodified.** `ado-comment-watcher.ts` and `.py` are spawned as-is.

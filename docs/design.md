@@ -110,6 +110,43 @@ The design replaces the prior infrastructure spec's event-sourced kernel, projec
 
 **The key inversion:** the sidecar does NOT run an agent loop. The side-terminal CLI does. Conductor's job is to keep the SQLite tables consistent, expose them via MCP, and wake CLIs up when trigger scripts demand it.
 
+### 4.1 Install modes
+
+The sidecar can be installed two ways via `clawdevbox init`:
+
+- **Global (recommended)** — `<globalDir>/config.json` holds account-wide
+  settings (HTTP port, bearer token, tunnel, notifications, plugin set).
+  Plugins live under `<globalDir>/plugins/` and are shared across every
+  project on the account. The MCP server can be launched from any
+  directory and treats the current working directory as `project_dir`.
+- **Project-specific** — legacy path. Writes
+  `<projectDir>/.clawdevbox/config.json`. Only takes effect when the
+  server is launched against that project. Useful when a particular repo
+  needs a different port / token / tunnel.
+
+`resolveConfig` merges both layers when both are present (project >
+global > defaults). Env vars and CLI flags override anything on disk.
+
+### 4.2 Background service
+
+`clawdevbox start --service` spawns the HTTP MCP server as a detached
+background process and registers an OS-level auto-start entry so the
+server relaunches at every login:
+
+- Windows: registry Run key (`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`)
+- macOS: LaunchAgent plist at `~/Library/LaunchAgents/com.clawdevbox.server.plist`
+- Linux: systemd-user unit at `~/.config/systemd/user/clawdevbox.service` (plus `loginctl enable-linger` for logout survival)
+
+`<globalDir>/service.json` records PID + port + version of the running
+instance. `clawdevbox stop` reads that file and sends `taskkill` /
+`SIGTERM` to the recorded PID. `clawdevbox status` reports running
+state + auto-start registration. `clawdevbox uninstall-service` stops the
+instance and removes the OS auto-start entry.
+
+Only one global instance is supported per user account; the service is
+bound to the global config. Per-project installs do not use the service
+mode.
+
 ## 5. The Kernel — `~/.conductor.db`
 
 Six logical tables plus a `schema_version` and a `settings_kv`. All access through `better-sqlite3` (TaskDock pattern, copy-fork). All schema changes additive only (Goose's policy, copy-fork).
@@ -1563,7 +1600,7 @@ plugin.install({ from: 'git+https://github.com/conductor/plugin-ado.git' })
 The reference implementation lives at `samples/plugins/ado/`. Disk layout:
 
 ```
-.conductor/plugins/ado/
+<global_dir>/plugins/ado/
 ├── plugin.yaml                       # manifest
 ├── README.md                         # install + customize instructions
 ├── skills/
@@ -1580,7 +1617,13 @@ The reference implementation lives at `samples/plugins/ado/`. Disk layout:
     └── ado.json                      # MCP server config (Continue-shape)
 ```
 
-The plugin **is** the directory. There is no package manager, no install script, no compile step. Conductor scans for `plugin.yaml` at boot and on file-watcher events; everything else in the directory is discovered through `provides`.
+Plugins live in the **global** plugin store (`<global_dir>/plugins/`) so the
+same install is shared across every project on the user's account. Sibling
+to each plugin directory is `<id>.install.json` — a sidecar install record
+recording where the plugin came from and how it was installed (git clone,
+local-folder junction, built-in copy, or manual). Conductor scans for
+`plugin.yaml` at boot and on file-watcher events; everything else in the
+directory is discovered through `provides`.
 
 ### 10.2 Manifest (`plugin.yaml`)
 
@@ -1794,8 +1837,16 @@ No process spawn, no MCP transport, no real ADO call — just function invocatio
 
 At boot:
 
-1. Scan `<workspace>/.conductor/plugins/*/plugin.yaml`.
-2. For each manifest: parse (YAML), validate (§10.8), check `requires.conductor_version` against the running build.
+1. Scan `<global_dir>/plugins/*/plugin.yaml`. Entries are either real
+   directories (built-in copies, git clones with `.git` retained) or
+   junctions / symlinks pointing back at user-provided absolute folders.
+   `statSync()` follows the link, so discovery walks them uniformly.
+   Sibling sidecar files `<id>.install.json` are skipped; dot-prefixed
+   entries (`.tmp-install-*` mid-install) are skipped.
+2. For each manifest: parse (YAML), validate (§10.8), check
+   `requires.conductor_version` against the running build. Reject any
+   plugin whose `manifest.id` doesn't equal its directory name (a
+   read-time guard against drift in junctioned local plugins).
 3. Register every entry in `provides`:
    - `skills[].id` → loadable via `skill.read({ scope: 'plugin:<id>' })`
    - `recipes[].id` → loadable via `recipe.read({ scope: 'plugin:<id>' })`
@@ -1804,9 +1855,19 @@ At boot:
    - `mcp_servers[].id` → exposed to spawned CLIs via the same `--mcp-config` merge that already includes `.conductor/mcp/*.json`
 4. If a plugin's manifest has any error, the plugin is marked `error` (visible via `plugin.list`); other plugins continue to load. The user sees the error in the renderer's plugin panel.
 
+**Visibility:** all installed plugins are visible to **every** workspace on
+this user account. There is no per-project opt-in — that's the whole point
+of centralizing the store. The off-switch is `plugin.disable({ id })`,
+which is also global.
+
 **Live reload:** the drop-folder watcher (§9) also covers each plugin's `plugin.yaml`. On change → re-validate + re-register. The same 500ms debounce applies. Removing a `plugin.yaml` file un-registers the plugin's provides; restoring it re-registers them. Hostable tools that change source on disk are re-imported with a cache-busting URL fragment; ESM module-cache realities mean the in-process JS engine still holds the old module, but new tool calls dispatch through the freshly-imported one.
 
 **Collision rule:** if two installed plugins both `provide` an item with the same id (e.g., both ship a `pr-review` recipe), boot does not pick a winner — both plugins load, but the colliding id resolves in plugin-id sort order. `plugin.list` surfaces a warning so the user can rename or disable one. This is intentionally not a hard error: removing or renaming a recipe in someone else's plugin is friction we don't want to force.
+
+**Legacy project-scope plugins:** earlier versions copied plugins into
+`<workspace>/.conductor/plugins/<id>/`. Those directories are silently
+ignored under the new model — Conductor emits a one-line boot warning if
+the legacy path is non-empty so the user can reinstall via `plugin.install`.
 
 ### 10.5 Scope and shadowing
 
@@ -1815,8 +1876,8 @@ Every recipe/skill/trigger the runtime knows about belongs to exactly one scope:
 | Scope | Path | Writable? |
 |---|---|---|
 | `project` | `<workspace>/.conductor/{recipes,skills,triggers}/` | yes |
-| `plugin:<id>` | `<workspace>/.conductor/plugins/<id>/{recipes,skills,triggers}/` | **no — read-only at runtime** |
-| `global` | `~/.conductor/{recipes,skills,triggers}/` | yes |
+| `plugin:<id>` | `<global_dir>/plugins/<id>/{recipes,skills,triggers}/` (real dir OR junction to user's folder) | **no — read-only at runtime** |
+| `global` | `<global_dir>/{recipes,skills,triggers}/` | yes |
 
 **Read resolution** on `recipe.read({ id: 'pr-review' })` (and `skill.read`, `trigger.list_types` lookup, etc.):
 
@@ -1848,34 +1909,77 @@ recipe.read({ id: 'pr-review' })
   → { id: 'pr-review', scope: 'plugin:ado', body: <original yaml> }
 ```
 
-### 10.6 Installation — git is supported
+### 10.6 Installation — git and local folders, never copied for local
 
 `plugin.install({ from, ref? })`:
 
 - `from` accepts:
   - `git+https://github.com/org/conductor-plugin-ado.git`
   - `git+ssh://git@github.com:org/conductor-plugin-ado.git`
-  - an absolute local filesystem path (for in-development plugins; copied, not symlinked)
+  - an absolute local filesystem path (for in-development plugins —
+    **junctioned, not copied**; edits in the user's folder are picked up
+    live)
 - `ref` is optional (branch / tag / sha); defaults to the repo's default branch
-- Implementation: spawn `git clone --depth 1 --branch <ref> <url> <tmp>`; validate `plugin.yaml` exists at the temp root; parse + validate the manifest; move `<tmp>` to `.conductor/plugins/<manifest.id>/`; write `.install.json` recording origin (`{ from, ref, installed_at }`); reload
-- If `<manifest.id>` collides with an installed plugin, the install is aborted (no overwrite) and the temp dir cleaned up. The user must `plugin.uninstall` first.
-- For `git+ssh`, the user's SSH agent must have access — Conductor inherits the user's git config, doesn't manage SSH keys
+- Implementation (git):
+  - `git clone <url> <tmp>` (full clone — no `--depth 1` — so `.git` history
+    is intact for `plugin.update`)
+  - Optional `--branch <ref>`
+  - Validate `plugin.yaml` exists at the temp root; parse + validate the
+    manifest
+  - Atomic publish: `renameSync(<tmp>, <global_dir>/plugins/<manifest.id>/)`
+  - Write sidecar `<global_dir>/plugins/<manifest.id>.install.json`
+    recording `{ kind: "git", from, ref, installed_at }`
+  - Reload the registry
+- Implementation (local folder):
+  - Validate `plugin.yaml` at the user's path
+  - Create a junction (Windows) or symlink (POSIX) at
+    `<global_dir>/plugins/<manifest.id>` → user's folder. **Never copy or
+    mutate** the user's folder.
+  - Best-effort: junction `<user_folder>/node_modules` →
+    clawdevbox's `node_modules` so the plugin's hostable tools'
+    `import 'zod'` resolves under Node's realpath-based walk-up.
+  - Write sidecar `{ kind: "local", from, source_path, installed_at }`
+- If `<manifest.id>` collides with an installed plugin, the install is
+  aborted (no overwrite) and the temp dir cleaned up. The user must
+  `plugin.uninstall` first.
+- For `git+ssh`, the user's SSH agent must have access — Conductor inherits
+  the user's git config, doesn't manage SSH keys.
 
 `plugin.update({ id })`:
 
-- Reads `.conductor/plugins/<id>/.install.json` to find the origin. Errors clearly if the plugin was placed by hand (no `.install.json`) — that case is a manual `git pull` by the user.
-- Runs `git pull` (or `git fetch && git checkout <ref>` if `ref` was pinned).
-- Re-validates the manifest; reloads. On validation failure, the working tree is left as-is and the user sees the error via `plugin.list`.
-- On version downgrade (semver compare), prompts via `approval.request` before proceeding — easy to mis-pin `ref` and unintentionally regress.
+- Reads `<global_dir>/plugins/<id>.install.json` to find the origin. Errors
+  clearly if the plugin was placed by hand (no sidecar) — that case is a
+  manual refresh by the user.
+- For `kind: "local"`: returns `LOCAL_SOURCE_NO_UPDATE` — the junction is
+  already live; edits in the user's folder take effect immediately.
+- For `kind: "builtin"` / `kind: "manual"`: returns `NOT_GIT_INSTALLED`
+  — reinstall to refresh.
+- For `kind: "git"`: runs `git fetch --prune origin` then
+  `git reset --hard origin/<ref or HEAD>` inside the plugin dir. This is
+  reliable across branches, tags, and SHAs because we keep full history.
+- Re-validates the manifest; reloads. On validation failure, the working
+  tree is left as-is and the user sees the error via `plugin.list`.
 
 `plugin.uninstall({ id })`:
 
-- Removes `.conductor/plugins/<id>/`.
-- Any project-scope copies the user made survive — that's the point of project scope. `recipe.list({ scope: 'project' })` still lists them; they continue to work without the plugin's MCP server, which is the only thing the user might notice (the recipes that reference `mcp_servers: [ado]` fail at run-time with a clear "ado mcp server not configured" error).
+- Removes `<global_dir>/plugins/<id>/`. The uninstall path detects symlinks
+  /junctions via `lstatSync` and uses `unlinkSync` to remove the link only
+  — the user's local-folder source is never deleted. Real dirs are
+  recursive-removed.
+- Removes the sidecar `<id>.install.json`.
+- Operates on the on-disk entry and sidecar even if the plugin failed to
+  load (so a broken local junction can still be uninstalled).
+- Any project-scope copies the user made survive — that's the point of
+  project scope. `recipe.list({ scope: 'project' })` still lists them; they
+  continue to work without the plugin's MCP server, which is the only thing
+  the user might notice (the recipes that reference `mcp_servers: [ado]` fail
+  at run-time with a clear "ado mcp server not configured" error).
 
 `plugin.enable` / `plugin.disable`:
 
-- Sets a flag in `~/.conductor.db` (`settings_kv` key `plugin.<id>.enabled`).
+- Sets a flag in `<global_dir>/state.json` (`plugins.<id>.enabled`).
+  Because the plugin store is global, the flag also applies globally — a
+  disabled plugin is disabled for every project.
 - A disabled plugin's `provides` are unregistered without removing the directory. Re-enable to restore.
 
 ### 10.7 Feedback / self-improvement loop

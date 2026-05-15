@@ -1,4 +1,4 @@
-# Conductor template (sub-recipe shape). See spec §7.2 + §7.6.
+# Clawdevbox template (sub-recipe shape). See spec §7.2 + §7.6.
 #
 # This recipe is invoked two ways:
 #   - INLINE from `pr-review` step 6 (the parent agent reads this body
@@ -21,7 +21,7 @@ kind: pr_review
 default_client: claude
 mcp_servers:
   - ado
-  - conductor
+  - clawdevbox
 
 steps:
   - id: 1
@@ -47,7 +47,7 @@ steps:
     goal: >
       Only on an approved change request: apply the change. Use the
       project's normal edit + commit flow (the agent's own coding
-      loop, not Conductor primitives). Push the commit to the PR
+      loop, not Clawdevbox primitives). Push the commit to the PR
       source branch. Register `artifact.write` for the patch so it's
       attached to the thread for audit.
     depends: [2]

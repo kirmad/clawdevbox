@@ -1,8 +1,8 @@
 {
-  "name": "@conductor/plugin-ado",
+  "name": "@clawdevbox/plugin-ado",
   "version": "1.0.0",
   "private": true,
-  "description": "Azure DevOps plugin for Conductor — recipes, skills, triggers, and hostable tools (spec §10.3) for ADO PRs and work items. The hostable tools under `tools/` import `zod` and `@conductor/sdk`; this package.json declares those deps so plugin.install can run `npm install` in the plugin directory after the clone/copy step. For the sample workspaces shipped here, the test harnesses link the Conductor server's node_modules into the workspace root so resolution works without a per-plugin install.",
+  "description": "Azure DevOps plugin for Clawdevbox — recipes, skills, triggers, and hostable tools (spec §10.3) for ADO PRs and work items. The hostable tools under `tools/` import `zod` and `@clawdevbox/sdk`; this package.json declares those deps so plugin.install can run `npm install` in the plugin directory after the clone/copy step. For the sample workspaces shipped here, the test harnesses link the Clawdevbox server's node_modules into the workspace root so resolution works without a per-plugin install.",
   "type": "module",
   "engines": {
     "node": ">=20.0.0"
@@ -11,6 +11,6 @@
     "zod": "^4.0.0"
   },
   "devDependencies": {
-    "@conductor/sdk": "1.0.0"
+    "@clawdevbox/sdk": "1.0.0"
   }
 }

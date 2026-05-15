@@ -1,11 +1,11 @@
 {
-  "name": "conductor-trigger-test-harness",
+  "name": "clawdevbox-trigger-test-harness",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "End-to-end test harness for Conductor trigger scripts against real Azure DevOps. Mocks only the Conductor side.",
+  "description": "End-to-end test harness for Clawdevbox trigger scripts against real Azure DevOps. Mocks only the Clawdevbox side.",
   "scripts": {
-    "mock": "tsx mock-conductor.ts",
+    "mock": "tsx mock-clawdevbox.ts",
     "setup:ado": "bash setup-ado.sh",
     "setup:ado:ps1": "pwsh -File setup-ado.ps1",
     "test": "tsx test-driver.ts",

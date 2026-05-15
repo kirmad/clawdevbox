@@ -1,24 +1,24 @@
 /**
  * workspaces-store.ts
  *
- * Workspace registry for Conductor (spec §10 — workspaces are the unit a
- * recipe runs in). A workspace is a directory with a `.conductor/` tree.
+ * Workspace registry for Clawdevbox (spec §10 — workspaces are the unit a
+ * recipe runs in). A workspace is a directory with a `.clawdevbox/` tree.
  *
  * Disk layout:
  *
  *   <workspaces_root>/
  *     index.json
  *     <id>/
- *       .conductor/
+ *       .clawdevbox/
  *         recipes/
  *         skills/
  *         plugins/
  *         triggers.json     -> { "registered": [] }
- *         workspace.json    -> { id, name, created_at, parent_workspace_id, conductor_workspaces_root }
+ *         workspace.json    -> { id, name, created_at, parent_workspace_id, clawdevbox_workspaces_root }
  *         recipe-instances/
  *
- * `<workspaces_root>` defaults to `~/.conductor/workspaces` and is
- * overridable via the `CONDUCTOR_WORKSPACES_ROOT` env var or by passing an
+ * `<workspaces_root>` defaults to `~/.clawdevbox/workspaces` and is
+ * overridable via the `CLAWDEVBOX_WORKSPACES_ROOT` env var or by passing an
  * explicit `base_path` to `createWorkspace`.
  *
  * The registry at `<workspaces_root>/index.json` is the source of truth for
@@ -57,15 +57,15 @@ interface WorkspaceIndexFile {
 // Root resolution
 // ============================================================================
 
-/** Default <workspaces_root> = $CONDUCTOR_WORKSPACES_ROOT || ~/.conductor/workspaces. */
+/** Default <workspaces_root> = $CLAWDEVBOX_WORKSPACES_ROOT || ~/.clawdevbox/workspaces. */
 export function resolveWorkspacesRoot(
   env: NodeJS.ProcessEnv = process.env,
   override?: string,
 ): string {
   if (override && override.length > 0) return resolve(override);
-  const fromEnv = env.CONDUCTOR_WORKSPACES_ROOT;
+  const fromEnv = env.CLAWDEVBOX_WORKSPACES_ROOT;
   if (fromEnv && fromEnv.length > 0) return resolve(fromEnv);
-  return resolve(join(homedir(), '.conductor', 'workspaces'));
+  return resolve(join(homedir(), '.clawdevbox', 'workspaces'));
 }
 
 // ============================================================================
@@ -141,102 +141,78 @@ export function findWorkspaceByPath(
 // ============================================================================
 
 /**
- * Initialize the `.conductor/` tree inside a workspace directory. Creates
+ * Initialize the `.clawdevbox/` tree inside a workspace directory. Creates
  * recipes/, skills/, plugins/, recipe-instances/ as empty dirs and seeds
  * triggers.json and workspace.json.
  */
-export function initConductorTree(args: {
+export function initClawdevboxTree(args: {
   workspacePath: string;
   info: WorkspaceInfo;
   workspacesRoot: string;
 }): void {
-  const conductorDir = join(args.workspacePath, '.conductor');
-  for (const sub of ['recipes', 'skills', 'plugins', 'recipe-instances']) {
-    mkdirSync(join(conductorDir, sub), { recursive: true });
+  const clawdevboxDir = join(args.workspacePath, '.clawdevbox');
+  // Plugins moved to the global store (<global_dir>/plugins/) — workspaces
+  // no longer scaffold a per-project plugins/ dir.
+  for (const sub of ['recipes', 'skills', 'recipe-instances']) {
+    mkdirSync(join(clawdevboxDir, sub), { recursive: true });
   }
 
-  const triggersPath = join(conductorDir, 'triggers.json');
+  const triggersPath = join(clawdevboxDir, 'triggers.json');
   if (!existsSync(triggersPath)) {
     writeFileAtomic(triggersPath, JSON.stringify({ registered: [] }, null, 2) + '\n');
   }
 
-  const workspaceJsonPath = join(conductorDir, 'workspace.json');
+  const workspaceJsonPath = join(clawdevboxDir, 'workspace.json');
   const workspaceMeta = {
     id: args.info.id,
     name: args.info.name,
     created_at: args.info.created_at,
     parent_workspace_id: args.info.parent_workspace_id,
-    conductor_workspaces_root: args.workspacesRoot,
+    clawdevbox_workspaces_root: args.workspacesRoot,
   };
   writeFileAtomic(workspaceJsonPath, JSON.stringify(workspaceMeta, null, 2) + '\n');
 }
 
 /**
- * Copy a calling workspace's plugins/ tree into the new workspace, skipping
- * node_modules and the legacy mcp-server dir. Used when `inherit_plugins: true`
- * is passed to `workspace.create`.
+ * @deprecated Plugins are now globally installed under `<global_dir>/plugins/`
+ * and visible to every workspace automatically. This function is kept as a
+ * no-op for any external caller still importing it; it always returns
+ * `{ copied: [] }`.
  */
-export function inheritPluginsFrom(args: {
+export function inheritPluginsFrom(_args: {
   sourcePluginsDir: string;
   destPluginsDir: string;
 }): { copied: string[] } {
-  const copied: string[] = [];
-  if (!existsSync(args.sourcePluginsDir)) return { copied };
-  let entries: string[];
-  try {
-    entries = readdirSync(args.sourcePluginsDir);
-  } catch {
-    return { copied };
-  }
-  mkdirSync(args.destPluginsDir, { recursive: true });
-  for (const entry of entries) {
-    const src = join(args.sourcePluginsDir, entry);
-    let isDir = false;
-    try {
-      isDir = statSync(src).isDirectory();
-    } catch {
-      continue;
-    }
-    if (!isDir) continue;
-    const dst = join(args.destPluginsDir, entry);
-    cpSync(src, dst, {
-      recursive: true,
-      filter: (s) =>
-        !s.includes(`${'node_modules'}`) &&
-        !s.includes('_legacy-mcp-server'),
-    });
-    copied.push(entry);
-  }
-  return { copied };
+  return { copied: [] };
 }
 
 /**
- * Clone a source workspace's `.conductor/` tree into the new workspace, but
+ * Clone a source workspace's `.clawdevbox/` tree into the new workspace, but
  * SKIP recipe-instances/ and workspace.json (those are regenerated for the
  * new workspace). triggers.json is copied as-is so the user gets the same
  * trigger registrations.
  */
-export function copyConductorTreeFrom(args: {
-  sourceConductorDir: string;
-  destConductorDir: string;
+export function copyClawdevboxTreeFrom(args: {
+  sourceClawdevboxDir: string;
+  destClawdevboxDir: string;
 }): { copied_subtrees: string[] } {
   const copied: string[] = [];
-  if (!existsSync(args.sourceConductorDir)) return { copied_subtrees: copied };
+  if (!existsSync(args.sourceClawdevboxDir)) return { copied_subtrees: copied };
 
   let entries: string[];
   try {
-    entries = readdirSync(args.sourceConductorDir);
+    entries = readdirSync(args.sourceClawdevboxDir);
   } catch {
     return { copied_subtrees: copied };
   }
 
   const skipSubtrees = new Set(['recipe-instances', 'workspace.json']);
-  mkdirSync(args.destConductorDir, { recursive: true });
+  mkdirSync(args.destClawdevboxDir, { recursive: true });
 
   for (const entry of entries) {
     if (skipSubtrees.has(entry)) continue;
-    const src = join(args.sourceConductorDir, entry);
-    const dst = join(args.destConductorDir, entry);
+    const src = join(args.sourceClawdevboxDir, entry);
+    const dst = join(args.destClawdevboxDir, entry);
     let isDir = false;
     try {
       isDir = statSync(src).isDirectory();
@@ -337,26 +313,27 @@ export function createWorkspace(args: CreateWorkspaceArgs): CreatedWorkspace {
         `copy_from workspace ${JSON.stringify(args.copy_from)} not found in registry.`,
       );
     }
-    const result = copyConductorTreeFrom({
-      sourceConductorDir: join(sourceInfo.path, '.conductor'),
-      destConductorDir: join(workspacePath, '.conductor'),
+    const result = copyClawdevboxTreeFrom({
+      sourceClawdevboxDir: join(sourceInfo.path, '.clawdevbox'),
+      destClawdevboxDir: join(workspacePath, '.clawdevbox'),
     });
     copiedFromSubtrees = result.copied_subtrees;
   }
 
   // Always (re)create the canonical scaffolding — fills in any subdirs that
   // copy_from didn't populate, regenerates workspace.json + triggers.json if absent.
-  initConductorTree({
+  initClawdevboxTree({
     workspacePath,
     info,
     workspacesRoot,
   });
 
   if (args.inherit_plugins && args.callerProjectDir) {
-    const sourcePluginsDir = join(args.callerProjectDir, '.conductor', 'plugins');
-    const destPluginsDir = join(workspacePath, '.conductor', 'plugins');
-    const result = inheritPluginsFrom({ sourcePluginsDir, destPluginsDir });
-    inheritedPlugins = result.copied;
+    // No-op since plugins moved to the global store at <global_dir>/plugins/
+    // and are visible to every workspace automatically. We still set
+    // `inheritedPlugins` to [] so older clients reading the structured
+    // response don't crash on `undefined`.
+    inheritedPlugins = [];
   }
 
   // Register in the index.
@@ -378,27 +355,11 @@ export interface WorkspaceCounts {
   registered_triggers: number;
 }
 
-/** Best-effort counts of `.conductor/` contents — used by workspace.get. */
+/** Best-effort counts of `.clawdevbox/` contents — used by workspace.get. */
 export function countWorkspaceContents(workspacePath: string): WorkspaceCounts {
-  const conductorDir = join(workspacePath, '.conductor');
-  const safeListDirs = (subdir: string): number => {
-    const p = join(conductorDir, subdir);
-    if (!existsSync(p)) return 0;
-    try {
-      const entries = readdirSync(p);
-      return entries.filter((e) => {
-        try {
-          return statSync(join(p, e)).isDirectory();
-        } catch {
-          return false;
-        }
-      }).length;
-    } catch {
-      return 0;
-    }
-  };
+  const clawdevboxDir = join(workspacePath, '.clawdevbox');
   const safeListFilesByExt = (subdir: string, ext: string): number => {
-    const p = join(conductorDir, subdir);
+    const p = join(clawdevboxDir, subdir);
     if (!existsSync(p)) return 0;
     try {
       return readdirSync(p).filter((e) => e.toLowerCase().endsWith(ext)).length;
@@ -408,7 +369,7 @@ export function countWorkspaceContents(workspacePath: string): WorkspaceCounts {
   };
 
   let registeredTriggers = 0;
-  const triggersPath = join(conductorDir, 'triggers.json');
+  const triggersPath = join(clawdevboxDir, 'triggers.json');
   if (existsSync(triggersPath)) {
     try {
       const parsed = JSON.parse(readFileSync(triggersPath, 'utf8')) as {
@@ -421,7 +382,9 @@ export function countWorkspaceContents(workspacePath: string): WorkspaceCounts {
   }
 
   return {
-    plugins: safeListDirs('plugins'),
+    // Plugins are global now (see <global_dir>/plugins/); this field is
+    // always 0 and kept for response-shape stability with older clients.
+    plugins: 0,
     recipes: safeListFilesByExt('recipes', '.yaml') + safeListFilesByExt('recipes', '.yml'),
     skills: safeListFilesByExt('skills', '.md'),
     registered_triggers: registeredTriggers,

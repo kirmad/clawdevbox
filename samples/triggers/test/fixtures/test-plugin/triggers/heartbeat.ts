@@ -2,8 +2,8 @@
 /**
  * heartbeat.ts — synthetic test-plugin trigger.
  *
- * Reads the standard TriggerEnvelope from stdin (the mock-conductor builds
- * it the same way real Conductor does), POSTs ONE Mode B callback with the
+ * Reads the standard TriggerEnvelope from stdin (the mock-clawdevbox builds
+ * it the same way real Clawdevbox does), POSTs ONE Mode B callback with the
  * literal prompt "plugin heartbeat tick", and exits 0 with a `{ state,
  * systemMessage }` envelope on stdout.
  *
@@ -58,9 +58,9 @@ async function main(): Promise<void> {
     process.exit(2);
   }
 
-  const secret = process.env.CONDUCTOR_MCP_SECRET;
+  const secret = process.env.CLAWDEVBOX_MCP_SECRET;
   if (!secret) {
-    process.stderr.write('CONDUCTOR_MCP_SECRET env var required for Mode B callback POSTs\n');
+    process.stderr.write('CLAWDEVBOX_MCP_SECRET env var required for Mode B callback POSTs\n');
     process.exit(2);
   }
 

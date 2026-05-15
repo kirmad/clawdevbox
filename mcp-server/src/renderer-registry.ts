@@ -4,9 +4,9 @@
  * Discovers `.mjs` artifact renderer modules and resolves a `type` to its
  * source file. Extensibility chain (first match wins):
  *
- *   1. <workspace>/.conductor/renderers/<type>.mjs   — agent-authored
+ *   1. <workspace>/.clawdevbox/renderers/<type>.mjs   — agent-authored
  *   2. <plugin_dir>/renderers/<type>.mjs             — plugin-shipped
- *   3. <conductor-mcp-server>/src/renderers/<type>.mjs — built-in
+ *   3. <clawdevbox-mcp-server>/src/renderers/<type>.mjs — built-in
  *
  * Used by:
  *   - terminal-server.ts  → serves `/__renderer/<type>.mjs` to the browser
@@ -39,7 +39,7 @@ export interface RendererEntry {
 // ============================================================================
 
 export function workspaceRenderersDir(workspacePath: string): string {
-  return join(workspacePath, '.conductor', 'renderers');
+  return join(workspacePath, '.clawdevbox', 'renderers');
 }
 
 export function builtinRenderersDir(): string {

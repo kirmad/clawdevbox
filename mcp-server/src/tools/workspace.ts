@@ -3,16 +3,16 @@
  *
  * Workspace MCP surface — the 4-tool set that lets an agent create, list,
  * inspect, and resolve "current" workspaces. A workspace is a directory with
- * a `.conductor/` tree; the registry at `<workspaces_root>/index.json` is the
+ * a `.clawdevbox/` tree; the registry at `<workspaces_root>/index.json` is the
  * source of truth for which workspaces exist.
  *
  *   - workspace.create   — mint a new id, scaffold dirs, register
  *   - workspace.list     — read the registry
  *   - workspace.get      — full info + counts (plugins/recipes/skills/triggers)
- *   - workspace.current  — match CONDUCTOR_PROJECT_DIR against the registry
+ *   - workspace.current  — match CLAWDEVBOX_PROJECT_DIR against the registry
  *
- * The Conductor MCP server is booted with a fixed `Workspace` from
- * `loadWorkspaceFromEnv` (read-only context derived from CONDUCTOR_PROJECT_DIR).
+ * The Clawdevbox MCP server is booted with a fixed `Workspace` from
+ * `loadWorkspaceFromEnv` (read-only context derived from CLAWDEVBOX_PROJECT_DIR).
  * These tools operate on the registry/filesystem directly, NOT on `ws`.
  */
 
@@ -38,7 +38,7 @@ export function registerWorkspaceTools(server: McpServer, ws: Workspace): void {
     'workspace.create',
     {
       description:
-        'Create a new Conductor workspace directory under <workspaces_root>/<id>/ (default <workspaces_root> = $CONDUCTOR_WORKSPACES_ROOT || ~/.conductor/workspaces). Scaffolds the .conductor/ tree (recipes/, skills/, plugins/, triggers.json, workspace.json, recipe-instances/) and registers in the workspace index. Optional: copy parent workspace plugins (`inherit_plugins`) or clone an existing workspace\'s .conductor tree (`copy_from`). Mutually exclusive.',
+        "Create a new Clawdevbox workspace directory under <workspaces_root>/<id>/ (default <workspaces_root> = $CLAWDEVBOX_WORKSPACES_ROOT || ~/.clawdevbox/workspaces). Scaffolds the .clawdevbox/ tree (recipes/, skills/, triggers.json, workspace.json, recipe-instances/) and registers in the workspace index. Optional: clone an existing workspace's .clawdevbox tree (`copy_from`). `inherit_plugins` is accepted but a no-op — plugins now live in the global store at <global_dir>/plugins/ and are visible to every workspace.",
       inputSchema: {
         name: z.string().min(1).optional().describe('Human-readable name (optional).'),
         parent_workspace_id: z
@@ -54,12 +54,12 @@ export function registerWorkspaceTools(server: McpServer, ws: Workspace): void {
         inherit_plugins: z
           .boolean()
           .optional()
-          .describe('When true, copy the calling workspace\'s plugins/ tree (minus node_modules and _legacy-mcp-server) into the new workspace.'),
+          .describe("Deprecated no-op. Plugins are global (under <global_dir>/plugins/) and visible to every workspace automatically. Kept for backward compatibility; `inherited_plugins` in the response is always [] now."),
         copy_from: z
           .string()
           .min(1)
           .optional()
-          .describe('Source workspace id to clone the .conductor/ tree from (except recipe-instances/ and workspace.json). Mutually exclusive with inherit_plugins.'),
+          .describe('Source workspace id to clone the .clawdevbox/ tree from (except recipe-instances/ and workspace.json). Mutually exclusive with inherit_plugins.'),
       },
     },
     async (args) => {
@@ -114,7 +114,7 @@ export function registerWorkspaceTools(server: McpServer, ws: Workspace): void {
     'workspace.list',
     {
       description:
-        'List all known Conductor workspaces from <workspaces_root>/index.json. Returns id, path, name, created_at, parent_workspace_id for each.',
+        'List all known Clawdevbox workspaces from <workspaces_root>/index.json. Returns id, path, name, created_at, parent_workspace_id for each.',
       inputSchema: {},
     },
     async () => {
@@ -136,7 +136,7 @@ export function registerWorkspaceTools(server: McpServer, ws: Workspace): void {
     'workspace.get',
     {
       description:
-        'Read full info for a workspace by id — registry entry plus counts of plugins, recipes, skills, and registered triggers under its .conductor/ tree.',
+        'Read full info for a workspace by id — registry entry plus counts of plugins, recipes, skills, and registered triggers under its .clawdevbox/ tree.',
       inputSchema: {
         id: z.string().min(1).describe('Workspace id (ws_<base36-ts>_<4hex>).'),
       },
@@ -180,7 +180,7 @@ export function registerWorkspaceTools(server: McpServer, ws: Workspace): void {
     'workspace.current',
     {
       description:
-        'Resolve the workspace matching the current CONDUCTOR_PROJECT_DIR against the registry. Returns the WorkspaceInfo, or { found: false } if the current project_dir is not a registered workspace.',
+        'Resolve the workspace matching the current CLAWDEVBOX_PROJECT_DIR against the registry. Returns the WorkspaceInfo, or { found: false } if the current project_dir is not a registered workspace.',
       inputSchema: {},
     },
     async () => {
@@ -191,7 +191,7 @@ export function registerWorkspaceTools(server: McpServer, ws: Workspace): void {
           content: [
             {
               type: 'text',
-              text: `No registered workspace matches CONDUCTOR_PROJECT_DIR=${ws.projectDir}.`,
+              text: `No registered workspace matches CLAWDEVBOX_PROJECT_DIR=${ws.projectDir}.`,
             },
           ],
           structuredContent: {

@@ -33,7 +33,7 @@ const stub = [
   '  const s = d.toString();',
   '  process.stdout.write(`\\x1b[33mecho:\\x1b[0m ${s.replace(/\\r/g, "")}\\r\\n`);',
   '});',
-  'process.stdout.write("\\x1b[32m== conductor demo pty ==\\x1b[0m\\r\\n");',
+  'process.stdout.write("\\x1b[32m== clawdevbox demo pty ==\\x1b[0m\\r\\n");',
   'process.stdout.write("type anything and hit enter to see it echoed back.\\r\\n");',
 ].join('');
 
@@ -55,7 +55,7 @@ registerPty({
 
 console.log('');
 console.log('================================================================');
-console.log(' Conductor terminal-viewer demo');
+console.log(' Clawdevbox terminal-viewer demo');
 console.log('================================================================');
 console.log(` View URL:  ${url}`);
 console.log('');

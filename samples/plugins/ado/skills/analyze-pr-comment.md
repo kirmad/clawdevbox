@@ -67,9 +67,9 @@ right tone and structure.
 
 - **Don't argue.** If the reviewer pushes back, acknowledge first, then
   state your reasoning, then ask "do you still want me to revise?"
-  Conductor surfaces the disagreement to the user via the inbox card.
+  Clawdevbox surfaces the disagreement to the user via the inbox card.
 - **Don't quote the entire comment back.** A short paraphrase ("on your
   question about `Error` catching: ...") is enough; the comment is right
   above your reply on the PR.
 - **Don't auto-resolve threads.** Leave that to the human author of the
-  PR. Conductor only writes comments; the user clicks "resolve".
+  PR. Clawdevbox only writes comments; the user clicks "resolve".

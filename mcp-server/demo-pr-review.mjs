@@ -27,22 +27,22 @@ const safeName = (p) => p.replace(/[\\/]/g, '__');
 
 // --- Workspace + server ----------------------------------------------------
 
-const tmp = mkdtempSync(join(tmpdir(), 'conductor-pr-demo-'));
+const tmp = mkdtempSync(join(tmpdir(), 'clawdevbox-pr-demo-'));
 const projectDir = join(tmp, 'project');
 mkdirSync(projectDir, { recursive: true });
 for (const sub of ['recipes', 'skills', 'plugins', 'recipe-instances']) {
-  mkdirSync(join(projectDir, '.conductor', sub), { recursive: true });
+  mkdirSync(join(projectDir, '.clawdevbox', sub), { recursive: true });
 }
 writeFileSync(
-  join(projectDir, '.conductor', 'workspace.json'),
+  join(projectDir, '.clawdevbox', 'workspace.json'),
   JSON.stringify({ schemaVersion: 1, id: 'demo-ws' }, null, 2),
 );
-writeFileSync(join(projectDir, '.conductor', 'triggers.json'), JSON.stringify({ registered: [] }, null, 2));
+writeFileSync(join(projectDir, '.clawdevbox', 'triggers.json'), JSON.stringify({ registered: [] }, null, 2));
 
 const workspacesRoot = join(tmp, 'workspaces');
 mkdirSync(workspacesRoot, { recursive: true });
-process.env.CONDUCTOR_PROJECT_DIR = projectDir;
-process.env.CONDUCTOR_WORKSPACES_ROOT = workspacesRoot;
+process.env.CLAWDEVBOX_PROJECT_DIR = projectDir;
+process.env.CLAWDEVBOX_WORKSPACES_ROOT = workspacesRoot;
 
 const ws = loadWorkspaceFromEnv();
 const wsRecord = createWorkspace(resolveWorkspacesRoot(), {
@@ -60,17 +60,17 @@ const pr = {
   title: 'Add hidden pty viewer + artifact renderer pipeline',
   description: [
     'Introduces a ConPTY-based hidden agent runner and an HTTP viewer',
-    'served by the Conductor MCP server. Also ships the artifact storage',
+    'served by the Clawdevbox MCP server. Also ships the artifact storage',
     'model and three built-in renderers (markdown, pr-review, walkthrough).',
     '',
     'Validated with `verify-artifacts.mjs` and `verify-agency-alignment.mjs`',
     'against headless Chromium.',
   ].join('\n'),
-  sourceBranch: 'feature/conductor-artifact-viewer',
+  sourceBranch: 'feature/clawdevbox-artifact-viewer',
   targetBranch: 'main',
   repository: 'taskdock',
   org: 'msft-eng',
-  project: 'Conductor',
+  project: 'Clawdevbox',
 };
 
 const fileList = [
@@ -142,7 +142,7 @@ const comments = [
     severity: 'minor', category: 'compliance',
     title: 'Inline mermaid SVG IDs use Math.random()',
     content:
-      "Diagram IDs use `Math.random().toString(36)`. Safe but not cryptographically random — fine for a renderer, but Conductor's security policy prefers `crypto.randomUUID()` for any identifier that crosses a process boundary.",
+      "Diagram IDs use `Math.random().toString(36)`. Safe but not cryptographically random — fine for a renderer, but Clawdevbox's security policy prefers `crypto.randomUUID()` for any identifier that crosses a process boundary.",
     confidence: 0.5, published: false,
   },
 ];
@@ -193,8 +193,8 @@ const walkthrough = {
     'Two changes land together: the hidden pty + viewer, and the artifact renderer pipeline. Open `pty-registry.ts` first to see the ring-buffer + broadcast pattern, then `terminal-server.ts` for the new HTTP routes, then `renderers/markdown.mjs` for the renderer contract.',
   architectureDiagram: [
     'flowchart LR',
-    '  Agent -- recipe.run --> Conductor',
-    '  Conductor -- node-pty --> Pty',
+    '  Agent -- recipe.run --> Clawdevbox',
+    '  Clawdevbox -- node-pty --> Pty',
     '  Browser -- WS --> TermServer',
     '  TermServer -- subscribe --> Pty',
     '  Agent -- artifact.add --> Disk',
@@ -237,7 +237,7 @@ const url = `${new URL(srv.url('x')).origin}/artifact/${encodeURIComponent(id)}`
 
 console.log('');
 console.log('================================================================');
-console.log(' Conductor — PR review demo (full-file diff + hierarchical tree)');
+console.log(' Clawdevbox — PR review demo (full-file diff + hierarchical tree)');
 console.log('================================================================');
 console.log(` View URL:  ${url}`);
 console.log('');

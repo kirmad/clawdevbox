@@ -4,7 +4,7 @@
 //
 //   1. Boots the terminal-server in-process.
 //   2. Authors the same walkthrough artifact as verify-artifacts.mjs —
-//      real conductor source files, 5 steps, mermaid architecture diagram,
+//      real clawdevbox source files, 5 steps, mermaid architecture diagram,
 //      per-step diagrams, related-file chips.
 //   3. Opens headed Chromium pointed at the view URL.
 //
@@ -27,22 +27,22 @@ const safeName = (p) => p.replace(/[\\/]/g, '__');
 
 // --- Workspace + server ----------------------------------------------------
 
-const tmp = mkdtempSync(join(tmpdir(), 'conductor-wt-demo-'));
+const tmp = mkdtempSync(join(tmpdir(), 'clawdevbox-wt-demo-'));
 const projectDir = join(tmp, 'project');
 mkdirSync(projectDir, { recursive: true });
 for (const sub of ['recipes', 'skills', 'plugins', 'recipe-instances']) {
-  mkdirSync(join(projectDir, '.conductor', sub), { recursive: true });
+  mkdirSync(join(projectDir, '.clawdevbox', sub), { recursive: true });
 }
 writeFileSync(
-  join(projectDir, '.conductor', 'workspace.json'),
+  join(projectDir, '.clawdevbox', 'workspace.json'),
   JSON.stringify({ schemaVersion: 1, id: 'demo-ws' }, null, 2),
 );
-writeFileSync(join(projectDir, '.conductor', 'triggers.json'), JSON.stringify({ registered: [] }, null, 2));
+writeFileSync(join(projectDir, '.clawdevbox', 'triggers.json'), JSON.stringify({ registered: [] }, null, 2));
 
 const workspacesRoot = join(tmp, 'workspaces');
 mkdirSync(workspacesRoot, { recursive: true });
-process.env.CONDUCTOR_PROJECT_DIR = projectDir;
-process.env.CONDUCTOR_WORKSPACES_ROOT = workspacesRoot;
+process.env.CLAWDEVBOX_PROJECT_DIR = projectDir;
+process.env.CLAWDEVBOX_WORKSPACES_ROOT = workspacesRoot;
 
 const ws = loadWorkspaceFromEnv();
 const wsRecord = createWorkspace(resolveWorkspacesRoot(), {
@@ -164,7 +164,7 @@ const url = `${new URL(srv.url('x')).origin}/artifact/${encodeURIComponent(id)}`
 
 console.log('');
 console.log('================================================================');
-console.log(' Conductor — walkthrough demo');
+console.log(' Clawdevbox — walkthrough demo');
 console.log('================================================================');
 console.log(` View URL:  ${url}`);
 console.log('');

@@ -1,7 +1,7 @@
-# Conductor plugin manifest. See spec §10.2.
+# Clawdevbox plugin manifest. See spec §10.2.
 #
 # This manifest is the single source of truth for what the plugin ships.
-# Conductor reads it at boot (and on file-watcher events) and registers
+# Clawdevbox reads it at boot (and on file-watcher events) and registers
 # every entry under `provides` into the appropriate runtime scope.
 #
 # Files referenced below are relative to this manifest's directory. The
@@ -19,9 +19,9 @@ description: >
   register concrete instances via `trigger.register` with the params
   the type declares.
 
-author: "Conductor team"
+author: "Clawdevbox team"
 license: "MIT"
-homepage: "https://github.com/conductor/plugin-ado"
+homepage: "https://github.com/clawdevbox/plugin-ado"
 
 provides:
   skills:
@@ -36,7 +36,7 @@ provides:
   # Each type declares its parameter schema, default cron (optional), and
   # callback binding. Agents activate a type by calling:
   #   trigger.register({ type_id: 'ado.new-pr-watcher', params: { repo: 'auth-svc' } })
-  # which mints a registered-trigger row in `.conductor/triggers.json`.
+  # which mints a registered-trigger row in `.clawdevbox/triggers.json`.
   trigger_types:
     # ---- Cold trigger — poll for new PRs and start a review for each ----
     - id: ado.new-pr-watcher
@@ -99,7 +99,7 @@ provides:
             description: "Skip events authored by this user." }
 
   # Hostable tools (spec §10.3) — single-file scripts hosted in-process by
-  # the Conductor MCP server. These supersede the legacy mcp-server/ approach
+  # the Clawdevbox MCP server. These supersede the legacy mcp-server/ approach
   # (kept on disk as `_legacy-mcp-server/` for reference). Each id is namespaced
   # `<plugin>.<verb>` and surfaces as an MCP tool unchanged. Recipes still
   # reference them as `ado.get_pr`, `ado.list_pr_comments`, etc.
@@ -118,8 +118,8 @@ provides:
   #   - { id: ado-heavy-indexer, file: mcp/ado-heavy-indexer.json }
 
 requires:
-  # Plugin requires Conductor 1.0+ — first release that exposes the plugin model.
-  conductor_version: ">=1.0.0"
+  # Plugin requires Clawdevbox 1.0+ — first release that exposes the plugin model.
+  clawdevbox_version: ">=1.0.0"
   # Required at runtime by the ADO MCP server and the trigger scripts.
   # Missing env vars don't fail load — they fail at the first tool call with a
   # clear "ADO_ORG env var required" message from the script (see triggers/*.ts).

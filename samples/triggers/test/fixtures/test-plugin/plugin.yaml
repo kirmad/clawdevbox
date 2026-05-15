@@ -1,6 +1,6 @@
 # Synthetic test plugin used by triggers/test/test-driver.ts Scenario G.
 #
-# Conductor plugin manifest. See spec §10.2 and plugins/ado/plugin.yaml for
+# Clawdevbox plugin manifest. See spec §10.2 and plugins/ado/plugin.yaml for
 # the reference shape. This file is intentionally minimal:
 #   - one trigger (`heartbeat`) registered under `provides.triggers`
 #   - no recipes / no skills / no MCP servers
@@ -21,7 +21,7 @@ description: >
   + bundled-trigger registration + the plugin-scoped callback contract. Emits
   one heartbeat callback per fire; that's it.
 
-author: "Conductor test harness"
+author: "Clawdevbox test harness"
 license: "MIT"
 
 provides:
@@ -31,4 +31,4 @@ provides:
       cron: "*/30 * * * * *"
 
 requires:
-  conductor_version: ">=1.0.0"
+  clawdevbox_version: ">=1.0.0"

@@ -20,7 +20,7 @@ print(json.dumps({
   "fired_at": int(time.time() * 1000),
   "cwd": os.getcwd(),
   "project_dir": os.getcwd(),
-  "trigger_data_dir": os.path.join(os.getcwd(), ".conductor/triggers/demo-capture/data"),
+  "trigger_data_dir": os.path.join(os.getcwd(), ".clawdevbox/triggers/demo-capture/data"),
   "subscriber_thread_id": "thr_DEMO",
   "callback_url": "http://localhost:5201/callback/threads/thr_DEMO/resume",
   "state": {

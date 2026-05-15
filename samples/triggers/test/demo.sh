@@ -2,17 +2,17 @@
 #
 # demo.sh
 #
-# Standalone linear demo of the Conductor trigger flow against real Azure DevOps.
+# Standalone linear demo of the Clawdevbox trigger flow against real Azure DevOps.
 #
 # Unlike the test-driver (which runs 5 scenarios and asserts), this demo walks
 # a single happy-path flow with narrative output:
 #
 #   1. Auto-discover a real PR via az
-#   2. Spawn a local mock-conductor and capture its port + secret
+#   2. Spawn a local mock-clawdevbox and capture its port + secret
 #   3. Post ONE comment to the PR via az devops invoke
-#   4. Fire /hooks/<trigger-id> on the mock-conductor (cron-style empty body),
+#   4. Fire /hooks/<trigger-id> on the mock-clawdevbox (cron-style empty body),
 #      which spawns ado-comment-watcher.ts as a subprocess
-#   5. Verify the mock-conductor received a callback whose prompt mentions our
+#   5. Verify the mock-clawdevbox received a callback whose prompt mentions our
 #      comment text and whose context.comment_id matches the comment we posted
 #
 # This is the "show, don't tell" complement to the test suite: it demonstrates
@@ -67,7 +67,7 @@ TRIGGER_ID="ado-comments-${THREAD_ID}"
 CALLBACK_PATH="/callback/threads/${THREAD_ID}/resume"
 
 # ---------------------------------------------------------------------------
-# Cleanup: kill the mock-conductor on any exit path
+# Cleanup: kill the mock-clawdevbox on any exit path
 # ---------------------------------------------------------------------------
 
 MOCK_PID=""
@@ -167,23 +167,23 @@ ADO_BEARER_TOKEN="$(mint_ado_bearer_token)"
 arrow "Minted ADO bearer token from az login (length=${#ADO_BEARER_TOKEN})"
 
 # ---------------------------------------------------------------------------
-# STEP 2: start the local mock Conductor server
+# STEP 2: start the local mock Clawdevbox server
 # ---------------------------------------------------------------------------
 
-step 2 "Starting local mock Conductor server"
+step 2 "Starting local mock Clawdevbox server"
 
 MOCK_LOG="$(mktemp)"
-# Run mock-conductor.ts in the background; its banner is on stdout.
+# Run mock-clawdevbox.ts in the background; its banner is on stdout.
 # Use npx tsx (matches what test-driver uses) — Node 20+ + tsx loader.
-( npx --yes tsx "${SCRIPT_DIR_NATIVE}/mock-conductor.ts" >"${MOCK_LOG}" 2>&1 ) &
+( npx --yes tsx "${SCRIPT_DIR_NATIVE}/mock-clawdevbox.ts" >"${MOCK_LOG}" 2>&1 ) &
 MOCK_PID=$!
 
 # Wait up to ~10s for the parseable ready banner.
 MOCK_PORT=""
 MOCK_SECRET=""
 for _ in $(seq 1 100); do
-  if [[ -s "${MOCK_LOG}" ]] && grep -q '^MOCK_CONDUCTOR_READY ' "${MOCK_LOG}"; then
-    READY_LINE="$(grep -m1 '^MOCK_CONDUCTOR_READY ' "${MOCK_LOG}")"
+  if [[ -s "${MOCK_LOG}" ]] && grep -q '^MOCK_CLAWDEVBOX_READY ' "${MOCK_LOG}"; then
+    READY_LINE="$(grep -m1 '^MOCK_CLAWDEVBOX_READY ' "${MOCK_LOG}")"
     # shellcheck disable=SC2206
     READY_PARTS=( ${READY_LINE} )
     MOCK_PORT="${READY_PARTS[1]:-}"
@@ -191,17 +191,17 @@ for _ in $(seq 1 100); do
     break
   fi
   if ! kill -0 "${MOCK_PID}" 2>/dev/null; then
-    fail_demo "mock-conductor exited before ready" "$(cat "${MOCK_LOG}")"
+    fail_demo "mock-clawdevbox exited before ready" "$(cat "${MOCK_LOG}")"
   fi
   sleep 0.1
 done
 
 if [[ -z "${MOCK_PORT}" ]] || [[ -z "${MOCK_SECRET}" ]]; then
-  fail_demo "mock-conductor did not print ready banner within 10s" "$(cat "${MOCK_LOG}")"
+  fail_demo "mock-clawdevbox did not print ready banner within 10s" "$(cat "${MOCK_LOG}")"
 fi
 
 MOCK_URL="http://127.0.0.1:${MOCK_PORT}"
-arrow "Mock Conductor running on ${MOCK_URL}"
+arrow "Mock Clawdevbox running on ${MOCK_URL}"
 arrow "Will capture callbacks at ${CALLBACK_PATH}"
 
 # ---------------------------------------------------------------------------
@@ -219,14 +219,14 @@ COMMENT_ID="$(post_pr_comment "${ORG_URL}" "${ADO_PROJECT}" "${ADO_REPO}" "${ADO
 arrow "Posted; comment id = ${COMMENT_ID}"
 
 # ---------------------------------------------------------------------------
-# STEP 4: configure the mock-conductor's trigger map, then fire /hooks/<id>
+# STEP 4: configure the mock-clawdevbox's trigger map, then fire /hooks/<id>
 # ---------------------------------------------------------------------------
 
 step 4 "Firing the trigger via /hooks/${TRIGGER_ID}"
 
-# The mock-conductor needs to know how to spawn the trigger when /hooks/<id>
+# The mock-clawdevbox needs to know how to spawn the trigger when /hooks/<id>
 # is hit. Configure the mapping via /test/configure-trigger before firing.
-# The trigger script will receive the envelope on stdin (the mock-conductor
+# The trigger script will receive the envelope on stdin (the mock-clawdevbox
 # builds it from cfg.state) and ADO_ORG / ADO_BEARER_TOKEN via env.
 SELF_USER_SENTINEL="__not_${AZ_USER}__"
 
@@ -302,10 +302,10 @@ fi
 arrow "Trigger ran successfully (exit_code=0, duration_ms=${DURATION_MS})"
 
 # ---------------------------------------------------------------------------
-# STEP 5: verify the mock-conductor captured the callback
+# STEP 5: verify the mock-clawdevbox captured the callback
 # ---------------------------------------------------------------------------
 
-step 5 "Verifying the mock Conductor received the callback"
+step 5 "Verifying the mock Clawdevbox received the callback"
 
 CB_RESP_FILE="$(mktemp)"
 CB_HTTP="$(curl -sS -o "${CB_RESP_FILE}" -w '%{http_code}' "${MOCK_URL}/test/received-callbacks")"

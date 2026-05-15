@@ -2,7 +2,7 @@
  * tools/approval.ts
  *
  * approval.request / resolve / list_pending — backed by the in-process
- * ApprovalStore. UI hosts (the Conductor desktop app) surface these as
+ * ApprovalStore. UI hosts (the Clawdevbox desktop app) surface these as
  * askUser modals; programmatic callers resolve them via `approval.resolve`.
  */
 

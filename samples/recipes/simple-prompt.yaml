@@ -1,14 +1,14 @@
 id: simple-prompt
 name: Simple Prompt
-description: Run an arbitrary instruction in a fresh workspace. The agent reads the user prompt, does whatever it asks, and calls conductor.recipe.done when finished.
+description: Run an arbitrary instruction in a fresh workspace. The agent reads the user prompt, does whatever it asks, and calls clawdevbox.recipe.done when finished.
 default_client: copilot
 mcp_servers:
-  - conductor
+  - clawdevbox
 steps:
   - id: 1
     goal: |
       Read the first user message — that's the actual task. Do whatever it asks
-      using the conductor.* MCP tools and any others available. When finished,
-      call conductor.recipe.done with status='success' (or 'failure' if you
+      using the clawdevbox.* MCP tools and any others available. When finished,
+      call clawdevbox.recipe.done with status='success' (or 'failure' if you
       couldn't complete it) and a brief summary in `message`. Optionally include
       structured `result` for the parent to consume.

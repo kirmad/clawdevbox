@@ -5,7 +5,7 @@
  * Cold trigger script for the `ado.new-pr-watcher` trigger TYPE.
  *
  * The plugin manifest declares the type with `binds_callback_to_recipe:
- * pr-review`, so Conductor mints a per-registration callback URL of the
+ * pr-review`, so Clawdevbox mints a per-registration callback URL of the
  * shape `/callback/recipes/pr-review/run`. The script posts one callback
  * per detected PR with `{ prompt, attach_to_inbox_item_id }` shape — Mode B.
  *
@@ -24,7 +24,7 @@
  *   ADO_BEARER_TOKEN  preferred (AAD access token)
  *   ADO_PAT           fallback (basic auth)
  *
- * Mode B requires CONDUCTOR_MCP_SECRET for the Authorization header on
+ * Mode B requires CLAWDEVBOX_MCP_SECRET for the Authorization header on
  * direct callback POSTs.
  *
  * Zero dependencies beyond Node 20+ built-in fetch.
@@ -120,7 +120,7 @@ const ADO_PAT = process.env.ADO_PAT ?? '';
 const ADO_BEARER_TOKEN = process.env.ADO_BEARER_TOKEN ?? '';
 
 /** Mode B requires this for the Authorization header on direct callback POSTs. */
-const CONDUCTOR_MCP_SECRET = process.env.CONDUCTOR_MCP_SECRET ?? '';
+const CLAWDEVBOX_MCP_SECRET = process.env.CLAWDEVBOX_MCP_SECRET ?? '';
 
 function adoAuthHeader(): string {
   if (ADO_BEARER_TOKEN) return `Bearer ${ADO_BEARER_TOKEN}`;
@@ -204,14 +204,14 @@ function bodyForPr(pr: AdoPullRequest, repo: string): CallbackBody {
 // ============================================================================
 
 async function postCallback(callbackUrl: string, body: CallbackBody): Promise<void> {
-  if (!CONDUCTOR_MCP_SECRET) {
-    throw new Error('CONDUCTOR_MCP_SECRET env var required for Mode B callback POSTs');
+  if (!CLAWDEVBOX_MCP_SECRET) {
+    throw new Error('CLAWDEVBOX_MCP_SECRET env var required for Mode B callback POSTs');
   }
   const res = await fetch(callbackUrl, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      Authorization: `Bearer ${CONDUCTOR_MCP_SECRET}`,
+      Authorization: `Bearer ${CLAWDEVBOX_MCP_SECRET}`,
     },
     body: JSON.stringify(body),
   });

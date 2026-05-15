@@ -1,10 +1,10 @@
 #!/usr/bin/env tsx
 /**
- * mock-conductor.ts
+ * mock-clawdevbox.ts
  *
- * A local HTTP mock of the Conductor sidecar's webhook + callback endpoints.
+ * A local HTTP mock of the Clawdevbox sidecar's webhook + callback endpoints.
  * Used to prove that the trigger scripts (ado-comment-watcher.ts/.py) work
- * end-to-end against real Azure DevOps without needing a real Conductor.
+ * end-to-end against real Azure DevOps without needing a real Clawdevbox.
  *
  * Supports BOTH script protocol modes (spec §8.4):
  *
@@ -53,24 +53,24 @@
  * ----
  *
  * /hooks/* and /callback/* require Authorization: Bearer <secret>.
- * Secret is read from CONDUCTOR_MCP_SECRET env, or generated fresh per launch
+ * Secret is read from CLAWDEVBOX_MCP_SECRET env, or generated fresh per launch
  * and printed to stdout.
  *
  * Port
  * ----
  *
  * Picks a random free port at startup, prints it to stdout in a parseable
- * banner: "MOCK_CONDUCTOR_READY {port} {secret}".
+ * banner: "MOCK_CLAWDEVBOX_READY {port} {secret}".
  *
  * Usage
  * -----
  *
- *   tsx mock-conductor.ts [--config path/to/config.json]
+ *   tsx mock-clawdevbox.ts [--config path/to/config.json]
  *
  * Or imported as a module:
  *
- *   import { startMockConductor } from './mock-conductor.ts';
- *   const { port, secret, close, getCallbacks, resetCallbacks } = await startMockConductor({...});
+ *   import { startMockClawdevbox } from './mock-clawdevbox.ts';
+ *   const { port, secret, close, getCallbacks, resetCallbacks } = await startMockClawdevbox({...});
  */
 
 import { spawn } from 'node:child_process';
@@ -131,7 +131,7 @@ export interface CapturedCallback {
    * How the callback reached the captured list:
    *   - 'mode-b': the trigger script POSTed it directly to /callback/* during its run
    *   - 'mode-a-stdout': the script returned it as a singular `callback` on
-   *                      stdout; the mock-conductor delivered it internally
+   *                      stdout; the mock-clawdevbox delivered it internally
    *                      after the subprocess exited
    * Mixed-mode triggers (e.g. ado-pr-pulse-watcher.ts) emit both kinds in a
    * single run; tests that need to assert on the mode use this field.
@@ -161,7 +161,7 @@ export interface MockServerHandle {
    *
    * Each trigger's callbackPath defaults to
    *   /callback/plugins/<plugin-id>/triggers/<trigger-id>/resume
-   * which mirrors the routing-baked URL that real Conductor would produce
+   * which mirrors the routing-baked URL that real Clawdevbox would produce
    * when a plugin trigger fires (no subscriber thread → plugin-scope route).
    */
   loadPlugin: (pluginDir: string) => Promise<string[]>;
@@ -170,7 +170,7 @@ export interface MockServerHandle {
 }
 
 export interface StartOptions {
-  /** Override secret. Defaults to CONDUCTOR_MCP_SECRET env or random. */
+  /** Override secret. Defaults to CLAWDEVBOX_MCP_SECRET env or random. */
   secret?: string;
   /** Initial trigger registrations. */
   triggers?: TriggerConfig[];
@@ -300,7 +300,7 @@ function runTrigger(
 // ============================================================================
 // Plugin manifest parsing
 //
-// Real Conductor uses a proper YAML parser. The test harness has a zero-deps
+// Real Clawdevbox uses a proper YAML parser. The test harness has a zero-deps
 // constraint (Node built-ins only), so we hand-roll a tiny parser that
 // understands the subset of YAML the plugin manifests actually use:
 //   - scalar key: value pairs
@@ -510,8 +510,8 @@ async function loadPluginManifest(pluginDir: string): Promise<PluginManifest> {
 // Server
 // ============================================================================
 
-export async function startMockConductor(opts: StartOptions = {}): Promise<MockServerHandle> {
-  const secret = opts.secret ?? process.env.CONDUCTOR_MCP_SECRET ?? generateSecret();
+export async function startMockClawdevbox(opts: StartOptions = {}): Promise<MockServerHandle> {
+  const secret = opts.secret ?? process.env.CLAWDEVBOX_MCP_SECRET ?? generateSecret();
   const inheritStderr = opts.inheritStderr ?? true;
   const callbacks: CapturedCallback[] = [];
   const triggers = new Map<string, TriggerConfig>();
@@ -538,7 +538,7 @@ export async function startMockConductor(opts: StartOptions = {}): Promise<MockS
       const scriptPath = pathResolve(absDir, t.file);
       // Pick a runner from the file extension. .ts → tsx, .py → python(3),
       // anything else → node. Mirrors how plugins/<id>/triggers/triggers.json
-      // composes commands in the real Conductor.
+      // composes commands in the real Clawdevbox.
       let command: string[];
       if (t.file.endsWith('.ts') || t.file.endsWith('.tsx')) {
         command = ['tsx', scriptPath];
@@ -548,7 +548,7 @@ export async function startMockConductor(opts: StartOptions = {}): Promise<MockS
         command = ['node', scriptPath];
       }
 
-      // Plugin-scoped routing-baked callback path. Real Conductor would derive
+      // Plugin-scoped routing-baked callback path. Real Clawdevbox would derive
       // this from the registry entry's binding (subscriber thread / plugin
       // global / etc.); we use a deterministic pattern the test can assert on.
       const callbackPath = `/callback/plugins/${manifest.id}/triggers/${t.id}/resume`;
@@ -665,7 +665,7 @@ export async function startMockConductor(opts: StartOptions = {}): Promise<MockS
           fired_at: Date.now(),
           cwd,
           project_dir: cwd,
-          trigger_data_dir: `${cwd}/.conductor/triggers/${cfg.id}/data`,
+          trigger_data_dir: `${cwd}/.clawdevbox/triggers/${cfg.id}/data`,
           subscriber_thread_id: cfg.subscriberThreadId ?? null,
           callback_url: callbackUrl,
           state: cfg.state,
@@ -673,14 +673,14 @@ export async function startMockConductor(opts: StartOptions = {}): Promise<MockS
         };
 
         const baseEnv: Record<string, string> = {
-          CONDUCTOR_PROJECT_DIR: cwd,
-          CONDUCTOR_MCP_URL: `${baseUrl}/mcp`,
-          CONDUCTOR_MCP_SECRET: secret,
-          CONDUCTOR_TRIGGER_ID: cfg.id,
-          CONDUCTOR_TRIGGER_RUN_ID: runId,
-          CONDUCTOR_TRIGGER_FIRED_BY: firedBy,
+          CLAWDEVBOX_PROJECT_DIR: cwd,
+          CLAWDEVBOX_MCP_URL: `${baseUrl}/mcp`,
+          CLAWDEVBOX_MCP_SECRET: secret,
+          CLAWDEVBOX_TRIGGER_ID: cfg.id,
+          CLAWDEVBOX_TRIGGER_RUN_ID: runId,
+          CLAWDEVBOX_TRIGGER_FIRED_BY: firedBy,
         };
-        if (cfg.subscriberThreadId) baseEnv.CONDUCTOR_THREAD_ID = cfg.subscriberThreadId;
+        if (cfg.subscriberThreadId) baseEnv.CLAWDEVBOX_THREAD_ID = cfg.subscriberThreadId;
 
         const result = await runTrigger(cfg, envelope, baseEnv, inheritStderr);
 
@@ -828,9 +828,9 @@ export async function startMockConductor(opts: StartOptions = {}): Promise<MockS
 // ============================================================================
 
 async function mainCli(): Promise<void> {
-  const handle = await startMockConductor();
+  const handle = await startMockClawdevbox();
   // Parseable banner so the test driver / shell scripts can capture port + secret.
-  process.stdout.write(`MOCK_CONDUCTOR_READY ${handle.port} ${handle.secret}\n`);
+  process.stdout.write(`MOCK_CLAWDEVBOX_READY ${handle.port} ${handle.secret}\n`);
   process.stdout.write(`URL: ${handle.url}\n`);
   process.stdout.write(`Endpoints:\n`);
   process.stdout.write(`  POST ${handle.url}/hooks/<trigger-id>\n`);
@@ -854,7 +854,7 @@ async function mainCli(): Promise<void> {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const invokedAs = process.argv[1] ? pathResolve(process.argv[1]) : '';
-if (invokedAs === __filename || invokedAs.endsWith('mock-conductor.ts') || invokedAs.endsWith('mock-conductor.js')) {
+if (invokedAs === __filename || invokedAs.endsWith('mock-clawdevbox.ts') || invokedAs.endsWith('mock-clawdevbox.js')) {
   mainCli().catch((err) => {
     process.stderr.write(`fatal: ${err instanceof Error ? err.stack : String(err)}\n`);
     process.exit(1);

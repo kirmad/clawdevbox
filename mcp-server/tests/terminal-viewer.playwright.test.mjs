@@ -89,7 +89,7 @@ test('xterm renders pty output, sends input, kill closes session', async () => {
   // robust way to read on-screen content regardless of styling spans.
   const readBuffer = async () =>
     page.evaluate(() => {
-      const t = window.__conductorTerm;
+      const t = window.__clawdevboxTerm;
       if (!t) return '';
       const buf = t.buffer.active;
       let out = '';

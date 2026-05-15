@@ -7,7 +7,7 @@
  * Layout:
  *
  *   <workspace>/
- *     artifacts/                ← top-level, sibling of .conductor/
+ *     artifacts/                ← top-level, sibling of .clawdevbox/
  *       <artifact_id>/
  *         manifest.json         ← always present
  *         <free-form files>     ← content for the renderer
@@ -52,7 +52,7 @@ export interface ArtifactManifest {
   workspace_id: string;
   /**
    * Optional link to a recipe instance — purely for UI grouping. Does NOT
-   * affect storage (artifacts live flat under .conductor/artifacts/). The
+   * affect storage (artifacts live flat under .clawdevbox/artifacts/). The
    * renderer / dashboards can filter "show me everything this recipe run
    * produced" without making artifact lifetimes depend on recipe state.
    */

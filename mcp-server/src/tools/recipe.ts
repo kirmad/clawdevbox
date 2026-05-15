@@ -2,8 +2,8 @@
  * tools/recipe.ts
  *
  * Implements recipe.list / read / upsert / delete.
- * - File-backed: reads/writes `.conductor/recipes/<id>.yaml` (project),
- *   `~/.conductor/recipes/<id>.yaml` (global), and looks up plugin recipes
+ * - File-backed: reads/writes `.clawdevbox/recipes/<id>.yaml` (project),
+ *   `~/.clawdevbox/recipes/<id>.yaml` (global), and looks up plugin recipes
  *   through the manifest's `provides.recipes` list.
  * - Scope semantics from spec §10.4: project shadows plugin shadows global.
  * - Plugin scope is read-only (writes return PLUGIN_SCOPE_READONLY).
@@ -217,9 +217,20 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
     'recipe.run',
     {
       description:
-        'Spawn a fresh agent CLI session running a recipe in a workspace. Creates (or reuses) a workspace, writes its `.mcp.json` so the spawned CLI sees the Conductor MCP server, mints a recipe-instance row in `<workspace>/.conductor/recipe-instances/`, then detach-spawns the agent CLI and returns immediately with ids + pid. The spawned agent calls `recipe.done` to signal completion.',
+        'Spawn a fresh agent CLI session running a recipe in a workspace. Two ways to specify the recipe: (a) `id` — load an already-saved recipe via the scope chain (project→plugin→global); or (b) `source` — pass the recipe YAML inline for an ad-hoc run without persisting it. Exactly one of `id` or `source` is required. Either way, mints a recipe-instance row in `<workspace>/.clawdevbox/recipe-instances/`, writes `.mcp.json` so the spawned CLI sees the Clawdevbox MCP server, then detach-spawns the agent CLI and returns immediately with ids + pid. The spawned agent calls `recipe.done` to signal completion.',
       inputSchema: {
-        id: z.string().min(1).describe('Recipe id to run.'),
+        id: z
+          .string()
+          .min(1)
+          .optional()
+          .describe('Recipe id to load from the scope chain. Mutually exclusive with `source`.'),
+        source: z
+          .string()
+          .min(1)
+          .optional()
+          .describe(
+            'Inline recipe YAML for an ad-hoc run (not persisted to disk). The YAML must include valid `id`, `name`, and `description` fields — they validate against the same rules as `recipe.upsert`. Mutually exclusive with `id`.',
+          ),
         prompt: z.string().min(1).describe('The first user message handed to the spawned agent.'),
         params: z
           .record(z.string(), z.unknown())
@@ -239,14 +250,58 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
           .enum(['copilot', 'claude', 'echo-stub'])
           .optional()
           .describe('Which CLI to spawn. `echo-stub` is a no-op spawn for tests.'),
+        session_id: z
+          .string()
+          .min(1)
+          .optional()
+          .describe('Explicit CLI session id. Recommended — lets the UI offer a "Resume" action later. Auto-minted if omitted.'),
+        resume_of: z
+          .string()
+          .min(1)
+          .optional()
+          .describe('Recipe-instance id to resume. When set, the agent CLI is spawned with --resume <session_id_of_resume_of> and the new instance is recorded as a continuation.'),
       },
     },
     async (args) => {
-      // 1. Resolve the recipe (any scope).
-      const idCheck = validateId(args.id);
-      if (!idCheck.ok) return structuredError('INVALID_ID', idCheck.message!);
-      const hit = resolveRead(ws, 'all', 'recipe', args.id, recipePath);
-      if (!hit) return notFound('recipe', args.id);
+      // 1. Resolve the recipe — either by id (saved) or by inline source (ad-hoc).
+      //    Exactly one of {id, source} must be supplied.
+      const hasId = typeof args.id === 'string' && args.id.length > 0;
+      const hasSource = typeof args.source === 'string' && args.source.length > 0;
+      if (hasId && hasSource) {
+        return structuredError(
+          'INVALID_REQUEST',
+          'Pass either `id` (load saved recipe) or `source` (inline ad-hoc YAML), not both.',
+        );
+      }
+      if (!hasId && !hasSource) {
+        return structuredError(
+          'INVALID_REQUEST',
+          'Either `id` (load saved recipe) or `source` (inline ad-hoc YAML) is required.',
+        );
+      }
+
+      let recipeId: string;
+      let recipeSnapshot: string;
+      let isAdhoc: boolean;
+      if (hasId) {
+        const idCheck = validateId(args.id!);
+        if (!idCheck.ok) return structuredError('INVALID_ID', idCheck.message!);
+        const hit = resolveRead(ws, 'all', 'recipe', args.id!, recipePath);
+        if (!hit) return notFound('recipe', args.id!);
+        recipeId = args.id!;
+        recipeSnapshot = hit.source;
+        isAdhoc = false;
+      } else {
+        // Ad-hoc: validate the inline YAML and pull the embedded id.
+        const validation = validateRecipeSource(args.source!);
+        if (!validation.ok) {
+          return validationError(validation.errors);
+        }
+        const parsed = yamlLoad(args.source!) as { id: string };
+        recipeId = parsed.id;
+        recipeSnapshot = args.source!;
+        isAdhoc = true;
+      }
 
       // 2. Resolve / create the workspace.
       const workspacesRoot = resolveWorkspacesRoot();
@@ -276,22 +331,32 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
       // 3. Mint instance id + write the `.mcp.json` for the spawned CLI.
       const agentCli = args.agent_cli ?? 'copilot';
       const instanceId = mintRecipeInstanceId();
+      // Mint a stable session id for the CLI. We ALWAYS pass an explicit
+      // id to the CLI rather than let it auto-mint, so:
+      //   - the recipe instance can be resumed deterministically later;
+      //   - the UI can show the id and offer a "Resume" action;
+      //   - logs in <workspace>/.clawdevbox/sessions/<id>/ are addressable.
+      const sessionId =
+        typeof args.session_id === 'string' && args.session_id.length > 0
+          ? args.session_id
+          : `cdb_${instanceId.slice(3)}`;
+      const isResume = !!args.resume_of;
       const mcpSecret = randomBytes(16).toString('hex');
-      const serverEntry = serverEntryPath();
+      const { command: spawnCmd, args: spawnArgs } = resolveSpawnedMcpCommand();
       const mcpConfigPath = resolvePath(workspaceInfo.path, '.mcp.json');
       const mcpConfig = {
         mcpServers: {
-          conductor: {
+          clawdevbox: {
             type: 'local',
-            command: 'npx',
-            args: ['-y', 'tsx', serverEntry],
+            command: spawnCmd,
+            args: spawnArgs,
             env: pruneUndefined({
-              CONDUCTOR_PROJECT_DIR: workspaceInfo.path,
-              CONDUCTOR_RECIPE_INSTANCE_ID: instanceId,
-              CONDUCTOR_WORKSPACE_ID: workspaceInfo.id,
-              CONDUCTOR_WORKSPACES_ROOT: workspacesRoot,
-              CONDUCTOR_MCP_URL: process.env.CONDUCTOR_MCP_URL,
-              CONDUCTOR_MCP_SECRET: mcpSecret,
+              CLAWDEVBOX_PROJECT_DIR: workspaceInfo.path,
+              CLAWDEVBOX_RECIPE_INSTANCE_ID: instanceId,
+              CLAWDEVBOX_WORKSPACE_ID: workspaceInfo.id,
+              CLAWDEVBOX_WORKSPACES_ROOT: workspacesRoot,
+              CLAWDEVBOX_MCP_URL: process.env.CLAWDEVBOX_MCP_URL,
+              CLAWDEVBOX_MCP_SECRET: mcpSecret,
               ADO_ORG: process.env.ADO_ORG,
               ADO_PROJECT: process.env.ADO_PROJECT,
               ADO_BEARER_TOKEN: process.env.ADO_BEARER_TOKEN,
@@ -305,8 +370,8 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
       // 4. Write the instance file (pid=null, status=running) before spawning.
       const instance: RecipeInstance = {
         id: instanceId,
-        recipe_id: args.id,
-        recipe_snapshot: hit.source,
+        recipe_id: recipeId,
+        recipe_snapshot: recipeSnapshot,
         workspace_id: workspaceInfo.id,
         workspace_path: workspaceInfo.path,
         prompt: args.prompt,
@@ -318,6 +383,8 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
         completed_at: null,
         result: null,
         message: null,
+        session_id: sessionId,
+        resume_of: args.resume_of ?? null,
       };
       writeRecipeInstance(workspaceInfo.path, instance);
 
@@ -331,18 +398,19 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
       //    Trade-off vs. `child_process.spawn({detached:true})`: the pty is
       //    bound to this MCP-server process. If the server exits while a
       //    recipe is running, the agent dies with it. That's acceptable for
-      //    Conductor — the MCP server lives as long as the client (Claude
-      //    Code, Conductor app, etc.) is open, and recipes finish in tens
+      //    Clawdevbox — the MCP server lives as long as the client (Claude
+      //    Code, Clawdevbox app, etc.) is open, and recipes finish in tens
       //    of seconds.
       const spawnEnv: Record<string, string> = {};
       for (const [k, v] of Object.entries(process.env)) {
         if (typeof v === 'string') spawnEnv[k] = v;
       }
-      spawnEnv.CONDUCTOR_PROJECT_DIR = workspaceInfo.path;
-      spawnEnv.CONDUCTOR_RECIPE_INSTANCE_ID = instanceId;
-      spawnEnv.CONDUCTOR_WORKSPACE_ID = workspaceInfo.id;
-      spawnEnv.CONDUCTOR_WORKSPACES_ROOT = workspacesRoot;
-      spawnEnv.CONDUCTOR_MCP_SECRET = mcpSecret;
+      spawnEnv.CLAWDEVBOX_PROJECT_DIR = workspaceInfo.path;
+      spawnEnv.CLAWDEVBOX_RECIPE_INSTANCE_ID = instanceId;
+      spawnEnv.CLAWDEVBOX_WORKSPACE_ID = workspaceInfo.id;
+      spawnEnv.CLAWDEVBOX_WORKSPACES_ROOT = workspacesRoot;
+      spawnEnv.CLAWDEVBOX_MCP_SECRET = mcpSecret;
+      spawnEnv.CLAWDEVBOX_SESSION_ID = sessionId;
 
       const instancesDir = recipeInstancesDir(workspaceInfo.path);
       mkdirSync(instancesDir, { recursive: true });
@@ -357,65 +425,114 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
 
       if (agentCli === 'echo-stub') {
         // Test mode — confirms the pty pipeline works without a real CLI.
-        ptyFile = process.execPath;
-        ptyArgs = [
-          '-e',
-          'process.stdout.write("[echo-stub recipe.run] ok\\n"); process.exit(0);',
-        ];
-      } else if (agentCli === 'copilot') {
-        // Use Microsoft's `agency copilot` wrapper.
+        // The agent script writes a real artifact AND marks the recipe
+        // instance success on exit, so the end-to-end "trigger fires →
+        // recipe runs → artifact appears" flow can be demonstrated
+        // without depending on a real agent CLI being installed.
         //
-        // Why agency.toml is needed even though we already wrote `.mcp.json`:
-        //   `copilot mcp --help` claims workspace `.mcp.json` is auto-loaded,
-        //   but agency invokes copilot as:
-        //     copilot --resume <fixed-session-id> --additional-mcp-config @<merged-temp.json>
-        //   The merged temp config is built from agency built-ins + global
-        //   `~/.copilot/mcp-config.json` + workspace `agency.toml`. Workspace
-        //   `.mcp.json` is NOT included, and because the same session is
-        //   resumed regardless of cwd, the resumed tool inventory excludes
-        //   anything declared only in `.mcp.json`. So we mirror the same
-        //   server entry into `agency.toml` at the workspace root — agency
-        //   merges that in, the temp config carries it, and copilot sees the
-        //   Conductor MCP server. We still write `.mcp.json` above so that
-        //   other clients (Claude Code, copilot run directly without
-        //   --resume, etc.) work without needing agency-specific config.
-        const agencyTomlPath = resolvePath(workspaceInfo.path, 'agency.toml');
-        const serverEntry = mcpConfig.mcpServers.conductor;
-        const tomlEscape = (s: string) =>
-          s.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-        const envLines = Object.entries(serverEntry.env)
-          .map(([k, v]) => `${k} = "${tomlEscape(String(v))}"`)
-          .join('\n');
-        const argsLine = serverEntry.args
-          .map((a) => `"${tomlEscape(a)}"`)
-          .join(', ');
-        const agencyToml =
-          `[mcps.servers.conductor]\n` +
-          `type = "stdio"\n` +
-          `command = "${tomlEscape(serverEntry.command)}"\n` +
-          `args = [${argsLine}]\n` +
-          `tools = ["*"]\n` +
-          `\n` +
-          `[mcps.servers.conductor.env]\n` +
-          `${envLines}\n`;
-        writeFileAtomic(agencyTomlPath, agencyToml);
-
+        // The script is large; we write it to a temp file rather than
+        // passing it via `node -e` to avoid command-line escaping issues
+        // on Windows.
+        const artifactId = `${recipeId}-${instanceId.slice(3)}-${isResume ? 'resume' : 'first'}`;
+        const scriptPath = resolvePath(instancesDir, `${instanceId}.script.cjs`);
+        const banner = isResume
+          ? `[echo-stub recipe.run] resume session=${sessionId} (was=${args.resume_of}) prompt=${JSON.stringify(args.prompt)}`
+          : `[echo-stub recipe.run] new session=${sessionId} prompt=${JSON.stringify(args.prompt)}`;
+        const scriptBody =
+`const fs = require('node:fs');
+const path = require('node:path');
+process.stdout.write(${JSON.stringify(banner + '\n')});
+const artifactsRoot = path.join(process.env.CLAWDEVBOX_PROJECT_DIR, 'artifacts');
+const artifactId = ${JSON.stringify(artifactId)};
+const dir = path.join(artifactsRoot, artifactId);
+fs.mkdirSync(dir, { recursive: true });
+const manifest = {
+  id: artifactId,
+  type: 'markdown',
+  title: ${JSON.stringify(args.prompt.slice(0, 80))},
+  workspace_id: process.env.CLAWDEVBOX_WORKSPACE_ID,
+  recipe_instance_id: process.env.CLAWDEVBOX_RECIPE_INSTANCE_ID,
+  step_id: null,
+  created_at: Date.now(),
+  meta: { entry: 'content.md', session_id: process.env.CLAWDEVBOX_SESSION_ID },
+};
+fs.writeFileSync(path.join(dir, 'manifest.json'), JSON.stringify(manifest, null, 2));
+const body = [
+  '# ' + manifest.title,
+  '',
+  'Generated by echo-stub recipe run.',
+  '',
+  '- session_id: \`' + process.env.CLAWDEVBOX_SESSION_ID + '\`',
+  '- recipe_instance_id: \`' + process.env.CLAWDEVBOX_RECIPE_INSTANCE_ID + '\`',
+  '- workspace_id: \`' + process.env.CLAWDEVBOX_WORKSPACE_ID + '\`',
+  '- resume: ' + ${JSON.stringify(isResume ? 'true' : 'false')},
+  '',
+  '## Prompt',
+  '',
+  ${JSON.stringify(args.prompt)},
+].join('\\n');
+fs.writeFileSync(path.join(dir, 'content.md'), body);
+const instPath = path.join(process.env.CLAWDEVBOX_PROJECT_DIR, '.clawdevbox', 'recipe-instances', process.env.CLAWDEVBOX_RECIPE_INSTANCE_ID + '.json');
+try {
+  const inst = JSON.parse(fs.readFileSync(instPath, 'utf8'));
+  inst.status = 'success';
+  inst.completed_at = Date.now();
+  inst.result = { artifact_id: artifactId };
+  inst.message = 'echo-stub recipe complete; artifact ' + artifactId + ' written.';
+  inst.steps = [
+    { id: 'spawn', title: 'Spawn agent CLI', status: 'done', started_at: inst.started_at, completed_at: inst.started_at + 50, message: 'session_id=' + process.env.CLAWDEVBOX_SESSION_ID },
+    { id: 'write-artifact', title: 'Write artifact', status: 'done', started_at: inst.started_at + 50, completed_at: Date.now(), message: 'wrote ' + artifactId + '/content.md', artifact_id: artifactId },
+  ];
+  fs.writeFileSync(instPath, JSON.stringify(inst, null, 2));
+} catch (err) {
+  process.stderr.write('failed to mark instance done: ' + err.message + '\\n');
+}
+process.stdout.write('[echo-stub recipe.run] wrote artifact ' + artifactId + '\\n');
+process.exit(0);
+`;
+        writeFileAtomic(scriptPath, scriptBody);
+        ptyFile = process.execPath;
+        ptyArgs = [scriptPath];
+      } else if (agentCli === 'copilot') {
+        // Real GitHub Copilot CLI. Bypass the agency wrapper and call
+        // `copilot.exe` directly so we get explicit session-id control
+        // without depending on agency's internal --resume handling.
+        //
+        // First run uses `--name=<sessionId>` to associate the new copilot
+        // session with our explicit id; subsequent resume calls use
+        // `--resume=<sessionId>`. This is the pattern straight out of
+        // `copilot --help`:
+        //     $ copilot --name="my feature"
+        //     $ copilot --resume=0cb916db-26aa-40f2-86b5-1ba81b225fd2
+        //
+        // MCP config is fed via `--additional-mcp-config @<path>` so the
+        // spawned agent sees the clawdevbox MCP server. We also pass
+        // --allow-all-tools so the run is fully non-interactive.
         const isWin = process.platform === 'win32';
-        const agencyBin =
-          process.env.CONDUCTOR_AGENCY_PATH ??
-          (isWin ? 'agency.exe' : 'agency');
-        ptyFile = agencyBin;
-        ptyArgs = ['copilot', '-p', args.prompt];
+        const copilotBin = process.env.CLAWDEVBOX_COPILOT_PATH ?? (isWin ? 'copilot.exe' : 'copilot');
+        ptyFile = copilotBin;
+        const sessionFlag = isResume ? `--resume=${sessionId}` : `--name=${sessionId}`;
+        ptyArgs = [
+          sessionFlag,
+          '--allow-all-tools',
+          '--additional-mcp-config',
+          `@${mcpConfigPath}`,
+          '-p',
+          args.prompt,
+        ];
       } else if (agentCli === 'claude') {
         // Claude Code is typically installed as `claude.cmd` on Windows. We
         // route through cmd.exe so PATHEXT resolution finds it; on Unix the
         // binary is on PATH directly.
+        const claudeArgs = isResume
+          ? ['--resume', sessionId, '-p', args.prompt]
+          : ['--session-id', sessionId, '-p', args.prompt];
         if (process.platform === 'win32') {
           ptyFile = 'cmd.exe';
-          ptyArgs = ['/d', '/s', '/c', 'claude', '-p', args.prompt];
+          ptyArgs = ['/d', '/s', '/c', 'claude', ...claudeArgs];
         } else {
           ptyFile = 'claude';
-          ptyArgs = ['-p', args.prompt];
+          ptyArgs = claudeArgs;
         }
       } else {
         // Type-narrow exhaustiveness (agentCli is `'echo-stub' | 'copilot' | 'claude'`).
@@ -453,19 +570,22 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
         });
         ptyProc.onExit(({ exitCode, signal }) => {
           logStream.end();
-          // If the agent exited without calling recipe.done, mark the
-          // instance failed so the caller isn't left polling forever.
+          // If the agent exited without calling recipe.done, derive
+          // status from the exit code. Real CLIs (claude, copilot)
+          // don't know about recipe.done — exiting cleanly (code 0) is
+          // a successful run from their perspective. Non-zero exit or
+          // a signal means failure.
           const current = readRecipeInstance(workspaceInfo.path, instanceId);
           if (current && current.status === 'running') {
-            const reason =
-              signal !== undefined && signal !== 0
-                ? `agent exited via signal ${signal} without calling recipe.done`
-                : `agent exited with code ${exitCode} without calling recipe.done`;
+            const ok = (signal === undefined || signal === 0) && exitCode === 0;
             writeRecipeInstance(workspaceInfo.path, {
               ...current,
-              status: 'failure',
+              status: ok ? 'success' : 'failure',
               completed_at: Date.now(),
-              message: reason,
+              message:
+                signal !== undefined && signal !== 0
+                  ? `agent exited via signal ${signal}`
+                  : `agent exited with code ${exitCode}${ok ? ' (no recipe.done call; treating as success)' : ''}`,
             });
           }
         });
@@ -487,25 +607,37 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
         return structuredError('SPAWN_FAILED', msg, { agent_cli: agentCli, instance_id: instanceId });
       }
 
-      // 6. Update the instance with the pid we got back.
+      // 6. Update the instance with the pid we got back. RE-READ first so
+      //    we don't clobber a fast-completing agent (echo-stub) that has
+      //    already written status=success in the time between spawn and
+      //    this line.
       if (typeof pid === 'number') {
-        writeRecipeInstance(workspaceInfo.path, { ...instance, pid });
+        const current = readRecipeInstance(workspaceInfo.path, instanceId);
+        if (current) {
+          writeRecipeInstance(workspaceInfo.path, { ...current, pid });
+        } else {
+          writeRecipeInstance(workspaceInfo.path, { ...instance, pid });
+        }
       }
 
       return {
         content: [
           {
             type: 'text',
-            text: `Spawned ${agentCli} for recipe ${args.id} (instance=${instanceId}, workspace=${workspaceInfo.id}, pid=${pid ?? 'n/a'}).`,
+            text: `Spawned ${agentCli} for recipe ${recipeId}${isAdhoc ? ' (ad-hoc)' : ''} (instance=${instanceId}, session=${sessionId}, workspace=${workspaceInfo.id}, pid=${pid ?? 'n/a'}${isResume ? `, resume_of=${args.resume_of}` : ''}).`,
           },
         ],
         structuredContent: {
           recipe_instance_id: instanceId,
+          recipe_id: recipeId,
+          adhoc: isAdhoc,
           workspace_id: workspaceInfo.id,
           workspace_path: workspaceInfo.path,
           attach_to_inbox_item_id: args.attach_to_inbox_item_id ?? null,
           pid: pid ?? null,
           agent_cli: agentCli,
+          session_id: sessionId,
+          resume_of: args.resume_of ?? null,
           status: 'spawned',
           log_path: logPath,
           view_url: getTerminalServer()?.url(instanceId) ?? null,
@@ -519,7 +651,7 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
     'recipe.done',
     {
       description:
-        'Called by the agent inside a spawned recipe-run session to signal completion. Requires CONDUCTOR_RECIPE_INSTANCE_ID and CONDUCTOR_WORKSPACE_ID env vars (set automatically by recipe.run). Updates the instance file with status / completed_at / result / message.',
+        'Called by the agent inside a spawned recipe-run session to signal completion. Requires CLAWDEVBOX_RECIPE_INSTANCE_ID and CLAWDEVBOX_WORKSPACE_ID env vars (set automatically by recipe.run). Updates the instance file with status / completed_at / result / message.',
       inputSchema: {
         status: z
           .enum(['success', 'failure', 'cancelled'])
@@ -533,18 +665,18 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
       },
     },
     async (args) => {
-      const instanceId = process.env.CONDUCTOR_RECIPE_INSTANCE_ID;
-      const workspaceId = process.env.CONDUCTOR_WORKSPACE_ID;
+      const instanceId = process.env.CLAWDEVBOX_RECIPE_INSTANCE_ID;
+      const workspaceId = process.env.CLAWDEVBOX_WORKSPACE_ID;
       if (!instanceId) {
         return structuredError(
           'NOT_IN_RECIPE_INSTANCE',
-          'CONDUCTOR_RECIPE_INSTANCE_ID env var required — recipe.done can only run inside a spawned recipe-run session.',
+          'CLAWDEVBOX_RECIPE_INSTANCE_ID env var required — recipe.done can only run inside a spawned recipe-run session.',
         );
       }
       if (!workspaceId) {
         return structuredError(
           'NOT_IN_RECIPE_INSTANCE',
-          'CONDUCTOR_WORKSPACE_ID env var required — recipe.done can only run inside a spawned recipe-run session.',
+          'CLAWDEVBOX_WORKSPACE_ID env var required — recipe.done can only run inside a spawned recipe-run session.',
         );
       }
       const root = resolveWorkspacesRoot();
@@ -595,7 +727,7 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
     'recipe.instance_info',
     {
       description:
-        'Read a recipe-run instance by id, or — when no id is passed — by reading CONDUCTOR_RECIPE_INSTANCE_ID + CONDUCTOR_WORKSPACE_ID env vars inside a spawned session. Returns the full instance row.',
+        'Read a recipe-run instance by id, or — when no id is passed — by reading CLAWDEVBOX_RECIPE_INSTANCE_ID + CLAWDEVBOX_WORKSPACE_ID env vars inside a spawned session. Returns the full instance row.',
       inputSchema: {
         id: z
           .string()
@@ -626,12 +758,12 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
       }
 
       // No explicit id — read env.
-      instanceId = process.env.CONDUCTOR_RECIPE_INSTANCE_ID;
-      const workspaceId = process.env.CONDUCTOR_WORKSPACE_ID;
+      instanceId = process.env.CLAWDEVBOX_RECIPE_INSTANCE_ID;
+      const workspaceId = process.env.CLAWDEVBOX_WORKSPACE_ID;
       if (!instanceId || !workspaceId) {
         return structuredError(
           'NOT_IN_RECIPE_INSTANCE',
-          'No id provided and CONDUCTOR_RECIPE_INSTANCE_ID / CONDUCTOR_WORKSPACE_ID env vars are not set.',
+          'No id provided and CLAWDEVBOX_RECIPE_INSTANCE_ID / CLAWDEVBOX_WORKSPACE_ID env vars are not set.',
         );
       }
       const wsInfo = getWorkspace(root, workspaceId);
@@ -670,16 +802,16 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
           .min(1)
           .optional()
           .describe(
-            'Recipe-instance id. When omitted, falls back to CONDUCTOR_RECIPE_INSTANCE_ID (useful from inside a spawned agent).',
+            'Recipe-instance id. When omitted, falls back to CLAWDEVBOX_RECIPE_INSTANCE_ID (useful from inside a spawned agent).',
           ),
       },
     },
     async (args) => {
-      const instanceId = args.id ?? process.env.CONDUCTOR_RECIPE_INSTANCE_ID;
+      const instanceId = args.id ?? process.env.CLAWDEVBOX_RECIPE_INSTANCE_ID;
       if (!instanceId) {
         return structuredError(
           'MISSING_INSTANCE_ID',
-          'No id provided and CONDUCTOR_RECIPE_INSTANCE_ID env var is not set.',
+          'No id provided and CLAWDEVBOX_RECIPE_INSTANCE_ID env var is not set.',
         );
       }
       if (!ptyHasSession(instanceId)) {
@@ -721,7 +853,7 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
           .string()
           .min(1)
           .optional()
-          .describe('Recipe-instance id. Falls back to CONDUCTOR_RECIPE_INSTANCE_ID.'),
+          .describe('Recipe-instance id. Falls back to CLAWDEVBOX_RECIPE_INSTANCE_ID.'),
         signal: z
           .string()
           .optional()
@@ -729,11 +861,11 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
       },
     },
     async (args) => {
-      const instanceId = args.id ?? process.env.CONDUCTOR_RECIPE_INSTANCE_ID;
+      const instanceId = args.id ?? process.env.CLAWDEVBOX_RECIPE_INSTANCE_ID;
       if (!instanceId) {
         return structuredError(
           'MISSING_INSTANCE_ID',
-          'No id provided and CONDUCTOR_RECIPE_INSTANCE_ID env var is not set.',
+          'No id provided and CLAWDEVBOX_RECIPE_INSTANCE_ID env var is not set.',
         );
       }
       if (!ptyHasSession(instanceId)) {
@@ -823,11 +955,25 @@ function successResponse(inst: RecipeInstance): CallToolResult {
 }
 
 function serverEntryPath(): string {
-  // The MCP server lives in `<conductor-mcp-server>/src/index.ts`. From this
+  // The MCP server lives in `<clawdevbox-mcp-server>/src/index.ts`. From this
   // file (`src/tools/recipe.ts`) that's `../index.ts`. Compute against the
   // current module URL so the resolved path survives tsx + ESM.
   const here = fileURLToPath(import.meta.url);
   return resolvePath(dirname(here), '..', 'index.ts');
+}
+
+/**
+ * Pick the command spawned recipe-run agents use to talk back to the same
+ * MCP server. Production path: `npx -y clawdevbox mcp` — works whenever the
+ * package is on the PATH (global install, `npm link`, or workspace install).
+ * Dev fallback: when CLAWDEVBOX_SPAWN_CMD is set (typically by tests), we use
+ * `tsx <src/index.ts>` so the workflow runs against unbuilt source.
+ */
+function resolveSpawnedMcpCommand(): { command: string; args: string[] } {
+  if (process.env.CLAWDEVBOX_SPAWN_TSX === '1') {
+    return { command: 'npx', args: ['-y', 'tsx', serverEntryPath()] };
+  }
+  return { command: 'npx', args: ['-y', 'clawdevbox', 'mcp'] };
 }
 
 function pruneUndefined<T extends Record<string, unknown>>(obj: T): T {

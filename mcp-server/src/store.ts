@@ -1,16 +1,33 @@
 /**
  * store.ts
  *
- * Per-process state for inbox items, threads, messages, and approvals.
+ * Per-process state for threads, messages, and approvals; file-backed
+ * state for inbox items.
  *
  * Row shapes follow spec §5 "Data model" so the tool surface (§6.1) is
  * stable; durability is the only thing that differs from a future
- * SQLite-backed kernel. The store is module-scoped: a single process owns
- * a single in-memory DB. Restarting the server clears it.
+ * SQLite-backed kernel.
+ *
+ * **Inbox**: when `inbox.bind(globalDir)` is called (from `buildServer`),
+ * the store reads `<globalDir>/inbox.json` on every operation and writes
+ * it back atomically on every mutation. This keeps multiple processes
+ * (the HTTP service + a stdio-MCP agent client) consistent without an
+ * external DB. When unbound (test harnesses, ad-hoc use), it falls back
+ * to an in-memory map — same API.
+ *
+ * **Threads / approvals** remain process-local; they don't outlive a
+ * server restart yet. Persistence lands with the SQLite kernel.
  *
  * Ids use a coarse `<prefix>_<base36-random>` pattern so they're
  * human-recognizable in test logs without pulling in nanoid.
+ *
+ * Mutating Inbox methods (upsert/setState/snooze/archive) emit `inbox`
+ * change events on the global bus so the SSE endpoint can push refresh
+ * hints to connected browsers in real time.
  */
+
+import { emitChange } from './event-bus.ts';
+import { loadInboxFromDisk, saveInboxToDisk } from './inbox-persistence.ts';
 
 // ============================================================================
 // Id minting
@@ -29,12 +46,51 @@ export function mintId(prefix: 'inb' | 'thr' | 'msg' | 'apr' | 'run'): string {
 
 export type InboxState = 'new' | 'open' | 'snoozed' | 'archived' | 'done';
 export type AgentTone = 'info' | 'warn' | 'err' | 'ok';
+export type InboxBodyFormat = 'markdown' | 'text';
+
+export interface InboxItemAttachment {
+  /** Artifact id (folder name under `<workspace>/artifacts/`). */
+  artifact_id: string;
+  /** Optional workspace hint — disambiguates if two workspaces have the same artifact id. */
+  workspace_id?: string;
+  /** Display override for the attachment chip in the SPA. */
+  title?: string;
+  /** Renderer-type hint for filtering / icons. */
+  type?: string;
+}
+
+export interface InboxItemRef {
+  /** Opaque id of the recipe instance, thread, or other linked object. */
+  id: string;
+  /** Optional workspace hint for cross-workspace disambiguation. */
+  workspace_id?: string;
+}
 
 export interface InboxItem {
   id: string;
   kind: string;                  // 'pr_review' | 'workitem' | 'incident' | 'epic' | string
   source: string;                // 'ado' | 'icm' | 'manual' | ...
   title?: string;
+  /** Short tldr shown on the card (max 500 chars enforced at the tool boundary). */
+  preview?: string;
+  /**
+   * Body format. The full body lives in a sidecar file at
+   * `<globalDir>/inbox-bodies/<safe-id>.<ext>` — see inbox-persistence.ts.
+   * inbox.json only stores the format + size; the SPA fetches the body
+   * lazily via `GET /api/inbox/:id` when the user expands the card.
+   */
+  description_format?: InboxBodyFormat;
+  /** Byte length of the description body. 0 / missing means no body. */
+  description_size?: number;
+  /** Artifact references — clickable "Open" chips in the SPA detail view. */
+  attachments?: InboxItemAttachment[];
+  /** Link to a recipe instance (clicking jumps to the Recipes tab). */
+  recipe_instance?: InboxItemRef | null;
+  /** Link to a registered trigger by id (e.g. `ado.new-pr-watcher#auth-svc`). */
+  trigger_id?: string | null;
+  /** Free-form labels/tags shown as chips on the card. Max 10, each max 40 chars. */
+  labels?: string[];
+  /** Legacy "agent banner" — kept for backwards compat. Prefer `preview`. */
   agent_message?: string;
   agent_tone?: AgentTone;
   state: InboxState;
@@ -48,43 +104,97 @@ export interface InboxPatch {
   kind?: string;
   source?: string;
   title?: string;
+  preview?: string;
+  description_format?: InboxBodyFormat;
+  description_size?: number;
+  attachments?: InboxItemAttachment[];
+  recipe_instance?: InboxItemRef | null;
+  trigger_id?: string | null;
+  labels?: string[];
   agent_message?: string;
   agent_tone?: AgentTone;
   [k: string]: unknown;
 }
 
-export class InboxStore {
-  private items = new Map<string, InboxItem>();
+export interface UpsertResult {
+  item: InboxItem;
+  /** True if the item was newly created; false if an existing row was updated. */
+  created: boolean;
+}
 
-  upsert(id: string, kind: string, source: string, patch: InboxPatch = {}): InboxItem {
-    const now = Date.now();
-    const existing = this.items.get(id);
-    if (existing) {
-      const merged: InboxItem = { ...existing, ...patch, kind, source, updated_at: now };
-      this.items.set(id, merged);
-      return merged;
+export class InboxStore {
+  private memory = new Map<string, InboxItem>();
+  private globalDir?: string;
+
+  /**
+   * Switch the store from in-memory mode to file-backed mode. After
+   * `bind`, every read/write goes through `<globalDir>/inbox.json` so
+   * multiple processes (HTTP service + stdio-MCP) stay consistent.
+   * Idempotent.
+   */
+  bind(globalDir: string): void {
+    this.globalDir = globalDir;
+  }
+
+  /** Read the current state from disk (bound) or memory (unbound). */
+  private load(): Map<string, InboxItem> {
+    if (!this.globalDir) return this.memory;
+    const items = loadInboxFromDisk(this.globalDir);
+    const m = new Map<string, InboxItem>();
+    for (const it of items) m.set(it.id, it);
+    return m;
+  }
+
+  /** Persist a mutated state. */
+  private save(items: Map<string, InboxItem>): void {
+    if (this.globalDir) {
+      saveInboxToDisk(this.globalDir, [...items.values()]);
+    } else {
+      this.memory = items;
     }
-    const created: InboxItem = {
-      id,
-      kind,
-      source,
-      state: 'new',
-      created_at: now,
-      updated_at: now,
-      ...patch,
-    };
-    this.items.set(id, created);
-    return created;
+  }
+
+  upsert(id: string, kind: string, source: string, patch: InboxPatch = {}): UpsertResult {
+    const items = this.load();
+    const now = Date.now();
+    const existing = items.get(id);
+    let item: InboxItem;
+    let created: boolean;
+    if (existing) {
+      item = { ...existing, ...patch, kind, source, updated_at: now };
+      created = false;
+    } else {
+      item = {
+        id,
+        kind,
+        source,
+        state: 'new',
+        created_at: now,
+        updated_at: now,
+        ...patch,
+      };
+      created = true;
+    }
+    items.set(id, item);
+    this.save(items);
+    emitChange('inbox');
+    return { item, created };
   }
 
   read(id: string): InboxItem | undefined {
-    return this.items.get(id);
+    return this.load().get(id);
   }
 
-  list(filter: { kind?: string; state?: InboxState; limit?: number; cursor?: string } = {}): InboxItem[] {
-    const arr = [...this.items.values()]
+  list(filter: { kind?: string; state?: InboxState; label?: string; limit?: number; cursor?: string } = {}): InboxItem[] {
+    const labelKey = filter.label?.toLowerCase();
+    const arr = [...this.load().values()]
       .filter((it) => !filter.kind || it.kind === filter.kind)
       .filter((it) => !filter.state || it.state === filter.state)
+      .filter((it) => {
+        if (!labelKey) return true;
+        const labels = (it.labels as string[] | undefined) ?? [];
+        return labels.some((l) => l.toLowerCase() === labelKey);
+      })
       .sort((a, b) => b.updated_at - a.updated_at);
     const startIdx = filter.cursor ? Math.max(0, arr.findIndex((x) => x.id === filter.cursor) + 1) : 0;
     const limit = filter.limit ?? 100;
@@ -92,23 +202,34 @@ export class InboxStore {
   }
 
   setState(id: string, state: InboxState): InboxItem | undefined {
-    const item = this.items.get(id);
+    const items = this.load();
+    const item = items.get(id);
     if (!item) return undefined;
-    item.state = state;
-    item.updated_at = Date.now();
-    return item;
+    const updated: InboxItem = { ...item, state, updated_at: Date.now() };
+    items.set(id, updated);
+    this.save(items);
+    emitChange('inbox');
+    return updated;
   }
 
   snooze(id: string, until: number): InboxItem | undefined {
-    const item = this.items.get(id);
+    const items = this.load();
+    const item = items.get(id);
     if (!item) return undefined;
-    item.state = 'snoozed';
-    item.snoozed_until = until;
-    item.updated_at = Date.now();
-    return item;
+    const updated: InboxItem = {
+      ...item,
+      state: 'snoozed',
+      snoozed_until: until,
+      updated_at: Date.now(),
+    };
+    items.set(id, updated);
+    this.save(items);
+    emitChange('inbox');
+    return updated;
   }
 
   archive(id: string): InboxItem | undefined {
+    // setState already emits + persists.
     return this.setState(id, 'archived');
   }
 }

@@ -4,7 +4,7 @@
  * Storage layer for REGISTERED triggers (spec §8.3). Distinct from the
  * trigger-TYPES registry built at boot in workspace.ts.
  *
- * Disk shape (`<project_dir>/.conductor/triggers.json`):
+ * Disk shape (`<project_dir>/.clawdevbox/triggers.json`):
  *
  *   {
  *     "registered": [
@@ -32,6 +32,7 @@
 
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
+import { emitChange } from './event-bus.ts';
 import { writeFileAtomic } from './fs-util.ts';
 
 // ============================================================================
@@ -83,6 +84,10 @@ export function readTriggersFile(path: string): TriggersFile {
 
 export function writeTriggersFile(path: string, file: TriggersFile): void {
   writeFileAtomic(path, JSON.stringify(file, null, 2) + '\n');
+  // Notify any SSE subscribers (the SPA, primarily) that the trigger
+  // registry changed. The bus payload is intentionally empty — clients
+  // refetch `/api/triggers` to get the authoritative state.
+  emitChange('triggers');
 }
 
 // ============================================================================
