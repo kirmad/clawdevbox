@@ -399,3 +399,106 @@ test('getStep returns null for missing step', () => {
   assert.equal(getStep(db, ri, 'nope'), null);
   db.close();
 });
+
+// ---------------------------------------------------------------- agent-sessions
+import {
+  closeSession,
+  findResumeTarget,
+  getSession,
+  listSessionsForInstance,
+  listSessionsForStep,
+  markSessionSuspended,
+  openSession,
+} from '../src/db/agent-sessions-store.ts';
+
+test('openSession creates a running row with started_at', () => {
+  const db = open();
+  const ws = ensureWorkspace(db, { path: 'C:\\tmp\\as1' });
+  const s = openSession(db, { workspace_id: ws.id, agent_cli: 'copilot', interactive: true });
+  assert.equal(s.status, 'running');
+  assert.equal(s.interactive, 1);
+  assert.ok(s.started_at > 0);
+  assert.equal(s.ended_at, null);
+  db.close();
+});
+
+test('closeSession sets ended_at + status', () => {
+  const db = open();
+  const ws = ensureWorkspace(db, { path: 'C:\\tmp\\as2' });
+  const s = openSession(db, { workspace_id: ws.id, agent_cli: 'copilot' });
+  closeSession(db, s.id, { status: 'success', result: 'done' });
+  const row = getSession(db, s.id);
+  assert.equal(row.status, 'success');
+  assert.equal(row.result, 'done');
+  assert.ok(row.ended_at != null);
+  db.close();
+});
+
+test('resume_of_agent_session_id chains across resumes', () => {
+  const db = open();
+  const ws = ensureWorkspace(db, { path: 'C:\\tmp\\as3' });
+  const s1 = openSession(db, { workspace_id: ws.id, agent_cli: 'copilot' });
+  markSessionSuspended(db, s1.id);
+  const s2 = openSession(db, {
+    workspace_id: ws.id,
+    agent_cli: 'copilot',
+    resume_of_agent_session_id: s1.id,
+  });
+  markSessionSuspended(db, s2.id);
+  const s3 = openSession(db, {
+    workspace_id: ws.id,
+    agent_cli: 'copilot',
+    resume_of_agent_session_id: s2.id,
+  });
+  assert.equal(getSession(db, s2.id).resume_of_agent_session_id, s1.id);
+  assert.equal(getSession(db, s3.id).resume_of_agent_session_id, s2.id);
+  db.close();
+});
+
+test('findResumeTarget returns latest suspended row', async () => {
+  const db = open();
+  const ws = ensureWorkspace(db, { path: 'C:\\tmp\\as4' });
+  // Create a step to hang the sessions on.
+  db.prepare(
+    `INSERT INTO recipe_instances (id, workspace_id, workspace_path, started_at, status)
+     VALUES ('ri_as4', ?, ?, ?, 'running')`,
+  ).run(ws.id, ws.path, Date.now());
+  db.prepare(
+    `INSERT INTO recipe_steps (id, recipe_instance_id, step_index, step_id, goal, status)
+     VALUES ('rs_as4', 'ri_as4', 0, 'one', 'g', 'pending')`,
+  ).run();
+  const s1 = openSession(db, {
+    workspace_id: ws.id,
+    recipe_step_id: 'rs_as4',
+    agent_cli: 'copilot',
+  });
+  markSessionSuspended(db, s1.id);
+  await new Promise((r) => setTimeout(r, 2));
+  const s2 = openSession(db, {
+    workspace_id: ws.id,
+    recipe_step_id: 'rs_as4',
+    agent_cli: 'copilot',
+  });
+  markSessionSuspended(db, s2.id);
+  const target = findResumeTarget(db, 'rs_as4');
+  assert.equal(target.id, s2.id);
+  db.close();
+});
+
+test('listSessionsForStep / listSessionsForInstance', () => {
+  const db = open();
+  const ws = ensureWorkspace(db, { path: 'C:\\tmp\\as5' });
+  db.prepare(
+    `INSERT INTO recipe_instances (id, workspace_id, workspace_path, started_at, status)
+     VALUES ('ri_as5', ?, ?, ?, 'running')`,
+  ).run(ws.id, ws.path, Date.now());
+  db.prepare(
+    `INSERT INTO recipe_steps (id, recipe_instance_id, step_index, step_id, goal, status)
+     VALUES ('rs_as5', 'ri_as5', 0, 'one', 'g', 'pending')`,
+  ).run();
+  openSession(db, { workspace_id: ws.id, recipe_instance_id: 'ri_as5', recipe_step_id: 'rs_as5', agent_cli: 'copilot' });
+  openSession(db, { workspace_id: ws.id, recipe_instance_id: 'ri_as5', recipe_step_id: 'rs_as5', agent_cli: 'claude' });
+  assert.equal(listSessionsForStep(db, 'rs_as5').length, 2);
+  assert.equal(listSessionsForInstance(db, 'ri_as5').length, 2);
+  db.close();
+});
