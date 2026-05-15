@@ -534,7 +534,7 @@ function renderTerminalHtml(instanceId: string): string {
       statusEl.textContent = 'attached';
       // Fit ONCE to the actual rendered xterm size, then lock. We don't
       // re-fit on window resize because the pty's scrollback (and any
-      // currently-on-screen TUI like agency's command palette) was painted
+      // currently-on-screen TUI like a CLI's command palette) was painted
       // using ANSI column positioning at the old cols. Re-fitting reflows
       // those columns onto a different viewport width and the boxes /
       // multi-column layouts misalign. Lock-after-attach gives a stable,

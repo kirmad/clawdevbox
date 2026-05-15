@@ -586,7 +586,7 @@ export async function runInit(flags: Flags): Promise<void> {
         '',
         `Next steps:`,
         ...tunnelNextSteps,
-        `  • clawdevbox mcp                    stdio MCP for Claude Code / agency`,
+        `  • clawdevbox mcp                    stdio MCP for Claude Code / Copilot CLI`,
         `  • clawdevbox start                  HTTP MCP server on port ${port}`,
         `  • clawdevbox start --service        run as background service (auto-starts at login)`,
         ...(notificationsConfig?.enabled
