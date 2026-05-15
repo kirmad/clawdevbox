@@ -82,6 +82,13 @@ export interface ClawdevboxNotificationsConfig {
   vapid?: ClawdevboxVapidKeys;
 }
 
+export interface ClawdevboxCronConfig {
+  /** Max concurrent in-flight fires in the dispatcher (default 4). */
+  max_concurrent?: number;
+  /** Graceful-shutdown drain window in ms (default 15000). */
+  dispatcher_drain_ms?: number;
+}
+
 export interface ClawdevboxConfig {
   version: typeof CONFIG_VERSION;
   /**
@@ -96,6 +103,7 @@ export interface ClawdevboxConfig {
   http?: ClawdevboxHttpConfig;
   tunnel?: ClawdevboxTunnelConfig;
   notifications?: ClawdevboxNotificationsConfig;
+  cron?: ClawdevboxCronConfig;
 }
 
 export interface ResolvedConfig {
@@ -116,6 +124,10 @@ export interface ResolvedConfig {
   notifications: {
     enabled: boolean;
     vapid: ClawdevboxVapidKeys | null;
+  };
+  cron: {
+    max_concurrent: number;
+    dispatcher_drain_ms: number;
   };
   /** Path to the config file that produced this (null if defaults-only). */
   configPath: string | null;
@@ -300,6 +312,37 @@ function validateConfig(parsed: unknown, source: string): ClawdevboxConfig {
     }
   }
 
+  let cron: ClawdevboxCronConfig | undefined;
+  if (obj.cron !== undefined) {
+    if (!obj.cron || typeof obj.cron !== 'object') {
+      throw new ConfigError(`${source}: cron must be an object`);
+    }
+    const c = obj.cron as Record<string, unknown>;
+    cron = {};
+    if (c.max_concurrent !== undefined) {
+      if (
+        typeof c.max_concurrent !== 'number' ||
+        !Number.isInteger(c.max_concurrent) ||
+        c.max_concurrent < 1
+      ) {
+        throw new ConfigError(`${source}: cron.max_concurrent must be a positive integer`);
+      }
+      cron.max_concurrent = c.max_concurrent;
+    }
+    if (c.dispatcher_drain_ms !== undefined) {
+      if (
+        typeof c.dispatcher_drain_ms !== 'number' ||
+        !Number.isInteger(c.dispatcher_drain_ms) ||
+        c.dispatcher_drain_ms < 0
+      ) {
+        throw new ConfigError(
+          `${source}: cron.dispatcher_drain_ms must be a non-negative integer`,
+        );
+      }
+      cron.dispatcher_drain_ms = c.dispatcher_drain_ms;
+    }
+  }
+
   let http: ClawdevboxHttpConfig | undefined;
   if (obj.http !== undefined) {
     if (!obj.http || typeof obj.http !== 'object') {
@@ -334,6 +377,7 @@ function validateConfig(parsed: unknown, source: string): ClawdevboxConfig {
     http,
     tunnel,
     notifications,
+    cron,
   };
 }
 
@@ -441,6 +485,15 @@ export function resolveConfig(opts: ResolveOptions = {}): ResolvedConfig {
   const notificationsEnabled = !!layered((c) => c.notifications?.enabled);
   const notificationsVapid = layered((c) => c.notifications?.vapid) ?? null;
 
+  const cronMaxConcurrent =
+    parseIntEnv(env.CLAWDEVBOX_CRON_MAX_CONCURRENT) ??
+    layered((c) => c.cron?.max_concurrent) ??
+    4;
+  const cronDrainMs =
+    parseIntEnv(env.CLAWDEVBOX_CRON_DRAIN_MS) ??
+    layered((c) => c.cron?.dispatcher_drain_ms) ??
+    15_000;
+
   // Pick a representative configPath: prefer project layer when present,
   // otherwise the global layer, otherwise null.
   const configPathUsed = projectCfg
@@ -464,8 +517,19 @@ export function resolveConfig(opts: ResolveOptions = {}): ResolvedConfig {
       enabled: notificationsEnabled,
       vapid: notificationsVapid,
     },
+    cron: {
+      max_concurrent: cronMaxConcurrent,
+      dispatcher_drain_ms: cronDrainMs,
+    },
     configPath: configPathUsed,
   };
+}
+
+function parseIntEnv(v: string | undefined): number | undefined {
+  if (!v) return undefined;
+  const n = Number.parseInt(v, 10);
+  if (!Number.isInteger(n) || n < 0) return undefined;
+  return n;
 }
 
 function parsePortEnv(v: string | undefined): number | undefined {

@@ -81,6 +81,8 @@ import { closeDatabase, openDatabase } from '../db/index.ts';
 import { scanLegacyFiles } from '../db/legacy-files.ts';
 import { readTriggersFile } from '../triggers-store.ts';
 import { loadWorkspaceFromEnv, triggersJsonPath, WorkspaceConfigError } from '../workspace.ts';
+import { Dispatcher } from '../dispatcher.ts';
+import { Scheduler } from '../scheduler.ts';
 import type { Flags } from './index.ts';
 
 function str(flags: Flags, key: string): string | undefined {
@@ -606,6 +608,27 @@ export async function runStart(flags: Flags): Promise<void> {
   const boundPort =
     addr && typeof addr === 'object' ? addr.port : cfg.http.port;
 
+  // Bring up the trigger kernel — dispatcher first (it accepts pickUp()
+  // calls immediately), then the scheduler that pokes it on each wake.
+  // The HTTP server is already bound so the script-binding callback URL
+  // (`http://127.0.0.1:<port>/callback/<fire_id>`) is reachable when
+  // Phase 8 lands the route.
+  const dispatcher = new Dispatcher(opened.db, ws, {
+    maxConcurrent: cfg.cron.max_concurrent,
+    drainMs: cfg.cron.dispatcher_drain_ms,
+    callbackUrlBase: `http://${cfg.http.host}:${boundPort}`,
+  });
+  dispatcher.start();
+  const scheduler = new Scheduler(opened.db, dispatcher, ws);
+  scheduler.start();
+  logger.info(
+    {
+      max_concurrent: cfg.cron.max_concurrent,
+      drain_ms: cfg.cron.dispatcher_drain_ms,
+    },
+    'trigger kernel started',
+  );
+
   // Spawn the dev-buddy main agent. Failures are non-fatal — the home page
   // still loads; the agent tab just shows a disconnected terminal.
   const mainAgent = startMainAgent({
@@ -670,12 +693,26 @@ export async function runStart(flags: Flags): Promise<void> {
 
   const shutdown = (signal: NodeJS.Signals): void => {
     logger.info({ signal }, 'shutting down');
-    stopTunnel().finally(() => {
-      closeDatabase();
-      httpServer.close(() => process.exit(0));
-    });
+    // Order: stop scheduler (no new wakes) → drain dispatcher → stop tunnel
+    // → close DB → close HTTP. We give the dispatcher its configured drain
+    // window before the hard 5s exit timeout below kicks in.
+    scheduler.stop();
+    dispatcher
+      .stop()
+      .catch((err) => {
+        logger.warn(
+          { err: err instanceof Error ? err.message : String(err) },
+          'dispatcher.stop threw',
+        );
+      })
+      .finally(() => {
+        stopTunnel().finally(() => {
+          closeDatabase();
+          httpServer.close(() => process.exit(0));
+        });
+      });
     // Hard exit after grace period in case sockets keep us alive.
-    setTimeout(() => process.exit(0), 5000).unref();
+    setTimeout(() => process.exit(0), 30_000).unref();
   };
   process.once('SIGINT', () => shutdown('SIGINT'));
   process.once('SIGTERM', () => shutdown('SIGTERM'));
