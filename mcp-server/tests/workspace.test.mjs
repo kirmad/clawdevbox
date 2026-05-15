@@ -431,6 +431,18 @@ test('workspace + recipe.run surface', async (t) => {
     assert.ok(paths.includes('id'), `expected id error, got: ${paths.join(', ')}`);
   });
 
+  await t.test('recipe.run rejects unknown agent_cli with UNKNOWN_AGENT_CLI', async () => {
+    const res = await h.call('recipe.run', {
+      id: 'simple-prompt',
+      prompt: 'x',
+      agent_cli: 'not-a-real-provider',
+    });
+    assert.equal(res.isError, true);
+    assert.equal(res.structuredContent?.code, 'UNKNOWN_AGENT_CLI');
+    assert.equal(res.structuredContent?.agent_cli, 'not-a-real-provider');
+    assert.ok(Array.isArray(res.structuredContent?.available));
+  });
+
   await t.test('recipe.done outside a recipe-run session is rejected', async () => {
     // The harness's MCP server has NO CLAWDEVBOX_RECIPE_INSTANCE_ID env var,
     // so calling recipe.done on it should fail with NOT_IN_RECIPE_INSTANCE.

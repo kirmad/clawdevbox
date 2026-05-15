@@ -298,9 +298,10 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
           .optional()
           .describe('Optional inbox item to associate the instance with.'),
         agent_cli: z
-          .enum(['copilot', 'claude', 'echo-stub'])
+          .string()
+          .min(1)
           .optional()
-          .describe('Which CLI to spawn. `echo-stub` is a no-op spawn for tests.'),
+          .describe('Which agent-CLI provider to spawn (must be a registered provider id; defaults to config.default_agent_cli or "copilot"). `echo-stub` is a no-op spawn for tests.'),
         session_id: z
           .string()
           .min(1)
@@ -379,8 +380,18 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
       }
 
       // 3. Delegate spawn to the recipe-runner.
-      const agentCli = args.agent_cli ?? 'copilot';
       const cfg = resolveConfig({ projectDir: ws.projectDir, globalDir: ws.globalDir });
+      const agentCli = args.agent_cli ?? cfg.defaultAgentCli ?? 'copilot';
+      if (!ws.agentCliProviders.has(agentCli)) {
+        const available = [...ws.agentCliProviders.entries()]
+          .filter(([, p]) => !p.internal)
+          .map(([id]) => id);
+        return structuredError(
+          'UNKNOWN_AGENT_CLI',
+          `agent_cli provider '${agentCli}' is not registered (available: ${available.join(', ') || '<none>'})`,
+          { agent_cli: agentCli, available },
+        );
+      }
       const result = await runRecipe({
         recipeId,
         recipeSnapshot,
