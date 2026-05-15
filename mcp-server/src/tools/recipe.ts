@@ -49,10 +49,12 @@ import { getDatabase } from '../db/index.ts';
 import { emitChange } from '../event-bus.ts';
 import {
   ToolErrorBox,
+  updateStatusImpl,
   updateStepsImpl,
+  type UpdateStatusOpts,
   type UpdateStepsOpts,
 } from '../recipe-step-tools.ts';
-import type { Step } from '../db/recipe-steps-store.ts';
+import type { RecipeStepStatus, Step } from '../db/recipe-steps-store.ts';
 
 const scopeFilter = z
   .enum(['project', 'global', 'all'])
@@ -709,6 +711,105 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
             removed: result.removed,
             updated: result.updated.map((r) => ({ id: r.id, step_id: r.step_id })),
             trigger_changes: result.trigger_changes,
+          },
+        };
+      } catch (e) {
+        if (e instanceof ToolErrorBox) {
+          return structuredError(e.payload.code, e.payload.message, e.payload.detail ?? {});
+        }
+        const msg = e instanceof Error ? e.message : String(e);
+        return structuredError('INTERNAL_ERROR', msg);
+      }
+    },
+  );
+
+  // -- recipe.steps.update_status -------------------------------------------
+  server.registerTool(
+    'recipe.steps.update_status',
+    {
+      description:
+        'Update the status, state, or attachments of a single step in a recipe instance (spec §10.5). Enforces the monotonic transition rule. Entry hook: transitioning into `running` registers the step\'s declared triggers. Exit hook: transitioning into a terminal state (`done`/`failed`/`skipped`) disables auto-declared triggers and cascades the instance to terminal when all siblings are terminal. `request_user_input` atomically transitions to `awaiting_user` and creates a linked inbox item. `state` merges; `state_replace` overwrites (mutually exclusive). Defaults `recipe_instance_id` from $CLAWDEVBOX_RECIPE_INSTANCE_ID when omitted.',
+      inputSchema: {
+        recipe_instance_id: z.string().min(1).optional(),
+        step_id: z.string().min(1),
+        status: z
+          .enum(['running', 'done', 'failed', 'skipped', 'awaiting_user'])
+          .optional(),
+        message: z.string().optional(),
+        state: z.record(z.string(), z.unknown()).optional(),
+        state_replace: z.record(z.string(), z.unknown()).optional(),
+        result: z.string().optional(),
+        error: z.string().optional(),
+        attach_artifact_ids: z.array(z.string()).optional(),
+        attach_inbox_item_ids: z.array(z.string()).optional(),
+        request_user_input: z
+          .object({
+            message: z.string().min(1),
+            options: z.array(z.string()).optional(),
+            inbox_item: z
+              .object({
+                title: z.string().optional(),
+                labels: z.array(z.string()).optional(),
+              })
+              .optional(),
+          })
+          .optional(),
+      },
+    },
+    async (args) => {
+      const instanceId =
+        args.recipe_instance_id ?? process.env.CLAWDEVBOX_RECIPE_INSTANCE_ID;
+      if (!instanceId) {
+        return structuredError(
+          'RECIPE_INSTANCE_NOT_FOUND',
+          'recipe_instance_id not provided and CLAWDEVBOX_RECIPE_INSTANCE_ID env var is not set.',
+        );
+      }
+      const opts: UpdateStatusOpts = {
+        recipe_instance_id: instanceId,
+        step_id: args.step_id,
+        status: args.status as RecipeStepStatus | undefined,
+        message: args.message,
+        state: args.state as Record<string, unknown> | undefined,
+        state_replace: args.state_replace as Record<string, unknown> | undefined,
+        result: args.result,
+        error: args.error,
+        attach_artifact_ids: args.attach_artifact_ids,
+        attach_inbox_item_ids: args.attach_inbox_item_ids,
+        request_user_input: args.request_user_input as UpdateStatusOpts['request_user_input'],
+        agent_session_id: process.env.CLAWDEVBOX_AGENT_SESSION_ID ?? null,
+      };
+      try {
+        const db = getDatabase();
+        const result = updateStatusImpl(db, opts);
+        emitChange('recipes');
+        if (result.created_inbox_item_id) emitChange('inbox');
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Step ${args.step_id} → ${result.step.status}.`,
+            },
+          ],
+          structuredContent: {
+            recipe_instance_id: instanceId,
+            step: {
+              id: result.step.id,
+              step_id: result.step.step_id,
+              status: result.step.status,
+              started_at: result.step.started_at,
+              completed_at: result.step.completed_at,
+              message: result.step.message,
+              awaiting_user_message: result.step.awaiting_user_message,
+              state: JSON.parse(result.step.state_json),
+            },
+            registered_trigger_ids: result.registered_trigger_ids,
+            disabled_trigger_ids: result.disabled_trigger_ids,
+            attached_artifact_ids: result.attached_artifact_ids,
+            attached_inbox_item_ids: result.attached_inbox_item_ids,
+            created_inbox_item_id: result.created_inbox_item_id,
+            recipe_instance_status: result.recipe_instance_status,
+            trigger_registration_errors: result.trigger_registration_errors,
           },
         };
       } catch (e) {
