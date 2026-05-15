@@ -440,6 +440,70 @@ Most workspaces will pick the changes up the next time *any* tool
 reads the registry (the MCP server's in-memory `ws` reflects the
 reload immediately; only out-of-process consumers need to restart).
 
+## `clawdevbox plugin sync`
+
+Manually trigger bidirectional plugin sync between clawdevbox and the
+configured agent CLI (Copilot, Claude, or Agency). Useful after
+changing `default_agent_cli`, after a `git pull` that updated a
+marketplace, or any time the two installations have drifted.
+
+Usage:
+
+```
+clawdevbox plugin sync [--direction=both|push|pull] [--dry-run] [--respect-config]
+```
+
+Flags:
+
+- `--direction=both` (default): run both Direction A (push
+  clawdevbox-installed plugins to the CLI) and Direction B (pull
+  client-installed plugins into clawdevbox).
+- `--direction=push`: only push clawdevbox-installed plugins to the
+  CLI via `<binary> plugin marketplace add` / `<binary> plugin install`
+  / `<binary> plugin uninstall`.
+- `--direction=pull`: only pull client-installed plugins into
+  clawdevbox. Honors the per-plugin opt-in list in
+  `cfg.client_sync.discovered_plugins`; plugins not opted in are listed
+  in the dry-run output but not registered.
+- `--dry-run`: report what would change without making any changes.
+  Combine with `--direction=push` to preview install/uninstall calls
+  before executing.
+- `--respect-config`: honor `cfg.client_sync.mode` (default: ignore
+  it; the manual command always runs even when the configured mode is
+  `'off'` or `'manual'`).
+
+Output is a human-readable summary with counts and per-plugin status:
+
+```
+plugin sync via 'copilot' (GitHub Copilot CLI)
+  (dry run — no changes will be made)
+  pull (dry-run): discovered 2 plugin(s), 1 opted in.
+    + superpowers@superpowers-marketplace /home/me/.copilot/plugins/superpowers-superpowers-marketplace
+      cfv@ic3-ai-plugins /home/me/.copilot/plugins/cfv-ic3-ai-plugins
+  push: (dry-run) sync report:
+    method: cli-command
+    marketplaces added (1):
+      + my-team-marketplace
+    plugins already present (3):
+      = team-tooling@my-team-marketplace
+      …
+```
+
+Exit codes:
+
+- `0` — always, even when individual marketplaces or plugins failed
+  to install (per-item errors are visible in the `failures` block of
+  the report).
+- `1` — the configured provider isn't registered (e.g.
+  `default_agent_cli` references a plugin that isn't installed).
+- `2` — invalid CLI arguments (`--direction` value, unknown flag).
+
+The command is also invoked automatically by lifecycle hooks (see
+[`docs/agent-clis.md`](../agent-clis.md#lifecycle-hooks)). Running it
+manually is most useful when you've made changes outside clawdevbox
+(e.g. ran `copilot plugin install foo` directly) and want to import
+the result back into clawdevbox.
+
 ## Edge cases & gotchas
 
 - **`plugin.install` does not call `ensureGlobalNodeModulesLink`.**

@@ -544,6 +544,29 @@ See [§ `status` field](#status-field-microsoft-extension) above.
 
 ## Installing plugins
 
+### Bidirectional sync with agent CLIs
+
+When clawdevbox is configured with an agent CLI (Copilot, Claude, or
+Agency), plugin installs flow in **both directions**:
+
+- clawdevbox-installed plugins are automatically installed in the
+  configured CLI via its own `<binary> plugin install` command. The
+  CLI's chat surface sees the same skills/agents/commands/MCP servers
+  the plugin ships.
+- Client-installed plugins that carry a `clawdevbox.*` extension block
+  are auto-registered in clawdevbox (after user opt-in via
+  `clawdevbox init` or `clawdevbox plugin sync`). Only the
+  `clawdevbox.*` capabilities are registered; skills, sub-agents,
+  slash-commands, and MCP entries stay client-side where they
+  already live.
+
+The behavior is configurable via the `client_sync` block (modes:
+`auto` / `discover-only` / `manual` / `off`). See
+[`docs/agent-clis.md`](./agent-clis.md#bidirectional-plugin-sync) for
+the full design and
+[`docs/tools/plugin.md`](./tools/plugin.md#clawdevbox-plugin-sync) for
+the `clawdevbox plugin sync` subcommand.
+
 Three end-to-end paths, in roughly the order Microsoft-side users
 encounter them:
 

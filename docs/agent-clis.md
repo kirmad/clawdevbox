@@ -76,6 +76,247 @@ Providers use `ctx.spawnPty` instead of importing `node-pty` directly
 to drop config files into the workspace (atomic write, rejects paths
 that escape via `..`).
 
+## Bidirectional plugin sync
+
+Once an agent CLI is configured (`default_agent_cli`), clawdevbox and
+the configured CLI share plugin inventory in **both directions**.
+Plugins you install in clawdevbox become available to the CLI; plugins
+the CLI already has — when they carry a `clawdevbox.*` extension —
+become available to clawdevbox (after a one-time opt-in). This keeps
+the two installations in lockstep without forcing users to install
+plugins twice.
+
+### Direction A — clawdevbox → CLI
+
+When `clawdevbox plugin install`, `clawdevbox plugin uninstall`,
+`clawdevbox marketplace add`, or `clawdevbox marketplace remove`
+mutates clawdevbox's plugin/marketplace state, the configured
+provider's `syncPluginInventory` method is invoked. The default
+implementation (shared across all built-in providers) shells out to
+the CLI's own commands:
+
+```
+<binary> plugin marketplace list
+<binary> plugin marketplace add <source>     # for clawdevbox marketplaces missing from the CLI
+<binary> plugin list
+<binary> plugin install <name>@<marketplace> # for clawdevbox plugins missing from the CLI
+<binary> plugin uninstall <name>@<marketplace> # bidirectional cleanup, opt-out via config
+```
+
+A `SyncReport` is returned summarizing what was added, what was
+already present, and any failures. Errors never block the originating
+operation — they're logged WARN and surfaced in the report.
+
+### Direction B — CLI → clawdevbox
+
+At workspace boot **and on demand** (`clawdevbox plugin sync`,
+`clawdevbox init`), the provider's `discoverInstalledPlugins` method
+returns the list of plugins already installed in the CLI's local
+plugin cache. clawdevbox loads each one via `loadPluginFromDir` and
+registers **only the `clawdevbox.*` extension capabilities** (recipes,
+tools, trigger_types, agent_clis, renderers). Skills, sub-agents,
+slash-commands, and MCP-server entries stay client-side — they
+already live in the CLI's runtime and clawdevbox does not duplicate
+them.
+
+Registered client-side plugins are tagged with `scope:
+'client:<provider_id>'` so the workspace can tell them apart from
+locally-installed plugins, and the user has to opt in once per plugin
+(via the `clawdevbox init` probe step or `clawdevbox plugin sync`).
+The opt-in is persisted in `cfg.client_sync.discovered_plugins`.
+
+### The two new provider methods
+
+Both methods are **optional**. Providers that don't implement them are
+skipped silently. Add them to `AgentCliProvider`:
+
+```ts
+export interface AgentCliProvider {
+  // …existing fields…
+  syncPluginInventory?(
+    ctx: ProviderCtx,
+    opts: SyncPluginInventoryOpts,
+  ): Promise<SyncReport>;
+  discoverInstalledPlugins?(
+    ctx: ProviderCtx,
+  ): Promise<DiscoveredPlugin[]>;
+}
+```
+
+#### Supporting types
+
+```ts
+export interface SyncPluginInventoryOpts {
+  /** clawdevbox-installed plugins to make available to the CLI. */
+  plugins: PluginEntry[];
+  /** clawdevbox-known marketplaces to register with the CLI. */
+  marketplaces: MarketplaceRecord[];
+  /** When true, report what would change without making any changes. */
+  dryRun?: boolean;
+  /** When true (default), uninstall plugins removed from clawdevbox. */
+  bidirectionalUninstall?: boolean;
+}
+
+export interface SyncReport {
+  marketplacesAdded: string[];
+  marketplacesPresent: string[];
+  pluginsInstalled: string[];
+  pluginsPresent: string[];
+  pluginsUninstalled: string[];
+  failed: Array<{ kind: 'marketplace' | 'plugin'; id: string; error: string }>;
+  method: 'cli-command' | 'config-write' | 'mixed';
+}
+
+export interface DiscoveredPlugin {
+  name: string;
+  /** Absolute path to the plugin's root dir (contains .claude-plugin/plugin.json). */
+  absoluteDir: string;
+  source: 'cli-marketplace' | 'cli-direct' | 'cli-cache';
+  marketplaceId: string | null;
+}
+
+export interface PluginCliBinding {
+  /** Resolved binary name or absolute path. */
+  binary: string;
+  /** Optional argv prefix injected before the args (e.g. Windows shell wrapper). */
+  argsPrefix?: string[];
+  /** Reserved for CLIs that nest `plugin` under a sub-command. */
+  subcommandPrefix?: string[];
+  /** Conventional on-disk plugin cache directory for this CLI. */
+  pluginCacheDir: string;
+}
+```
+
+### Shared helpers
+
+clawdevbox ships two helpers in
+[`mcp-server/src/agent-clis/shared.ts`](../mcp-server/src/agent-clis/shared.ts)
+that all three built-in providers (copilot, claude, agency) reuse
+verbatim — and that third-party provider plugins should use too:
+
+```ts
+import { cliPluginSync, cliPluginDiscover } from 'clawdevbox/agent-clis';
+
+export const myProvider: AgentCliProvider = {
+  // …
+  async syncPluginInventory(ctx, opts) {
+    return cliPluginSync(ctx, opts, {
+      binary: resolveMyBinary(),
+      pluginCacheDir: path.join(os.homedir(), '.my-cli', 'plugins'),
+    });
+  },
+  async discoverInstalledPlugins(ctx) {
+    return cliPluginDiscover(ctx, {
+      binary: resolveMyBinary(),
+      pluginCacheDir: path.join(os.homedir(), '.my-cli', 'plugins'),
+    });
+  },
+};
+```
+
+The helpers:
+
+- Spawn the CLI with `windowsHide: true`, `shell: false`, and a 30s
+  per-command timeout.
+- Parse `plugin list` / `marketplace list` output with ANSI-tolerant
+  regexes (`parsePluginListOutput`, `parseMarketplaceListOutput`).
+- Try multiple disk layouts for the plugin cache (`<name>-<mp>/`,
+  `<name>/`, `<mp>/<name>/`) so the same code works for Copilot's
+  flat layout and Claude's marketplace-nested layout.
+- Capture per-plugin failures into `SyncReport.failed[]` instead of
+  throwing, so a single bad install doesn't abort the whole sync.
+
+Any future provider that ships a `<binary> plugin install` /
+`<binary> plugin list` surface can use these helpers directly. CLIs
+with non-standard surfaces can implement `syncPluginInventory` /
+`discoverInstalledPlugins` from scratch — the kernel only cares about
+the return shape.
+
+### Lifecycle hooks
+
+| Event | Direction A (push) | Direction B (pull) |
+|---|---|---|
+| Workspace boot (`clawdevbox start`) | ✓ after kernel reload | ✓ after kernel reload |
+| `clawdevbox plugin install <src>` | ✓ after success | — |
+| `clawdevbox plugin uninstall <id>` | ✓ after success | — |
+| `clawdevbox marketplace add <src>` | ✓ after success | — |
+| `clawdevbox marketplace remove <id>` | ✓ after success | — |
+| Config change (`default_agent_cli` flip) | ✓ on next reload | ✓ on next reload |
+| `clawdevbox plugin sync` (manual) | ✓ unless `--direction=pull` | ✓ unless `--direction=push` |
+| `plugin.install` / `plugin.uninstall` MCP tools | ✓ after success | — |
+
+All hooks route through `maybeRunClientSync(ws, cfg, eventType)` in
+[`mcp-server/src/agent-clis/lifecycle.ts`](../mcp-server/src/agent-clis/lifecycle.ts).
+The helper is a no-op when `cfg.client_sync.mode === 'off'` or
+`'manual'`; it skips Direction A when the mode is `'discover-only'`.
+Errors are logged WARN and swallowed — sync **never blocks** the
+originating operation.
+
+### Config knob: `client_sync`
+
+```toml
+# clawdevbox.toml (project or global scope)
+[client_sync]
+mode = "auto"                  # 'auto' | 'discover-only' | 'manual' | 'off'
+bidirectional_uninstall = true # when true, removing a plugin in clawdevbox uninstalls it in the CLI too
+
+[[client_sync.discovered_plugins]]
+provider = "copilot"
+name = "superpowers"
+```
+
+| Value | Meaning |
+|---|---|
+| `mode = 'auto'` | Default. Both directions run automatically on every lifecycle event. |
+| `mode = 'discover-only'` | Direction B runs automatically; Direction A is skipped (use `clawdevbox plugin sync --direction=push` to opt in manually). |
+| `mode = 'manual'` | No automatic sync. `clawdevbox plugin sync` still runs both directions on demand. |
+| `mode = 'off'` | All sync disabled (including `clawdevbox plugin sync` when `--respect-config` is set). |
+| `bidirectional_uninstall = true` | Default. When clawdevbox uninstalls a plugin that came from a clawdevbox-known marketplace, the CLI also uninstalls it. Plugins from marketplaces clawdevbox doesn't know about are never touched. |
+| `discovered_plugins[]` | Persisted opt-in list for Direction B. Each entry binds a provider id to a client-installed plugin name; without an entry, the plugin is shown in init but **not registered**. |
+
+The merge is project-over-global-over-defaults, same as every other
+clawdevbox config field. See
+[`mcp-server/src/config.ts`](../mcp-server/src/config.ts) for the
+resolver.
+
+### Init probe step
+
+When `clawdevbox init` runs, after the `--plugin` install pass and
+before the agent-CLI chooser, an additional **probe step** kicks in
+(only when `cfg.client_sync.mode !== 'off'`). It calls
+`discoverInstalledPlugins` on every non-internal provider that reports
+`available: true`, then filters to plugins that ship a non-empty
+`clawdevbox.*` extension block. For each survivor it prints a
+box-drawn card listing:
+
+- The clawdevbox capabilities the plugin would register (recipes,
+  tools, trigger_types, agent_clis, renderers — with descriptions
+  harvested from disk).
+- The client-side capabilities (skills/agents/commands/mcp-servers)
+  that would **stay** in the CLI, for transparency.
+
+The user gets a per-plugin `Enable clawdevbox capabilities from
+'<name>'?` confirm prompt, and a final summary asks for one
+confirmation before persisting the selection to
+`cfg.client_sync.discovered_plugins`. See
+[`mcp-server/src/cli/probe-client-plugins.ts`](../mcp-server/src/cli/probe-client-plugins.ts)
+and
+[`mcp-server/src/cli/init-probe-prompt.ts`](../mcp-server/src/cli/init-probe-prompt.ts)
+for the implementation.
+
+### `clawdevbox plugin sync` subcommand
+
+```
+clawdevbox plugin sync [--direction=both|push|pull] [--dry-run] [--respect-config]
+```
+
+Manually trigger bidirectional sync at any time. Defaults to running
+both directions and ignoring `cfg.client_sync.mode` so the command
+always does something (pass `--respect-config` to honor the configured
+mode). `--dry-run` prints the planned changes without making them. See
+[`docs/tools/plugin.md`](./tools/plugin.md#clawdevbox-plugin-sync) for
+the full flag reference and exit semantics.
+
 ## `SpawnSessionOpts` modes
 
 | mode          | init.kind | typical caller                                                |
