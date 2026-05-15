@@ -42,6 +42,7 @@ import type { TriggerRuntime } from './validators.ts';
 import { recipePath, type RegisteredTriggerType, type Workspace } from './workspace.ts';
 import { resolveRead } from './scope.ts';
 import { runRecipe } from './recipe-runner.ts';
+import { resolveConfig } from './config.ts';
 import { resolveWorkspacesRoot } from './workspaces-store.ts';
 
 /** Error code emitted by the resume-binding stub. Phase 2 will implement it. */
@@ -444,6 +445,7 @@ export class Dispatcher {
     const hit = resolveRead(this.ws, 'all', 'recipe', recipeId, recipePath);
     if (!hit) throw new Error(`recipe not found: ${recipeId}`);
     const workspacesRoot = resolveWorkspacesRoot();
+    const cfg = resolveConfig({ projectDir: this.ws.projectDir, globalDir: this.ws.globalDir });
     const out = await runRecipe({
       recipeId,
       recipeSnapshot: hit.source,
@@ -454,6 +456,8 @@ export class Dispatcher {
       triggerId: trigger.id,
       fireId: fire.fire_id,
       workspacesRoot,
+      ws: this.ws,
+      cfg,
     });
     if (out.spawn_error) {
       throw new Error(`${out.spawn_error.code}: ${out.spawn_error.message}`);

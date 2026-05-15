@@ -30,6 +30,7 @@ import {
   type RecipeInstanceStatus,
 } from '../recipe-instances-store.ts';
 import { runRecipe } from '../recipe-runner.ts';
+import { resolveConfig } from '../config.ts';
 import {
   ensureWritableScope,
   listAllInScope,
@@ -378,7 +379,8 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
       }
 
       // 3. Delegate spawn to the recipe-runner.
-      const agentCli = (args.agent_cli ?? 'copilot') as 'copilot' | 'claude' | 'echo-stub';
+      const agentCli = args.agent_cli ?? 'copilot';
+      const cfg = resolveConfig({ projectDir: ws.projectDir, globalDir: ws.globalDir });
       const result = await runRecipe({
         recipeId,
         recipeSnapshot,
@@ -391,6 +393,8 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
         sessionId: args.session_id,
         resumeOf: args.resume_of,
         workspacesRoot,
+        ws,
+        cfg,
       });
 
       if (result.spawn_error) {
