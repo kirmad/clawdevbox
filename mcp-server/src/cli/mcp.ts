@@ -11,6 +11,7 @@
 
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { applyConfigToEnv, ConfigError, resolveConfig } from '../config.ts';
+import { openDatabase } from '../db/index.ts';
 import { logger } from '../logger.ts';
 import { buildServer } from '../server.ts';
 import { startTerminalServer } from '../terminal-server.ts';
@@ -48,6 +49,22 @@ export async function runMcp(flags: Flags): Promise<void> {
       process.exit(2);
     }
     throw err;
+  }
+
+  // Open the kernel DB so DB-backed stores (triggers, recipe-instances,
+  // inbox) have a working singleton. Runs migrations on first open.
+  try {
+    const opened = openDatabase(cfg.globalDir);
+    logger.info(
+      { path: opened.path, schema_version: opened.schemaVersion },
+      'db opened',
+    );
+  } catch (err) {
+    logger.error(
+      { err: err instanceof Error ? err.message : String(err) },
+      'db open failed',
+    );
+    process.exit(2);
   }
 
   const { server, hostedRegistry } = await buildServer(ws);
