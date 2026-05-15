@@ -45,6 +45,14 @@ import {
   listWorkspaces,
   resolveWorkspacesRoot,
 } from '../workspaces-store.ts';
+import { getDatabase } from '../db/index.ts';
+import { emitChange } from '../event-bus.ts';
+import {
+  ToolErrorBox,
+  updateStepsImpl,
+  type UpdateStepsOpts,
+} from '../recipe-step-tools.ts';
+import type { Step } from '../db/recipe-steps-store.ts';
 
 const scopeFilter = z
   .enum(['project', 'global', 'all'])
@@ -655,7 +663,68 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
       };
     },
   );
+  // -- recipe.update_steps --------------------------------------------------
+  server.registerTool(
+    'recipe.update_steps',
+    {
+      description:
+        'Mutate the step plan of a running recipe instance (spec §10.5). Supports three operations in one call: `add` new steps, `remove` pending steps by step_id, and `update_meta` to patch existing step declarations. All mutations run inside a single DB transaction; any failure rolls everything back. Added triggers on running steps register immediately; removed triggers disable matching auto-declared rows. Defaults `recipe_instance_id` from $CLAWDEVBOX_RECIPE_INSTANCE_ID when omitted.',
+      inputSchema: {
+        recipe_instance_id: z.string().min(1).optional(),
+        add: z.array(z.record(z.string(), z.unknown())).optional(),
+        remove: z.array(z.string()).optional(),
+        update_meta: z.array(z.record(z.string(), z.unknown())).optional(),
+      },
+    },
+    async (args) => {
+      const instanceId =
+        args.recipe_instance_id ?? process.env.CLAWDEVBOX_RECIPE_INSTANCE_ID;
+      if (!instanceId) {
+        return structuredError(
+          'RECIPE_INSTANCE_NOT_FOUND',
+          'recipe_instance_id not provided and CLAWDEVBOX_RECIPE_INSTANCE_ID env var is not set.',
+        );
+      }
+      const opts: UpdateStepsOpts = {
+        recipe_instance_id: instanceId,
+        add: args.add as Step[] | undefined,
+        remove: args.remove,
+        update_meta: args.update_meta as Array<Partial<Step> & { id: string }> | undefined,
+        agent_session_id: process.env.CLAWDEVBOX_AGENT_SESSION_ID ?? null,
+      };
+      try {
+        const db = getDatabase();
+        const result = updateStepsImpl(db, opts);
+        emitChange('recipes');
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Updated recipe_steps for ${instanceId}: +${result.added.length} added, -${result.removed.length} removed, ~${result.updated.length} updated.`,
+            },
+          ],
+          structuredContent: {
+            recipe_instance_id: instanceId,
+            added: result.added.map((r) => ({ id: r.id, step_id: r.step_id })),
+            removed: result.removed,
+            updated: result.updated.map((r) => ({ id: r.id, step_id: r.step_id })),
+            trigger_changes: result.trigger_changes,
+          },
+        };
+      } catch (e) {
+        if (e instanceof ToolErrorBox) {
+          return structuredError(e.payload.code, e.payload.message, e.payload.detail ?? {});
+        }
+        const msg = e instanceof Error ? e.message : String(e);
+        return structuredError('INTERNAL_ERROR', msg);
+      }
+    },
+  );
 }
+
+// ----------------------------------------------------------------------------
+// Helpers
+// ----------------------------------------------------------------------------
 
 function successResponse(inst: RecipeInstance): CallToolResult {
   return {
@@ -677,10 +746,6 @@ function successResponse(inst: RecipeInstance): CallToolResult {
     },
   };
 }
-
-// ----------------------------------------------------------------------------
-// Helpers
-// ----------------------------------------------------------------------------
 
 function safeRead(path: string): string | null {
   try {

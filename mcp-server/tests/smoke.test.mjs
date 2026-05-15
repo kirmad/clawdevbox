@@ -179,6 +179,7 @@ test('clawdevbox MCP server smoke', async (t) => {
     // Spot-check families
     for (const n of [
       'recipe.list', 'recipe.read', 'recipe.upsert', 'recipe.delete',
+      'recipe.update_steps',
       'skill.list', 'skill.read', 'skill.upsert', 'skill.delete',
       // New trigger surface (spec §6.1) — types + registered instances split.
       'trigger.list_types', 'trigger.list_registered', 'trigger.register',
