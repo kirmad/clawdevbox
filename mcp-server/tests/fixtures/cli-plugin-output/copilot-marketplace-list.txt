@@ -1,0 +1,7 @@
+Γ£¿ Included with GitHub Copilot:
+  Γùå copilot-plugins (GitHub: github/copilot-plugins)
+  Γùå awesome-copilot (GitHub: github/awesome-copilot)
+
+Registered marketplaces:
+  ΓÇó superpowers-marketplace (GitHub: obra/superpowers-marketplace)
+  ΓÇó ic3-ai-plugins (URL: https://dev.azure.com/skype/SCC/_git/ado-private)
