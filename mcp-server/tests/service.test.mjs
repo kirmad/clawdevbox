@@ -224,6 +224,82 @@ test('resolveConfig — project default_agent_cli overrides global', async () =>
   }
 });
 
+test('resolveConfig — clientSync defaults when unset', async () => {
+  const cfg = await import(configModUrl);
+  const { tmpRoot, cleanup } = makeProject();
+  try {
+    const resolved = cfg.resolveConfig({
+      projectDir: tmpRoot,
+      globalDir: join(tmpRoot, '.global'),
+      env: {},
+    });
+    assert.deepEqual(resolved.clientSync, {
+      mode: 'auto',
+      bidirectionalUninstall: true,
+      discoveredPlugins: [],
+    });
+  } finally {
+    cleanup();
+  }
+});
+
+test('resolveConfig — clientSync project > global merge', async () => {
+  const cfg = await import(configModUrl);
+  const { tmpRoot, cleanup } = makeProject();
+  try {
+    const globalDir = join(tmpRoot, '.global');
+    mkdirSync(globalDir, { recursive: true });
+    cfg.writeGlobalConfig(globalDir, {
+      version: cfg.CONFIG_VERSION,
+      global_dir: globalDir,
+      client_sync: {
+        mode: 'manual',
+        bidirectional_uninstall: false,
+        discovered_plugins: [{ provider: 'copilot', name: 'cfv' }],
+      },
+    });
+    let resolved = cfg.resolveConfig({ projectDir: tmpRoot, globalDir, env: {} });
+    assert.equal(resolved.clientSync.mode, 'manual');
+    assert.equal(resolved.clientSync.bidirectionalUninstall, false);
+    assert.deepEqual(resolved.clientSync.discoveredPlugins, [{ provider: 'copilot', name: 'cfv' }]);
+
+    // Project overrides mode but global discovered_plugins still wins because
+    // project doesn't set it (layered() returns whichever sub-field is defined).
+    cfg.writeConfig(tmpRoot, {
+      version: cfg.CONFIG_VERSION,
+      project_dir: tmpRoot,
+      global_dir: globalDir,
+      client_sync: { mode: 'off' },
+    });
+    resolved = cfg.resolveConfig({ projectDir: tmpRoot, globalDir, env: {} });
+    assert.equal(resolved.clientSync.mode, 'off');
+  } finally {
+    cleanup();
+  }
+});
+
+test('validateConfig — rejects invalid client_sync.mode', async () => {
+  const cfg = await import(configModUrl);
+  const { tmpRoot, cleanup } = makeProject();
+  try {
+    const globalDir = join(tmpRoot, '.global');
+    mkdirSync(globalDir, { recursive: true });
+    const bad = {
+      version: cfg.CONFIG_VERSION,
+      global_dir: globalDir,
+      client_sync: { mode: 'bogus' },
+    };
+    const { writeFileSync } = await import('node:fs');
+    writeFileSync(cfg.globalConfigPath(globalDir), JSON.stringify(bad));
+    assert.throws(
+      () => cfg.resolveConfig({ projectDir: tmpRoot, globalDir, env: {} }),
+      /client_sync\.mode must be one of/,
+    );
+  } finally {
+    cleanup();
+  }
+});
+
 test('validateConfig — rejects invalid default_agent_cli', async () => {
   const cfg = await import(configModUrl);
   const { tmpRoot, cleanup } = makeProject();

@@ -89,6 +89,19 @@ export interface ClawdevboxCronConfig {
   dispatcher_drain_ms?: number;
 }
 
+export interface ClawdevboxClientSyncConfig {
+  /** auto = both directions eager. manual = via `clawdevbox plugin sync` only.
+   *  discover-only = pull side only (no writes to CLI). off = no sync. */
+  mode?: 'auto' | 'manual' | 'discover-only' | 'off';
+  /** When true (default), plugins removed from clawdevbox are also
+   *  uninstalled from the CLI (only those that came from a clawdevbox-managed
+   *  marketplace). */
+  bidirectional_uninstall?: boolean;
+  /** Persisted from `clawdevbox init` opt-in. Each entry is a (provider, name)
+   *  tuple of a CLI-installed plugin clawdevbox should register. */
+  discovered_plugins?: Array<{ provider: string; name: string }>;
+}
+
 export interface ClawdevboxConfig {
   version: typeof CONFIG_VERSION;
   /**
@@ -111,6 +124,8 @@ export interface ClawdevboxConfig {
    * field is `null` when neither config layer sets it.
    */
   default_agent_cli?: string;
+  /** Bidirectional plugin sync settings (spec §9). */
+  client_sync?: ClawdevboxClientSyncConfig;
 }
 
 export interface ResolvedConfig {
@@ -145,6 +160,12 @@ export interface ResolvedConfig {
    * call edge.
    */
   defaultAgentCli: string | null;
+  /** Bidirectional plugin sync (project > global, defaults applied). */
+  clientSync: {
+    mode: 'auto' | 'manual' | 'discover-only' | 'off';
+    bidirectionalUninstall: boolean;
+    discoveredPlugins: Array<{ provider: string; name: string }>;
+  };
 }
 
 export class ConfigError extends Error {
@@ -397,6 +418,56 @@ function validateConfig(parsed: unknown, source: string): ClawdevboxConfig {
       http.token = h.token;
     }
   }
+  let client_sync: ClawdevboxClientSyncConfig | undefined;
+  if (obj.client_sync !== undefined) {
+    if (!obj.client_sync || typeof obj.client_sync !== 'object') {
+      throw new ConfigError(`${source}: client_sync must be an object`);
+    }
+    const cs = obj.client_sync as Record<string, unknown>;
+    client_sync = {};
+    if (cs.mode !== undefined) {
+      if (
+        typeof cs.mode !== 'string' ||
+        (cs.mode !== 'auto' && cs.mode !== 'manual' && cs.mode !== 'discover-only' && cs.mode !== 'off')
+      ) {
+        throw new ConfigError(
+          `${source}: client_sync.mode must be one of 'auto' | 'manual' | 'discover-only' | 'off'`,
+        );
+      }
+      client_sync.mode = cs.mode;
+    }
+    if (cs.bidirectional_uninstall !== undefined) {
+      if (typeof cs.bidirectional_uninstall !== 'boolean') {
+        throw new ConfigError(`${source}: client_sync.bidirectional_uninstall must be a boolean`);
+      }
+      client_sync.bidirectional_uninstall = cs.bidirectional_uninstall;
+    }
+    if (cs.discovered_plugins !== undefined) {
+      if (!Array.isArray(cs.discovered_plugins)) {
+        throw new ConfigError(`${source}: client_sync.discovered_plugins must be an array`);
+      }
+      const out: Array<{ provider: string; name: string }> = [];
+      for (const e of cs.discovered_plugins) {
+        if (!e || typeof e !== 'object') {
+          throw new ConfigError(`${source}: client_sync.discovered_plugins[] entries must be objects`);
+        }
+        const en = e as Record<string, unknown>;
+        if (typeof en.provider !== 'string' || en.provider.length === 0) {
+          throw new ConfigError(
+            `${source}: client_sync.discovered_plugins[].provider must be a non-empty string`,
+          );
+        }
+        if (typeof en.name !== 'string' || en.name.length === 0) {
+          throw new ConfigError(
+            `${source}: client_sync.discovered_plugins[].name must be a non-empty string`,
+          );
+        }
+        out.push({ provider: en.provider, name: en.name });
+      }
+      client_sync.discovered_plugins = out;
+    }
+  }
+
   return {
     version: CONFIG_VERSION,
     project_dir: obj.project_dir,
@@ -407,6 +478,7 @@ function validateConfig(parsed: unknown, source: string): ClawdevboxConfig {
     notifications,
     cron,
     default_agent_cli,
+    client_sync,
   };
 }
 
@@ -525,6 +597,13 @@ export function resolveConfig(opts: ResolveOptions = {}): ResolvedConfig {
 
   const defaultAgentCli = layered((c) => c.default_agent_cli) ?? null;
 
+  const clientSyncMode =
+    layered((c) => c.client_sync?.mode) ?? 'auto';
+  const clientSyncBidirectionalUninstall =
+    layered((c) => c.client_sync?.bidirectional_uninstall) ?? true;
+  const clientSyncDiscoveredPlugins =
+    layered((c) => c.client_sync?.discovered_plugins) ?? [];
+
   // Pick a representative configPath: prefer project layer when present,
   // otherwise the global layer, otherwise null.
   const configPathUsed = projectCfg
@@ -554,6 +633,11 @@ export function resolveConfig(opts: ResolveOptions = {}): ResolvedConfig {
     },
     configPath: configPathUsed,
     defaultAgentCli,
+    clientSync: {
+      mode: clientSyncMode,
+      bidirectionalUninstall: clientSyncBidirectionalUninstall,
+      discoveredPlugins: clientSyncDiscoveredPlugins,
+    },
   };
 }
 
