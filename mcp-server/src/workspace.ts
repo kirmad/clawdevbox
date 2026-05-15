@@ -28,6 +28,7 @@ import { load as yamlLoad } from 'js-yaml';
 import { validatePluginManifest } from './validators.ts';
 import { listAgentAuthoredTemplates, toRegisteredType } from './template-store.ts';
 import type { AgentCliProvider, AgentCliProviderError } from './agent-clis/types.ts';
+import { registerBuiltinProviders } from './agent-clis/index.ts';
 
 // ============================================================================
 // Types
@@ -350,6 +351,11 @@ export async function reloadTypeRegistries(ws: Workspace): Promise<void> {
   ws.plugins.clear();
   ws.triggerTypes.clear();
   ws.triggerTypeErrors.length = 0;
+  // Clear and reseed the agent-CLI registry on every reload. Built-ins always
+  // go first so plugin-provided providers can't shadow built-in ids.
+  ws.agentCliProviders = new Map();
+  ws.agentCliProviderErrors = [];
+  registerBuiltinProviders(ws);
   const pluginsRoot = globalPluginsDir(ws);
   if (existsSync(pluginsRoot)) {
     let entries: string[] = [];
