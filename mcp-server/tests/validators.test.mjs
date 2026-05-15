@@ -563,6 +563,96 @@ test("validatePluginManifestJson: valid clawdevbox block passes", () => {
 });
 
 // ============================================================================
+// Polymorphic clawdevbox.* fields (auto-discovery design §2)
+// ============================================================================
+
+test("validatePluginManifestJson: clawdevbox.recipes accepts a string path", () => {
+  const errs = validatePluginManifestJson({
+    name: "demo",
+    clawdevbox: { recipes: "custom-recipes" },
+  });
+  assert.deepEqual(errs, []);
+});
+
+test("validatePluginManifestJson: clawdevbox.recipes rejects unsafe string path", () => {
+  const errs = validatePluginManifestJson({
+    name: "demo",
+    clawdevbox: { recipes: "../escape" },
+  });
+  assert.ok(errs.some((e) => e.path === "clawdevbox.recipes" && e.code === "PATH_ESCAPE"));
+});
+
+test("validatePluginManifestJson: clawdevbox.tools accepts a string[] of paths", () => {
+  const errs = validatePluginManifestJson({
+    name: "demo",
+    clawdevbox: { tools: ["tools-a", "tools-b/echo.ts"] },
+  });
+  assert.deepEqual(errs, []);
+});
+
+test("validatePluginManifestJson: clawdevbox.tools rejects unsafe entry in string[]", () => {
+  const errs = validatePluginManifestJson({
+    name: "demo",
+    clawdevbox: { tools: ["tools", "../escape"] },
+  });
+  assert.ok(errs.some((e) => e.path === "clawdevbox.tools[1]" && e.code === "PATH_ESCAPE"));
+});
+
+test("validatePluginManifestJson: clawdevbox.trigger_types accepts undefined (auto-discover)", () => {
+  const errs = validatePluginManifestJson({ name: "demo", clawdevbox: {} });
+  assert.deepEqual(errs, []);
+});
+
+test("validatePluginManifestJson: clawdevbox.agent_clis rejects non-string/non-array", () => {
+  const errs = validatePluginManifestJson({
+    name: "demo",
+    clawdevbox: { agent_clis: 42 },
+  });
+  assert.ok(errs.some((e) => e.path === "clawdevbox.agent_clis" && e.code === "TYPE"));
+});
+
+test("validatePluginManifestJson: clawdevbox.renderers entry validates type + module", () => {
+  const errs = validatePluginManifestJson({
+    name: "demo",
+    clawdevbox: {
+      renderers: [{ type: "pr-review", module: "renderers/pr.mjs" }],
+    },
+  });
+  assert.deepEqual(errs, []);
+});
+
+test("validatePluginManifestJson: clawdevbox.renderers rejects entry missing type", () => {
+  const errs = validatePluginManifestJson({
+    name: "demo",
+    clawdevbox: { renderers: [{ module: "renderers/x.mjs" }] },
+  });
+  assert.ok(errs.some((e) => e.path === "clawdevbox.renderers[0].type" && e.code === "REQUIRED"));
+});
+
+test("validatePluginManifestJson: clawdevbox.renderers rejects unsafe module path", () => {
+  const errs = validatePluginManifestJson({
+    name: "demo",
+    clawdevbox: { renderers: [{ type: "x", module: "../escape.mjs" }] },
+  });
+  assert.ok(
+    errs.some((e) => e.path === "clawdevbox.renderers[0].module" && e.code === "PATH_ESCAPE"),
+  );
+});
+
+test("validatePluginManifestJson: clawdevbox.renderers rejects duplicate type", () => {
+  const errs = validatePluginManifestJson({
+    name: "demo",
+    clawdevbox: {
+      renderers: [
+        { type: "x", module: "renderers/x.mjs" },
+        { type: "x", module: "renderers/x2.mjs" },
+      ],
+    },
+  });
+  assert.ok(errs.some((e) => e.path === "clawdevbox.renderers[1].type" && e.code === "DUPLICATE"));
+});
+
+// ============================================================================
 // validateAgencyJson
 // ============================================================================
 

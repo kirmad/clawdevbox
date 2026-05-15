@@ -1195,6 +1195,116 @@ function validateClawdevboxToolEntry(
   }
 }
 
+/**
+ * Validate a single `clawdevbox.renderers[]` entry. The `type` is a
+ * filename-stem (kebab-or-snake mix is allowed via the standard id regex).
+ * `module` is a relative path with no escape segments.
+ */
+function validatePluginRendererEntry(entry: unknown, fieldPath: string): ValidationError[] {
+  const errors: ValidationError[] = [];
+  if (!isPlainObject(entry)) {
+    errors.push({ path: fieldPath, code: 'TYPE', message: 'renderer entry must be an object.' });
+    return errors;
+  }
+  const e = entry as Record<string, unknown>;
+  if (!isNonEmptyString(e.type)) {
+    errors.push({
+      path: `${fieldPath}.type`,
+      code: 'REQUIRED',
+      message: 'renderer.type is required.',
+    });
+  } else if (!/^[a-z0-9][a-z0-9._-]*$/i.test(e.type)) {
+    errors.push({
+      path: `${fieldPath}.type`,
+      code: 'PATTERN',
+      message: 'renderer.type must match /^[a-z0-9][a-z0-9._-]*$/i.',
+    });
+  }
+  if (!isNonEmptyString(e.module)) {
+    errors.push({
+      path: `${fieldPath}.module`,
+      code: 'REQUIRED',
+      message: 'renderer.module is required.',
+    });
+  } else if (isUnsafeRelPath(e.module)) {
+    errors.push({
+      path: `${fieldPath}.module`,
+      code: 'PATH_ESCAPE',
+      message: 'renderer.module must be a relative path with no ".." segments.',
+    });
+  }
+  if (e.description !== undefined && typeof e.description !== 'string') {
+    errors.push({
+      path: `${fieldPath}.description`,
+      code: 'TYPE',
+      message: 'renderer.description must be a string.',
+    });
+  }
+  return errors;
+}
+
+/**
+ * Validate a `clawdevbox.<capability>` field that accepts the polymorphic
+ * `string | string[] | Entry[]` shape (auto-discovery design §2).
+ *
+ *   - `string`   ⇒ a relative directory path (no `..`).
+ *   - `string[]` ⇒ each entry is a relative path (file or directory).
+ *   - `object[]` ⇒ each entry is validated by `entryValidator`.
+ *
+ * The `entryValidator` is invoked with the entry, the index, and the parent
+ * field path (e.g. `clawdevbox.recipes`); it returns the errors for that one
+ * entry. The duplicate-id pass is delegated to the caller because not every
+ * capability shares the same id-field name.
+ */
+function validateCapabilityField(
+  value: unknown,
+  fieldPath: string,
+  errors: ValidationError[],
+  entryValidator: (entry: unknown, fp: string) => void,
+): void {
+  if (value === undefined) return;
+  if (typeof value === 'string') {
+    if (isUnsafeRelPath(value)) {
+      errors.push({
+        path: fieldPath,
+        code: 'PATH_ESCAPE',
+        message: `${fieldPath} must be a relative path with no ".." segments.`,
+      });
+    }
+    return;
+  }
+  if (!Array.isArray(value)) {
+    errors.push({
+      path: fieldPath,
+      code: 'TYPE',
+      message: `${fieldPath} must be a string, array of strings, or array of entry objects.`,
+    });
+    return;
+  }
+  if (value.length === 0) return;
+  // Decide between string[] and Entry[] by inspecting the first non-null item.
+  const first = value.find((v) => v !== undefined && v !== null);
+  if (typeof first === 'string') {
+    value.forEach((entry, i) => {
+      const fp = `${fieldPath}[${i}]`;
+      if (typeof entry !== 'string') {
+        errors.push({ path: fp, code: 'TYPE', message: `${fp} must be a string.` });
+      } else if (isUnsafeRelPath(entry)) {
+        errors.push({
+          path: fp,
+          code: 'PATH_ESCAPE',
+          message: `${fp} must be a relative path with no ".." segments.`,
+        });
+      }
+    });
+    return;
+  }
+  // Default: array of entry objects.
+  value.forEach((entry, i) => {
+    entryValidator(entry, `${fieldPath}[${i}]`);
+  });
+}
+
 function validateClawdevboxExtensions(value: unknown, errors: ValidationError[]): void {
   if (!isPlainObject(value)) {
     errors.push({ path: 'clawdevbox', code: 'TYPE', message: 'clawdevbox must be an object.' });
@@ -1202,123 +1312,100 @@ function validateClawdevboxExtensions(value: unknown, errors: ValidationError[])
   }
   const c = value as Record<string, unknown>;
 
-  if (c.recipes !== undefined) {
-    if (!Array.isArray(c.recipes)) {
-      errors.push({
-        path: 'clawdevbox.recipes',
-        code: 'TYPE',
-        message: 'clawdevbox.recipes must be an array.',
-      });
-    } else {
-      const seen = new Set<string>();
-      c.recipes.forEach((entry, i) => {
-        const p = `clawdevbox.recipes[${i}]`;
-        validateSimpleProvideEntry(entry, p, ID_PATTERN, errors);
-        if (isPlainObject(entry) && isNonEmptyString((entry as Record<string, unknown>).id)) {
-          const id = (entry as Record<string, unknown>).id as string;
-          if (seen.has(id)) {
-            errors.push({
-              path: `${p}.id`,
-              code: 'DUPLICATE',
-              message: `recipe id ${id} duplicated within plugin.`,
-            });
-          } else {
-            seen.add(id);
-          }
-        }
-      });
+  const recipeSeen = new Set<string>();
+  validateCapabilityField(c.recipes, 'clawdevbox.recipes', errors, (entry, p) => {
+    validateSimpleProvideEntry(entry, p, ID_PATTERN, errors);
+    if (isPlainObject(entry) && isNonEmptyString((entry as Record<string, unknown>).id)) {
+      const id = (entry as Record<string, unknown>).id as string;
+      if (recipeSeen.has(id)) {
+        errors.push({
+          path: `${p}.id`,
+          code: 'DUPLICATE',
+          message: `recipe id ${id} duplicated within plugin.`,
+        });
+      } else {
+        recipeSeen.add(id);
+      }
     }
-  }
+  });
 
-  if (c.tools !== undefined) {
-    if (!Array.isArray(c.tools)) {
-      errors.push({
-        path: 'clawdevbox.tools',
-        code: 'TYPE',
-        message: 'clawdevbox.tools must be an array.',
-      });
-    } else {
-      const seen = new Set<string>();
-      c.tools.forEach((entry, i) => {
-        const p = `clawdevbox.tools[${i}]`;
-        validateClawdevboxToolEntry(entry, p, errors);
-        if (isPlainObject(entry) && isNonEmptyString((entry as Record<string, unknown>).id)) {
-          const id = (entry as Record<string, unknown>).id as string;
-          if (seen.has(id)) {
-            errors.push({
-              path: `${p}.id`,
-              code: 'DUPLICATE',
-              message: `tool id ${id} duplicated within plugin.`,
-            });
-          } else {
-            seen.add(id);
-          }
-        }
-      });
+  const toolSeen = new Set<string>();
+  validateCapabilityField(c.tools, 'clawdevbox.tools', errors, (entry, p) => {
+    validateClawdevboxToolEntry(entry, p, errors);
+    if (isPlainObject(entry) && isNonEmptyString((entry as Record<string, unknown>).id)) {
+      const id = (entry as Record<string, unknown>).id as string;
+      if (toolSeen.has(id)) {
+        errors.push({
+          path: `${p}.id`,
+          code: 'DUPLICATE',
+          message: `tool id ${id} duplicated within plugin.`,
+        });
+      } else {
+        toolSeen.add(id);
+      }
     }
-  }
+  });
 
-  if (c.trigger_types !== undefined) {
-    if (!Array.isArray(c.trigger_types)) {
-      errors.push({
-        path: 'clawdevbox.trigger_types',
-        code: 'TYPE',
-        message: 'clawdevbox.trigger_types must be an array.',
-      });
-    } else {
-      const seenIds = new Set<string>();
-      c.trigger_types.forEach((entry, i) => {
-        const p = `clawdevbox.trigger_types[${i}]`;
-        const entryErrors = validateTriggerTypeEntry(entry, p);
-        errors.push(...entryErrors);
-        if (isPlainObject(entry) && isNonEmptyString((entry as Record<string, unknown>).id)) {
-          const id = (entry as Record<string, unknown>).id as string;
-          if (seenIds.has(id)) {
-            errors.push({
-              path: `${p}.id`,
-              code: 'DUPLICATE',
-              message: `trigger_type id ${id} duplicated within plugin.`,
-            });
-          } else {
-            seenIds.add(id);
-          }
-        }
-      });
+  const triggerSeen = new Set<string>();
+  validateCapabilityField(c.trigger_types, 'clawdevbox.trigger_types', errors, (entry, p) => {
+    const entryErrors = validateTriggerTypeEntry(entry, p);
+    errors.push(...entryErrors);
+    if (isPlainObject(entry) && isNonEmptyString((entry as Record<string, unknown>).id)) {
+      const id = (entry as Record<string, unknown>).id as string;
+      if (triggerSeen.has(id)) {
+        errors.push({
+          path: `${p}.id`,
+          code: 'DUPLICATE',
+          message: `trigger_type id ${id} duplicated within plugin.`,
+        });
+      } else {
+        triggerSeen.add(id);
+      }
     }
-  }
+  });
 
-  if (c.agent_clis !== undefined) {
-    if (!Array.isArray(c.agent_clis)) {
-      errors.push({
-        path: 'clawdevbox.agent_clis',
-        code: 'TYPE',
-        message: 'clawdevbox.agent_clis must be an array.',
-      });
-    } else {
-      const seenIds = new Set<string>();
-      c.agent_clis.forEach((entry, i) => {
-        // validatePluginAgentCliEntry writes paths prefixed `provides.agent_clis[i]`;
-        // remap to the new `clawdevbox.agent_clis[i]` prefix for caller-friendly messages.
-        const reused = validatePluginAgentCliEntry(entry, i).map((err) => ({
-          ...err,
-          path: err.path.replace(/^provides\.agent_clis/, 'clawdevbox.agent_clis'),
-        }));
-        errors.push(...reused);
-        if (isPlainObject(entry) && isNonEmptyString((entry as Record<string, unknown>).id)) {
-          const id = (entry as Record<string, unknown>).id as string;
-          if (seenIds.has(id)) {
-            errors.push({
-              path: `clawdevbox.agent_clis[${i}].id`,
-              code: 'DUPLICATE',
-              message: `agent_cli id ${id} duplicated within plugin.`,
-            });
-          } else {
-            seenIds.add(id);
-          }
-        }
-      });
+  const cliSeen = new Set<string>();
+  validateCapabilityField(c.agent_clis, 'clawdevbox.agent_clis', errors, (entry, p) => {
+    // validatePluginAgentCliEntry prefixes paths with `provides.agent_clis[i]`;
+    // remap to the actual caller-supplied field path for readability.
+    const m = p.match(/\[(\d+)\]$/);
+    const i = m ? Number(m[1]) : 0;
+    const reused = validatePluginAgentCliEntry(entry, i).map((err) => ({
+      ...err,
+      path: err.path.replace(/^provides\.agent_clis\[\d+\]/, p),
+    }));
+    errors.push(...reused);
+    if (isPlainObject(entry) && isNonEmptyString((entry as Record<string, unknown>).id)) {
+      const id = (entry as Record<string, unknown>).id as string;
+      if (cliSeen.has(id)) {
+        errors.push({
+          path: `${p}.id`,
+          code: 'DUPLICATE',
+          message: `agent_cli id ${id} duplicated within plugin.`,
+        });
+      } else {
+        cliSeen.add(id);
+      }
     }
-  }
+  });
+
+  const rendererSeen = new Set<string>();
+  validateCapabilityField(c.renderers, 'clawdevbox.renderers', errors, (entry, p) => {
+    const entryErrors = validatePluginRendererEntry(entry, p);
+    errors.push(...entryErrors);
+    if (isPlainObject(entry) && isNonEmptyString((entry as Record<string, unknown>).type)) {
+      const type = (entry as Record<string, unknown>).type as string;
+      if (rendererSeen.has(type)) {
+        errors.push({
+          path: `${p}.type`,
+          code: 'DUPLICATE',
+          message: `renderer type ${type} duplicated within plugin.`,
+        });
+      } else {
+        rendererSeen.add(type);
+      }
+    }
+  });
 }
 
 function validateMcpServersField(value: unknown, errors: ValidationError[]): void {
