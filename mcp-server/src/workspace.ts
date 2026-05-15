@@ -97,6 +97,18 @@ export interface PluginTriggerType {
   runtime?: 'node' | 'tsx' | 'python' | 'bash';
 }
 
+/**
+ * `provides.agent_clis[]` entry — declares a plugin-provided AgentCliProvider
+ * (spec §4). Loader at `agent-clis/load-plugin.ts` dynamic-imports `module`
+ * relative to the plugin directory and validates the exported provider shape.
+ */
+export interface PluginAgentCliEntry {
+  id: string;
+  module: string;
+  display_name?: string;
+  description?: string;
+}
+
 export interface PluginManifest {
   id: string;
   name: string;
@@ -117,6 +129,8 @@ export interface PluginManifest {
     /** Hostable tools (spec §10.3) — single-file scripts hosted in-process. */
     tools?: PluginProvideEntry[];
     mcp_servers?: PluginProvideEntry[];
+    /** AgentCliProvider declarations (spec §4) loaded via dynamic import. */
+    agent_clis?: PluginAgentCliEntry[];
   };
   requires?: {
     clawdevbox_version?: string;

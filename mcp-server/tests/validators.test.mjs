@@ -11,6 +11,8 @@ import {
   validateRecipeParsed,
   validateRecipeSource,
   parseRecipeSource,
+  validatePluginAgentCliEntry,
+  validatePluginManifest,
 } from '../src/validators.ts';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -319,5 +321,112 @@ test('validateBackoffMs rejects empty non-array negative non-integer and out-of-
   for (const v of [[], 'no', [1, -1], [1.5], [86400001], null]) {
     const r = validateBackoffMs(v);
     assert.equal(r.ok, false);
+  }
+});
+
+// ============================================================================
+// validatePluginAgentCliEntry — provides.agent_clis[] (spec §4)
+// ============================================================================
+
+test('validatePluginAgentCliEntry accepts a valid entry', () => {
+  const errs = validatePluginAgentCliEntry(
+    { id: 'agency', module: 'scripts/agency-provider.js', display_name: 'Agency', description: 'desc' },
+    0,
+  );
+  assert.deepEqual(errs, []);
+});
+
+test('validatePluginAgentCliEntry rejects missing id', () => {
+  const errs = validatePluginAgentCliEntry({ module: 'a.js' }, 0);
+  assert.ok(errs.some((e) => e.path === 'provides.agent_clis[0].id' && e.code === 'INVALID_VALUE'));
+});
+
+test('validatePluginAgentCliEntry rejects bad id pattern', () => {
+  const errs = validatePluginAgentCliEntry({ id: 'has space!', module: 'a.js' }, 1);
+  assert.ok(errs.some((e) => e.path === 'provides.agent_clis[1].id' && e.code === 'INVALID_VALUE'));
+});
+
+test('validatePluginAgentCliEntry rejects missing module', () => {
+  const errs = validatePluginAgentCliEntry({ id: 'ok' }, 2);
+  assert.ok(errs.some((e) => e.path === 'provides.agent_clis[2].module' && e.code === 'REQUIRED'));
+});
+
+test('validatePluginAgentCliEntry rejects path traversal in module', () => {
+  const errs = validatePluginAgentCliEntry({ id: 'ok', module: '../foo.js' }, 0);
+  assert.ok(errs.some((e) => e.path === 'provides.agent_clis[0].module' && e.code === 'INVALID_VALUE'));
+});
+
+test('validatePluginAgentCliEntry rejects nested path traversal in module', () => {
+  const errs = validatePluginAgentCliEntry({ id: 'ok', module: 'a/../../b.js' }, 0);
+  assert.ok(errs.some((e) => e.path === 'provides.agent_clis[0].module' && e.code === 'INVALID_VALUE'));
+});
+
+test('validatePluginAgentCliEntry rejects absolute Unix path', () => {
+  const errs = validatePluginAgentCliEntry({ id: 'ok', module: '/etc/evil.js' }, 0);
+  assert.ok(errs.some((e) => e.path === 'provides.agent_clis[0].module' && e.code === 'INVALID_VALUE'));
+});
+
+test('validatePluginAgentCliEntry rejects absolute Windows drive path', () => {
+  const errs = validatePluginAgentCliEntry({ id: 'ok', module: 'C:/evil.js' }, 0);
+  assert.ok(errs.some((e) => e.path === 'provides.agent_clis[0].module' && e.code === 'INVALID_VALUE'));
+});
+
+test('validatePluginAgentCliEntry rejects bad display_name type', () => {
+  const errs = validatePluginAgentCliEntry(
+    { id: 'ok', module: 'a.js', display_name: 42 },
+    0,
+  );
+  assert.ok(errs.some((e) => e.path === 'provides.agent_clis[0].display_name' && e.code === 'TYPE'));
+});
+
+test('validatePluginAgentCliEntry rejects non-object entry', () => {
+  const errs = validatePluginAgentCliEntry('not-an-object', 0);
+  assert.ok(errs.some((e) => e.path === 'provides.agent_clis[0]' && e.code === 'TYPE'));
+});
+
+test('validatePluginManifest integrates provides.agent_clis validation', () => {
+  const r = validatePluginManifest({
+    id: 'p',
+    name: 'P',
+    version: '0.1.0',
+    description: 'd',
+    provides: {
+      agent_clis: [
+        { id: 'good', module: 'a.js' },
+        { id: 'bad space', module: '../escape.js' },
+      ],
+    },
+  });
+  assert.equal(r.ok, false);
+  if (!r.ok) {
+    assert.ok(r.errors.some((e) => e.path === 'provides.agent_clis[1].id'));
+    assert.ok(r.errors.some((e) => e.path === 'provides.agent_clis[1].module'));
+  }
+});
+
+test('validatePluginManifest rejects non-array provides.agent_clis', () => {
+  const r = validatePluginManifest({
+    id: 'p', name: 'P', version: '0.1.0', description: 'd',
+    provides: { agent_clis: 'nope' },
+  });
+  assert.equal(r.ok, false);
+  if (!r.ok) {
+    assert.ok(r.errors.some((e) => e.path === 'provides.agent_clis' && e.code === 'TYPE'));
+  }
+});
+
+test('validatePluginManifest detects duplicate agent_clis ids within a plugin', () => {
+  const r = validatePluginManifest({
+    id: 'p', name: 'P', version: '0.1.0', description: 'd',
+    provides: {
+      agent_clis: [
+        { id: 'dup', module: 'a.js' },
+        { id: 'dup', module: 'b.js' },
+      ],
+    },
+  });
+  assert.equal(r.ok, false);
+  if (!r.ok) {
+    assert.ok(r.errors.some((e) => e.path === 'provides.agent_clis[1].id' && e.code === 'DUPLICATE'));
   }
 });

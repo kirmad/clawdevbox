@@ -501,6 +501,37 @@ export function validatePluginManifest(parsed: unknown): ValidationResult {
           });
         }
       }
+
+      // agent_clis — AgentCliProvider declarations (spec §4).
+      if (provides.agent_clis !== undefined) {
+        if (!Array.isArray(provides.agent_clis)) {
+          errors.push({
+            path: 'provides.agent_clis',
+            code: 'TYPE',
+            message: 'provides.agent_clis must be an array.',
+          });
+        } else {
+          const seenCliIds = new Set<string>();
+          provides.agent_clis.forEach((entry, i) => {
+            const entryErrors = validatePluginAgentCliEntry(entry, i);
+            if (entryErrors.length > 0) {
+              errors.push(...entryErrors);
+              return;
+            }
+            const e = entry as Record<string, unknown>;
+            const id = e.id as string;
+            if (seenCliIds.has(id)) {
+              errors.push({
+                path: `provides.agent_clis[${i}].id`,
+                code: 'DUPLICATE',
+                message: `agent_cli id ${id} duplicated within plugin.`,
+              });
+            } else {
+              seenCliIds.add(id);
+            }
+          });
+        }
+      }
     }
   }
   return errors.length === 0 ? { ok: true } : { ok: false, errors };
@@ -560,6 +591,52 @@ export function validateBackoffMs(
     out.push(n);
   }
   return { ok: true, value: out };
+}
+
+/**
+ * `provides.agent_clis[]` entry validator (spec §4). Mirrors the
+ * `validateTriggerTypeEntry` pattern. Ids must match the standard pattern;
+ * module is a relative path with no `..` segments and no absolute roots.
+ */
+export function validatePluginAgentCliEntry(entry: unknown, i: number): ValidationError[] {
+  const errors: ValidationError[] = [];
+  const path = `provides.agent_clis[${i}]`;
+  if (!isPlainObject(entry)) {
+    errors.push({ path, code: 'TYPE', message: 'agent_clis entry must be an object.' });
+    return errors;
+  }
+  const e = entry as Record<string, unknown>;
+  if (typeof e.id !== 'string' || !/^[a-z0-9][a-z0-9._-]*$/i.test(e.id)) {
+    errors.push({
+      path: `${path}.id`,
+      code: 'INVALID_VALUE',
+      message: 'id is required and must match /^[a-z0-9][a-z0-9._-]*$/i',
+    });
+  }
+  if (typeof e.module !== 'string' || (e.module as string).trim() === '') {
+    errors.push({ path: `${path}.module`, code: 'REQUIRED', message: 'module is required.' });
+  } else {
+    const m = e.module as string;
+    if (
+      m.split(/[\\/]/).some((seg) => seg === '..') ||
+      m.startsWith('/') ||
+      m.startsWith('\\') ||
+      /^[A-Z]:/i.test(m)
+    ) {
+      errors.push({
+        path: `${path}.module`,
+        code: 'INVALID_VALUE',
+        message: 'module must be a relative path with no .. segments.',
+      });
+    }
+  }
+  if (e.display_name !== undefined && typeof e.display_name !== 'string') {
+    errors.push({ path: `${path}.display_name`, code: 'TYPE', message: 'display_name must be a string.' });
+  }
+  if (e.description !== undefined && typeof e.description !== 'string') {
+    errors.push({ path: `${path}.description`, code: 'TYPE', message: 'description must be a string.' });
+  }
+  return errors;
 }
 
 function validateTriggerTypeEntry(entry: unknown, p: string): ValidationError[] {
