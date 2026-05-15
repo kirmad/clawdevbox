@@ -182,7 +182,7 @@ export interface Workspace {
 }
 
 /** Read CLAWDEVBOX_PROJECT_DIR (required) + CLAWDEVBOX_GLOBAL_DIR (optional). */
-export function loadWorkspaceFromEnv(env: NodeJS.ProcessEnv = process.env): Workspace {
+export async function loadWorkspaceFromEnv(env: NodeJS.ProcessEnv = process.env): Promise<Workspace> {
   const projectDir = env.CLAWDEVBOX_PROJECT_DIR;
   if (!projectDir || projectDir.trim() === '') {
     throw new WorkspaceConfigError(
@@ -204,7 +204,7 @@ export function loadWorkspaceFromEnv(env: NodeJS.ProcessEnv = process.env): Work
     agentCliProviders: new Map(),
     agentCliProviderErrors: [],
   };
-  reloadTypeRegistries(ws);
+  await reloadTypeRegistries(ws);
   warnIfLegacyProjectPlugins(ws);
   return ws;
 }
@@ -346,7 +346,7 @@ export function stateJsonPath(ws: Workspace): string {
 // ============================================================================
 
 /** Rescan <globalDir>/plugins/* and rebuild ws.plugins. */
-export function reloadTypeRegistries(ws: Workspace): void {
+export async function reloadTypeRegistries(ws: Workspace): Promise<void> {
   ws.plugins.clear();
   ws.triggerTypes.clear();
   ws.triggerTypeErrors.length = 0;

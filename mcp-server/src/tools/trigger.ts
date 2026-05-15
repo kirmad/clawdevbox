@@ -678,7 +678,7 @@ export function registerTriggerTools(server: McpServer, ws: Workspace): void {
       }
 
       const written = writeTemplate(ws, scope, { manifest, scriptContent });
-      reloadTypeRegistries(ws);
+      await reloadTypeRegistries(ws);
 
       return {
         content: [{ type: 'text', text: `Created template ${args.id} (scope=${scope}).` }],
@@ -796,7 +796,7 @@ export function registerTriggerTools(server: McpServer, ws: Workspace): void {
       }
 
       const written = writeTemplate(ws, existing.scope, { manifest: merged, scriptContent });
-      reloadTypeRegistries(ws);
+      await reloadTypeRegistries(ws);
 
       return {
         content: [{ type: 'text', text: `Updated template ${args.id}.` }],
@@ -833,7 +833,7 @@ export function registerTriggerTools(server: McpServer, ws: Workspace): void {
           { id: args.id, registered_ids: refs });
       }
       const removed = deleteTemplate(ws, existing.scope, args.id);
-      reloadTypeRegistries(ws);
+      await reloadTypeRegistries(ws);
       return {
         content: [{ type: 'text', text: `Deleted template ${args.id} (scope=${existing.scope}).` }],
         structuredContent: { id: args.id, scope: existing.scope, removed },

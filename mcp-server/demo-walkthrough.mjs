@@ -44,7 +44,7 @@ mkdirSync(workspacesRoot, { recursive: true });
 process.env.CLAWDEVBOX_PROJECT_DIR = projectDir;
 process.env.CLAWDEVBOX_WORKSPACES_ROOT = workspacesRoot;
 
-const ws = loadWorkspaceFromEnv();
+const ws = await loadWorkspaceFromEnv();
 const wsRecord = createWorkspace(resolveWorkspacesRoot(), {
   name: 'demo-ws',
   baseProjectPath: projectDir,

@@ -368,7 +368,7 @@ export function registerPluginTools(server: McpServer, ws: Workspace): void {
       if (!existsSync(manifestPath)) {
         return structuredError('MANIFEST_MISSING', `plugin.yaml not found at ${manifestPath} after update`);
       }
-      reloadPluginRegistry(ws);
+      await reloadPluginRegistry(ws);
       return {
         content: [{ type: 'text', text: `Updated plugin ${args.id} (reset to ${resetTarget}).` }],
         structuredContent: { id: args.id, reset_to: resetTarget, output: reset.stdout?.trim() ?? '' },
@@ -420,7 +420,7 @@ export function registerPluginTools(server: McpServer, ws: Workspace): void {
         }
       }
       removeInstallRecord(ws, args.id);
-      reloadPluginRegistry(ws);
+      await reloadPluginRegistry(ws);
       return {
         content: [{ type: 'text', text: `Uninstalled plugin ${args.id}.` }],
         structuredContent: { id: args.id, dir: targetDir },
@@ -443,7 +443,7 @@ export function registerPluginTools(server: McpServer, ws: Workspace): void {
         state.plugins ??= {};
         state.plugins[args.id] = { enabled: action === 'enable' };
         writeStateFile(ws, state);
-        reloadPluginRegistry(ws);
+        await reloadPluginRegistry(ws);
         return {
           content: [
             { type: 'text', text: `${action === 'enable' ? 'Enabled' : 'Disabled'} plugin ${args.id}.` },
@@ -464,7 +464,7 @@ export function registerPluginTools(server: McpServer, ws: Workspace): void {
  * rename to `<global_dir>/plugins/<id>/`. Full clones (no `--depth 1`) so
  * `plugin.update` can fetch+reset across branches/tags/SHAs reliably.
  */
-function installFromGit(ws: Workspace, from: string, ref: string | null): CallToolResult {
+async function installFromGit(ws: Workspace, from: string, ref: string | null): Promise<CallToolResult> {
   const pluginsRoot = globalPluginsDir(ws);
   const tmp = mkdtempSync(join(pluginsRoot, '.tmp-install-'));
   let succeeded = false;
@@ -519,7 +519,7 @@ function installFromGit(ws: Workspace, from: string, ref: string | null): CallTo
     };
     writeInstallRecord(ws, manifest.id, record);
 
-    reloadPluginRegistry(ws);
+    await reloadPluginRegistry(ws);
     return {
       content: [{ type: 'text', text: `Installed plugin ${manifest.id} from ${from}.` }],
       structuredContent: { id: manifest.id, dir: destDir, origin: record },
@@ -541,7 +541,7 @@ function installFromGit(ws: Workspace, from: string, ref: string | null): CallTo
  * user's folder is never modified beyond a best-effort `node_modules`
  * junction for hostable-tool deps.
  */
-function installFromLocalFolder(ws: Workspace, sourcePath: string): CallToolResult {
+async function installFromLocalFolder(ws: Workspace, sourcePath: string): Promise<CallToolResult> {
   const absoluteSource = resolve(sourcePath);
   const manifestPath = join(absoluteSource, 'plugin.yaml');
   if (!existsSync(manifestPath)) {
@@ -604,7 +604,7 @@ function installFromLocalFolder(ws: Workspace, sourcePath: string): CallToolResu
     }
   }
 
-  reloadPluginRegistry(ws);
+  await reloadPluginRegistry(ws);
   const messages = [`Installed plugin ${manifest.id} as a local-folder link → ${absoluteSource}.`];
   if (nodeModulesHint) messages.push(nodeModulesHint);
   return {

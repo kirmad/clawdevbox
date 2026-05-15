@@ -198,7 +198,7 @@ export async function runMcp(flags: Flags): Promise<void> {
 
   let ws;
   try {
-    ws = loadWorkspaceFromEnv();
+    ws = await loadWorkspaceFromEnv();
   } catch (err) {
     if (err instanceof WorkspaceConfigError) {
       logger.error({ err: err.message }, 'workspace config error');

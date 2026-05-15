@@ -18,7 +18,7 @@ test('agent-authored project template appears in ws.triggerTypes', async () => {
     writeFileSync(join(localTplDir, 'trigger.ts'), '// demo\n');
     mkdirSync(join(tmp, 'global'), { recursive: true });
 
-    const ws = loadWorkspaceFromEnv({
+    const ws = await loadWorkspaceFromEnv({
       CLAWDEVBOX_PROJECT_DIR: projectDir,
       CLAWDEVBOX_GLOBAL_DIR: join(tmp, 'global'),
     });
@@ -45,7 +45,7 @@ test('project template shadows global with same id', async () => {
     writeFileSync(join(globTpl, 'template.yaml'), yamlDump({ id: 'local.shared', file: 'trigger.ts', runtime: 'tsx' }));
     writeFileSync(join(globTpl, 'trigger.ts'), '// global\n');
 
-    const ws = loadWorkspaceFromEnv({
+    const ws = await loadWorkspaceFromEnv({
       CLAWDEVBOX_PROJECT_DIR: projectDir,
       CLAWDEVBOX_GLOBAL_DIR: globalDir,
     });
@@ -68,7 +68,7 @@ test('_oneoff directory is excluded from project template walk', async () => {
     writeFileSync(join(oneoff, 'template.yaml'), yamlDump({ id: 'local.oneoff.abc', file: 'trigger.ts', runtime: 'tsx' }));
     writeFileSync(join(oneoff, 'trigger.ts'), '');
 
-    const ws = loadWorkspaceFromEnv({
+    const ws = await loadWorkspaceFromEnv({
       CLAWDEVBOX_PROJECT_DIR: projectDir,
       CLAWDEVBOX_GLOBAL_DIR: join(tmp, 'global'),
     });
