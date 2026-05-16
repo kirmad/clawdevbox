@@ -232,10 +232,26 @@ export async function loadWorkspaceFromEnv(env: NodeJS.ProcessEnv = process.env)
  * tree still has plugins inside. Under the new global-store model those are
  * silently ignored; users need to reinstall into the global store to get them
  * back. Errors here are swallowed (logging is best-effort).
+ *
+ * Skips the warning when `<projectDir>/.clawdevbox/plugins` resolves to the
+ * SAME path as the global plugin store — which happens whenever projectDir is
+ * an ancestor of globalDir (e.g. running `clawdevbox init` from `~` with the
+ * default globalDir at `~/.clawdevbox`). In that case the directory isn't
+ * "legacy" at all, it's the live store.
  */
 function warnIfLegacyProjectPlugins(ws: Workspace): void {
   const legacy = join(ws.projectDir, '.clawdevbox', 'plugins');
   if (!existsSync(legacy)) return;
+  // False-positive guard: if `legacy` IS the global plugin store (common when
+  // the user's projectDir is an ancestor of globalDir), the directory is the
+  // live store, not a leftover. Compare resolved paths case-insensitively on
+  // Windows where filesystems are case-insensitive.
+  const resolvedLegacy = resolve(legacy);
+  const resolvedGlobal = resolve(globalPluginsDir(ws));
+  const samePath = process.platform === 'win32'
+    ? resolvedLegacy.toLowerCase() === resolvedGlobal.toLowerCase()
+    : resolvedLegacy === resolvedGlobal;
+  if (samePath) return;
   let entries: string[];
   try {
     entries = readdirSync(legacy).filter((n) => !n.startsWith('.'));

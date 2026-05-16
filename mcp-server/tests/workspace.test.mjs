@@ -596,3 +596,57 @@ test('workspace + recipe.run surface', async (t) => {
     assert.equal(res.structuredContent?.code, 'NOT_IN_RECIPE_INSTANCE');
   });
 });
+
+// ----------------------------------------------------------------------------
+// Regression: warnIfLegacyProjectPlugins must NOT fire when
+// `<projectDir>/.clawdevbox/plugins` resolves to the same path as the global
+// plugin store (common when projectDir is an ancestor of globalDir — e.g.
+// running `clawdevbox init` from `~` with the default globalDir at `~/.clawdevbox`).
+// ----------------------------------------------------------------------------
+
+test('legacy-plugin warning is suppressed when project plugins dir == global plugins dir', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'legacy-warn-'));
+  try {
+    const home = join(tmp, 'home');
+    const projectDir = home;
+    const globalDir = join(home, '.clawdevbox');
+    // Set up the global plugin store at <globalDir>/plugins/fake-plugin.
+    // From projectDir's perspective, <projectDir>/.clawdevbox/plugins is the
+    // SAME path, which used to trigger a spurious "legacy plugins detected"
+    // warning.
+    mkdirSync(join(globalDir, 'plugins', 'fake-plugin', '.claude-plugin'), { recursive: true });
+    writeFileSync(
+      join(globalDir, 'plugins', 'fake-plugin', '.claude-plugin', 'plugin.json'),
+      '{"name":"fake-plugin","version":"0.0.0","description":"x"}',
+    );
+
+    // Spawn a stdio MCP child with these env vars; capture stderr; assert the
+    // warning string is NOT present.
+    const child = spawnSync(
+      process.execPath,
+      ['--import', 'tsx', entry, 'mcp'],
+      {
+        env: {
+          ...process.env,
+          CLAWDEVBOX_PROJECT_DIR: projectDir,
+          CLAWDEVBOX_GLOBAL_DIR: globalDir,
+        },
+        input: JSON.stringify({
+          jsonrpc: '2.0',
+          method: 'initialize',
+          id: 1,
+          params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 't', version: '0' } },
+        }) + '\n',
+        encoding: 'utf8',
+        timeout: 15_000,
+      },
+    );
+    const stderr = child.stderr ?? '';
+    assert.ok(
+      !stderr.includes('Legacy project-scope plugins detected'),
+      `false-positive legacy warning fired:\n${stderr.slice(0, 1500)}`,
+    );
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
