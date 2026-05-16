@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "clawdevbox": {
+      "command": "npx",
+      "args": ["-y", "clawdevbox", "mcp"]
+    }
+  }
+}

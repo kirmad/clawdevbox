@@ -1,0 +1,8 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "dev-buddy",
+  "version": "1.0.0",
+  "description": "Workspace persona for the clawdevbox main agent.",
+  "author": { "name": "Clawdevbox team" },
+  "keywords": ["clawdevbox", "main-agent", "skill"]
+}
