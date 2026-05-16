@@ -18,7 +18,7 @@ import { existsSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { cancel, confirm, intro, isCancel, multiselect, note, outro, select, text } from '@clack/prompts';
+import { cancel, confirm, intro, isCancel, log, multiselect, note, outro, select, text } from '@clack/prompts';
 import {
   ensureBuiltinMarketplaceRegistered,
   ensureGlobalNodeModulesLink,
@@ -134,8 +134,9 @@ async function runBuiltinMarketplaceInstall(ctx: BuiltinInstallContext): Promise
   // Discover on-disk plugin dirs (sync; we need DiscoveredPlugin → installPluginFromDir).
   const { plugins: discovered, errors: discoverErrors } =
     discoverPluginsInDir(marketplaceDir);
-  for (const e of discoverErrors) {
-    note(`Built-in marketplace: skipped ${e.dir} (${e.message})`);
+  if (discoverErrors.length > 0) {
+    const lines = discoverErrors.map((e) => `  • ${e.message}`).join('\n');
+    log.warn(`Built-in marketplace: ${discoverErrors.length} entr${discoverErrors.length === 1 ? 'y' : 'ies'} skipped\n${lines}`);
   }
   const byName = new Map<string, DiscoveredPlugin>();
   for (const p of discovered) byName.set(p.id, p);
@@ -195,8 +196,8 @@ async function runBuiltinMarketplaceInstall(ctx: BuiltinInstallContext): Promise
     if (r?.status === 'installed') installedAnyRequired = true;
   }
   if (installedAnyRequired && !isClawdevboxOnPath()) {
-    note(
-      `Warning: 'clawdevbox' is not on PATH. Run \`npm install -g clawdevbox\` so the CLI integration installed by clawdevbox-mcp works.`,
+    log.warn(
+      `'clawdevbox' is not on PATH. Run \`npm install -g clawdevbox\` so the CLI integration installed by clawdevbox-mcp works.`,
     );
   }
 
@@ -528,12 +529,12 @@ export async function runInit(flags: Flags): Promise<void> {
           results: builtinResults,
         });
       } catch (err) {
-        note(
+        log.warn(
           `Built-in marketplace install skipped: ${err instanceof Error ? err.message : String(err)}`,
         );
       }
     } else {
-      note(
+      log.warn(
         `Built-in marketplace unavailable at ${builtinMarketplaceDir}; skipping built-in plugin install.`,
       );
     }
@@ -919,14 +920,10 @@ export async function runInit(flags: Flags): Promise<void> {
                 inspectUrl: tunnel.inspect_url ?? null,
               });
             } else if (tunnel?.error) {
-              note(
-                `Tunnel did not come up: ${tunnel.error}`,
-                'Tunnel error',
-              );
+              log.warn(`Tunnel did not come up: ${tunnel.error}`);
             } else {
-              note(
+              log.warn(
                 `Tunnel URL not yet available — run \`clawdevbox status\` once the tunnel finishes registering.`,
-                'Tunnel pending',
               );
             }
           }

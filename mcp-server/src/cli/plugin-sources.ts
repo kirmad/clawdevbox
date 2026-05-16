@@ -205,6 +205,15 @@ export function discoverPluginsInDir(dir: string): {
       errors.push({ dir: catalogPath, message: 'marketplace catalog `plugins` is not an array' });
       return { plugins, errors, isSinglePluginAtRoot: false };
     }
+    // Honor `metadata.pluginRoot` so a catalog like `{plugins:[{source:"x"}],
+    // metadata:{pluginRoot:"./plugins"}}` resolves source 'x' against
+    // <marketplaceRoot>/plugins/x (matching Claude Code's convention).
+    const meta = (parsed as { metadata?: { pluginRoot?: unknown } }).metadata;
+    const pluginRoot =
+      meta && typeof meta.pluginRoot === 'string' && meta.pluginRoot.trim() !== ''
+        ? meta.pluginRoot
+        : '.';
+    const pluginRootDir = resolve(dir, pluginRoot);
     for (const raw of entries) {
       if (!raw || typeof raw !== 'object') continue;
       const e = raw as {
@@ -214,13 +223,25 @@ export function discoverPluginsInDir(dir: string): {
         version?: unknown;
       };
       if (typeof e.name !== 'string') continue;
-      const localDir = resolveCatalogEntryDir(e.source, dir);
-      if (!localDir || !existsSync(localDir)) {
-        // Remote source — init can't install without cloning each entry,
-        // so we surface them as errors (skipped) for visibility.
+      const localDir = resolveCatalogEntryDir(e.source, pluginRootDir);
+      if (!localDir) {
+        // The entry's source is remote (git URL, https://, etc.). --plugin
+        // can only install local-source entries; remote-source entries are
+        // skipped here. Use `clawdevbox marketplace add <url>` followed by
+        // `clawdevbox plugin install <name>@<marketplace>` if you want them.
         errors.push({
           dir,
-          message: `marketplace entry '${e.name}' has a non-local source; remote-source installs are not yet supported by --plugin (skipped)`,
+          message: `marketplace entry '${e.name}' has a remote source; --plugin only installs local-source entries (skipped)`,
+        });
+        continue;
+      }
+      if (!existsSync(localDir)) {
+        // Local source but the resolved directory doesn't exist on disk.
+        // Common cause: marketplace.json's metadata.pluginRoot doesn't
+        // match where the plugin directories actually live.
+        errors.push({
+          dir,
+          message: `marketplace entry '${e.name}': resolved plugin dir '${localDir}' does not exist (check metadata.pluginRoot and the source field)`,
         });
         continue;
       }
