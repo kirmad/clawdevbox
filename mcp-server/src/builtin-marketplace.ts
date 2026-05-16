@@ -34,36 +34,6 @@ import { fileURLToPath } from 'node:url';
 import { logger } from './logger.ts';
 import type { ResolvedConfig } from './config.ts';
 
-// ---------------------------------------------------------------------------
-// Legacy built-in registry (to be removed in task 1.4)
-//
-// These exports survive only so `cli/init.ts`'s body still compiles during
-// the file rename + helper-add commit. The next commit deletes them along
-// with the consumer code.
-// ---------------------------------------------------------------------------
-
-export interface BuiltinPluginDef {
-  id: string;
-  name: string;
-  description: string;
-  required_env: string[];
-}
-
-export const BUILTIN_PLUGINS: BuiltinPluginDef[] = [];
-
-export function installBuiltinPlugin(
-  globalDir: string,
-  id: string,
-): { destination: string; source: string; copied: boolean } {
-  // Legacy shim: the new tier-driven init step (task 1.4) calls
-  // installPluginFromDir against the bundled marketplace instead. Until
-  // that commit lands, this stub keeps the typecheck honest.
-  void globalDir;
-  throw new Error(
-    `installBuiltinPlugin('${id}') is no longer supported; use the bundled marketplace at <globalDir>/marketplaces/clawdevbox/`,
-  );
-}
-
 /**
  * Resolve the absolute path to the bundled built-in marketplace dir.
  * Returns null if the dir cannot be found in any candidate location.

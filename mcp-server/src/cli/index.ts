@@ -118,7 +118,7 @@ function printUsage(): void {
   process.stdout.write(`clawdevbox — toolkit for running AI coding agents headlessly.
 
 Usage:
-  clawdevbox init [--project <dir>] [--scope global|project] [--plugin <src> ...]
+  clawdevbox init [--project <dir>] [--scope global|project] [--plugin <src> ...] [--no-builtin]
       Interactive project setup. Writes either <project>/.clawdevbox/config.json
       (project scope) or <globalDir>/config.json (global scope, recommended)
       with project_dir, global_dir, http port + bearer token.
@@ -136,6 +136,11 @@ Usage:
                       catalog (.claude-plugin/marketplace.json at root),
                       or a collection (subdirs with manifests). init
                       discovers the plugins and asks which to install.
+
+      --no-builtin    Skip the built-in marketplace install step. By default
+                      init auto-installs install_tier: required plugins
+                      (clawdevbox-mcp) and prompts for recommended
+                      (dev-buddy) and optional (ado) ones.
 
   clawdevbox mcp [--project <dir>] [--global <dir>]
       Run the MCP server over stdio. Connect via:

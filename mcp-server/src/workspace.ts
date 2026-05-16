@@ -16,7 +16,7 @@
  * goes straight to disk. The registry is rebuilt on demand
  * (`reloadPluginRegistry()`) by the plugin.* tools after install/uninstall.
  *
- * CLAWDEVBOX_PROJECT_DIR is mandatory; the server refuses to start without it.
+ * CLAWDEVBOX_PROJECT_DIR defaults to cwd when unset.
  * CLAWDEVBOX_GLOBAL_DIR is optional (defaults to `~/.clawdevbox`) — useful when
  * tests want to redirect "global" away from the real user home.
  */
@@ -201,17 +201,13 @@ export interface Workspace {
   }>;
 }
 
-/** Read CLAWDEVBOX_PROJECT_DIR (required) + CLAWDEVBOX_GLOBAL_DIR (optional). */
+/** Read CLAWDEVBOX_PROJECT_DIR (defaults to cwd) + CLAWDEVBOX_GLOBAL_DIR (optional). */
 export async function loadWorkspaceFromEnv(env: NodeJS.ProcessEnv = process.env): Promise<Workspace> {
-  const projectDir = env.CLAWDEVBOX_PROJECT_DIR;
-  if (!projectDir || projectDir.trim() === '') {
-    throw new WorkspaceConfigError(
-      'CLAWDEVBOX_PROJECT_DIR env var is required (path to the workspace root).',
-    );
-  }
+  let projectDir = (env.CLAWDEVBOX_PROJECT_DIR ?? '').trim();
+  if (!projectDir) projectDir = process.cwd();
   if (!existsSync(projectDir)) {
     throw new WorkspaceConfigError(
-      `CLAWDEVBOX_PROJECT_DIR does not exist: ${projectDir}`,
+      `Resolved project dir does not exist: ${projectDir}`,
     );
   }
   const globalDir = env.CLAWDEVBOX_GLOBAL_DIR ?? join(homedir(), '.clawdevbox');

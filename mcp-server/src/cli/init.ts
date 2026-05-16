@@ -13,6 +13,7 @@
  */
 
 import { randomBytes } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
@@ -21,8 +22,6 @@ import { cancel, confirm, intro, isCancel, multiselect, note, outro, select, tex
 import {
   ensureBuiltinMarketplaceRegistered,
   ensureGlobalNodeModulesLink,
-  BUILTIN_PLUGINS,
-  installBuiltinPlugin,
 } from '../builtin-marketplace.ts';
 import {
   CONFIG_DIRNAME,
@@ -56,7 +55,7 @@ import {
   type DiscoveredPlugin,
   type ResolvedSource,
 } from './plugin-sources.ts';
-import { filterByEngines } from '../manifest/load-marketplace.ts';
+import { filterByEngines, loadMarketplace } from '../manifest/load-marketplace.ts';
 import { validateAgencyJson } from '../validators.ts';
 import { readFileSync } from 'node:fs';
 import type { AgencyJson } from '../manifest/types.ts';
@@ -76,6 +75,180 @@ function arrFlag(flags: Flags, key: string): string[] {
   if (Array.isArray(v)) return v.filter((s): s is string => typeof s === 'string');
   if (typeof v === 'string') return [v];
   return [];
+}
+
+function boolFlag(flags: Flags, key: string): boolean {
+  const v = flags[key];
+  return v === true || v === 'true' || v === '1';
+}
+
+function isClawdevboxOnPath(): boolean {
+  const cmd = process.platform === 'win32' ? 'where' : 'which';
+  try {
+    const r = spawnSync(cmd, ['clawdevbox'], { stdio: 'pipe', windowsHide: true });
+    return r.status === 0;
+  } catch {
+    return false;
+  }
+}
+
+interface BuiltinInstallContext {
+  marketplaceDir: string;
+  globalDir: string;
+  globalPluginsDirPath: string;
+  results: Array<{
+    name: string;
+    status: 'installed' | 'kept' | 'error';
+    detail?: string;
+    required_env: string[];
+  }>;
+}
+
+/**
+ * Tier-driven install pass over the bundled marketplace at
+ * `<globalDir>/marketplaces/clawdevbox/`. Auto-installs `required`
+ * entries, then prompts for `recommended` + `optional` ones with the
+ * appropriate pre-checked state. Each entry's `clawdevbox` slot
+ * (`install_tier`, `required_env`) is read from the raw marketplace.json
+ * since those are clawdevbox-specific extensions not carried on
+ * `ResolvedMarketplacePluginEntry`.
+ */
+async function runBuiltinMarketplaceInstall(ctx: BuiltinInstallContext): Promise<void> {
+  const { marketplaceDir, globalDir, globalPluginsDirPath, results } = ctx;
+
+  // Validate the catalog (and surface load errors as a single note).
+  await loadMarketplace(marketplaceDir);
+
+  // Read the raw catalog so we can pick up the clawdevbox.* extension
+  // fields (install_tier, required_env) that the resolver drops.
+  type RawEntry = {
+    name: string;
+    description?: string;
+    version?: string;
+    clawdevbox?: { install_tier?: string; required_env?: string[] };
+  };
+  const raw = JSON.parse(
+    readFileSync(join(marketplaceDir, '.claude-plugin', 'marketplace.json'), 'utf8'),
+  ) as { plugins: RawEntry[] };
+
+  // Discover on-disk plugin dirs (sync; we need DiscoveredPlugin → installPluginFromDir).
+  const { plugins: discovered, errors: discoverErrors } =
+    discoverPluginsInDir(marketplaceDir);
+  for (const e of discoverErrors) {
+    note(`Built-in marketplace: skipped ${e.dir} (${e.message})`);
+  }
+  const byName = new Map<string, DiscoveredPlugin>();
+  for (const p of discovered) byName.set(p.id, p);
+
+  const fakeSource: ResolvedSource = {
+    origin: 'built-in',
+    dir: marketplaceDir,
+    isGitClone: false,
+    isLocalFolder: false,
+    cleanup() {
+      /* nothing to clean for built-in marketplace */
+    },
+  };
+
+  function installOne(rawEntry: RawEntry): void {
+    const plugin = byName.get(rawEntry.name);
+    if (!plugin) {
+      results.push({
+        name: rawEntry.name,
+        status: 'error',
+        detail: 'plugin directory not found in bundled marketplace',
+        required_env: rawEntry.clawdevbox?.required_env ?? [],
+      });
+      return;
+    }
+    try {
+      const r = installPluginFromDir({
+        globalDir,
+        plugin,
+        origin: 'built-in',
+        source: fakeSource,
+      });
+      results.push({
+        name: rawEntry.name,
+        status: r.copied ? 'installed' : 'kept',
+        required_env: rawEntry.clawdevbox?.required_env ?? plugin.required_env,
+      });
+    } catch (err) {
+      results.push({
+        name: rawEntry.name,
+        status: 'error',
+        detail: err instanceof Error ? err.message : String(err),
+        required_env: rawEntry.clawdevbox?.required_env ?? [],
+      });
+    }
+  }
+
+  // Auto-install required tier.
+  const requiredEntries = raw.plugins.filter(
+    (p) => p.clawdevbox?.install_tier === 'required',
+  );
+  let installedAnyRequired = false;
+  for (const e of requiredEntries) {
+    const before = results.length;
+    installOne(e);
+    const r = results[before];
+    if (r?.status === 'installed') installedAnyRequired = true;
+  }
+  if (installedAnyRequired && !isClawdevboxOnPath()) {
+    note(
+      `Warning: 'clawdevbox' is not on PATH. Run \`npm install -g clawdevbox\` so the CLI integration installed by clawdevbox-mcp works.`,
+    );
+  }
+
+  // Multi-select for recommended + optional.
+  const choosable = raw.plugins.filter((p) => {
+    const tier = p.clawdevbox?.install_tier;
+    return tier === 'recommended' || tier === 'optional';
+  });
+  if (choosable.length === 0) return;
+
+  const alreadyInstalled = new Set<string>();
+  for (const e of choosable) {
+    if (existsSync(join(globalPluginsDirPath, e.name))) alreadyInstalled.add(e.name);
+  }
+  const initialValues = choosable
+    .filter(
+      (e) =>
+        e.clawdevbox?.install_tier === 'recommended' || alreadyInstalled.has(e.name),
+    )
+    .map((e) => e.name);
+
+  const selected = abortIfCancel(
+    await multiselect<Array<{ value: string; label: string; hint?: string }>, string>({
+      message: 'Install built-in plugins from clawdevbox marketplace?',
+      options: choosable.map((e) => {
+        const tier = e.clawdevbox?.install_tier ?? 'optional';
+        const reqEnv = e.clawdevbox?.required_env ?? [];
+        const tierLabel = tier === 'recommended' ? ' (recommended)' : '';
+        return {
+          value: e.name,
+          label: `${e.name}${e.version ? `@${e.version}` : ''}${tierLabel}`,
+          hint:
+            (e.description ?? '') +
+            (reqEnv.length ? `  needs: ${reqEnv.join(', ')}` : ''),
+        };
+      }),
+      initialValues,
+      required: false,
+    }),
+  );
+
+  for (const name of selected) {
+    if (alreadyInstalled.has(name)) {
+      // The install function itself reports `kept` when the dir exists,
+      // but recording it explicitly keeps the summary line.
+      const e = choosable.find((x) => x.name === name);
+      if (e) installOne(e);
+      continue;
+    }
+    const e = choosable.find((x) => x.name === name);
+    if (e) installOne(e);
+  }
 }
 
 function abortIfCancel<T>(value: T | symbol): T {
@@ -326,33 +499,45 @@ export async function runInit(flags: Flags): Promise<void> {
     notificationsConfig = { ...existing.notifications, enabled: false };
   }
 
-  // ----- Built-in plugins ----------------------------------------------
-  // Multi-select from the bundled catalog. Already-installed plugins are
-  // pre-checked so re-running init doesn't accidentally drop one. Plugins
-  // now live in the global store so the check looks under <globalDir>.
+  // ----- Built-in marketplace plugins -----------------------------------
+  // Auto-installs `install_tier: required` (e.g. clawdevbox-mcp), pre-checks
+  // `install_tier: recommended` (e.g. dev-buddy), leaves `optional` (e.g.
+  // ado) unchecked. Skipped if --no-builtin flag is set. The bundled
+  // marketplace lives at <repoRoot>/.claude-plugin/marketplace.json
+  // (dev) or <dist>/marketplace/.claude-plugin/marketplace.json (prod);
+  // `ensureBuiltinMarketplaceRegistered` plants the sidecar that the
+  // marketplace.* tools later read.
   const globalPluginsDirPath = join(globalDir, 'plugins');
-  const alreadyInstalled = new Set<string>();
-  for (const p of BUILTIN_PLUGINS) {
-    if (existsSync(join(globalPluginsDirPath, p.id))) alreadyInstalled.add(p.id);
+  const builtinResults: Array<{
+    name: string;
+    status: 'installed' | 'kept' | 'error';
+    detail?: string;
+    required_env: string[];
+  }> = [];
+  if (!boolFlag(flags, 'no-builtin')) {
+    const tmpCfgForBuiltin = resolveConfig({ projectDir, globalDir });
+    ensureBuiltinMarketplaceRegistered(tmpCfgForBuiltin);
+
+    const builtinMarketplaceDir = join(globalDir, 'marketplaces', 'clawdevbox');
+    if (existsSync(builtinMarketplaceDir)) {
+      try {
+        await runBuiltinMarketplaceInstall({
+          marketplaceDir: builtinMarketplaceDir,
+          globalDir,
+          globalPluginsDirPath,
+          results: builtinResults,
+        });
+      } catch (err) {
+        note(
+          `Built-in marketplace install skipped: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    } else {
+      note(
+        `Built-in marketplace unavailable at ${builtinMarketplaceDir}; skipping built-in plugin install.`,
+      );
+    }
   }
-  const selectedPluginIds = abortIfCancel(
-    await multiselect<
-      Array<{ value: string; label: string; hint?: string }>,
-      string
-    >({
-      message:
-        'Install built-in plugins? (Space to toggle, Enter to confirm. Plugins are installed once into the global store at <globalDir>/plugins/ and visible to every project.)',
-      options: BUILTIN_PLUGINS.map((p) => ({
-        value: p.id,
-        label: `${p.name} (${p.id})`,
-        hint:
-          p.description +
-          (p.required_env.length ? `  needs: ${p.required_env.join(', ')}` : ''),
-      })),
-      initialValues: [...alreadyInstalled],
-      required: false,
-    }),
-  );
 
   // ----- External plugin sources (--plugin <git-url-or-folder>) --------
   // Each --plugin source is resolved (git clone or local path), scanned
@@ -469,26 +654,14 @@ export async function runInit(flags: Flags): Promise<void> {
       required_env: string[];
     }
     const pluginResults: PluginResult[] = [];
-    for (const id of selectedPluginIds) {
-      const def = BUILTIN_PLUGINS.find((p) => p.id === id);
-      const requiredEnv = def?.required_env ?? [];
-      try {
-        const r = installBuiltinPlugin(globalDir, id);
-        pluginResults.push({
-          id,
-          origin: 'built-in',
-          status: r.copied ? 'installed' : 'kept',
-          required_env: requiredEnv,
-        });
-      } catch (err) {
-        pluginResults.push({
-          id,
-          origin: 'built-in',
-          status: 'error',
-          detail: err instanceof Error ? err.message : String(err),
-          required_env: requiredEnv,
-        });
-      }
+    for (const r of builtinResults) {
+      pluginResults.push({
+        id: r.name,
+        origin: 'built-in',
+        status: r.status,
+        detail: r.detail,
+        required_env: r.required_env,
+      });
     }
 
     // Install plugins picked from --plugin sources. Git single-plugin
