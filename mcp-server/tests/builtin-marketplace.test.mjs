@@ -143,7 +143,7 @@ test('built-in marketplace declares the expected install_tier for each plugin', 
   assert.deepEqual(ado.clawdevbox?.required_env, ['ADO_ORG', 'ADO_BEARER_TOKEN']);
 });
 
-test('dev-buddy SKILL.md has correct YAML frontmatter (name: Dev Buddy)', () => {
+test('dev-buddy SKILL.md has correct YAML frontmatter (name: dev-buddy)', () => {
   const text = readFileSync(
     join(repoRoot, 'plugins', 'dev-buddy', 'skills', 'dev-buddy', 'SKILL.md'),
     'utf8',
@@ -151,8 +151,9 @@ test('dev-buddy SKILL.md has correct YAML frontmatter (name: Dev Buddy)', () => 
   const match = text.match(/^---\r?\n([\s\S]*?)\r?\n---/);
   assert.ok(match, 'expected YAML frontmatter');
   const fm = match[1];
-  assert.ok(/^id:\s*dev-buddy/m.test(fm), 'frontmatter must declare id: dev-buddy');
-  assert.ok(/^name:\s*Dev Buddy/m.test(fm), 'frontmatter must declare name: Dev Buddy');
+  // Claude Code skill convention: frontmatter `name` is the canonical
+  // identifier and must equal the directory name. No separate `id` field.
+  assert.ok(/^name:\s*dev-buddy/m.test(fm), 'frontmatter must declare name: dev-buddy');
   // Key prose line from the opening playbook.
   assert.ok(text.includes('When the conversation starts (or the user types `/catchup`)'));
   assert.ok(text.includes('`recipe.run({ id, prompt, params })`'));
