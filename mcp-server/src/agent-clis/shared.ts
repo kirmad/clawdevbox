@@ -406,11 +406,14 @@ export async function cliPluginDiscover(
   const rows = parsePluginListOutput(pList.stdout);
   const out: DiscoveredPlugin[] = [];
   for (const row of rows) {
+    // Canonical layout for both Claude (`~/.claude/plugins/cache/<mp>/<name>/`)
+    // and Copilot (`~/.copilot/installed-plugins/<mp>/<name>/`) is
+    // `<pluginCacheDir>/<marketplace>/<name>/`. The other two are
+    // legacy / fallback shapes some older CLI versions used.
     const candidates = [
+      join(binding.pluginCacheDir, row.marketplace, row.name),
       join(binding.pluginCacheDir, `${row.name}-${row.marketplace}`),
       join(binding.pluginCacheDir, row.name),
-      // Claude's user-scope layout nests under `cache/<marketplace>/<name>`.
-      join(binding.pluginCacheDir, row.marketplace, row.name),
     ];
     const dir = candidates.find((p) => existsSync(p));
     if (!dir) {

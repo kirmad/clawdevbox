@@ -6,4 +6,4 @@ tools = ["*"]
 
 [mcps.servers.clawdevbox.env]
 CLAWDEVBOX_PROJECT_DIR = "C:\\git\\clawdevbox"
-CLAWDEVBOX_GLOBAL_DIR = "C:\\Users\\kirmadi\\.clawdevbox"
+CLAWDEVBOX_GLOBAL_DIR = "C:\\Users\\kirmadi\\AppData\\Local\\Temp\\clawdevbox-e2e"

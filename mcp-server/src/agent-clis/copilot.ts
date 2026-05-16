@@ -16,7 +16,11 @@ function resolveBinary(): string {
   return process.env.CLAWDEVBOX_COPILOT_PATH ?? (isWin ? 'copilot.exe' : 'copilot');
 }
 
-const COPILOT_PLUGIN_CACHE = join(os.homedir(), '.copilot', 'plugins');
+// Copilot stores installed plugins at `~/.copilot/installed-plugins/<marketplace>/<name>/`.
+// (Older Copilot versions used `~/.copilot/plugins`; the current layout is
+// `installed-plugins`.) `agency copilot ...` shares this exact cache since
+// agency wraps copilot — the agency provider sets the same pluginCacheDir.
+const COPILOT_PLUGIN_CACHE = join(os.homedir(), '.copilot', 'installed-plugins');
 
 export const copilotProvider: AgentCliProvider = {
   id: 'copilot',
