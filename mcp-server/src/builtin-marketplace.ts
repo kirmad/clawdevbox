@@ -23,14 +23,16 @@
 import { spawnSync } from 'node:child_process';
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
+  rmSync,
   statSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { logger } from './logger.ts';
 import type { ResolvedConfig } from './config.ts';
 
@@ -200,27 +202,166 @@ export function ensureGlobalNodeModulesLink(globalDir: string): void {
 }
 
 /**
- * Ensure `<hostNodeModules>/clawdevbox` exists and points at the package
- * root so `import 'clawdevbox/agent-clis'` (and any other subpath export)
- * resolves via Node's standard `node_modules` walk. Idempotent.
+ * Ensure `<hostNodeModules>/clawdevbox/` exists as a *minimal stub package*
+ * that re-exports the actual host package files. This lets plugin code do
+ * `import 'clawdevbox/agent-clis'` and resolve correctly via Node's standard
+ * `node_modules` walk.
+ *
+ * IMPORTANT: do NOT create this as a symlink/junction back to the package
+ * root. A self-link causes infinite recursion (the host's own node_modules
+ * contains the stub, and the stub points back at the host…), which breaks
+ * any CLI that tree-copies plugins (Copilot, agency copilot) — the copy
+ * follows the junction infinitely until the filesystem max-path is hit,
+ * leaving multi-GB worth of bogus nested directories.
+ *
+ * Instead, write a tiny stub package that uses Node's `exports` field
+ * to redirect each subpath to the real file via an absolute path string.
+ * That keeps the stub small (just a package.json), doesn't introduce any
+ * symlinks, and Node still resolves `clawdevbox/agent-clis` to
+ * `<pkgRoot>/dist/agent-clis.mjs` (or whatever `package.json#exports`
+ * dictates).
+ *
+ * Idempotent: keeps the existing stub if the contents are already valid.
  */
 export function ensureClawdevboxSelfLink(hostNodeModules: string): void {
   const pkgRoot = locateClawdevboxPackageRoot();
   if (!pkgRoot) return;
-  const selfLink = join(hostNodeModules, 'clawdevbox');
-  if (existsSync(selfLink)) return;
-  try {
-    const type = process.platform === 'win32' ? 'junction' : 'dir';
-    symlinkSync(pkgRoot, selfLink, type);
-  } catch {
-    if (process.platform === 'win32') {
+  const stubDir = join(hostNodeModules, 'clawdevbox');
+
+  // If something is already there, validate it's a directory (not a stale
+  // junction from a previous version of this code). Replace any reparse
+  // point with a fresh stub.
+  if (existsSync(stubDir)) {
+    let isReparse = false;
+    try {
+      isReparse = lstatSync(stubDir).isSymbolicLink();
+    } catch {
+      return;
+    }
+    if (isReparse) {
       try {
-        spawnSync('cmd', ['/c', 'mklink', '/J', selfLink, pkgRoot], { stdio: 'ignore' });
+        rmSync(stubDir, { recursive: true, force: true });
       } catch {
-        /* best-effort */
+        return;
       }
     }
   }
+
+  try {
+    writeStubPackage(stubDir, pkgRoot);
+  } catch {
+    /* best-effort */
+  }
+}
+
+/**
+ * Create the stub package tree at `stubDir`:
+ *
+ *   <stubDir>/
+ *     package.json                 — name + exports map pointing at './stub-N.mjs'
+ *     stub-<idx>.mjs               — `export * from 'file:///<absolute-path>'`
+ *
+ * Each subpath in the real package's `exports` map becomes one `stub-N.mjs`
+ * re-export file. The package.json `exports` map uses relative `./stub-N.mjs`
+ * targets (Node refuses absolute paths in `exports`). Idempotent: if the stub
+ * already matches the current pkgRoot's exports, we leave it alone.
+ */
+function writeStubPackage(stubDir: string, pkgRoot: string): void {
+  let realPkg: { name?: string; version?: string; exports?: Record<string, unknown> };
+  try {
+    realPkg = JSON.parse(readFileSync(join(pkgRoot, 'package.json'), 'utf8'));
+  } catch {
+    realPkg = {};
+  }
+  const realExports = (realPkg.exports ?? {}) as Record<string, unknown>;
+  const stubExports: Record<string, unknown> = {};
+  const reExports: Array<{ rel: string; absSrc: string }> = [];
+  let counter = 0;
+  for (const [key, value] of Object.entries(realExports)) {
+    // For each leaf string target, write a re-export stub file and
+    // rewrite the exports entry to point at it.
+    stubExports[key] = mapExportTarget(value, () => {
+      const rel = `./stub-${++counter}.mjs`;
+      return rel;
+    }, (rel, abs) => {
+      reExports.push({ rel, absSrc: abs });
+    }, pkgRoot);
+  }
+  // Always include a fallback "main" so `import 'clawdevbox'` resolves to
+  // something — Node would otherwise fall back to legacy behavior.
+  const stub = {
+    name: realPkg.name ?? 'clawdevbox',
+    version: realPkg.version ?? '0.0.0',
+    type: 'module',
+    exports: stubExports,
+  };
+  const pkgJsonText = JSON.stringify(stub, null, 2) + '\n';
+
+  // Idempotency check.
+  if (existsSync(stubDir)) {
+    try {
+      const existing = readFileSync(join(stubDir, 'package.json'), 'utf8');
+      if (existing === pkgJsonText) return;
+    } catch {
+      /* fall through to rewrite */
+    }
+  }
+
+  mkdirSync(stubDir, { recursive: true });
+  writeFileSync(join(stubDir, 'package.json'), pkgJsonText, 'utf8');
+  for (const { rel, absSrc } of reExports) {
+    const out = join(stubDir, rel.slice(2));
+    // ESM re-export. `export *` is universally safe; the default export
+    // is forwarded conditionally via a dynamic-import wrapper so we don't
+    // fail at parse time when the source has no default export.
+    const url = JSON.stringify(pathToFileURL(absSrc).href);
+    const body =
+      `export * from ${url};\n` +
+      `const __cdbModule = await import(${url});\n` +
+      `export default __cdbModule.default;\n`;
+    writeFileSync(out, body, 'utf8');
+  }
+}
+
+/**
+ * Walk one exports-map value (string | array | conditional object), call
+ * `assignRel()` to get a relative stub path for each leaf string, record
+ * the (rel, absSrc) pair via `recordReExport`, and return the rewritten
+ * value with all leaf strings replaced by their relative stubs.
+ *
+ * Absolute-path strings (already rewritten) and non-relative bare-name
+ * targets are passed through unchanged.
+ */
+function mapExportTarget(
+  value: unknown,
+  assignRel: () => string,
+  recordReExport: (rel: string, absSrc: string) => void,
+  pkgRoot: string,
+): unknown {
+  if (typeof value === 'string') {
+    if (!value.startsWith('./')) return value;
+    const abs = join(pkgRoot, value.slice(2));
+    const rel = assignRel();
+    recordReExport(rel, abs);
+    return rel;
+  }
+  if (Array.isArray(value)) {
+    return value.map((v) => mapExportTarget(v, assignRel, recordReExport, pkgRoot));
+  }
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      // Skip `types` condition — TypeScript type files don't need a runtime
+      // re-export and Node ignores `types` for the runtime resolver anyway.
+      if (k === 'types') {
+        out[k] = v;
+        continue;
+      }
+      out[k] = mapExportTarget(v, assignRel, recordReExport, pkgRoot);
+    }
+    return out;
+  }
+  return value;
 }
 
 function locateClawdevboxPackageRoot(): string | null {
