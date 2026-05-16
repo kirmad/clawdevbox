@@ -29,6 +29,7 @@ import type { AgentCliProvider, MarketplaceRecord, SyncReport } from './types.ts
 
 export type LifecycleEvent =
   | 'boot'
+  | 'init'
   | 'plugin-install'
   | 'plugin-uninstall'
   | 'marketplace-add'

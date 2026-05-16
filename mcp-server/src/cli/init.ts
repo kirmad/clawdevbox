@@ -782,6 +782,56 @@ export async function runInit(flags: Flags): Promise<void> {
         ? writeGlobalConfig(globalDir, cfg)
         : writeConfig(projectDir, cfg);
 
+    // ---- Direction A: push installed plugins + bundled marketplace into
+    // the chosen agent CLI. This lets the user start a Claude/Copilot/Agency
+    // session with /commands, MCP servers, and skills already wired up from
+    // the plugins we just installed — no second 'plugin install' step.
+    //
+    // Reloads the workspace (now that the .install.json sidecars are on
+    // disk and the manifest registry is current) and re-resolves config
+    // from disk so resolveConfiguredProvider() picks up default_agent_cli.
+    // Skipped silently when no provider was chosen or client_sync is off.
+    let clientSyncSummary: {
+      provider: string;
+      installed: number;
+      failed: number;
+      marketplacesAdded: number;
+      reason?: string;
+    } | null = null;
+    if (chosenProviderId && pluginResults.some((r) => r.status !== 'error')) {
+      try {
+        const tmpEnv = {
+          ...process.env,
+          CLAWDEVBOX_PROJECT_DIR: projectDir,
+          CLAWDEVBOX_GLOBAL_DIR: globalDir,
+        };
+        const ws = await loadWorkspaceFromEnv(tmpEnv);
+        const freshCfg = resolveConfig({ projectDir, globalDir });
+        const { maybeRunClientSync } = await import('../agent-clis/lifecycle.ts');
+        const result = await maybeRunClientSync(ws, freshCfg, 'init');
+        if (result.ran && result.syncReport) {
+          clientSyncSummary = {
+            provider: chosenProviderLabel ?? chosenProviderId,
+            installed: result.syncReport.pluginsInstalled.length,
+            failed: result.syncReport.failed.length,
+            marketplacesAdded: result.syncReport.marketplacesAdded.length,
+          };
+        } else if (!result.ran) {
+          clientSyncSummary = {
+            provider: chosenProviderLabel ?? chosenProviderId,
+            installed: 0,
+            failed: 0,
+            marketplacesAdded: 0,
+            reason: result.reason,
+          };
+        }
+      } catch (err) {
+        log.warn(
+          `Client sync skipped: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+
     const tunnelLine =
       tunnelKind === 'devtunnel'
         ? `Tunnel:      devtunnel "${tunnelName}" (auto-starts; URL stable across restarts)`
@@ -839,6 +889,32 @@ export async function runInit(flags: Flags): Promise<void> {
       }
     }
 
+    const clientSyncLines: string[] = [];
+    if (clientSyncSummary) {
+      if (clientSyncSummary.reason) {
+        clientSyncLines.push(
+          `Client sync:   skipped (${clientSyncSummary.reason})`,
+        );
+      } else {
+        const parts: string[] = [];
+        if (clientSyncSummary.marketplacesAdded > 0) {
+          parts.push(
+            `+${clientSyncSummary.marketplacesAdded} marketplace${clientSyncSummary.marketplacesAdded > 1 ? 's' : ''}`,
+          );
+        }
+        if (clientSyncSummary.installed > 0) {
+          parts.push(
+            `+${clientSyncSummary.installed} plugin${clientSyncSummary.installed > 1 ? 's' : ''}`,
+          );
+        }
+        if (clientSyncSummary.failed > 0) {
+          parts.push(`${clientSyncSummary.failed} failed`);
+        }
+        const detail = parts.length > 0 ? ` (${parts.join(', ')})` : ' (no changes)';
+        clientSyncLines.push(`Client sync:   ${clientSyncSummary.provider}${detail}`);
+      }
+    }
+
     note(
       [
         `Scope:       ${installScope}`,
@@ -851,6 +927,7 @@ export async function runInit(flags: Flags): Promise<void> {
         chosenProviderLabel
           ? `Agent CLI:   ${chosenProviderLabel}`
           : `Agent CLI:   not selected (runtime fallback: copilot)`,
+        ...clientSyncLines,
         ...(pluginLines.length ? ['', ...pluginLines] : []),
         ...(envLines.length ? ['', ...envLines] : []),
         '',
