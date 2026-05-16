@@ -64,6 +64,22 @@ await build({
   },
 });
 
+// Build the `clawdevbox/agent-clis` subpath entry. External plugins (e.g.
+// agency-cli) `import 'clawdevbox/agent-clis'` to call shared helpers
+// like cliPluginSync / cliPluginDiscover. The package.json `exports` map
+// resolves that subpath to this file.
+await build({
+  entryPoints: [join(root, 'src/agent-clis/index.ts')],
+  outfile: join(outDir, 'agent-clis.mjs'),
+  bundle: true,
+  platform: 'node',
+  target: 'node20',
+  format: 'esm',
+  sourcemap: 'linked',
+  legalComments: 'none',
+  external: externalDeps,
+});
+
 // Make `dist/cli.js` executable on POSIX. On Windows `chmod` is a no-op
 // but npm's bin shim handles the .cmd wrapping regardless.
 try {

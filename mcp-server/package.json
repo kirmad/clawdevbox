@@ -6,6 +6,15 @@
   "bin": {
     "clawdevbox": "./dist/cli.js"
   },
+  "exports": {
+    ".": {
+      "default": "./dist/cli.js"
+    },
+    "./agent-clis": {
+      "types": "./src/agent-clis/index.ts",
+      "default": "./dist/agent-clis.mjs"
+    }
+  },
   "files": [
     "dist",
     "src",

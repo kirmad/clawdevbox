@@ -1,6 +1,5 @@
 ---
-id: dev-buddy
-name: Dev Buddy
+name: dev-buddy
 description: Persona + opening playbook for the clawdevbox main agent. Catches the user up on workspace state, surfaces inbox items, and helps schedule or run recipes.
 ---
 

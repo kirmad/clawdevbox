@@ -171,23 +171,78 @@ export function ensureGlobalNodeModulesLink(globalDir: string): void {
   if (!target) return;
   mkdirSync(globalDir, { recursive: true });
   const linkPath = join(globalDir, 'node_modules');
-  if (existsSync(linkPath)) return;
-  try {
-    // On Windows, `junction` doesn't require admin rights — unlike a
-    // standard `symlink`. cross-platform: fall back to symlink on POSIX.
-    const type = process.platform === 'win32' ? 'junction' : 'dir';
-    symlinkSync(target, linkPath, type);
-  } catch {
-    // Last resort: try `mklink /J` via cmd, which is more permissive on
-    // some Windows setups.
-    if (process.platform === 'win32') {
-      try {
-        spawnSync('cmd', ['/c', 'mklink', '/J', linkPath, target], { stdio: 'ignore' });
-      } catch {
-        /* give up silently — manual copy still works */
+  if (!existsSync(linkPath)) {
+    try {
+      // On Windows, `junction` doesn't require admin rights — unlike a
+      // standard `symlink`. cross-platform: fall back to symlink on POSIX.
+      const type = process.platform === 'win32' ? 'junction' : 'dir';
+      symlinkSync(target, linkPath, type);
+    } catch {
+      // Last resort: try `mklink /J` via cmd, which is more permissive on
+      // some Windows setups.
+      if (process.platform === 'win32') {
+        try {
+          spawnSync('cmd', ['/c', 'mklink', '/J', linkPath, target], { stdio: 'ignore' });
+        } catch {
+          /* give up silently — manual copy still works */
+        }
       }
     }
   }
+  // Also ensure a `clawdevbox` self-link inside the host's node_modules
+  // so plugin modules (junction-installed) that `import 'clawdevbox/agent-clis'`
+  // can resolve. In production (`npm install -g clawdevbox`) npm already
+  // places the package at <global>/node_modules/clawdevbox — this is a
+  // no-op there. In dev mode (running from the source tree) the package
+  // is at <repo>/mcp-server with nothing at node_modules/clawdevbox; we
+  // synthesize the link.
+  ensureClawdevboxSelfLink(target);
+}
+
+/**
+ * Ensure `<hostNodeModules>/clawdevbox` exists and points at the package
+ * root so `import 'clawdevbox/agent-clis'` (and any other subpath export)
+ * resolves via Node's standard `node_modules` walk. Idempotent.
+ */
+export function ensureClawdevboxSelfLink(hostNodeModules: string): void {
+  const pkgRoot = locateClawdevboxPackageRoot();
+  if (!pkgRoot) return;
+  const selfLink = join(hostNodeModules, 'clawdevbox');
+  if (existsSync(selfLink)) return;
+  try {
+    const type = process.platform === 'win32' ? 'junction' : 'dir';
+    symlinkSync(pkgRoot, selfLink, type);
+  } catch {
+    if (process.platform === 'win32') {
+      try {
+        spawnSync('cmd', ['/c', 'mklink', '/J', selfLink, pkgRoot], { stdio: 'ignore' });
+      } catch {
+        /* best-effort */
+      }
+    }
+  }
+}
+
+function locateClawdevboxPackageRoot(): string | null {
+  // The package root is the directory containing `package.json` with
+  // name === 'clawdevbox'. Walk up from this file.
+  const here = dirname(fileURLToPath(import.meta.url));
+  let cur = here;
+  for (let i = 0; i < 8; i++) {
+    const pkgPath = join(cur, 'package.json');
+    if (existsSync(pkgPath)) {
+      try {
+        const pkg = JSON.parse(readFileSync(pkgPath, 'utf8')) as { name?: string };
+        if (pkg.name === 'clawdevbox') return cur;
+      } catch {
+        /* ignore parse errors and keep walking */
+      }
+    }
+    const parent = resolve(cur, '..');
+    if (parent === cur) break;
+    cur = parent;
+  }
+  return null;
 }
 
 function locateClawdevboxNodeModules(): string | null {
