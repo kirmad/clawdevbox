@@ -3,7 +3,7 @@
  *
  * Same flow as manual-test.mjs but as node:test assertions. No external
  * services required — the server runs against an isolated temp workspace
- * populated from samples/plugins/ado/.
+ * populated from plugins/ado/.
  *
  *   node --test tests/
  */
@@ -19,7 +19,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const projectRoot = resolve(__dirname, '..');
 const entry = resolve(projectRoot, 'src/index.ts');
-const repoSampleAdoPlugin = resolve(projectRoot, '..', 'samples', 'plugins', 'ado');
+const repoSampleAdoPlugin = resolve(projectRoot, '..', 'plugins', 'ado');
 
 // ----------------------------------------------------------------------------
 // Test harness

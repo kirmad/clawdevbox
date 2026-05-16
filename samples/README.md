@@ -16,9 +16,12 @@ node test/capture.mjs   # full end-to-end against real ADO (needs az login)
 
 Minimal `simple-prompt.yaml` showing the recipe shape. Used by `e2e-test.mjs` in `../mcp-server/`.
 
-## `plugins/` — Plugin samples
+## Note: built-in plugins moved
 
-`ado/` — an Azure DevOps plugin with three trigger types (cron, webhook, comment-watcher), five hostable tools, two recipes, two skills. Shows the full plugin layout (`plugin.yaml` + `recipes/` + `skills/` + `triggers/` + `tools/`).
+Built-in plugins (`ado`, `dev-buddy`, `clawdevbox-mcp`) now live at the
+repo-root `plugins/` directory and ship as a marketplace catalog via
+`.claude-plugin/marketplace.json`. This `samples/` directory keeps only
+sample recipes and trigger fixtures used by tests.
 
 ## Common conventions
 

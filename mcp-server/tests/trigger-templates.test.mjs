@@ -12,7 +12,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const projectRoot = resolve(__dirname, '..');
 const entry = resolve(projectRoot, 'src/index.ts');
-const repoSampleAdoPlugin = resolve(projectRoot, '..', 'samples', 'plugins', 'ado');
+const repoSampleAdoPlugin = resolve(projectRoot, '..', 'plugins', 'ado');
 
 class TplHarness {
   constructor() {

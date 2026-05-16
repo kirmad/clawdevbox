@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-marketplace.json",
+  "name": "clawdevbox",
+  "description": "Built-in plugins shipped with clawdevbox.",
+  "owner": { "name": "Clawdevbox team" },
+  "metadata": {
+    "version": "0.1.0",
+    "pluginRoot": "./plugins"
+  },
+  "plugins": [
+    {
+      "name": "clawdevbox-mcp",
+      "source": "clawdevbox-mcp",
+      "version": "0.1.0",
+      "description": "Registers the clawdevbox MCP server with the configured CLI. After install, any session that CLI spawns can call recipe.*, trigger.*, inbox.*, artifact.*, plugin.*, and the other clawdevbox tools.",
+      "author": { "name": "Clawdevbox team" },
+      "category": "core",
+      "clawdevbox": { "install_tier": "required" }
+    },
+    {
+      "name": "dev-buddy",
+      "source": "dev-buddy",
+      "version": "1.0.0",
+      "description": "Workspace persona for the clawdevbox main agent. Catches users up on workspace state on /catchup, surfaces inbox items, and helps schedule or run recipes.",
+      "author": { "name": "Clawdevbox team" },
+      "category": "core",
+      "clawdevbox": { "install_tier": "recommended" }
+    },
+    {
+      "name": "ado",
+      "source": "ado",
+      "version": "1.0.0",
+      "description": "Azure DevOps: PR review, comments, iterations, and cold/hot/pulse triggers.",
+      "author": { "name": "Clawdevbox team" },
+      "category": "azure",
+      "keywords": ["azure-devops", "code-review", "ado", "pr"],
+      "clawdevbox": {
+        "install_tier": "optional",
+        "required_env": ["ADO_ORG", "ADO_BEARER_TOKEN"]
+      }
+    }
+  ]
+}

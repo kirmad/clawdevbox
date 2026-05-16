@@ -119,7 +119,7 @@ test('validateRecipeParsed coerces integer depends to strings', () => {
 
 test('validateRecipeSource accepts the legacy pr-review.yaml sample and coerces ids/depends', () => {
   const sample = readFileSync(
-    resolve(__dirname, '..', '..', 'samples', 'plugins', 'ado', 'recipes', 'pr-review.yaml'),
+    resolve(__dirname, '..', '..', 'plugins', 'ado', 'recipes', 'pr-review.yaml'),
     'utf8',
   );
   const parsed = yamlLoad(sample);

@@ -24,13 +24,13 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const projectRoot = resolve(__dirname, '..');
 const entry = resolve(projectRoot, 'src/index.ts');
-const repoSampleAdoPlugin = resolve(projectRoot, '..', 'samples', 'plugins', 'ado');
+const repoSampleAdoPlugin = resolve(projectRoot, '..', 'plugins', 'ado');
 
 // The harness copies the plugin into a tmpRoot and junctions
 // `mcp-server/node_modules` into `tmpRoot/node_modules` so the plugin's
 // hostable tools resolve `zod` etc. via Node's ESM walk-up. The pure-
 // function unit test below imports the plugin tool directly from
-// `samples/plugins/ado/tools/get_pr.ts`, which has no node_modules walk-up
+// `plugins/ado/tools/get_pr.ts`, which has no node_modules walk-up
 // path back to the server. Create a sibling junction so resolution lands
 // in the server's node_modules. Skips silently if already present.
 {
