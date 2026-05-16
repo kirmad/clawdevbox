@@ -165,6 +165,7 @@ async function runCli(
   return new Promise((resolveRun) => {
     let stdout = '';
     let stderr = '';
+    let timedOut = false;
     let proc;
     try {
       proc = spawn(binding.binary, fullArgs, {
@@ -177,6 +178,7 @@ async function runCli(
       return;
     }
     const timer = setTimeout(() => {
+      timedOut = true;
       try {
         proc.kill('SIGKILL');
       } catch {
@@ -193,9 +195,27 @@ async function runCli(
       clearTimeout(timer);
       resolveRun({ stdout, stderr: stderr + (err.message ?? ''), code: -1 });
     });
-    proc.on('exit', (code) => {
+    proc.on('exit', (code, signal) => {
       clearTimeout(timer);
-      resolveRun({ stdout, stderr, code: code ?? 0 });
+      if (timedOut) {
+        resolveRun({
+          stdout,
+          stderr: stderr + `\n[runCli] timed out after ${opts.timeoutMs ?? 30_000}ms`,
+          code: -1,
+        });
+        return;
+      }
+      // A process killed by signal (e.g. SIGTERM from outside) reports
+      // code: null. Treat that as failure too.
+      if (code === null) {
+        resolveRun({
+          stdout,
+          stderr: stderr + `\n[runCli] terminated by signal ${signal ?? '?'}`,
+          code: -1,
+        });
+        return;
+      }
+      resolveRun({ stdout, stderr, code });
     });
   });
 }
@@ -327,7 +347,7 @@ export async function cliPluginSync(
       report.pluginsInstalled.push(source);
       continue;
     }
-    const res = await runCli(binding, ['plugin', 'install', source]);
+    const res = await runCli(binding, ['plugin', 'install', source], { timeoutMs: 300_000 });
     if (res.code === 0) {
       report.pluginsInstalled.push(source);
     } else {
@@ -355,7 +375,7 @@ export async function cliPluginSync(
         report.pluginsUninstalled.push(id);
         continue;
       }
-      const res = await runCli(binding, ['plugin', 'uninstall', id]);
+      const res = await runCli(binding, ['plugin', 'uninstall', id], { timeoutMs: 120_000 });
       if (res.code === 0) {
         report.pluginsUninstalled.push(id);
       } else {
