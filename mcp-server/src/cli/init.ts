@@ -19,10 +19,11 @@ import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { cancel, confirm, intro, isCancel, multiselect, note, outro, select, text } from '@clack/prompts';
 import {
-  BUILTIN_PLUGINS,
+  ensureBuiltinMarketplaceRegistered,
   ensureGlobalNodeModulesLink,
+  BUILTIN_PLUGINS,
   installBuiltinPlugin,
-} from '../builtin-plugins.ts';
+} from '../builtin-marketplace.ts';
 import {
   CONFIG_DIRNAME,
   ClawdevboxConfig,

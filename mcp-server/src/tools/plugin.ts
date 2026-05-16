@@ -208,7 +208,7 @@ function locateHostNodeModules(): string | null {
   return null;
 }
 
-// Derive this module's directory under ESM — same trick `builtin-plugins.ts`
+// Derive this module's directory under ESM — same trick `builtin-marketplace.ts`
 // uses. Used by `locateHostNodeModules()` to find clawdevbox's installed deps.
 import { fileURLToPath } from 'node:url';
 const thisDir = dirname(fileURLToPath(import.meta.url));
