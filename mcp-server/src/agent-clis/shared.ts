@@ -342,10 +342,13 @@ export async function cliPluginSync(
   // -- bidirectional uninstall step ---------------------------------------
   const bidiUninstall = opts.bidirectionalUninstall !== false;
   if (bidiUninstall) {
+    const clawdevboxMarketplaceSet = new Set(clawdevboxMarketplaceIds);
     for (const row of installedRows) {
-      // Only auto-uninstall plugins that came from a clawdevbox-known
-      // marketplace AND whose name no longer appears in clawdevbox.
-      if (!knownMarketplaces.has(row.marketplace)) continue;
+      // Only auto-uninstall plugins that came from a marketplace clawdevbox
+      // MANAGES (not just one the CLI happens to know about) AND whose name
+      // no longer appears in clawdevbox. This prevents removing plugins the
+      // user installed via the CLI's own pre-existing marketplaces.
+      if (!clawdevboxMarketplaceSet.has(row.marketplace)) continue;
       if (clawdevboxNames.has(row.name)) continue;
       const id = `${row.name}@${row.marketplace}`;
       if (opts.dryRun) {
