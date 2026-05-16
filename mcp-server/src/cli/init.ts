@@ -18,7 +18,7 @@ import { existsSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { cancel, confirm, intro, isCancel, log, multiselect, note, outro, select, text } from '@clack/prompts';
+import { cancel, confirm, intro, isCancel, log, multiselect, note, outro, select, spinner, text } from '@clack/prompts';
 import {
   ensureBuiltinMarketplaceRegistered,
   ensureGlobalNodeModulesLink,
@@ -59,6 +59,7 @@ import { filterByEngines, loadMarketplace } from '../manifest/load-marketplace.t
 import { validateAgencyJson } from '../validators.ts';
 import { readFileSync } from 'node:fs';
 import type { AgencyJson } from '../manifest/types.ts';
+import { logger } from '../logger.ts';
 
 // Plugin storage is now global (see §10 in docs/design.md). The project
 // dir keeps recipes/skills/triggers/artifacts only; plugins live under
@@ -239,7 +240,11 @@ async function runBuiltinMarketplaceInstall(ctx: BuiltinInstallContext): Promise
     }),
   );
 
+  if (selected.length === 0) return;
+  const instSpinner = spinner();
+  instSpinner.start(`Installing ${selected.length} built-in plugin${selected.length === 1 ? '' : 's'}...`);
   for (const name of selected) {
+    instSpinner.message(`Installing ${name}...`);
     if (alreadyInstalled.has(name)) {
       // The install function itself reports `kept` when the dir exists,
       // but recording it explicitly keeps the summary line.
@@ -250,6 +255,14 @@ async function runBuiltinMarketplaceInstall(ctx: BuiltinInstallContext): Promise
     const e = choosable.find((x) => x.name === name);
     if (e) installOne(e);
   }
+  const installedNow = ctx.results.filter((r) => r.status === 'installed').length;
+  const keptNow = ctx.results.filter((r) => r.status === 'kept').length;
+  const errCount = ctx.results.filter((r) => r.status === 'error').length;
+  const parts = [];
+  if (installedNow > 0) parts.push(`+${installedNow}`);
+  if (keptNow > 0) parts.push(`${keptNow} kept`);
+  if (errCount > 0) parts.push(`${errCount} failed`);
+  instSpinner.stop(`Built-in install: ${parts.join(', ') || 'no changes'}.`);
 }
 
 function abortIfCancel<T>(value: T | symbol): T {
@@ -286,6 +299,19 @@ function validateTunnelName(input: string): string | void {
 }
 
 export async function runInit(flags: Flags): Promise<void> {
+  // Silence the pino info-level chatter (e.g. 'agent-cli provider loaded',
+  // 'client plugin sync done') for the duration of the interactive flow.
+  // Real warnings/errors still come through. Restored on exit.
+  const priorLogLevel = logger.level;
+  logger.level = process.env.CLAWDEVBOX_LOG_LEVEL ?? 'warn';
+  try {
+    return await runInitInner(flags);
+  } finally {
+    logger.level = priorLogLevel;
+  }
+}
+
+async function runInitInner(flags: Flags): Promise<void> {
   intro('clawdevbox init');
 
   const cwd = process.cwd();
@@ -559,10 +585,18 @@ export async function runInit(flags: Flags): Promise<void> {
   const sourceDiagnostics: string[] = [];
   try {
     for (const raw of pluginSourceRaws) {
+      const srcSpinner = spinner();
+      const isGit = /^(git\+|https?:|git@|ssh:)/.test(raw);
+      srcSpinner.start(
+        isGit
+          ? `Cloning ${raw} to scan for plugins...`
+          : `Scanning ${raw} for plugins...`,
+      );
       let source: ResolvedSource;
       try {
         source = resolvePluginSource(raw);
       } catch (err) {
+        srcSpinner.stop(`Failed to resolve --plugin ${raw}.`, 1);
         sourceDiagnostics.push(
           `--plugin ${raw}: ${err instanceof Error ? err.message : String(err)}`,
         );
@@ -574,11 +608,13 @@ export async function runInit(flags: Flags): Promise<void> {
         sourceDiagnostics.push(`--plugin ${raw}: skipped ${e.dir} (${e.message})`);
       }
       if (plugins.length === 0) {
+        srcSpinner.stop(`No plugins found in ${raw}.`);
         sourceDiagnostics.push(
           `--plugin ${raw}: no .claude-plugin/plugin.json found at the root or any subdirectory.`,
         );
         continue;
       }
+      srcSpinner.stop(`Found ${plugins.length} plugin${plugins.length === 1 ? '' : 's'} in ${raw}.`);
       // Engines filter (spec §4.4): each discovered plugin may have a
       // sibling agency.json. Hide incompatible plugins from the prompt
       // (and surface a diagnostic line). configuredAgentCli is whatever
@@ -669,29 +705,45 @@ export async function runInit(flags: Flags): Promise<void> {
     // sources are moved (preserving .git for plugin.update); collection
     // subdirs are copied; local folders are junctioned. Sidecar records
     // capture the origin so plugin.update knows what to do.
-    for (const pick of externalPicks) {
-      try {
-        const r = installPluginFromDir({
-          globalDir,
-          plugin: pick.plugin,
-          origin: pick.origin,
-          source: pick.source,
-        });
-        pluginResults.push({
-          id: pick.plugin.id,
-          origin: pick.origin,
-          status: r.copied ? 'installed' : 'kept',
-          required_env: pick.plugin.required_env,
-        });
-      } catch (err) {
-        pluginResults.push({
-          id: pick.plugin.id,
-          origin: pick.origin,
-          status: 'error',
-          detail: err instanceof Error ? err.message : String(err),
-          required_env: pick.plugin.required_env,
-        });
+    if (externalPicks.length > 0) {
+      const instSpinner = spinner();
+      instSpinner.start(
+        `Installing ${externalPicks.length} plugin${externalPicks.length === 1 ? '' : 's'} into global store...`,
+      );
+      let installedCount = 0;
+      let errorCount = 0;
+      for (const pick of externalPicks) {
+        instSpinner.message(`Installing ${pick.plugin.id}...`);
+        try {
+          const r = installPluginFromDir({
+            globalDir,
+            plugin: pick.plugin,
+            origin: pick.origin,
+            source: pick.source,
+          });
+          pluginResults.push({
+            id: pick.plugin.id,
+            origin: pick.origin,
+            status: r.copied ? 'installed' : 'kept',
+            required_env: pick.plugin.required_env,
+          });
+          installedCount++;
+        } catch (err) {
+          pluginResults.push({
+            id: pick.plugin.id,
+            origin: pick.origin,
+            status: 'error',
+            detail: err instanceof Error ? err.message : String(err),
+            required_env: pick.plugin.required_env,
+          });
+          errorCount++;
+        }
       }
+      instSpinner.stop(
+        errorCount === 0
+          ? `Installed ${installedCount} plugin${installedCount === 1 ? '' : 's'}.`
+          : `Installed ${installedCount}, ${errorCount} failed.`,
+      );
     }
 
     // Make sure node_modules is junctioned into <globalDir> so plugin
@@ -715,8 +767,14 @@ export async function runInit(flags: Flags): Promise<void> {
         CLAWDEVBOX_PROJECT_DIR: projectDir,
         CLAWDEVBOX_GLOBAL_DIR: globalDir,
       };
+
+      const wsSpinner = spinner();
+      wsSpinner.start('Loading installed plugins and agent CLI providers...');
       const ws = await loadWorkspaceFromEnv(tmpEnv);
       const tmpCfg = resolveConfig({ projectDir, globalDir });
+      wsSpinner.stop(
+        `Loaded ${ws.plugins.size} plugin(s), ${ws.agentCliProviders.size} agent CLI provider(s).`,
+      );
 
       // Probe client-installed plugins for clawdevbox.* extensions BEFORE
       // the agent-CLI chooser (spec §10). The probe surfaces plugins the
@@ -724,7 +782,14 @@ export async function runInit(flags: Flags): Promise<void> {
       // probe is skipped entirely when client_sync.mode === 'off'.
       if (tmpCfg.clientSync.mode !== 'off') {
         try {
+          const probeSpinner = spinner();
+          probeSpinner.start('Scanning CLI-installed plugins for clawdevbox extensions...');
           const probed = await probeClientPlugins(ws, tmpCfg);
+          probeSpinner.stop(
+            probed.length === 0
+              ? 'No CLI-installed clawdevbox plugins found.'
+              : `Found ${probed.length} CLI-installed plugin${probed.length === 1 ? '' : 's'} with clawdevbox extensions.`,
+          );
           if (probed.length > 0) {
             const targetConfigPath =
               installScope === 'global' ? globalConfigPath(globalDir) : configPath(projectDir);
@@ -734,9 +799,8 @@ export async function runInit(flags: Flags): Promise<void> {
             });
           }
         } catch (err) {
-          // eslint-disable-next-line no-console
-          console.warn(
-            `[clawdevbox] skipping client plugin probe: ${err instanceof Error ? err.message : String(err)}`,
+          log.warn(
+            `Skipping client plugin probe: ${err instanceof Error ? err.message : String(err)}`,
           );
         }
       }
@@ -747,9 +811,8 @@ export async function runInit(flags: Flags): Promise<void> {
           ws.agentCliProviders.get(chosenProviderId)?.displayName ?? chosenProviderId;
       }
     } catch (err) {
-      // eslint-disable-next-line no-console
-      console.warn(
-        `[clawdevbox] skipping agent-CLI chooser: ${err instanceof Error ? err.message : String(err)}`,
+      log.warn(
+        `Skipping agent-CLI chooser: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
 
@@ -805,18 +868,36 @@ export async function runInit(flags: Flags): Promise<void> {
           CLAWDEVBOX_PROJECT_DIR: projectDir,
           CLAWDEVBOX_GLOBAL_DIR: globalDir,
         };
+        const syncSpinner = spinner();
+        syncSpinner.start(
+          `Syncing marketplace + plugins to ${chosenProviderLabel ?? chosenProviderId}... (this can take a minute)`,
+        );
         const ws = await loadWorkspaceFromEnv(tmpEnv);
         const freshCfg = resolveConfig({ projectDir, globalDir });
         const { maybeRunClientSync } = await import('../agent-clis/lifecycle.ts');
         const result = await maybeRunClientSync(ws, freshCfg, 'init');
         if (result.ran && result.syncReport) {
+          const r = result.syncReport;
+          const parts: string[] = [];
+          if (r.marketplacesAdded.length > 0) {
+            parts.push(`+${r.marketplacesAdded.length} marketplace${r.marketplacesAdded.length === 1 ? '' : 's'}`);
+          }
+          if (r.pluginsInstalled.length > 0) {
+            parts.push(`+${r.pluginsInstalled.length} plugin${r.pluginsInstalled.length === 1 ? '' : 's'}`);
+          }
+          if (r.failed.length > 0) {
+            parts.push(`${r.failed.length} failed`);
+          }
+          const tail = parts.length > 0 ? ` (${parts.join(', ')})` : ' (already in sync)';
+          syncSpinner.stop(`Synced to ${chosenProviderLabel ?? chosenProviderId}${tail}.`);
           clientSyncSummary = {
             provider: chosenProviderLabel ?? chosenProviderId,
-            installed: result.syncReport.pluginsInstalled.length,
-            failed: result.syncReport.failed.length,
-            marketplacesAdded: result.syncReport.marketplacesAdded.length,
+            installed: r.pluginsInstalled.length,
+            failed: r.failed.length,
+            marketplacesAdded: r.marketplacesAdded.length,
           };
         } else if (!result.ran) {
+          syncSpinner.stop(`Client sync skipped (${result.reason ?? 'unknown'}).`);
           clientSyncSummary = {
             provider: chosenProviderLabel ?? chosenProviderId,
             installed: 0,
@@ -824,6 +905,8 @@ export async function runInit(flags: Flags): Promise<void> {
             marketplacesAdded: 0,
             reason: result.reason,
           };
+        } else {
+          syncSpinner.stop('Client sync done.');
         }
       } catch (err) {
         log.warn(
@@ -958,8 +1041,11 @@ export async function runInit(flags: Flags): Promise<void> {
         }),
       );
       if (installNow) {
+        const svcSpinner = spinner();
+        svcSpinner.start('Starting service in background + verifying /healthz...');
         const r = await tryInstallService({ globalDir, projectDir, port, token });
         if (r.ok) {
+          svcSpinner.stop(`Service installed (pid ${r.pid}, port ${port}).`);
           note(
             [
               `pid:        ${r.pid}`,
@@ -983,6 +1069,8 @@ export async function runInit(flags: Flags): Promise<void> {
           if (tunnelKind === 'devtunnel') {
             const { fetchTunnelStatus } = await import('../service.ts');
             const { renderTunnelInfo } = await import('./tunnel-display.ts');
+            const tunnelSpinner = spinner();
+            tunnelSpinner.start('Waiting for devtunnel URL (up to 30s)...');
             const tunnel = await fetchTunnelStatus({
               host: DEFAULT_HTTP_HOST,
               port,
@@ -991,20 +1079,20 @@ export async function runInit(flags: Flags): Promise<void> {
               waitForUrl: true,
             });
             if (tunnel?.url) {
+              tunnelSpinner.stop(`Tunnel ready: ${tunnel.url}`);
               renderTunnelInfo({
                 url: tunnel.url,
                 token,
                 inspectUrl: tunnel.inspect_url ?? null,
               });
             } else if (tunnel?.error) {
-              log.warn(`Tunnel did not come up: ${tunnel.error}`);
+              tunnelSpinner.stop(`Tunnel did not come up: ${tunnel.error}`, 1);
             } else {
-              log.warn(
-                `Tunnel URL not yet available — run \`clawdevbox status\` once the tunnel finishes registering.`,
-              );
+              tunnelSpinner.stop('Tunnel URL not yet available — run `clawdevbox status` once the tunnel finishes registering.');
             }
           }
         } else {
+          svcSpinner.stop(`Service install failed.`, 1);
           const lines = [`Service install failed: ${r.error}`];
           if (r.logPath) {
             lines.push(`See log: ${r.logPath}`);

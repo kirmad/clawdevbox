@@ -26,6 +26,10 @@ async function loadEnv() {
     CLAWDEVBOX_PROJECT_DIR: tmp.project,
     CLAWDEVBOX_GLOBAL_DIR: tmp.global,
   });
+  // Isolate from real-host provider discovery so probe tests are
+  // deterministic regardless of what the dev has installed in
+  // ~/.copilot/installed-plugins or ~/.claude/plugins/cache.
+  isolateRealProviders(ws);
   const cfg = resolveConfig({ projectDir: tmp.project, globalDir: tmp.global });
   return { ws, cfg, tmp };
 }
@@ -83,6 +87,25 @@ function stubProvider(ws, providerId, discovered) {
   if (!provider) throw new Error(`provider ${providerId} not registered in workspace`);
   provider.detect = async () => ({ available: true, binary: 'fake', version: '1.0.0' });
   provider.discoverInstalledPlugins = async () => discovered;
+}
+
+/**
+ * Replace every non-internal provider's discoverInstalledPlugins with one
+ * that returns []. Tests then call `stubProvider(ws, 'claude', [...])` to
+ * inject the providers they actually want to exercise. Prevents real-host
+ * provider discovery (which inspects ~/.copilot/installed-plugins on the
+ * dev's machine) from leaking into the test result.
+ */
+function isolateRealProviders(ws) {
+  for (const [, provider] of ws.agentCliProviders) {
+    if (provider.internal) continue;
+    if (typeof provider.discoverInstalledPlugins === 'function') {
+      provider.discoverInstalledPlugins = async () => [];
+    }
+    // Don't replace detect — the probe filters on detect.available, and we
+    // want isolated providers to *not* be probed at all (so set unavailable).
+    provider.detect = async () => ({ available: false, reason: 'isolated for test' });
+  }
 }
 
 test('probeClientPlugins: returns plugins carrying clawdevbox extensions', async () => {
