@@ -42,3 +42,10 @@ Thumbs.db
 .pnpm-store/
 .yarn/
 .npm/
+
+# Dev-mode junctions created by 'clawdevbox plugin install <local-folder>'.
+# Each plugin with executable code gets a node_modules junction to the host's
+# node_modules so its tool .ts files can resolve their bare-name imports. Don't
+# commit these.
+plugins/*/node_modules
+
