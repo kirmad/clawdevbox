@@ -81,18 +81,38 @@ if (existsSync(rendererSrc)) {
   cpSync(rendererSrc, rendererDst, { recursive: true });
 }
 
-// Copy built-in plugins (samples/plugins/) into dist/plugins/ so the
-// published package can install them via `clawdevbox init` without
-// shipping the entire `samples/` tree. Dev mode (tsx) still resolves
-// from samples/plugins/ via the fallback chain in builtin-plugins.ts.
-const pluginsSrc = join(root, '..', 'samples', 'plugins');
-const pluginsDst = join(outDir, 'plugins');
-if (existsSync(pluginsSrc)) {
-  mkdirSync(pluginsDst, { recursive: true });
-  cpSync(pluginsSrc, pluginsDst, {
-    recursive: true,
-    filter: (src) => !/[/\\]node_modules([/\\]|$)/.test(src) && !/[/\\]_legacy/.test(src),
-  });
+// Copy the built-in marketplace into dist/marketplace/. Reads the
+// repo-root .claude-plugin/marketplace.json and copies each referenced
+// plugin from <repo>/plugins/<source>/. Dev mode (tsx) resolves from
+// the repo root via the fallback chain in builtin-marketplace.ts.
+const repoRoot = join(root, '..');
+const marketplaceJsonSrc = join(repoRoot, '.claude-plugin', 'marketplace.json');
+const marketplaceDst = join(outDir, 'marketplace');
+if (existsSync(marketplaceJsonSrc)) {
+  const catalog = JSON.parse(readFileSync(marketplaceJsonSrc, 'utf8'));
+  mkdirSync(join(marketplaceDst, '.claude-plugin'), { recursive: true });
+  cpSync(marketplaceJsonSrc, join(marketplaceDst, '.claude-plugin', 'marketplace.json'));
+  const pluginsOutDir = join(marketplaceDst, 'plugins');
+  mkdirSync(pluginsOutDir, { recursive: true });
+  for (const entry of catalog.plugins ?? []) {
+    const src = typeof entry.source === 'string' ? entry.source : null;
+    if (!src) continue;
+    // pluginRoot defaults to "./plugins" per marketplace metadata.
+    const pluginRoot = catalog.metadata?.pluginRoot ?? './plugins';
+    const sourceDir = join(repoRoot, pluginRoot, src);
+    if (!existsSync(sourceDir)) {
+      process.stderr.write(`marketplace: plugin source missing: ${sourceDir}\n`);
+      continue;
+    }
+    const destDir = join(pluginsOutDir, src);
+    cpSync(sourceDir, destDir, {
+      recursive: true,
+      filter: (p) =>
+        !/[/\\]node_modules([/\\]|$)/.test(p) &&
+        !/[/\\]_legacy[^/\\]*/.test(p) &&
+        !/[/\\]\.git([/\\]|$)/.test(p),
+    });
+  }
 }
 
 // Build the Vue + PrimeVue SPA in web/ (if it exists) and copy its
@@ -127,6 +147,6 @@ if (existsSync(webPkg)) {
 
 process.stdout.write(
   `built dist/cli.js (+ ${existsSync(rendererDst) ? 'renderers/' : 'no renderers'}` +
-    `, ${existsSync(pluginsDst) ? 'plugins/' : 'no plugins'}` +
+    `, ${existsSync(marketplaceDst) ? 'marketplace/' : 'no marketplace'}` +
     `, ${existsSync(webOut) ? 'web/' : 'no web'})\n`,
 );
