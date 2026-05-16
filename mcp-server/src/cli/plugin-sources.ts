@@ -61,6 +61,13 @@ export interface DiscoveredPlugin {
   required_env: string[];
   /** Absolute path to the plugin directory (containing .claude-plugin/plugin.json). */
   dir: string;
+  /**
+   * Whether the manifest declares any capability that loads JS at runtime
+   * (`tools`, `agent_clis`, or `renderers`). Used by the local-folder install
+   * path to decide whether to junction the host `node_modules` into the
+   * user's plugin folder so `import 'clawdevbox'` / `import 'zod'` resolves.
+   */
+  hasExecutableCode: boolean;
 }
 
 export interface ResolvedSource {
@@ -264,6 +271,7 @@ export function discoverPluginsInDir(dir: string): {
           description: typeof e.description === 'string' ? e.description : '',
           required_env: [],
           dir: localDir,
+          hasExecutableCode: false,
         });
       }
     }
@@ -351,6 +359,13 @@ function readManifest(
   const required_env: string[] = Array.isArray(requiresRaw?.env)
     ? (requiresRaw!.env as unknown[]).filter((v): v is string => typeof v === 'string')
     : [];
+  const cb = m.clawdevbox as
+    | { tools?: unknown; agent_clis?: unknown; renderers?: unknown }
+    | undefined;
+  const hasExecutableCode =
+    (Array.isArray(cb?.tools) && cb!.tools!.length > 0) ||
+    (Array.isArray(cb?.agent_clis) && cb!.agent_clis!.length > 0) ||
+    (Array.isArray(cb?.renderers) && cb!.renderers!.length > 0);
   return {
     ok: true,
     plugin: {
@@ -360,6 +375,7 @@ function readManifest(
       description: (m.description as string) ?? '',
       required_env,
       dir,
+      hasExecutableCode,
     },
   };
 }
@@ -430,6 +446,23 @@ export function installPluginFromDir(args: {
     record.kind = 'local';
     record.source_path = target;
     record.from = target;
+    // Best-effort: junction the host's node_modules into the user's
+    // source folder so plugin code (tools / agent_clis / renderers) can
+    // resolve `import 'clawdevbox'` etc. via Node's realpath-based
+    // module walk-up. Skipped for purely declarative plugins.
+    if (args.plugin.hasExecutableCode) {
+      const host = locateHostNodeModulesForInit();
+      if (host) {
+        const nmLink = join(target, 'node_modules');
+        if (!existsSync(nmLink)) {
+          try {
+            symlinkSync(host, nmLink, linkType);
+          } catch {
+            /* best-effort — silently ignore EPERM etc. */
+          }
+        }
+      }
+    }
   } else if (
     args.source.isGitClone &&
     isSinglePluginRoot(args.source.dir, args.plugin.dir)
@@ -485,6 +518,29 @@ export function installPluginFromDir(args: {
 function isSinglePluginRoot(sourceDir: string, pluginDir: string): boolean {
   return resolve(sourceDir) === resolve(pluginDir);
 }
+
+/**
+ * Locate the host `node_modules` from the running clawdevbox install.
+ * Mirrors `tools/plugin.ts::locateHostNodeModules` but lives here so the
+ * init-only install path doesn't have to import the MCP-tools module.
+ */
+function locateHostNodeModulesForInit(): string | null {
+  let cur = resolve(thisFileDir);
+  for (let i = 0; i < 8; i++) {
+    const candidate = join(cur, 'node_modules');
+    if (existsSync(candidate)) return candidate;
+    const parent = resolve(cur, '..');
+    if (parent === cur) break;
+    cur = parent;
+  }
+  return null;
+}
+
+// Derive this module's directory under ESM so locateHostNodeModulesForInit
+// can walk up from the compiled bundle to find node_modules.
+import { fileURLToPath } from 'node:url';
+import { dirname } from 'node:path';
+const thisFileDir = dirname(fileURLToPath(import.meta.url));
 
 /**
  * Best-effort kind detection for the idempotent path. Reads an existing

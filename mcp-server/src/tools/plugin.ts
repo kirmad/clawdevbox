@@ -646,19 +646,27 @@ async function installFromLocalFolder(ws: Workspace, sourcePath: string): Promis
   };
   writeInstallRecord(ws, manifest.name, record);
 
-  // Best-effort: junction node_modules in the user's folder so hostable
-  // tools' `import 'zod'` resolves via realpath walk-up. Only attempted
-  // if the plugin actually has hostable tools.
+  // Best-effort: junction node_modules in the user's folder so any plugin
+  // code (hostable tools, agent_cli providers, renderers) can resolve
+  // `import 'zod'` and the rest of the host deps via Node's realpath
+  // walk-up. Skipped for purely declarative plugins (skills/recipes/
+  // triggers/agents only, no JS modules).
   let nodeModulesHint: string | null = null;
-  const hasHostableTools = Array.isArray(manifest.clawdevbox?.tools) && manifest.clawdevbox!.tools!.length > 0;
-  if (hasHostableTools) {
+  const cb = manifest.clawdevbox as
+    | { tools?: unknown; agent_clis?: unknown; renderers?: unknown }
+    | undefined;
+  const hasExecutableCode =
+    (Array.isArray(cb?.tools) && cb!.tools!.length > 0) ||
+    (Array.isArray(cb?.agent_clis) && cb!.agent_clis!.length > 0) ||
+    (Array.isArray(cb?.renderers) && cb!.renderers!.length > 0);
+  if (hasExecutableCode) {
     const host = locateHostNodeModules();
     if (host) {
       const r = ensureLocalSourceNodeModulesLink(absoluteSource, host);
       if (!r.linked && r.reason !== 'already exists') {
         nodeModulesHint =
           `Heads-up: could not junction ${join(absoluteSource, 'node_modules')} → ${host} ` +
-          `(${r.reason}). Hostable tools' \`import 'zod'\` may fail until node_modules is reachable from the source folder.`;
+          `(${r.reason}). Plugin code's \`import 'clawdevbox'\` may fail until node_modules is reachable from the source folder.`;
       }
     }
   }
