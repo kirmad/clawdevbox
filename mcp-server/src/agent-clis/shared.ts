@@ -202,25 +202,27 @@ async function runCli(
 
 /**
  * Decide what source string to pass to `<binary> plugin install` for a given
- * clawdevbox-installed plugin. Prefers `<name>@<marketplace>` when the plugin's
- * `clawdevbox-plugin` marketplace ref matches one of the known marketplaces;
- * otherwise falls back to the plugin's `homepage` / `repository` git URL or
- * the bare plugin name.
+ * clawdevbox-installed plugin. Prefers `<name>@<marketplace>` form using a
+ * marketplace that *clawdevbox itself manages* (so we never pick an unrelated
+ * pre-existing CLI marketplace like `awesome-copilot`). Falls back to the
+ * plugin's `homepage` / `repository` git URL or the bare plugin name.
  */
 function resolveInstallSource(
   plugin: {
     id: string;
     manifest: { name: string; homepage?: unknown; repository?: unknown };
   },
-  marketplaceIds: Set<string>,
+  clawdevboxMarketplaceIds: string[],
+  cliKnownMarketplaceIds: Set<string>,
 ): { source: string; isMarketplaceRef: boolean; marketplaceId: string | null } {
-  // Prefer `<name>@<marketplace>` form when at least one marketplace is known
-  // (most clawdevbox plugins are installed via `marketplace add` -> `plugin
-  // install`). When multiple are known, pick the first deterministically.
-  const sorted = [...marketplaceIds].sort();
-  if (sorted.length > 0) {
-    const mid = sorted[0]!;
-    return { source: `${plugin.manifest.name}@${mid}`, isMarketplaceRef: true, marketplaceId: mid };
+  // Prefer the first clawdevbox-managed marketplace that the CLI also knows
+  // about. This guards against picking a marketplace that wasn't pushed via
+  // clawdevbox (e.g. `awesome-copilot`) and ensures `<name>@<marketplace>`
+  // resolves to a source the CLI can actually find.
+  for (const mid of clawdevboxMarketplaceIds) {
+    if (cliKnownMarketplaceIds.has(mid)) {
+      return { source: `${plugin.manifest.name}@${mid}`, isMarketplaceRef: true, marketplaceId: mid };
+    }
   }
   const repo = (plugin.manifest as { repository?: { url?: string } | string }).repository;
   if (typeof repo === 'string' && repo) return { source: repo, isMarketplaceRef: false, marketplaceId: null };
@@ -300,9 +302,17 @@ export async function cliPluginSync(
   }
 
   const clawdevboxNames = new Set<string>();
+  // List of marketplace ids clawdevbox is responsible for, in declaration
+  // order. resolveInstallSource prefers these over the CLI's full marketplace
+  // list so we don't accidentally pick an unrelated pre-existing one.
+  const clawdevboxMarketplaceIds = opts.marketplaces.map((m) => m.id);
   for (const p of opts.plugins) {
     clawdevboxNames.add(p.manifest.name);
-    const { source, isMarketplaceRef, marketplaceId } = resolveInstallSource(p, knownMarketplaces);
+    const { source, isMarketplaceRef, marketplaceId } = resolveInstallSource(
+      p,
+      clawdevboxMarketplaceIds,
+      knownMarketplaces,
+    );
     const key = isMarketplaceRef && marketplaceId
       ? `${p.manifest.name}@${marketplaceId}`
       : p.manifest.name;

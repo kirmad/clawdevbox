@@ -160,7 +160,9 @@ test('cliPluginSync: plugin install error is captured in failed[]', async () => 
         ctx,
         {
           plugins: [mkPlugin('fail')],
-          marketplaces: [],
+          // The plugin is pushed via the 'market' marketplace which clawdevbox
+          // manages; this is what determines the install source.
+          marketplaces: [{ id: 'market', kind: 'git', source: 'https://example.com/m.git' }],
         },
         mkBinding(),
       );
