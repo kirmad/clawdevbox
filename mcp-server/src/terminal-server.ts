@@ -134,12 +134,28 @@ export async function startTerminalServer(opts: {
     const addr = httpServer.address();
     if (addr && typeof addr === 'object') {
       boundPort = addr.port;
+    } else {
+      // Shared server hasn't started listening yet (caller will call
+      // listen() afterwards). Pick up the port once the listen completes
+      // so handle.url() returns a valid URL.
+      httpServer.once('listening', () => {
+        const a = httpServer?.address();
+        if (a && typeof a === 'object') {
+          boundPort = a.port;
+        }
+      });
     }
   }
 
   activeHandle = {
-    url: (instanceId: string) =>
-      `http://${boundHost}:${boundPort}/terminal/${encodeURIComponent(instanceId)}`,
+    url: (instanceId: string) => {
+      // Defensive: if boundPort hasn't been set yet (shared server still
+      // pre-listen), return null-equivalent string so callers can fall
+      // back. Callers like buildViewUrl() handle null-port by returning
+      // null themselves rather than constructing an invalid URL.
+      if (boundPort == null) return '';
+      return `http://${boundHost}:${boundPort}/terminal/${encodeURIComponent(instanceId)}`;
+    },
     port: () => boundPort ?? 0,
     close: () =>
       new Promise<void>((resolve) => {

@@ -87,7 +87,13 @@ function resolveTargetWorkspace(
 function buildViewUrl(artifactId: string): string | null {
   const handle = getTerminalServer();
   if (!handle) return null;
-  return `${new URL(handle.url('x')).origin}/artifact/${encodeURIComponent(artifactId)}`;
+  const baseUrl = handle.url('x');
+  if (!baseUrl) return null;
+  try {
+    return `${new URL(baseUrl).origin}/artifact/${encodeURIComponent(artifactId)}`;
+  } catch {
+    return null;
+  }
 }
 
 // ============================================================================
