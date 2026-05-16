@@ -20,6 +20,32 @@ the same Claude keys plus a clawdevbox-specific extension under the
 top-level `clawdevbox` key. Plugin authors target both runtimes with one
 file.
 
+## Built-in marketplace
+
+clawdevbox ships its own Claude-Code-style plugin marketplace at the
+repo root (`.claude-plugin/marketplace.json`). At init time the catalog
+is registered as a `builtin`-kind marketplace under
+`<globalDir>/marketplaces/clawdevbox/`, and the init flow runs a
+tier-driven install pass over its entries.
+
+Each entry's `clawdevbox.install_tier` controls the default behavior:
+
+- **`required`** — auto-installed without prompting. Currently only
+  `clawdevbox-mcp` (registers the clawdevbox MCP server with the
+  configured CLI).
+- **`recommended`** — pre-checked in the multi-select prompt. Currently
+  `dev-buddy` (the workspace persona for the main agent).
+- **`optional`** — unchecked by default. Currently `ado` (Azure DevOps
+  PR tools).
+
+Pass `--no-builtin` to `clawdevbox init` to skip the built-in install
+pass entirely; the marketplace is still registered (so
+`clawdevbox marketplace list` shows it), but no plugins are installed.
+
+The built-in marketplace is read-only: `clawdevbox marketplace update
+clawdevbox` is a no-op since the live source IS the truth — upgrades
+ship via a new `clawdevbox` package release.
+
 ```
 <plugin>/
 ├── .claude-plugin/

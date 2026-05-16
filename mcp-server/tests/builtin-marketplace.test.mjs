@@ -121,6 +121,28 @@ test('each built-in plugin.json passes validatePluginManifestJson', () => {
   }
 });
 
+test('built-in marketplace declares the expected install_tier for each plugin', () => {
+  // The init flow reads `clawdevbox.install_tier` straight off the raw
+  // marketplace.json (since the resolver type drops the extension), so
+  // it has to keep matching the contract: clawdevbox-mcp=required,
+  // dev-buddy=recommended, ado=optional. If somebody renames or retiers
+  // an entry here, the auto-install/pre-check behavior in init silently
+  // shifts — this test pins the expected mapping.
+  const catalog = JSON.parse(
+    readFileSync(join(repoRoot, '.claude-plugin', 'marketplace.json'), 'utf8'),
+  );
+  const tiers = Object.fromEntries(
+    catalog.plugins.map((p) => [p.name, p.clawdevbox?.install_tier ?? null]),
+  );
+  assert.equal(tiers['clawdevbox-mcp'], 'required');
+  assert.equal(tiers['dev-buddy'], 'recommended');
+  assert.equal(tiers['ado'], 'optional');
+  // Optional entries that declare required_env should still surface them
+  // so init can render the "needs: …" hint.
+  const ado = catalog.plugins.find((p) => p.name === 'ado');
+  assert.deepEqual(ado.clawdevbox?.required_env, ['ADO_ORG', 'ADO_BEARER_TOKEN']);
+});
+
 test('dev-buddy SKILL.md has correct YAML frontmatter (name: Dev Buddy)', () => {
   const text = readFileSync(
     join(repoRoot, 'plugins', 'dev-buddy', 'skills', 'dev-buddy', 'SKILL.md'),

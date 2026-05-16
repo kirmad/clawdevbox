@@ -695,8 +695,6 @@ export async function runInit(flags: Flags): Promise<void> {
 
     // Make sure node_modules is junctioned into <globalDir> so plugin
     // tools that `import 'zod'` resolve from the global plugin store.
-    // installBuiltinPlugin() already calls this; the call here also
-    // covers the external-plugins-only case (no built-ins picked).
     if (pluginResults.length > 0) {
       ensureGlobalNodeModulesLink(globalDir);
     }

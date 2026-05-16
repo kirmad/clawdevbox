@@ -107,6 +107,15 @@ A `SyncReport` is returned summarizing what was added, what was
 already present, and any failures. Errors never block the originating
 operation — they're logged WARN and surfaced in the report.
 
+The built-in `clawdevbox-mcp` plugin (auto-installed at init, see
+[`docs/plugins.md` → Built-in marketplace](./plugins.md#built-in-marketplace))
+piggybacks on this same mechanism: once `clawdevbox init` installs it,
+Direction A propagates it to the configured CLI's plugin store. Any
+standalone CLI session the user then spawns sees a `.mcp.json` that
+points at the running clawdevbox HTTP server, so `recipe.*`,
+`workspace.*`, and the rest of the clawdevbox tools are visible there
+too — without a second install step.
+
 ### Direction B — CLI → clawdevbox
 
 At workspace boot **and on demand** (`clawdevbox plugin sync`,
