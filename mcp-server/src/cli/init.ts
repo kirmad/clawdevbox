@@ -83,6 +83,22 @@ function boolFlag(flags: Flags, key: string): boolean {
   return v === true || v === 'true' || v === '1';
 }
 
+/**
+ * Format the linked/copied breakdown shown after the install spinner.
+ * Returns an empty string when nothing was installed (so the caller can
+ * tack it onto either the success or error message without padding).
+ *
+ * Examples:
+ *   linked=3, copied=0 → " (linked to source — edits auto-flow)"
+ *   linked=0, copied=2 → ""                      // not noteworthy
+ *   linked=2, copied=1 → " (2 linked, 1 copied)"
+ */
+function describeInstallBreakdown(linked: number, copied: number): string {
+  if (linked === 0) return '';
+  if (copied === 0) return ' (linked to source — edits auto-flow)';
+  return ` (${linked} linked, ${copied} copied)`;
+}
+
 function isClawdevboxOnPath(): boolean {
   const cmd = process.platform === 'win32' ? 'where' : 'which';
   try {
@@ -712,6 +728,8 @@ async function runInitInner(flags: Flags): Promise<void> {
       );
       let installedCount = 0;
       let errorCount = 0;
+      let linkedCount = 0;
+      let copiedCount = 0;
       for (const pick of externalPicks) {
         instSpinner.message(`Installing ${pick.plugin.id}...`);
         try {
@@ -728,6 +746,10 @@ async function runInitInner(flags: Flags): Promise<void> {
             required_env: pick.plugin.required_env,
           });
           installedCount++;
+          if (r.copied) {
+            if (r.kind === 'local') linkedCount++;
+            else copiedCount++;
+          }
         } catch (err) {
           pluginResults.push({
             id: pick.plugin.id,
@@ -739,10 +761,11 @@ async function runInitInner(flags: Flags): Promise<void> {
           errorCount++;
         }
       }
+      const breakdown = describeInstallBreakdown(linkedCount, copiedCount);
       instSpinner.stop(
         errorCount === 0
-          ? `Installed ${installedCount} plugin${installedCount === 1 ? '' : 's'}.`
-          : `Installed ${installedCount}, ${errorCount} failed.`,
+          ? `Installed ${installedCount} plugin${installedCount === 1 ? '' : 's'}${breakdown}.`
+          : `Installed ${installedCount}${breakdown}, ${errorCount} failed.`,
       );
     }
 
