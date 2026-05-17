@@ -5,9 +5,10 @@ import type { AgentCliProvider, AgentHandle, ProviderCtx, SpawnSessionOpts } fro
 
 function renderScriptBody(opts: SpawnSessionOpts): string {
   const isResume = opts.init.kind === 'resume';
+  const agentLabel = opts.agent ? ` agent=${opts.agent}` : '';
   const banner = isResume
-    ? `[echo-stub] resume session=${opts.init.session_id} prompt=${JSON.stringify(opts.prompt ?? '')}`
-    : `[echo-stub] new session=${opts.init.session_id} prompt=${JSON.stringify(opts.prompt ?? '')}`;
+    ? `[echo-stub] resume session=${opts.init.session_id}${agentLabel} prompt=${JSON.stringify(opts.prompt ?? '')}`
+    : `[echo-stub] new session=${opts.init.session_id}${agentLabel} prompt=${JSON.stringify(opts.prompt ?? '')}`;
   return `// echo-stub generated script for session ${opts.init.session_id}
 const fs = require('node:fs');
 const path = require('node:path');
@@ -18,6 +19,7 @@ const dir = path.join(artifactsRoot, artifactId);
 fs.mkdirSync(dir, { recursive: true });
 const sessionId = ${JSON.stringify(opts.init.session_id)};
 const prompt = ${JSON.stringify(opts.prompt ?? '')};
+const agent = ${JSON.stringify(opts.agent ?? null)};
 const manifest = {
   id: artifactId,
   type: 'markdown',
@@ -26,7 +28,7 @@ const manifest = {
   recipe_instance_id: process.env.CLAWDEVBOX_RECIPE_INSTANCE_ID || null,
   step_id: null,
   created_at: Date.now(),
-  meta: { entry: 'content.md', session_id: sessionId },
+  meta: { entry: 'content.md', session_id: sessionId, agent },
 };
 fs.writeFileSync(path.join(dir, 'manifest.json'), JSON.stringify(manifest, null, 2));
 const body = [
@@ -36,6 +38,7 @@ const body = [
   '',
   '- session_id: \`' + sessionId + '\`',
   '- workspace_id: \`' + (process.env.CLAWDEVBOX_WORKSPACE_ID || '') + '\`',
+  '- agent: \`' + (agent || '<none>') + '\`',
   '- resume: ' + ${JSON.stringify(isResume ? 'true' : 'false')},
   '',
   '## Prompt',

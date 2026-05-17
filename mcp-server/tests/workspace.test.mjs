@@ -483,6 +483,175 @@ test('workspace + recipe.run surface', async (t) => {
     );
   });
 
+  await t.test('recipe.run end-to-end: agent: dev-buddy in YAML flows to echo-stub spawn', async () => {
+    // Inline ad-hoc recipe with `agent: dev-buddy`. Spawned via echo-stub.
+    // We then poll for the recipe instance to close, locate the artifact
+    // echo-stub wrote, and assert that the agent name landed in both the
+    // manifest meta AND the markdown body — proving the field travelled
+    // from YAML -> validator -> recipe.run -> recipe-runner ->
+    // SpawnSessionOpts -> echo-stub provider in full.
+    const source = [
+      'id: e2e-agent-from-yaml',
+      'name: E2E agent passthrough',
+      'description: Verifies the agent field flows recipe -> CLI provider.',
+      'agent: dev-buddy',
+    ].join('\n') + '\n';
+    const res = await h.call('recipe.run', {
+      source,
+      prompt: 'e2e ping',
+      agent_cli: 'echo-stub',
+    });
+    assert.ok(!res.isError, JSON.stringify(res));
+    const sc = res.structuredContent;
+    assert.equal(sc.recipe_id, 'e2e-agent-from-yaml');
+    assert.equal(sc.adhoc, true);
+
+    // Echo-stub is fast (< 1s on a typical box). Poll the artifacts/ dir
+    // up to 10s for the manifest.json that this run wrote.
+    const artifactsDir = join(sc.workspace_path, 'artifacts');
+    const deadline = Date.now() + 10000;
+    let manifestPath = null;
+    let manifest = null;
+    let contentMd = null;
+    while (Date.now() < deadline) {
+      const dirs = existsSync(artifactsDir)
+        ? readdirSync(artifactsDir).filter((n) => n.startsWith('echo-stub-'))
+        : [];
+      // Pick the latest one that lists this recipe_instance_id in its manifest.
+      for (const d of dirs) {
+        const mp = join(artifactsDir, d, 'manifest.json');
+        if (!existsSync(mp)) continue;
+        const m = JSON.parse(readFileSync(mp, 'utf8'));
+        if (m.recipe_instance_id === sc.recipe_instance_id) {
+          manifestPath = mp;
+          manifest = m;
+          contentMd = readFileSync(join(artifactsDir, d, 'content.md'), 'utf8');
+          break;
+        }
+      }
+      if (manifest) break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.ok(manifestPath, `echo-stub artifact for ${sc.recipe_instance_id} not found under ${artifactsDir}`);
+    assert.equal(
+      manifest.meta.agent,
+      'dev-buddy',
+      `manifest.meta.agent should be 'dev-buddy', got ${JSON.stringify(manifest.meta.agent)}`,
+    );
+    assert.match(
+      contentMd,
+      /- agent: `dev-buddy`/,
+      `content.md should include 'agent: \`dev-buddy\`', got:\n${contentMd}`,
+    );
+  });
+
+  await t.test('recipe.run end-to-end: runtime agent= override beats recipe YAML field', async () => {
+    // Same recipe (agent: dev-buddy) but caller passes agent: 'icm-investigator'
+    // — the runtime override must win. Proves the precedence:
+    //   args.agent > parsed.agent > undefined.
+    const source = [
+      'id: e2e-agent-override',
+      'name: E2E agent override',
+      'description: YAML says one agent; runtime says another.',
+      'agent: dev-buddy',
+    ].join('\n') + '\n';
+    const res = await h.call('recipe.run', {
+      source,
+      prompt: 'e2e override',
+      agent_cli: 'echo-stub',
+      agent: 'icm-investigator',
+    });
+    assert.ok(!res.isError, JSON.stringify(res));
+    const sc = res.structuredContent;
+
+    const artifactsDir = join(sc.workspace_path, 'artifacts');
+    const deadline = Date.now() + 10000;
+    let manifest = null;
+    while (Date.now() < deadline) {
+      const dirs = existsSync(artifactsDir)
+        ? readdirSync(artifactsDir).filter((n) => n.startsWith('echo-stub-'))
+        : [];
+      for (const d of dirs) {
+        const mp = join(artifactsDir, d, 'manifest.json');
+        if (!existsSync(mp)) continue;
+        const m = JSON.parse(readFileSync(mp, 'utf8'));
+        if (m.recipe_instance_id === sc.recipe_instance_id) {
+          manifest = m;
+          break;
+        }
+      }
+      if (manifest) break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.ok(manifest, 'echo-stub artifact not found');
+    assert.equal(
+      manifest.meta.agent,
+      'icm-investigator',
+      `runtime agent override should win; got ${JSON.stringify(manifest.meta.agent)}`,
+    );
+  });
+
+  await t.test('recipe.run end-to-end: recipes without agent: pass through as <none>', async () => {
+    // Sanity check: when no agent is set anywhere, the spawn must not
+    // include --agent and the echo-stub artifact records agent: null.
+    const source = [
+      'id: e2e-no-agent',
+      'name: E2E no agent',
+      'description: No agent field anywhere.',
+    ].join('\n') + '\n';
+    const res = await h.call('recipe.run', {
+      source,
+      prompt: 'e2e none',
+      agent_cli: 'echo-stub',
+    });
+    assert.ok(!res.isError, JSON.stringify(res));
+    const sc = res.structuredContent;
+
+    const artifactsDir = join(sc.workspace_path, 'artifacts');
+    const deadline = Date.now() + 10000;
+    let manifest = null;
+    while (Date.now() < deadline) {
+      const dirs = existsSync(artifactsDir)
+        ? readdirSync(artifactsDir).filter((n) => n.startsWith('echo-stub-'))
+        : [];
+      for (const d of dirs) {
+        const mp = join(artifactsDir, d, 'manifest.json');
+        if (!existsSync(mp)) continue;
+        const m = JSON.parse(readFileSync(mp, 'utf8'));
+        if (m.recipe_instance_id === sc.recipe_instance_id) {
+          manifest = m;
+          break;
+        }
+      }
+      if (manifest) break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.ok(manifest, 'echo-stub artifact not found');
+    assert.equal(manifest.meta.agent, null, `agent should be null, got ${JSON.stringify(manifest.meta.agent)}`);
+  });
+
+  await t.test('recipe.upsert warns (does NOT fail) when agent is not yet registered', async () => {
+    const source = [
+      'id: future-agent-recipe',
+      'name: Future agent',
+      'description: References an agent not yet registered.',
+      'agent: not-installed-agent',
+    ].join('\n') + '\n';
+    const res = await h.call('recipe.upsert', {
+      id: 'future-agent-recipe',
+      scope: 'project',
+      source,
+    });
+    assert.ok(!res.isError, JSON.stringify(res));
+    const warnings = res.structuredContent?.warnings ?? [];
+    assert.ok(
+      warnings.some(
+        (w) => w.code === 'UNKNOWN_AGENT' && w.field === 'agent' && w.value === 'not-installed-agent',
+      ),
+      `expected UNKNOWN_AGENT warning, got: ${JSON.stringify(warnings)}`,
+    );
+  });
+
   await t.test('recipe.done outside a recipe-run session is rejected', async () => {
     // The harness's MCP server has NO CLAWDEVBOX_RECIPE_INSTANCE_ID env var,
     // so calling recipe.done on it should fail with NOT_IN_RECIPE_INSTANCE.
