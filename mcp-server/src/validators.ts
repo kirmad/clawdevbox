@@ -140,6 +140,25 @@ export function validateRecipeParsed(parsed: unknown): ValidationResult {
       });
     }
   }
+  if (r.agent !== undefined) {
+    // The agent name maps to `<plugin>/agents/<name>.agent.md`. When set,
+    // recipe-runner forwards it to the CLI via the provider's `--agent`
+    // flag so the spawned session loads that persona. Validate the name
+    // shape only here; existence is checked lazily at `recipe.run` time
+    // (the recipe may reference an agent from a plugin scheduled for
+    // later install).
+    if (
+      typeof r.agent !== 'string' ||
+      r.agent.length === 0 ||
+      !/^[a-z0-9][a-z0-9._-]*$/i.test(r.agent)
+    ) {
+      errors.push({
+        path: 'agent',
+        code: 'INVALID_VALUE',
+        message: `agent must be a non-empty agent name (e.g. 'dev-buddy', 'icm-investigator').`,
+      });
+    }
+  }
   if (r.mcp_servers !== undefined) {
     if (!Array.isArray(r.mcp_servers) || !r.mcp_servers.every((s) => typeof s === 'string')) {
       errors.push({ path: 'mcp_servers', code: 'TYPE', message: 'mcp_servers must be an array of strings.' });

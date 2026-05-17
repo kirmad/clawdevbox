@@ -6,6 +6,7 @@ description: >
   pending, recipe runs that completed, and one suggested focus for the
   day. Writes an artifact + an inbox card. Push only if there's
   something genuinely time-sensitive.
+agent: dev-buddy
 
 inputs:
   hours_back:

@@ -6,6 +6,7 @@ description: >
   summary to the inbox only if something materially changed since the
   last pulse. Never pushes to the user's phone unless a STANDING_ORDERS
   urgent category trips.
+agent: dev-buddy
 
 inputs:
   push_threshold:

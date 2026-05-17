@@ -17,6 +17,14 @@ export interface SpawnSessionOpts {
   role: SessionRole;
   /** Required when mode === 'headless'. Optional in interactive mode. */
   prompt?: string;
+  /**
+   * Optional agent persona to launch the CLI with. Maps to the CLI's
+   * `--agent <name>` flag (supported by both `copilot` and `claude`).
+   * The name must resolve to an `agents/<name>.agent.md` definition
+   * loaded by one of the registered plugins. Providers that don't
+   * support a named-agent flag (e.g. `echo-stub`) ignore this field.
+   */
+  agent?: string;
   workspaceInfo: { id: string; path: string };
   /** Env vars the kernel wants the child process to see (ambient context). */
   ambientEnv: Record<string, string>;

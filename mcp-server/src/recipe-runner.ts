@@ -54,6 +54,12 @@ export interface RunRecipeOptions {
   attachToInboxItemId?: string;
   /** Which CLI to spawn. Default 'copilot'. */
   agentCli?: string;
+  /**
+   * Optional agent persona to launch the CLI with (passed as `--agent
+   * <name>` to copilot/claude/agency). Resolved from the recipe YAML's
+   * `agent:` field; can be overridden by the caller of `recipe.run`.
+   */
+  agent?: string;
   /** Explicit CLI session id. Auto-minted from the instance id when absent. */
   sessionId?: string;
   /** Resume a prior recipe instance (CLI session id of the predecessor). */
@@ -254,6 +260,7 @@ export async function runRecipe(opts: RunRecipeOptions): Promise<RunRecipeResult
         : { kind: 'new', session_id: sessionId },
       role: 'recipe-instance',
       prompt: opts.prompt,
+      agent: opts.agent,
       workspaceInfo: opts.workspaceInfo,
       ambientEnv: spawnEnv,
       mcp: { url: opts.mcpUrl ?? '', secret: mcpSecret },

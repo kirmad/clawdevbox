@@ -49,6 +49,7 @@ import {
 } from '../workspaces-store.ts';
 import { getDatabase } from '../db/index.ts';
 import { emitChange } from '../event-bus.ts';
+import { logger } from '../logger.ts';
 import {
   ToolErrorBox,
   updateStatusImpl,
@@ -232,6 +233,25 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
         });
       }
 
+      // Same lenient pattern for `agent`: the recipe can reference an
+      // agent persona that's defined in a plugin not yet installed.
+      // We warn but don't block the write.
+      const declaredAgent = parsed && typeof parsed.agent === 'string' ? parsed.agent : null;
+      if (declaredAgent) {
+        const knownAgents = new Set<string>();
+        for (const plugin of ws.plugins.values()) {
+          for (const a of plugin.capabilities.agents ?? []) knownAgents.add(a.id);
+        }
+        if (!knownAgents.has(declaredAgent)) {
+          warnings.push({
+            code: 'UNKNOWN_AGENT',
+            field: 'agent',
+            value: declaredAgent,
+            message: `agent '${declaredAgent}' is not currently registered (available: ${[...knownAgents].sort().join(', ') || '<none>'}). The recipe was written; install the plugin that ships this agent before running it.`,
+          });
+        }
+      }
+
       return {
         content: [{ type: 'text', text: `Wrote recipe ${args.id} to ${args.scope} scope (${format}).` }],
         structuredContent: {
@@ -320,6 +340,11 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
           .min(1)
           .optional()
           .describe('Which agent-CLI provider to spawn (must be a registered provider id; defaults to config.default_agent_cli or "copilot"). `echo-stub` is a no-op spawn for tests.'),
+        agent: z
+          .string()
+          .min(1)
+          .optional()
+          .describe('Optional agent persona name. Maps to the CLI\'s `--agent <name>` flag (supported by copilot, claude, and agency). When omitted, falls back to the recipe YAML\'s `agent:` field if it has one, else no `--agent` flag is passed.'),
         session_id: z
           .string()
           .min(1)
@@ -438,6 +463,36 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
           { agent_cli: agentCli, available },
         );
       }
+      // Resolve the agent persona to launch the CLI with:
+      //   1. explicit `args.agent` runtime override (recipe.run input)
+      //   2. recipe YAML's `agent:` field
+      //   3. nothing — provider's spawnSession will skip the --agent flag
+      // We don't fail-loudly here when the agent name isn't currently
+      // registered: plugins are loaded lazily and the CLI will surface
+      // a clean error if `--agent <missing>` doesn't resolve at runtime.
+      // We do an idempotent best-effort lookup across all loaded plugin
+      // capabilities for an early diagnostic stderr line.
+      const recipeAgent =
+        parsedRecipe && typeof parsedRecipe.agent === 'string'
+          ? (parsedRecipe.agent as string)
+          : null;
+      const agent: string | undefined =
+        (typeof args.agent === 'string' && args.agent.length > 0
+          ? args.agent
+          : recipeAgent) ?? undefined;
+      if (agent) {
+        const knownAgents = new Set<string>();
+        for (const plugin of ws.plugins.values()) {
+          for (const a of plugin.capabilities.agents ?? []) knownAgents.add(a.id);
+        }
+        if (!knownAgents.has(agent)) {
+          logger.warn(
+            { agent, available: [...knownAgents].sort() },
+            'recipe.run: agent persona not currently registered; passing through to the CLI anyway',
+          );
+        }
+      }
+
       const result = await runRecipe({
         recipeId,
         recipeSnapshot,
@@ -447,6 +502,7 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
         workspaceInfo: { id: workspaceInfo.id, path: workspaceInfo.path },
         attachToInboxItemId: args.attach_to_inbox_item_id,
         agentCli,
+        agent,
         sessionId: args.session_id,
         resumeOf: args.resume_of,
         workspacesRoot,

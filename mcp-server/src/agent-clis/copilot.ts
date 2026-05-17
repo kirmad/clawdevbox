@@ -42,6 +42,9 @@ export const copilotProvider: AgentCliProvider = {
       : `--resume=${opts.init.session_id}`;
 
     const argv: string[] = [sessionFlag, '--additional-mcp-config', `@${mcpPath}`];
+    if (opts.agent) {
+      argv.push('--agent', opts.agent);
+    }
     if (opts.mode === 'headless') {
       if (!opts.prompt) throw new Error('copilot: headless mode requires opts.prompt');
       argv.push('--allow-all-tools', '-p', opts.prompt);

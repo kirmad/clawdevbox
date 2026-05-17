@@ -321,6 +321,34 @@ test('default_client rejects empty / wrong-type / bad-shape values', () => {
   }
 });
 
+test('agent accepts any agent-name-shaped string (mirrors default_client validation)', () => {
+  const base = { id: 'r', name: 'R', description: 'd' };
+  for (const good of ['dev-buddy', 'icm-investigator', 'agent.0', 'foo_bar', 'a1b2']) {
+    const r = validateRecipeParsed({ ...base, agent: good });
+    assert.equal(r.ok, true, `expected ${good} to be accepted; got ${JSON.stringify(r.ok ? null : r.errors)}`);
+  }
+});
+
+test('agent rejects empty / wrong-type / bad-shape values', () => {
+  const base = { id: 'r', name: 'R', description: 'd' };
+  for (const bad of ['', '-leading-dash', 'has space', 123, true, {}]) {
+    const r = validateRecipeParsed({ ...base, agent: bad });
+    assert.equal(r.ok, false, `expected rejection for ${JSON.stringify(bad)}`);
+    if (!r.ok) {
+      assert.ok(
+        r.errors.some((e) => e.path === 'agent' && e.code === 'INVALID_VALUE'),
+        `missing agent/INVALID_VALUE for ${JSON.stringify(bad)}`,
+      );
+    }
+  }
+});
+
+test('agent is optional — recipes without it still validate', () => {
+  const base = { id: 'r', name: 'R', description: 'd' };
+  const r = validateRecipeParsed(base);
+  assert.equal(r.ok, true);
+});
+
 
 import { validateMaxAttempts, validateBackoffMs } from '../src/validators.ts';
 
