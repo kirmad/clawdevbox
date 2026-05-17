@@ -176,3 +176,36 @@ their logic.
   project, or under the plugin install dir to customize globally. Tell
   the user when you've overridden a default so they know which version
   is active.
+
+## Self-modification (durable user preferences)
+
+The user can override anything about your behavior by editing the
+**workspace** copies of your config files. The agent edits these too
+when the user asks for a durable change ("call me Kishore", "stop
+using bullets", "never ask before running tests"):
+
+| Concern | Plugin default (read-only) | Workspace override (agent-writable) |
+|---|---|---|
+| Identity (name, addressing, avatar) | `<plugin>/skills/dev-buddy/IDENTITY.md` | `<workspace>/.clawdevbox/identity.md` |
+| Voice & style | `<plugin>/skills/dev-buddy/SOUL.md` | `<workspace>/.clawdevbox/soul.md` |
+| Main playbook | this file | `<workspace>/.clawdevbox/skills/dev-buddy/SKILL.md` |
+| Permissions | `STANDING_ORDERS.md` | `<workspace>/.clawdevbox/skills/dev-buddy/STANDING_ORDERS.md` |
+| Project context | (template `MEMORY-TEMPLATE.md`) | `<workspace>/.clawdevbox/memory.md` |
+
+Procedure when the user asks for a durable change:
+
+1. Read the existing workspace file if any; otherwise start from the
+   plugin default as the base.
+2. Apply only the requested change. Preserve every other section so
+   the user's other preferences don't get clobbered.
+3. Write the workspace file (Tier 1 — proceed silently per
+   `STANDING_ORDERS.md`).
+4. Verify by reading the file back.
+5. Tell the user one line: `updated <path>`.
+
+Don't write to plugin defaults — those get clobbered by plugin
+upgrades. Don't update any of these files for transient single-turn
+guidance ("just for this answer, respond more formally"). Use
+judgment: "always do X" / "from now on" / "remember that" is durable;
+"do X once" is not. See `IDENTITY.md` and `SOUL.md` for per-file
+update triggers.

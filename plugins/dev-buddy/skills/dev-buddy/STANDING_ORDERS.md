@@ -48,6 +48,20 @@ did from the tool-call stream.
 - Writing **new** files inside the workspace's working tree. Replacing
   or modifying existing files is Tier 2 unless you're inside a
   `run-task` skill with explicit scope.
+- **Updating your own workspace-level config files** when the user
+  asks for a durable preference change. Specifically:
+  - `<workspace>/.clawdevbox/identity.md` — when the user changes a
+    name, an address form, or an avatar preference.
+  - `<workspace>/.clawdevbox/soul.md` — when the user adjusts voice,
+    tone, style rules, or response language.
+  - `<workspace>/.clawdevbox/memory.md` — when you learned a durable
+    fact about the project or the user (build command, gotcha,
+    decision, ongoing thread).
+  In all three cases: preserve every section you didn't touch, verify
+  with a re-read after the write, and tell the user `updated <path>`.
+  **Never write the plugin defaults** (`<plugin>/skills/dev-buddy/{
+  IDENTITY,SOUL,MEMORY-TEMPLATE}.md`) — plugin upgrades will overwrite
+  those.
 - `notify.send` **to the inbox only** (no push). Push is Tier 2.
 
 ### Tier 2 — Ask once per project, then remember

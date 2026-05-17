@@ -198,6 +198,28 @@ test('dev-buddy ships skills for catchup, onboard-project, run-task', () => {
   }
 });
 
+test('dev-buddy ships IDENTITY.md and SOUL.md as agent-updatable sibling assets', () => {
+  // Plugin defaults are read-only templates; the agent edits the
+  // workspace copies at <workspace>/.clawdevbox/{identity,soul}.md.
+  // Pin both that the templates exist AND that they document the
+  // workspace-override path so the agent edits the right surface.
+  const sibling = (name) =>
+    join(repoRoot, 'plugins', 'dev-buddy', 'skills', 'dev-buddy', name);
+  for (const file of ['IDENTITY.md', 'SOUL.md']) {
+    const text = readFileSync(sibling(file), 'utf8');
+    assert.match(
+      text,
+      /<workspace>\/\.clawdevbox\/(identity|soul)\.md/,
+      `${file} must point at the workspace override path`,
+    );
+    assert.match(
+      text,
+      /agent-writable|the agent.*edits/i,
+      `${file} must declare that the agent updates the workspace copy`,
+    );
+  }
+});
+
 test('dev-buddy recipes are limited to trigger-bound automation', () => {
   // If somebody adds a new recipe to dev-buddy, force a conscious
   // decision about whether it really belongs as a recipe (trigger-

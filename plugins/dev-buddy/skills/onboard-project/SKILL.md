@@ -88,11 +88,38 @@ If `"no"`: skip silently.
 Same flow for `enable_daily_standup` with a `0 9 * * 1-5` cron
 (weekday 9 AM local — confirm time zone from `memory.md`).
 
+## Step 4.5 — Offer identity / soul overrides (optional)
+
+The plugin ships sensible defaults at
+`<plugin>/skills/dev-buddy/IDENTITY.md` and
+`<plugin>/skills/dev-buddy/SOUL.md`. The user can override per-project
+by creating `<workspace>/.clawdevbox/identity.md` and
+`<workspace>/.clawdevbox/soul.md`.
+
+You don't need to create these proactively — they'll get created
+automatically the first time the user asks for a durable identity or
+voice change ("call me X", "stop using bullets"). But if the user
+mentions any preference during onboarding ("formal tone for this
+project", "no emoji in customer-facing repos", "different name here"),
+seed the relevant file now:
+
+- For identity changes: write
+  `<workspace>/.clawdevbox/identity.md` with the plugin default as
+  the base, then apply the user's change.
+- For soul changes: same for
+  `<workspace>/.clawdevbox/soul.md`.
+
+Read the plugin defaults first via `skill.read({ id: 'dev-buddy' })`
+sibling-asset paths so you start from the current content rather than
+making up a structure. Preserve every section the user didn't touch.
+
 ## Step 5 — Wrap up
 
 Report:
 
 - **memory.md:** `created` | `updated` | `unchanged` — with the path.
+- **identity.md:** `seeded with override` | `using plugin default`.
+- **soul.md:** `seeded with override` | `using plugin default`.
 - **Heartbeat:** `enabled @ <cron>` | `skipped`.
 - **Daily standup:** `enabled @ <cron>` | `skipped`.
 - One line on what's next: `Try \`/catchup\`, or just describe what
@@ -105,6 +132,9 @@ Don't write an artifact — onboarding output belongs in chat.
 - This is a Tier-2 batch (writing `memory.md` + registering triggers).
   Step 3's ask doubles as the consent gate. Don't proceed past Step 2
   without the user's answers.
+- Identity / soul seeding in Step 4.5 is Tier-1 (proceed silently) per
+  `STANDING_ORDERS.md` — it's writing to the agent's own
+  workspace-level config.
 - Never enable triggers without confirmation when `enable_heartbeat` /
   `enable_daily_standup` is `"ask"`.
 - If the user has already onboarded (memory.md exists and looks
