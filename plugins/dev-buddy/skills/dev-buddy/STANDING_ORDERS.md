@@ -47,7 +47,7 @@ did from the tool-call stream.
 - Creating new branches (`git checkout -b`) — the user can prune easily.
 - Writing **new** files inside the workspace's working tree. Replacing
   or modifying existing files is Tier 2 unless you're inside a
-  `run-task` recipe with explicit scope.
+  `run-task` skill with explicit scope.
 - `notify.send` **to the inbox only** (no push). Push is Tier 2.
 
 ### Tier 2 — Ask once per project, then remember

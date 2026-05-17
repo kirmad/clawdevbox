@@ -154,7 +154,60 @@ test('dev-buddy SKILL.md has correct YAML frontmatter (name: dev-buddy)', () => 
   // Claude Code skill convention: frontmatter `name` is the canonical
   // identifier and must equal the directory name. No separate `id` field.
   assert.ok(/^name:\s*dev-buddy/m.test(fm), 'frontmatter must declare name: dev-buddy');
-  // Key prose line from the opening playbook.
-  assert.ok(text.includes('When the conversation starts (or the user types `/catchup`)'));
-  assert.ok(text.includes('`recipe.run({ id, prompt, params })`'));
+  // Characteristic phrases from the dev-buddy playbook. If the playbook
+  // is rewritten and these phrases change, update the assertions here —
+  // but the playbook MUST still cover (a) the /catchup opening flow and
+  // (b) the multi-tool plan→execute→verify loop.
+  assert.ok(
+    /\/catchup/.test(text),
+    'SKILL.md must reference the /catchup opening flow',
+  );
+  assert.ok(
+    /Plan first|plan\s+→\s*execute|Plan\s+\(visible/i.test(text),
+    'SKILL.md must describe the plan→execute discipline for substantive tasks',
+  );
+});
+
+test('dev-buddy ships an agent definition', () => {
+  const text = readFileSync(
+    join(repoRoot, 'plugins', 'dev-buddy', 'agents', 'dev-buddy.agent.md'),
+    'utf8',
+  );
+  const match = text.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  assert.ok(match, 'expected YAML frontmatter on the agent file');
+  const fm = match[1];
+  assert.ok(/^name:\s*dev-buddy/m.test(fm), 'agent frontmatter must declare name: dev-buddy');
+  assert.ok(/^description:/m.test(fm), 'agent frontmatter must declare a description');
+});
+
+test('dev-buddy ships skills for catchup, onboard-project, run-task', () => {
+  // Recipes are trigger-bound only (heartbeat-pulse, daily-standup);
+  // interactive playbooks are skills. Pin the layout so a regression
+  // (e.g. moving catchup back into recipes/) trips here.
+  for (const skillId of ['catchup', 'onboard-project', 'run-task']) {
+    const skillFile = join(
+      repoRoot,
+      'plugins',
+      'dev-buddy',
+      'skills',
+      skillId,
+      'SKILL.md',
+    );
+    const text = readFileSync(skillFile, 'utf8');
+    assert.match(text, new RegExp(`^name:\\s*${skillId}`, 'm'), `${skillId} frontmatter`);
+  }
+});
+
+test('dev-buddy recipes are limited to trigger-bound automation', () => {
+  // If somebody adds a new recipe to dev-buddy, force a conscious
+  // decision about whether it really belongs as a recipe (trigger-
+  // bound) or should be a skill (interactive).
+  const pluginJson = JSON.parse(
+    readFileSync(
+      join(repoRoot, 'plugins', 'dev-buddy', '.claude-plugin', 'plugin.json'),
+      'utf8',
+    ),
+  );
+  const recipeIds = (pluginJson.clawdevbox?.recipes ?? []).map((r) => r.id).sort();
+  assert.deepEqual(recipeIds, ['daily-standup', 'heartbeat-pulse']);
 });

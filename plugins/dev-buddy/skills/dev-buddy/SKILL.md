@@ -24,7 +24,7 @@ edits any of them:
 3. **`<workspace>/.clawdevbox/memory.md`** *(if it exists)* — durable
    project context: what this project is, who the user is, prior
    decisions, ongoing threads. If it doesn't exist, suggest running the
-   `onboard-project` recipe on your first substantive turn.
+   `onboard-project` skill on your first substantive turn.
 
 If any of these files is missing or unreadable, surface that to the user
 as a single line (`memory.md not found — run onboard-project?`) and
@@ -32,10 +32,21 @@ proceed without it. Don't refuse to work.
 
 ## Opening turn
 
-When a conversation starts (or the user types `/catchup`), call the
-`catchup` recipe with `recipe.run({ id: 'catchup', prompt: ... })`. Don't
-hand-roll the inbox/recipe/trigger summary inline — the recipe does it
-consistently and produces an artifact the user can revisit.
+When a conversation starts (or the user types `/catchup`), load and
+follow the **`catchup`** skill. Don't hand-roll the inbox/recipe/trigger
+summary inline — the skill is the canonical script for the opening
+briefing.
+
+```
+skill.read({ id: 'catchup' })
+```
+
+Same pattern for first-run setup: load **`onboard-project`** when the
+workspace has no `memory.md` yet.
+
+```
+skill.read({ id: 'onboard-project' })
+```
 
 ## How you respond to substantive task requests
 
@@ -107,19 +118,34 @@ Neither is on by default. Offer to schedule them during onboarding
 (`onboard-project`) or when the user asks "what can you do for me
 automatically?"
 
-## Recipes available out of the box
+## Recipes available out of the box (trigger-bound only)
 
-| Recipe id | What it does |
+Recipes are reserved for **trigger-bound automation** — things that
+should run on a schedule or in response to an event without user
+invocation. Both of these are opt-in via `onboard-project`.
+
+| Recipe id | Trigger pattern | What it does |
+|---|---|---|
+| `heartbeat-pulse` | Cron, e.g. `*/30 * * * *` | Ambient check; writes to inbox only on material change; push only on STANDING_ORDERS urgent categories |
+| `daily-standup` | Cron, e.g. `0 9 * * 1-5` | Weekday morning summary artifact + inbox card |
+
+## Skills available out of the box (interactive)
+
+Skills are documentation you read at the start of a task. Use these
+for anything the user invokes interactively — chat, slash commands, or
+free-form task descriptions.
+
+| Skill id | When to use |
 |---|---|
-| `catchup` | The opening-turn briefing (inbox + recipes + triggers + one suggested next step) |
-| `onboard-project` | One-time first-run: builds `memory.md`, offers to enable heartbeat |
-| `heartbeat-pulse` | Opt-in periodic ambient check (writes to inbox; silent otherwise) |
-| `daily-standup` | Once-a-day morning summary |
-| `run-task` | Wrap any task in plan → execute → verify → artifact → memorize. Use when the user wants a persistent record of the work. |
+| `dev-buddy` | Main playbook. Always loaded. |
+| `catchup` | When the user starts a conversation or types `/catchup`. |
+| `onboard-project` | First time you encounter a workspace without `memory.md`. |
+| `run-task` | When the user gives you a substantive task that warrants a persistent artifact. |
 
-For everything else, use `recipe.list({ scope: 'all' })` to see what
-the user's plugins expose. Prefer existing recipes over inlining their
-logic.
+For everything else, use `skill.list` to see what the user's plugins
+expose and `recipe.list({ scope: 'all' })` for trigger-bound recipes
+the user could schedule. Prefer existing skills/recipes over inlining
+their logic.
 
 ## Style
 
