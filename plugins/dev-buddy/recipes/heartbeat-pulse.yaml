@@ -1,0 +1,117 @@
+id: heartbeat-pulse
+name: "Ambient periodic check — inbox-by-default, push only on urgent"
+description: >
+  Opt-in. Designed to be cron-scheduled (e.g. every 30 min). Scans the
+  inbox, approvals, and recently-fired triggers; writes a one-card
+  summary to the inbox only if something materially changed since the
+  last pulse. Never pushes to the user's phone unless a STANDING_ORDERS
+  urgent category trips.
+
+inputs:
+  push_threshold:
+    description: "Which urgent category, if any, justifies a push notification. One of: 'never', 'incidents-only', 'all-urgent'. Default 'incidents-only'."
+    type: string
+    required: false
+    default: "incidents-only"
+  materiality:
+    description: "How much has to change to write an inbox card. 'any' = always write, 'change' = only on diff vs prior pulse, 'high' = only when something needs human action."
+    type: string
+    required: false
+    default: "change"
+
+prompt: |
+  You are running a heartbeat pulse — an unattended ambient check.
+  Be quiet unless something matters. The user is not waiting for you;
+  they will see whatever lands in the inbox on their schedule.
+
+  ## Step 1 — Snapshot current state (parallel, all Tier-1 reads)
+
+  - `inbox.list({ state: 'new', limit: 20 })`
+  - `inbox.list({ state: 'open', limit: 20 })`
+  - `approval.list_pending()`
+  - `recipe.list({ scope: 'workspace', kind: 'instances', limit: 20 })`
+    — recent recipe runs and their statuses.
+
+  ## Step 2 — Find prior pulse for diff
+
+  `inbox.list({ kind: 'heartbeat', limit: 1 })` — the most recent
+  heartbeat inbox card. Read its body. If absent, treat everything as
+  new for this pulse.
+
+  ## Step 3 — Decide what (if anything) to surface
+
+  Apply the `materiality` policy:
+  - **`any`:** always write a card.
+  - **`change`** *(default)*: write a card only if at least one of:
+    - A new inbox item appeared since the prior pulse.
+    - An approval became pending (or one was resolved).
+    - A recipe instance transitioned to `failed` or `success` since
+      the prior pulse.
+    - Otherwise, **return without writing anything**.
+  - **`high`:** write a card only when something needs human action
+    (new approvals, failed recipes, Sev1/2 incidents).
+
+  If nothing meets the policy, finish with `recipe.done({ status:
+  'success', message: 'BEAT_OK' })` and **do not** write to the inbox
+  or push.
+
+  ## Step 4 — Write the card
+
+  When you have material to surface:
+
+  ```
+  inbox.create({
+    kind: 'heartbeat',
+    tag: 'heartbeat-<YYYY-MM-DD>',         // collapses same-day pulses
+    title: '<concise change summary, e.g. "2 new inbox, 1 approval pending">',
+    body: <markdown listing the deltas + suggested next action>,
+  })
+  ```
+
+  Use a stable per-day `tag` so multiple pulses on the same day
+  collapse rather than creating one card per pulse. Body should be
+  ≤ 20 lines, bulleted, with `inbox_id` / `approval_id` / `ri_…`
+  citations for everything mentioned.
+
+  ## Step 5 — Push only on urgent (subject to `push_threshold`)
+
+  Walk the snapshot for STANDING_ORDERS urgent categories:
+
+  - **Sev 1 / Sev 2 incident** in any IcM inbox item that wasn't there
+    on the prior pulse.
+  - **3+ consecutive CI failures** on a branch the user owns.
+  - **Security advisory** matching a dep in the workspace.
+  - **Approval pending > 4 hours** AND the user touched the workspace
+    in the last hour.
+
+  If `push_threshold` is `'never'`: skip the push step regardless.
+
+  If `push_threshold` is `'incidents-only'`: push only for the
+  Sev 1/2 incident case.
+
+  If `push_threshold` is `'all-urgent'`: push for any matching
+  category.
+
+  When pushing:
+
+  ```
+  notify.send({
+    title: '<one-line summary>',
+    body: '<2-3 sentences>',
+    url: <view_url of inbox card or artifact>,
+    tag: 'urgent-<category>',
+    require_interaction: false,   // true only for Sev 1
+  })
+  ```
+
+  ## Step 6 — Finish
+
+  - If nothing was written: `recipe.done({ status: 'success', message:
+    'BEAT_OK' })`.
+  - If a card was written: `recipe.done({ status: 'success', message:
+    'wrote inbox card <id>' })`.
+  - If a push was sent: include `pushed: true` in the message.
+
+  **Never write a chat message back to the user from this recipe.** The
+  only communication channel is the inbox (and optionally push). The
+  user reads the inbox on their schedule.

@@ -1,0 +1,49 @@
+id: catchup
+name: "Catch the user up on workspace state"
+description: >
+  The opening-turn briefing. Surfaces what's new in the inbox, pending
+  approvals, recipes the user could run, and scheduled triggers. Ends
+  with one suggested next step. Run this when a conversation starts or
+  when the user types `/catchup`.
+
+inputs:
+  brief:
+    description: "If true, skip the recipe + trigger inventory and just summarize inbox + approvals."
+    type: boolean
+    required: false
+    default: false
+
+prompt: |
+  Brief the user on the current workspace state. Keep it tight — 5–10
+  lines total, bullets over prose, code-style formatting for ids.
+
+  Run these tools in parallel:
+
+  1. `workspace.current()` — confirm which project this is.
+  2. `inbox.list({ state: 'new', limit: 10 })` and
+     `inbox.list({ state: 'open', limit: 10 })`.
+  3. `approval.list_pending()` — anything waiting on a human decision.
+  4. *(unless `brief: true`)* `recipe.list({ scope: 'all' })` — recipes
+     the user could run.
+  5. *(unless `brief: true`)* `trigger.list_registered()` — what's
+     scheduled or watching.
+
+  Format the summary as:
+
+  - **Workspace:** `<name>` (`<workspace_id>`)
+  - **Inbox:** `N new, M open` — list up to 3 most-recent titles with
+    their state.
+  - **Approvals:** `K pending` — list the titles if K > 0; omit the
+    line entirely if K == 0.
+  - **(unless brief) Recipes available:** `` `<id1>` ``, `` `<id2>` ``,
+    … (top 5 by relevance to inbox titles)
+  - **(unless brief) Triggers:** `N enabled, M disabled` — name the
+    enabled ones.
+  - **Suggested next:** one concrete thing the user might do, picked
+    from inbox / approvals / a stuck thread. If nothing's pressing,
+    say "nothing pressing — what do you want to work on?"
+
+  Do NOT narrate "I'll check the inbox..." — just call the tools and
+  report. Do NOT emit a push notification from this recipe.
+
+  When done: `recipe.done({ status: 'success' })`.

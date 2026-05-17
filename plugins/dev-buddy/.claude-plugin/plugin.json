@@ -1,8 +1,17 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "dev-buddy",
-  "version": "1.0.0",
-  "description": "Workspace persona for the clawdevbox main agent.",
+  "version": "1.1.0",
+  "description": "The main agent for clawdevbox. Plans before acting, verifies after, summarizes work into artifacts, memorizes durable learnings to a per-workspace memory.md, and runs opt-in ambient checks (heartbeat + daily standup) that stay in the inbox unless something genuinely urgent trips.",
   "author": { "name": "Clawdevbox team" },
-  "keywords": ["clawdevbox", "main-agent", "skill"]
+  "keywords": ["clawdevbox", "main-agent", "skill", "autonomous", "developer-assistant"],
+  "clawdevbox": {
+    "recipes": [
+      { "id": "catchup", "file": "recipes/catchup.yaml" },
+      { "id": "onboard-project", "file": "recipes/onboard-project.yaml" },
+      { "id": "heartbeat-pulse", "file": "recipes/heartbeat-pulse.yaml" },
+      { "id": "daily-standup", "file": "recipes/daily-standup.yaml" },
+      { "id": "run-task", "file": "recipes/run-task.yaml" }
+    ]
+  }
 }
