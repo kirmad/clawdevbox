@@ -705,6 +705,13 @@ export async function runStart(flags: Flags): Promise<void> {
   // banner + /api/tunnel/status surface a clear, actionable message.
   let tunnelStatus: TunnelStatus = getTunnelStatus();
   if (cfg.tunnel.kind === 'devtunnel' && cfg.tunnel.auto_start) {
+    // Refresh PATH from registry / scan install dirs BEFORE probing for
+    // devtunnel. On Windows the service can boot in a shell that pre-dates
+    // a winget install (Run-key auto-start, npx invocation from an old
+    // terminal, etc.) — the registry refresh catches that.
+    const { ensureDevtunnelOnPath } = await import('./ensure-devtunnel.ts');
+    ensureDevtunnelOnPath();
+
     const tunnelName = cfg.tunnel.name ?? deriveTunnelName(cfg.projectDir);
     tunnelStatus = await startTunnel({
       kind: 'devtunnel',

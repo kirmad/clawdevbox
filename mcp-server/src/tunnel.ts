@@ -270,11 +270,29 @@ export async function stopTunnel(): Promise<void> {
  */
 function resolveDevtunnelPath(): string {
   // node-pty doesn't do PATH lookups the way child_process.spawn does, so
-  // resolve to an absolute path. On Windows, `where devtunnel` returns one
-  // path per line; on POSIX, `which` is the equivalent.
-  const which = process.platform === 'win32' ? 'where' : 'which';
+  // resolve to an absolute path. On Windows, `where devtunnel.exe` returns
+  // the actual .exe (not the .cmd shim); on POSIX, `which devtunnel` is
+  // the equivalent. Targeting `.exe` instead of bare `devtunnel` is
+  // important on Windows because `where devtunnel` returns the WinGet .cmd
+  // shim, which node-pty.spawn cannot execute directly.
+  if (process.platform === 'win32') {
+    try {
+      const res = spawnSync('cmd.exe', ['/d', '/s', '/c', 'where', 'devtunnel.exe'], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+      });
+      if (res.status === 0) {
+        const first = (res.stdout ?? '').split(/\r?\n/).find((l) => l.trim().endsWith('.exe'));
+        if (first) return first.trim();
+      }
+    } catch {
+      /* fall through */
+    }
+    return 'devtunnel.exe';
+  }
   try {
-    const res = spawnSync(which, ['devtunnel'], { encoding: 'utf8' });
+    const res = spawnSync('which', ['devtunnel'], { encoding: 'utf8' });
     if (res.status === 0) {
       const first = (res.stdout ?? '').split(/\r?\n/).find((l) => l.trim().length > 0);
       if (first) return first.trim();
@@ -282,7 +300,7 @@ function resolveDevtunnelPath(): string {
   } catch {
     /* fall through */
   }
-  return process.platform === 'win32' ? 'devtunnel.exe' : 'devtunnel';
+  return 'devtunnel';
 }
 
 function spawnHostPty(opts: StartTunnelOptions): void {
@@ -415,11 +433,19 @@ export function deriveTunnelName(projectDir: string): string {
 }
 
 function runDevtunnel(args: string[]): { status: number; stdout: string; stderr: string } {
+  // On Windows, `devtunnel` is typically the WinGet `.cmd` shim (under
+  // `LOCALAPPDATA\Microsoft\WinGet\Links`). Node's child_process.spawn
+  // can't execute `.cmd` files directly anymore (DEP0190 deprecates the
+  // shell:true workaround). Wrap with `cmd.exe /d /s /c` instead — same
+  // pattern claude.ts and ensure-devtunnel.ts use.
+  const { file, spawnArgs } = process.platform === 'win32'
+    ? { file: 'cmd.exe', spawnArgs: ['/d', '/s', '/c', 'devtunnel', ...args] }
+    : { file: 'devtunnel', spawnArgs: args };
   try {
-    const res = spawnSync('devtunnel', args, {
+    const res = spawnSync(file, spawnArgs, {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
-      shell: false,
+      windowsHide: true,
     });
     return {
       status: typeof res.status === 'number' ? res.status : -1,

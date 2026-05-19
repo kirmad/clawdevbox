@@ -248,6 +248,39 @@ function findDevtunnelInstallDir(): string | null {
   return null;
 }
 
+/**
+ * Idempotent: try every PATH-resolution trick we know to make devtunnel
+ * findable in the current process. Returns true if devtunnel is on PATH
+ * after the call (whether already-there or newly-resolved).
+ *
+ * Safe to call from any process at any time. Use this from the service
+ * boot path so devtunnel works even when the service was started in a
+ * shell that pre-dates the install — and from init's post-install path
+ * so the immediate service spawn has the refreshed PATH.
+ *
+ * The 3 layers, in order, each followed by a re-probe:
+ *   1. refreshPathFromRegistry() — Windows-only; ask PowerShell for the
+ *      live HKCU\\Environment\\Path + HKLM\\...\\Path (catches winget's
+ *      User-PATH update that the running Node process can't see).
+ *   2. findDevtunnelInstallDir() — scan known install locations on every
+ *      platform and add the matching one to process.env.PATH.
+ *   3. (no-op — gives up)
+ */
+export function ensureDevtunnelOnPath(): boolean {
+  if (probeDevtunnel()) return true;
+
+  refreshPathFromRegistry();
+  if (probeDevtunnel()) return true;
+
+  const found = findDevtunnelInstallDir();
+  if (found) {
+    refreshPath([found]);
+    if (probeDevtunnel()) return true;
+  }
+
+  return false;
+}
+
 // ---------------------------------------------------------------------------
 // Step 1: install the CLI
 // ---------------------------------------------------------------------------
@@ -297,31 +330,13 @@ async function installDevtunnelCli(): Promise<{
 
   refreshPath(cmd.pathExtensions);
 
-  // First post-install probe (with the install-dir hints merged in).
-  let postVersion = probeDevtunnel();
-
-  // If still not found, refresh PATH from the OS registry/env store. On
-  // Windows this catches winget's User-PATH update that the running Node
-  // process can't otherwise observe.
-  if (!postVersion) {
-    refreshPathFromRegistry();
-    postVersion = probeDevtunnel();
-  }
-
-  // Last resort: scan well-known install dirs and add the matching one to
-  // process.env.PATH. Handles edge cases where winget installs the binary
-  // to a versioned subdirectory that wasn't in our static hints.
-  if (!postVersion) {
-    const found = findDevtunnelInstallDir();
-    if (found) {
-      refreshPath([found]);
-      postVersion = probeDevtunnel();
-    }
-  }
-
-  if (postVersion) {
+  // Use the same multi-layer resolver the service uses at boot time. This
+  // catches winget's User-PATH update via the registry refresh and falls
+  // back to scanning known install dirs.
+  if (ensureDevtunnelOnPath()) {
+    const postVersion = probeDevtunnel();
     sp.stop(`devtunnel installed (${postVersion}).`);
-    return { ok: true, version: postVersion };
+    return { ok: true, version: postVersion ?? undefined };
   }
 
   sp.stop(
