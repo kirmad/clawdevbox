@@ -42,6 +42,7 @@ import {
 } from '../config.ts';
 import { DEFAULT_VAPID_SUBJECT, generateVapidKeys } from '../notifications.ts';
 import { deriveTunnelName } from '../tunnel.ts';
+import { ensureDevtunnelReady } from './ensure-devtunnel.ts';
 import { loadWorkspaceFromEnv, type Workspace } from '../workspace.ts';
 import { buildProviderCtx } from '../agent-clis/shared.ts';
 import type { DetectResult } from '../agent-clis/types.ts';
@@ -477,6 +478,25 @@ async function runInitInner(flags: Flags): Promise<void> {
   let tunnelName: string | undefined;
   let tunnelAllowAnon = true;
   if (tunnelKind === 'devtunnel') {
+    // Make sure devtunnel is installed + signed in BEFORE we write config
+    // and start the service. The service spawned downstream inherits the
+    // current process's PATH, so installing here means `devtunnel host` can
+    // launch successfully without a shell restart.
+    const ready = await ensureDevtunnelReady();
+    if (!ready.ok) {
+      log.warn(
+        `Devtunnel setup incomplete (${ready.failedAt}): ${ready.reason}`,
+      );
+      log.warn(
+        'Config will be saved, but the tunnel will not come up on `clawdevbox start` ' +
+        'until you finish the setup. Run `clawdevbox init` again after fixing.',
+      );
+    } else if (!ready.cliPreInstalled || !ready.loginPreExisting) {
+      log.info(
+        `Devtunnel ready: ${ready.version} (signed in as ${ready.account ?? '?'}).`,
+      );
+    }
+
     const derived = existing?.tunnel?.name ?? deriveTunnelName(projectDir);
     const nameRaw = abortIfCancel(
       await text({
