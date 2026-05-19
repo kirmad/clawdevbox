@@ -18,7 +18,7 @@
  * recipe.done.
  */
 
-import { randomBytes } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { createWriteStream, mkdirSync } from 'node:fs';
 import { dirname, resolve as resolvePath } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -133,10 +133,14 @@ function pruneUndefined<T extends Record<string, unknown>>(obj: T): T {
 export async function runRecipe(opts: RunRecipeOptions): Promise<RunRecipeResult> {
   const agentCli: string = opts.agentCli ?? 'copilot';
   const instanceId = mintRecipeInstanceId();
+  // Use a UUID for the session id by default. Claude Code's --session-id
+  // requires a valid UUID; Copilot accepts arbitrary strings, so UUIDs work
+  // for both. A caller can still pass a custom opts.sessionId — but it must
+  // be UUID-shaped if agentCli is claude/agency-with-claude.
   const sessionId =
     typeof opts.sessionId === 'string' && opts.sessionId.length > 0
       ? opts.sessionId
-      : `cdb_${instanceId.slice(3)}`;
+      : randomUUID();
   const isResume = !!opts.resumeOf;
   const mcpSecret = opts.mcpSecret ?? randomBytes(16).toString('hex');
 

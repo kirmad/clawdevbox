@@ -27,6 +27,7 @@ import { hasSession, killPty, listSessions, registerPty } from './pty-registry.t
 import type { Workspace } from './workspace.ts';
 import type { ResolvedConfig } from './config.ts';
 import { buildProviderCtx } from './agent-clis/shared.ts';
+import { randomUUID } from 'node:crypto';
 
 export const MAIN_AGENT_INSTANCE_ID = 'main';
 
@@ -51,7 +52,12 @@ let agentPid: number | null = null;
 let agentCliId: string = 'copilot';
 
 function mintMainAgentSessionId(): string {
-  return 'main-' + Date.now().toString(36);
+  // Claude Code's --session-id flag REQUIRES a valid UUID (verified against
+  // claude 2.1.x: 'Invalid session ID. Must be a valid UUID.'). Copilot CLI's
+  // --name accepts arbitrary strings, so a UUID works for both providers.
+  // The fact that this session represents the main agent is recorded via
+  // MAIN_AGENT_INSTANCE_ID in pty-registry, not in the session id itself.
+  return randomUUID();
 }
 
 export function getMainAgentStatus(): MainAgentStatus {

@@ -61,10 +61,14 @@ export function writeMcpJson(
   _wsPath: string,
   mcp: { url: string; secret: string },
 ): void {
+  // Use `type: "http"` (not `"streamable-http"`). Copilot CLI's MCP config
+  // schema rejects `streamable-http` with `Invalid literal value`, and Claude
+  // Code happily accepts `http` (verified against copilot 1.0.49 and claude
+  // 2.1.x). The shape is otherwise identical to MCP spec §6.2.
   const config = {
     mcpServers: {
       clawdevbox: {
-        type: 'streamable-http',
+        type: 'http',
         url: mcp.url,
         headers: { Authorization: `Bearer ${mcp.secret}` },
         tools: ['*'],
