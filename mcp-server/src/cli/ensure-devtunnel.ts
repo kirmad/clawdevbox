@@ -31,6 +31,7 @@ import { spawnSync } from 'node:child_process';
 import { confirm, isCancel, log, select, spinner } from '@clack/prompts';
 import { delimiter, join } from 'node:path';
 import { homedir } from 'node:os';
+import { existsSync, readdirSync } from 'node:fs';
 
 export type EnsureStage = 'install' | 'login' | 'verify';
 
@@ -54,15 +55,26 @@ export interface EnsureDevtunnelResult {
 // Probes
 // ---------------------------------------------------------------------------
 
+/**
+ * Wrap a Windows shim-resolvable binary (like `devtunnel`, which exists as
+ * `devtunnel.cmd` under `WinGet\Links\`) into a `cmd.exe /d /s /c ...`
+ * invocation. On POSIX we exec directly. This avoids `shell: true`, which
+ * Node 22+ deprecates (DEP0190 — args are not escaped, only concatenated).
+ */
+function windowsCmdWrap(bin: string, args: string[]): { file: string; args: string[] } {
+  if (process.platform === 'win32') {
+    return { file: 'cmd.exe', args: ['/d', '/s', '/c', bin, ...args] };
+  }
+  return { file: bin, args };
+}
+
 /** Returns the devtunnel version string when on PATH; null otherwise. */
 export function probeDevtunnel(): string | null {
-  const r = spawnSync('devtunnel', ['--version'], {
+  const { file, args } = windowsCmdWrap('devtunnel', ['--version']);
+  const r = spawnSync(file, args, {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
-    // Use shell on Windows so PATH is fully expanded through cmd.exe; on
-    // POSIX direct exec works.
-    shell: process.platform === 'win32',
   });
   if (r.status !== 0) return null;
   return ((r.stdout ?? '') as string).trim().split(/\r?\n/)[0] || 'unknown';
@@ -75,11 +87,11 @@ export function probeDevtunnel(): string | null {
  * stderr or stdout) when not.
  */
 export function probeDevtunnelLogin(): string | null {
-  const r = spawnSync('devtunnel', ['user', 'show'], {
+  const { file, args } = windowsCmdWrap('devtunnel', ['user', 'show']);
+  const r = spawnSync(file, args, {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
-    shell: process.platform === 'win32',
   });
   if (r.status !== 0) return null;
   // devtunnel user show prints the account on the first non-empty line.
@@ -152,6 +164,90 @@ function refreshPath(extensions: string[]): void {
   if (changed) process.env.PATH = segments.join(delimiter);
 }
 
+/**
+ * On Windows: ask PowerShell for the freshly-updated **registry** User and
+ * Machine PATH (winget writes to the User registry hive; the running Node
+ * process's env is a stale snapshot from before winget ran). Merge any new
+ * segments into process.env.PATH so subsequent spawns see them without a
+ * shell restart.
+ *
+ * On POSIX: no-op (no analogous registry layer; the platform's install
+ * commands write into shell rc files instead of an env store, and those
+ * only take effect on next shell). Callers fall back to scanning well-
+ * known install dirs.
+ */
+function refreshPathFromRegistry(): void {
+  if (process.platform !== 'win32') return;
+
+  const cmd = `[Environment]::GetEnvironmentVariable("Path","User") + ";" + [Environment]::GetEnvironmentVariable("Path","Machine")`;
+  const r = spawnSync('powershell.exe', [
+    '-NoLogo',
+    '-NoProfile',
+    '-NonInteractive',
+    '-Command',
+    cmd,
+  ], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    windowsHide: true,
+  });
+  if (r.status !== 0 || !r.stdout) return;
+
+  const registryPath = r.stdout.trim();
+  const merged = `${process.env.PATH ?? ''}${delimiter}${registryPath}`;
+  const seen = new Set<string>();
+  const segments: string[] = [];
+  for (const seg of merged.split(delimiter)) {
+    const s = seg.trim();
+    if (!s || seen.has(s.toLowerCase())) continue;
+    seen.add(s.toLowerCase());
+    segments.push(s);
+  }
+  process.env.PATH = segments.join(delimiter);
+}
+
+/**
+ * Scan well-known install locations for the devtunnel binary. Returns the
+ * directory containing it, or null. Used as last-resort fallback after
+ * registry refresh fails to surface the binary.
+ */
+function findDevtunnelInstallDir(): string | null {
+  const candidates: string[] = [];
+  if (process.platform === 'win32') {
+    const local = process.env.LOCALAPPDATA ?? join(homedir(), 'AppData', 'Local');
+    const programFiles = process.env['ProgramFiles'] ?? 'C:\\Program Files';
+    const programFilesX86 = process.env['ProgramFiles(x86)'] ?? 'C:\\Program Files (x86)';
+    candidates.push(
+      join(local, 'Microsoft', 'WinGet', 'Links'),
+      join(local, 'Microsoft', 'WinGet', 'Packages'),
+      join(programFiles, 'Microsoft', 'dev-tunnel'),
+      join(programFilesX86, 'Microsoft', 'dev-tunnel'),
+    );
+  } else if (process.platform === 'darwin') {
+    candidates.push('/opt/homebrew/bin', '/usr/local/bin');
+  } else {
+    candidates.push(join(homedir(), 'bin'), '/usr/local/bin', '/usr/bin');
+  }
+
+  const binName = process.platform === 'win32' ? 'devtunnel.exe' : 'devtunnel';
+  for (const dir of candidates) {
+    try {
+      // Direct hit
+      if (existsSync(join(dir, binName))) return dir;
+      // Some installers nest under <dir>/<version>/devtunnel.exe — scan one level deep
+      const entries = readdirSync(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        const nested = join(dir, entry.name, binName);
+        if (existsSync(nested)) return join(dir, entry.name);
+      }
+    } catch {
+      // dir doesn't exist or not readable — skip
+    }
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // Step 1: install the CLI
 // ---------------------------------------------------------------------------
@@ -201,7 +297,28 @@ async function installDevtunnelCli(): Promise<{
 
   refreshPath(cmd.pathExtensions);
 
-  const postVersion = probeDevtunnel();
+  // First post-install probe (with the install-dir hints merged in).
+  let postVersion = probeDevtunnel();
+
+  // If still not found, refresh PATH from the OS registry/env store. On
+  // Windows this catches winget's User-PATH update that the running Node
+  // process can't otherwise observe.
+  if (!postVersion) {
+    refreshPathFromRegistry();
+    postVersion = probeDevtunnel();
+  }
+
+  // Last resort: scan well-known install dirs and add the matching one to
+  // process.env.PATH. Handles edge cases where winget installs the binary
+  // to a versioned subdirectory that wasn't in our static hints.
+  if (!postVersion) {
+    const found = findDevtunnelInstallDir();
+    if (found) {
+      refreshPath([found]);
+      postVersion = probeDevtunnel();
+    }
+  }
+
   if (postVersion) {
     sp.stop(`devtunnel installed (${postVersion}).`);
     return { ok: true, version: postVersion };
@@ -250,10 +367,10 @@ async function loginDevtunnel(): Promise<{
   // We need an interactive subprocess. spawnSync with stdio: 'inherit' lets
   // the user see the OAuth code / browser prompts and answer them right in
   // this terminal. clack's UI is paused until devtunnel exits.
-  const loginRes = spawnSync('devtunnel', loginArgs, {
+  const { file, args: wrappedArgs } = windowsCmdWrap('devtunnel', loginArgs);
+  const loginRes = spawnSync(file, wrappedArgs, {
     stdio: 'inherit',
     windowsHide: false,
-    shell: process.platform === 'win32',
   });
 
   if (loginRes.error || loginRes.status !== 0) {

@@ -50,14 +50,27 @@ export interface RunResult {
 }
 
 function spawnArgv(runtime: TriggerRuntime, scriptPath: string): { command: string; args: string[] } {
+  // On Windows, npx/python are typically .cmd shims (e.g. npx.cmd installed
+  // via Node, python.exe shim from the App Execution Aliases). Spawning a
+  // shim directly works on older Node, but Node 22+ deprecated the
+  // `shell: true` hack that used to be the cross-platform escape. Wrap
+  // them in `cmd.exe /d /s /c <bin> <args...>` instead — same approach
+  // we use for the agent CLIs (claude.ts).
+  const wrap = (bin: string, args: string[]): { command: string; args: string[] } => {
+    if (process.platform === 'win32') {
+      return { command: 'cmd.exe', args: ['/d', '/s', '/c', bin, ...args] };
+    }
+    return { command: bin, args };
+  };
+
   switch (runtime) {
-    case 'tsx': return { command: 'npx', args: ['tsx', scriptPath] };
-    case 'node': return { command: 'node', args: [scriptPath] };
+    case 'tsx':  return wrap('npx', ['tsx', scriptPath]);
+    case 'node': return wrap('node', [scriptPath]);
     case 'python': {
       const cmd = process.platform === 'win32' ? 'python' : 'python3';
-      return { command: cmd, args: [scriptPath] };
+      return wrap(cmd, [scriptPath]);
     }
-    case 'bash': return { command: 'bash', args: [scriptPath] };
+    case 'bash': return wrap('bash', [scriptPath]);
   }
 }
 
@@ -76,7 +89,6 @@ export async function runTriggerScript(opts: RunOptions): Promise<RunResult> {
       CLAWDEVBOX_MCP_SECRET: opts.callbackSecret,
     },
     stdio: ['pipe', 'pipe', 'pipe'],
-    shell: process.platform === 'win32',
     windowsHide: true,
   });
 
