@@ -87,6 +87,9 @@ jobs:
             mcp-server/package-lock.json
             mcp-server/web/package-lock.json
 
+      - name: Upgrade npm (Trusted Publishing requires npm 11.5.1+)
+        run: npm install --global npm@latest
+
       - name: Install mcp-server deps
         working-directory: mcp-server
         run: npm ci
@@ -106,6 +109,9 @@ jobs:
             echo "::error::package.json version ($PKG_VERSION) does not match tag ($TAG_VERSION)"
             exit 1
           fi
+
+      - name: Show npm version (sanity)
+        run: npm --version
 
       - name: Publish (prepublishOnly runs build)
         working-directory: mcp-server
