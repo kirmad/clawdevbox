@@ -15,7 +15,7 @@ jobs:
   build-and-test:
     name: Build & fast tests
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
 
     steps:
       - name: Checkout
@@ -50,7 +50,7 @@ jobs:
       - name: Fast test subset
         working-directory: mcp-server
         run: |
-          node --import tsx --test \
+          node --import tsx --test --test-force-exit \
             tests/smoke.test.mjs \
             tests/workspace.test.mjs \
             tests/validators.test.mjs \
