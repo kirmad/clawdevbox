@@ -109,9 +109,9 @@ jobs:
 
       - name: Publish (prepublishOnly runs build)
         working-directory: mcp-server
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --access public
-        # NPM_TOKEN secret used because the account has 2FA enforced.
-        # publishConfig in package.json sets access=public. Provenance is
-        # set per-publish via the v0.2.0+ switch to Trusted Publishing.
+        run: npm publish --provenance --access public
+        # Trusted Publishing via OIDC (configured on npmjs.com for this package).
+        # No NPM_TOKEN needed; npm CLI exchanges the GitHub Actions OIDC token
+        # for a short-lived publish token automatically.
+        # --provenance attaches a signed attestation linking this tarball to
+        # this exact commit + workflow run.
