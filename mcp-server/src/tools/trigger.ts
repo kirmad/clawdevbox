@@ -655,7 +655,7 @@ export function registerTriggerTools(server: McpServer, ws: Workspace): void {
       if (args.accepts_webhook !== undefined) manifest.accepts_webhook = args.accepts_webhook;
       if (args.binds_callback_to_recipe !== undefined) manifest.binds_callback_to_recipe = args.binds_callback_to_recipe;
       if (args.binds_callback_to !== undefined) manifest.binds_callback_to = args.binds_callback_to;
-      if (Array.isArray(args.parameters)) manifest.parameters = args.parameters as TemplateManifest['parameters'];
+      if (Array.isArray(args.parameters)) manifest.parameters = args.parameters as unknown as TemplateManifest['parameters'];
 
       const validation = validateAgentAuthoredTemplate(manifest);
       if (!validation.ok) {
@@ -775,7 +775,7 @@ export function registerTriggerTools(server: McpServer, ws: Workspace): void {
       if (args.accepts_webhook !== undefined) merged.accepts_webhook = args.accepts_webhook;
       if (args.binds_callback_to_recipe !== undefined) merged.binds_callback_to_recipe = args.binds_callback_to_recipe;
       if (args.binds_callback_to !== undefined) merged.binds_callback_to = args.binds_callback_to;
-      if (Array.isArray(args.parameters)) merged.parameters = args.parameters as TemplateManifest['parameters'];
+      if (Array.isArray(args.parameters)) merged.parameters = args.parameters as unknown as TemplateManifest['parameters'];
 
       const validation = validateAgentAuthoredTemplate(merged);
       if (!validation.ok) return validationError(validation.errors);

@@ -36,7 +36,7 @@ import { loadInboxFromDisk, saveInboxToDisk } from './inbox-persistence.ts';
 function rand36(): string {
   return Math.random().toString(36).slice(2, 10);
 }
-export function mintId(prefix: 'inb' | 'thr' | 'msg' | 'apr' | 'run'): string {
+export function mintId(prefix: 'inb' | 'thr' | 'msg' | 'apr' | 'run' | 'oneoff'): string {
   return `${prefix}_${rand36()}`;
 }
 

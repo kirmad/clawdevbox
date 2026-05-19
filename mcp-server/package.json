@@ -67,10 +67,17 @@
     "typescript": "^5.4.0"
   },
   "license": "MIT",
-  "homepage": "https://github.com/kirmadi/clawdevbox",
+  "homepage": "https://github.com/kirmad/clawdevbox",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/kirmadi/clawdevbox.git"
+    "url": "git+https://github.com/kirmad/clawdevbox.git"
+  },
+  "bugs": {
+    "url": "https://github.com/kirmad/clawdevbox/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
   },
   "keywords": [
     "mcp",
