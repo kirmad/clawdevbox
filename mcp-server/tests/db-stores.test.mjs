@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import BetterSqlite3 from 'better-sqlite3';
-import { resolve } from 'node:path';
+import { resolve, sep } from 'node:path';
 import { runMigrations } from '../src/db/index.ts';
 import {
   ensureWorkspace,
@@ -38,12 +38,20 @@ function mkTrigger(db, ws_id, id) {
   return id;
 }
 
+// Platform-aware path roots so tests work on both Windows and POSIX runners.
+// We rely on path.resolve() normalization semantics, which differ per-platform.
+const WIN = process.platform === 'win32';
+const wsPath = (name) => WIN ? `C:\\tmp\\${name}` : `/tmp/${name}`;
+const wsPathWithDot = (name) => WIN
+  ? `C:\\tmp\\${name}\\.\\`
+  : `/tmp/${name}/./`;
+
 // ---------------------------------------------------------------- workspaces
 
 test('ensureWorkspace upserts by path (no duplicate row)', () => {
   const db = open();
-  const a = ensureWorkspace(db, { path: 'C:\\tmp\\ws1', name: 'one' });
-  const b = ensureWorkspace(db, { path: 'C:\\tmp\\ws1', name: 'ignored-on-upsert' });
+  const a = ensureWorkspace(db, { path: wsPath('ws1'), name: 'one' });
+  const b = ensureWorkspace(db, { path: wsPath('ws1'), name: 'ignored-on-upsert' });
   assert.equal(a.id, b.id);
   const count = db.prepare('SELECT COUNT(*) AS c FROM workspaces').get();
   assert.equal(count.c, 1);
@@ -52,16 +60,16 @@ test('ensureWorkspace upserts by path (no duplicate row)', () => {
 
 test('ensureWorkspace normalizes equivalent paths', () => {
   const db = open();
-  const a = ensureWorkspace(db, { path: 'C:\\tmp\\ws-norm' });
-  const b = ensureWorkspace(db, { path: resolve('C:\\tmp\\ws-norm\\.\\') });
+  const a = ensureWorkspace(db, { path: wsPath('ws-norm') });
+  const b = ensureWorkspace(db, { path: resolve(wsPathWithDot('ws-norm')) });
   assert.equal(a.id, b.id);
   db.close();
 });
 
 test('getWorkspaceByPath / getWorkspaceById round-trip', () => {
   const db = open();
-  const created = ensureWorkspace(db, { path: 'C:\\tmp\\ws2', name: 'two' });
-  const byPath = getWorkspaceByPath(db, 'C:\\tmp\\ws2');
+  const created = ensureWorkspace(db, { path: wsPath('ws2'), name: 'two' });
+  const byPath = getWorkspaceByPath(db, wsPath('ws2'));
   const byId = getWorkspaceById(db, created.id);
   assert.equal(byPath?.id, created.id);
   assert.equal(byId?.path, created.path);
@@ -71,9 +79,9 @@ test('getWorkspaceByPath / getWorkspaceById round-trip', () => {
 
 test('listWorkspaces returns all rows', () => {
   const db = open();
-  ensureWorkspace(db, { path: 'C:\\tmp\\a' });
-  ensureWorkspace(db, { path: 'C:\\tmp\\b' });
-  ensureWorkspace(db, { path: 'C:\\tmp\\c' });
+  ensureWorkspace(db, { path: wsPath('a') });
+  ensureWorkspace(db, { path: wsPath('b') });
+  ensureWorkspace(db, { path: wsPath('c') });
   const rows = listWorkspaces(db);
   assert.equal(rows.length, 3);
   db.close();
