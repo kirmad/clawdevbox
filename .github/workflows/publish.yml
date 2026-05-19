@@ -109,5 +109,9 @@ jobs:
 
       - name: Publish (prepublishOnly runs build)
         working-directory: mcp-server
-        run: npm publish --provenance --access public
-        # publishConfig in package.json also pins provenance + access; flags are belt-and-suspenders.
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public
+        # NPM_TOKEN secret used because the account has 2FA enforced.
+        # publishConfig in package.json sets access=public. Provenance is
+        # set per-publish via the v0.2.0+ switch to Trusted Publishing.

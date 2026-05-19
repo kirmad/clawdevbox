@@ -76,8 +76,7 @@
     "url": "https://github.com/kirmad/clawdevbox/issues"
   },
   "publishConfig": {
-    "access": "public",
-    "provenance": true
+    "access": "public"
   },
   "keywords": [
     "mcp",
