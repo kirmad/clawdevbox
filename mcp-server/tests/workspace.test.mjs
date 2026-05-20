@@ -336,16 +336,22 @@ test('workspace + recipe.run surface', async (t) => {
     recipeRunWorkspaceId = sc.workspace_id;
     recipeRunWorkspacePath = sc.workspace_path;
 
-    // Verify .mcp.json was written.
+    // Verify .mcp.json was written with the per-spawn HTTP MCP shape.
+    // The clawdevbox MCP server is long-lived and HTTP-served; per-spawn
+    // workspace context flows via headers, not via the spawned MCP
+    // subprocess's env. See agent-clis/shared.ts:writeMcpJson and
+    // context-resolver.ts.
     const mcpConfigPath = join(sc.workspace_path, '.mcp.json');
     assert.ok(existsSync(mcpConfigPath), 'expected .mcp.json to be written');
     const mcpConfig = JSON.parse(readFileSync(mcpConfigPath, 'utf8'));
     assert.ok(mcpConfig.mcpServers?.clawdevbox);
-    const env = mcpConfig.mcpServers.clawdevbox.env;
-    assert.equal(env.CLAWDEVBOX_PROJECT_DIR, sc.workspace_path);
-    assert.equal(env.CLAWDEVBOX_RECIPE_INSTANCE_ID, sc.recipe_instance_id);
-    assert.equal(env.CLAWDEVBOX_WORKSPACE_ID, sc.workspace_id);
-    assert.ok(typeof env.CLAWDEVBOX_MCP_SECRET === 'string' && env.CLAWDEVBOX_MCP_SECRET.length >= 32);
+    assert.equal(mcpConfig.mcpServers.clawdevbox.type, 'http');
+    const headers = mcpConfig.mcpServers.clawdevbox.headers;
+    assert.ok(headers, 'expected headers block in .mcp.json');
+    assert.ok(typeof headers.Authorization === 'string' && headers.Authorization.startsWith('Bearer '));
+    assert.equal(headers['X-Clawdevbox-Workspace-Id'], sc.workspace_id);
+    assert.equal(headers['X-Clawdevbox-Recipe-Instance-Id'], sc.recipe_instance_id);
+    assert.equal(headers['X-Clawdevbox-Project-Dir'], sc.workspace_path);
 
     // Verify instance file.
     const instancePath = join(sc.workspace_path, '.clawdevbox', 'recipe-instances', `${sc.recipe_instance_id}.json`);

@@ -55,27 +55,64 @@ export async function probeBinary(
   });
 }
 
-/** Write `.mcp.json` so the spawned CLI sees the clawdevbox MCP server. */
+/**
+ * Write `.mcp.json` so the spawned CLI sees the clawdevbox MCP server.
+ *
+ * The .mcp.json is written into the agent's working directory (`wsPath`),
+ * which is the cwd the CLI is spawned with (claude/copilot resolve their
+ * MCP config relative to their cwd). This is intentionally NOT
+ * `ctx.writeWorkspaceFile`, which resolves against the SERVER's projectDir
+ * and would be wrong for any spawn whose workspace differs from the server.
+ *
+ * Per-spawn headers (workspace_id, recipe_instance_id, project_dir,
+ * session_id) are injected so the long-lived HTTP MCP server can identify
+ * the calling agent on every request via `extra.requestInfo.headers`. The
+ * header values are baked into THIS agent's .mcp.json; a different agent
+ * spawn writes its own .mcp.json with different headers. See
+ * context-resolver.ts for the read side.
+ */
 export function writeMcpJson(
-  ctx: ProviderCtx,
-  _wsPath: string,
-  mcp: { url: string; secret: string },
+  _ctx: ProviderCtx,
+  wsPath: string,
+  mcp: {
+    url: string;
+    secret: string;
+    workspaceId?: string;
+    recipeInstanceId?: string;
+    projectDir?: string;
+    sessionId?: string;
+  },
 ): void {
   // Use `type: "http"` (not `"streamable-http"`). Copilot CLI's MCP config
   // schema rejects `streamable-http` with `Invalid literal value`, and Claude
   // Code happily accepts `http` (verified against copilot 1.0.49 and claude
   // 2.1.x). The shape is otherwise identical to MCP spec §6.2.
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${mcp.secret}`,
+  };
+  if (mcp.workspaceId) headers['X-Clawdevbox-Workspace-Id'] = mcp.workspaceId;
+  if (mcp.recipeInstanceId) headers['X-Clawdevbox-Recipe-Instance-Id'] = mcp.recipeInstanceId;
+  if (mcp.projectDir) headers['X-Clawdevbox-Project-Dir'] = mcp.projectDir;
+  if (mcp.sessionId) headers['X-Clawdevbox-Session-Id'] = mcp.sessionId;
+
   const config = {
     mcpServers: {
       clawdevbox: {
         type: 'http',
         url: mcp.url,
-        headers: { Authorization: `Bearer ${mcp.secret}` },
+        headers,
         tools: ['*'],
       },
     },
   };
-  ctx.writeWorkspaceFile('.mcp.json', JSON.stringify(config, null, 2) + '\n');
+
+  // Resolve target path. Validate it doesn't try to escape via `..` etc.
+  const target = resolve(wsPath, '.mcp.json');
+  if (!target.startsWith(resolve(wsPath))) {
+    throw new Error(`writeMcpJson: refusing to write outside wsPath '${wsPath}'`);
+  }
+  mkdirSync(dirname(target), { recursive: true });
+  writeFileAtomic(target, JSON.stringify(config, null, 2) + '\n');
 }
 
 /** Build the ProviderCtx the kernel hands to a provider for one call. */

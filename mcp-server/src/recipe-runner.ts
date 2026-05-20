@@ -20,9 +20,7 @@
 
 import { randomBytes, randomUUID } from 'node:crypto';
 import { createWriteStream, mkdirSync } from 'node:fs';
-import { dirname, resolve as resolvePath } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { writeFileAtomic } from './fs-util.ts';
+import { resolve as resolvePath } from 'node:path';
 import { registerPty } from './pty-registry.ts';
 import { getTerminalServer } from './terminal-server.ts';
 import {
@@ -100,35 +98,10 @@ export interface RunRecipeResult {
   spawn_error?: { code: string; message: string };
 }
 
-function serverEntryPath(): string {
-  const here = fileURLToPath(import.meta.url);
-  return resolvePath(dirname(here), 'index.ts');
-}
+// (stdio-MCP-spawn-per-recipe mechanism has been retired in favor of
+// per-spawn HTTP MCP headers — see writeMcpJson in agent-clis/shared.ts
+// and context-resolver.ts.)
 
-/**
- * Resolve the spawn command for the recipe-run's child MCP server.
- *
- *   - Tests (CLAWDEVBOX_SPAWN_TSX=1)        → `npx -y tsx <src/index.ts>`
- *   - CLAWDEVBOX_SPAWN_CMD                  → `<that>` (used by integration tests)
- *   - default                               → `npx -y clawdevbox mcp`
- */
-function resolveSpawnedMcpCommand(): { command: string; args: string[] } {
-  if (process.env.CLAWDEVBOX_SPAWN_TSX === '1') {
-    return { command: 'npx', args: ['-y', 'tsx', serverEntryPath()] };
-  }
-  if (process.env.CLAWDEVBOX_SPAWN_CMD) {
-    return { command: process.env.CLAWDEVBOX_SPAWN_CMD, args: ['mcp'] };
-  }
-  return { command: 'npx', args: ['-y', 'clawdevbox', 'mcp'] };
-}
-
-function pruneUndefined<T extends Record<string, unknown>>(obj: T): T {
-  const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(obj)) {
-    if (v !== undefined) out[k] = v;
-  }
-  return out as T;
-}
 
 export async function runRecipe(opts: RunRecipeOptions): Promise<RunRecipeResult> {
   const agentCli: string = opts.agentCli ?? 'copilot';
@@ -144,31 +117,14 @@ export async function runRecipe(opts: RunRecipeOptions): Promise<RunRecipeResult
   const isResume = !!opts.resumeOf;
   const mcpSecret = opts.mcpSecret ?? randomBytes(16).toString('hex');
 
-  // 1. Write .mcp.json so the spawned CLI sees clawdevbox.
-  const { command: spawnCmd, args: spawnArgs } = resolveSpawnedMcpCommand();
-  const mcpConfigPath = resolvePath(opts.workspaceInfo.path, '.mcp.json');
-  const mcpConfig = {
-    mcpServers: {
-      clawdevbox: {
-        type: 'local',
-        command: spawnCmd,
-        args: spawnArgs,
-        env: pruneUndefined({
-          CLAWDEVBOX_PROJECT_DIR: opts.workspaceInfo.path,
-          CLAWDEVBOX_RECIPE_INSTANCE_ID: instanceId,
-          CLAWDEVBOX_WORKSPACE_ID: opts.workspaceInfo.id,
-          CLAWDEVBOX_WORKSPACES_ROOT: opts.workspacesRoot,
-          CLAWDEVBOX_MCP_URL: opts.mcpUrl ?? process.env.CLAWDEVBOX_MCP_URL,
-          CLAWDEVBOX_MCP_SECRET: mcpSecret,
-          ADO_ORG: process.env.ADO_ORG,
-          ADO_PROJECT: process.env.ADO_PROJECT,
-          ADO_BEARER_TOKEN: process.env.ADO_BEARER_TOKEN,
-        }),
-        tools: ['*'],
-      },
-    },
-  };
-  writeFileAtomic(mcpConfigPath, JSON.stringify(mcpConfig, null, 2) + '\n');
+  // The agent's .mcp.json is written by the provider's writeMcpJson via the
+  // SpawnSessionOpts.mcp object (see agent-clis/shared.ts). That write
+  // points the agent at the long-lived HTTP MCP server and injects per-spawn
+  // headers (X-Clawdevbox-Workspace-Id, X-Clawdevbox-Recipe-Instance-Id, etc.)
+  // that the server's tool handlers read via extra.requestInfo.headers (see
+  // context-resolver.ts). Workspace context is therefore identified
+  // per-request rather than relying on a shared server's process.env, which
+  // doesn't reflect the calling agent in multi-agent HTTP scenarios.
 
   // 2. Write the instance row (file + DB) before spawning.
   const instance: RecipeInstance = {
@@ -267,7 +223,14 @@ export async function runRecipe(opts: RunRecipeOptions): Promise<RunRecipeResult
       agent: opts.agent,
       workspaceInfo: opts.workspaceInfo,
       ambientEnv: spawnEnv,
-      mcp: { url: opts.mcpUrl ?? '', secret: mcpSecret },
+      mcp: {
+        url: opts.mcpUrl ?? '',
+        secret: mcpSecret,
+        workspaceId: opts.workspaceInfo.id,
+        recipeInstanceId: instanceId,
+        projectDir: opts.workspaceInfo.path,
+        sessionId,
+      },
       recipeInstanceId: instanceId,
       agentSessionId: sessionId,
       triggerId: opts.triggerId,

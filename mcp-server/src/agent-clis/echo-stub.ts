@@ -1,6 +1,7 @@
 import { join } from 'node:path';
 import { mkdirSync } from 'node:fs';
 import { writeFileAtomic } from '../fs-util.ts';
+import { writeMcpJson } from './shared.ts';
 import type { AgentCliProvider, AgentHandle, ProviderCtx, SpawnSessionOpts } from './types.ts';
 
 function renderScriptBody(opts: SpawnSessionOpts): string {
@@ -67,6 +68,12 @@ export const echoStubProvider: AgentCliProvider = {
     mkdirSync(dir, { recursive: true });
     const scriptPath = join(dir, `${opts.init.session_id}.cjs`);
     writeFileAtomic(scriptPath, renderScriptBody(opts));
+
+    // Write .mcp.json with per-spawn headers (same pattern as claude/copilot
+    // providers). echo-stub doesn't actually read the MCP config — but
+    // maintaining the "every spawn writes .mcp.json" invariant simplifies the
+    // test surface and matches what real CLIs see.
+    writeMcpJson(ctx, opts.workspaceInfo.path, opts.mcp);
 
     const env = { ...process.env, ...opts.ambientEnv } as Record<string, string>;
     const pty = ctx.spawnPty(process.execPath, [scriptPath], {

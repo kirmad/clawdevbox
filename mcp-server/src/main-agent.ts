@@ -117,6 +117,12 @@ export async function startMainAgent(opts: MainAgentOptions): Promise<MainAgentS
       mcp: {
         url: `http://${host}:${port}/mcp`,
         secret: opts.cfg.http.token ?? '',
+        // The main agent doesn't have a specific registered workspace; the
+        // resolver falls through (header workspace_id is unset) to project_dir
+        // matching against the registered workspaces. If no workspace is
+        // registered for this projectDir yet, tools that need a workspace
+        // surface NO_TARGET_WORKSPACE and prompt the user to `workspace.create`.
+        projectDir: opts.workspace.projectDir,
       },
       ptyCols: 120,
       ptyRows: 30,

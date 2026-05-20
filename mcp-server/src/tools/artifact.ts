@@ -35,11 +35,15 @@ import {
   validateArtifactId,
   writeArtifact,
 } from '../artifact-store.ts';
+import {
+  resolveWorkspaceContext,
+  resolveRecipeInstanceId,
+  type ResolveExtra,
+} from '../context-resolver.ts';
 import { structuredError } from '../scope.ts';
 import { getTerminalServer } from '../terminal-server.ts';
 import type { Workspace } from '../workspace.ts';
 import {
-  findWorkspaceByPath,
   getWorkspace,
   listWorkspaces,
   resolveWorkspacesRoot,
@@ -49,39 +53,27 @@ import {
 // Workspace resolution
 // ============================================================================
 
+/**
+ * Bridges the artifact tools to the shared context resolver. Tools accept an
+ * optional `workspace_id` argument and the SDK's `extra` (request metadata),
+ * and we resolve through the standard chain:
+ *
+ *   args.workspace_id → header X-Clawdevbox-Workspace-Id → env CLAWDEVBOX_WORKSPACE_ID → project_dir match
+ *
+ * The header path is the dominant case for agents connected over the long-lived
+ * HTTP MCP transport (`clawdevbox start`). The env path is the dominant case
+ * for stdio-mode (`clawdevbox mcp` spawned as the agent's child).
+ */
 function resolveTargetWorkspace(
-  ws: Workspace,
+  _ws: Workspace,
   argsWorkspaceId: string | undefined,
+  extra: ResolveExtra | undefined,
 ):
   | { ok: true; workspaceId: string; workspacePath: string }
   | { ok: false; error: ReturnType<typeof structuredError> } {
-  const root = resolveWorkspacesRoot();
-  const explicitId = argsWorkspaceId ?? process.env.CLAWDEVBOX_WORKSPACE_ID;
-  if (explicitId) {
-    const info = getWorkspace(root, explicitId);
-    if (!info) {
-      return {
-        ok: false,
-        error: structuredError(
-          'WORKSPACE_NOT_FOUND',
-          `Workspace ${explicitId} not found in registry.`,
-          { workspace_id: explicitId },
-        ),
-      };
-    }
-    return { ok: true, workspaceId: info.id, workspacePath: info.path };
-  }
-  const matched = findWorkspaceByPath(root, ws.projectDir);
-  if (matched) {
-    return { ok: true, workspaceId: matched.id, workspacePath: matched.path };
-  }
-  return {
-    ok: false,
-    error: structuredError(
-      'NO_TARGET_WORKSPACE',
-      'No workspace_id provided, CLAWDEVBOX_WORKSPACE_ID env not set, and CLAWDEVBOX_PROJECT_DIR is not a registered workspace.',
-    ),
-  };
+  const r = resolveWorkspaceContext(extra, { argsWorkspaceId });
+  if (!r.ok) return { ok: false, error: r.error };
+  return { ok: true, workspaceId: r.ctx.workspaceId, workspacePath: r.ctx.workspacePath };
 }
 
 function buildViewUrl(artifactId: string): string | null {
@@ -148,7 +140,7 @@ export function registerArtifactTools(server: McpServer, ws: Workspace): void {
           .describe('Free-form metadata for the renderer.'),
       },
     },
-    async (args) => {
+    async (args, extra) => {
       try {
         validateArtifactId(args.id);
       } catch (err) {
@@ -159,7 +151,7 @@ export function registerArtifactTools(server: McpServer, ws: Workspace): void {
         );
       }
 
-      const target = resolveTargetWorkspace(ws, args.workspace_id);
+      const target = resolveTargetWorkspace(ws, args.workspace_id, extra);
       if (!target.ok) return target.error;
 
       const inlineFiles = args.files ?? {};
@@ -190,7 +182,7 @@ export function registerArtifactTools(server: McpServer, ws: Workspace): void {
         title: args.title,
         workspace_id: target.workspaceId,
         recipe_instance_id:
-          args.recipe_instance_id ?? process.env.CLAWDEVBOX_RECIPE_INSTANCE_ID ?? null,
+          args.recipe_instance_id ?? resolveRecipeInstanceId(extra),
         step_id: args.step_id ?? null,
         created_at: existing?.manifest.created_at ?? Date.now(),
         meta: args.meta ?? undefined,

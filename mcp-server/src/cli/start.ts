@@ -1109,6 +1109,10 @@ async function handleRecipeResume(
       mcp: {
         url: `http://${cfg.http.host}:${cfg.http.port}/mcp`,
         secret: cfg.http.token ?? '',
+        workspaceId: source.workspace_id,
+        recipeInstanceId: newInstanceId,
+        projectDir: workspacePath,
+        sessionId,
       },
       recipeInstanceId: newInstanceId,
       agentSessionId: sessionId,

@@ -28,8 +28,24 @@ export interface SpawnSessionOpts {
   workspaceInfo: { id: string; path: string };
   /** Env vars the kernel wants the child process to see (ambient context). */
   ambientEnv: Record<string, string>;
-  /** MCP server the child should connect back to. */
-  mcp: { url: string; secret: string };
+  /**
+   * MCP server the spawned agent connects back to. Headers are injected
+   * per-spawn so the long-lived HTTP MCP server can identify the calling
+   * agent (workspace_id, recipe_instance_id, etc.) on every request via
+   * `extra.requestInfo.headers`. See context-resolver.ts.
+   */
+  mcp: {
+    url: string;
+    secret: string;
+    /** Workspace this agent is acting in. Becomes X-Clawdevbox-Workspace-Id. */
+    workspaceId?: string;
+    /** Recipe instance the agent is running, if any. Becomes X-Clawdevbox-Recipe-Instance-Id. */
+    recipeInstanceId?: string;
+    /** Project dir hint for fallback resolution. Becomes X-Clawdevbox-Project-Dir. */
+    projectDir?: string;
+    /** Agent session id. Becomes X-Clawdevbox-Session-Id. */
+    sessionId?: string;
+  };
   recipeInstanceId?: string;
   agentSessionId?: string;
   triggerId?: string;

@@ -48,6 +48,12 @@ import {
   resolveWorkspacesRoot,
 } from '../workspaces-store.ts';
 import { getDatabase } from '../db/index.ts';
+import {
+  resolveWorkspaceContext,
+  resolveRecipeInstanceId,
+  resolveAgentSessionId,
+  type ResolveExtra,
+} from '../context-resolver.ts';
 import { emitChange } from '../event-bus.ts';
 import { logger } from '../logger.ts';
 import {
@@ -561,30 +567,20 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
         message: z.string().optional().describe('Optional human summary.'),
       },
     },
-    async (args) => {
-      const instanceId = process.env.CLAWDEVBOX_RECIPE_INSTANCE_ID;
-      const workspaceId = process.env.CLAWDEVBOX_WORKSPACE_ID;
+    async (args, extra) => {
+      const instanceId = resolveRecipeInstanceId(extra);
+      const wsResult = resolveWorkspaceContext(extra);
       if (!instanceId) {
         return structuredError(
           'NOT_IN_RECIPE_INSTANCE',
-          'CLAWDEVBOX_RECIPE_INSTANCE_ID env var required — recipe.done can only run inside a spawned recipe-run session.',
+          'recipe.done could not resolve a recipe instance id from X-Clawdevbox-Recipe-Instance-Id header or CLAWDEVBOX_RECIPE_INSTANCE_ID env. recipe.done can only run inside a spawned recipe-run session.',
         );
       }
-      if (!workspaceId) {
-        return structuredError(
-          'NOT_IN_RECIPE_INSTANCE',
-          'CLAWDEVBOX_WORKSPACE_ID env var required — recipe.done can only run inside a spawned recipe-run session.',
-        );
+      if (!wsResult.ok) {
+        return wsResult.error;
       }
-      const root = resolveWorkspacesRoot();
-      const wsInfo = getWorkspace(root, workspaceId);
-      if (!wsInfo) {
-        return structuredError(
-          'WORKSPACE_NOT_FOUND',
-          `Workspace ${workspaceId} not found in registry.`,
-          { id: workspaceId },
-        );
-      }
+      const wsInfo = wsResult.ctx.workspaceInfo;
+      const workspaceId = wsResult.ctx.workspaceId;
       const instance = readRecipeInstance(wsInfo.path, instanceId);
       if (!instance) {
         return structuredError(
@@ -633,7 +629,7 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
           .describe('Optional recipe-instance id. When omitted, falls back to env vars.'),
       },
     },
-    async (args) => {
+    async (args, extra) => {
       const root = resolveWorkspacesRoot();
       let instanceId = args.id;
 
@@ -654,23 +650,17 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
         );
       }
 
-      // No explicit id — read env.
-      instanceId = process.env.CLAWDEVBOX_RECIPE_INSTANCE_ID;
-      const workspaceId = process.env.CLAWDEVBOX_WORKSPACE_ID;
-      if (!instanceId || !workspaceId) {
+      // No explicit id — resolve via header → env (per-request, not just server env).
+      instanceId = resolveRecipeInstanceId(extra) ?? undefined;
+      const wsResult = resolveWorkspaceContext(extra);
+      if (!instanceId || !wsResult.ok) {
         return structuredError(
           'NOT_IN_RECIPE_INSTANCE',
-          'No id provided and CLAWDEVBOX_RECIPE_INSTANCE_ID / CLAWDEVBOX_WORKSPACE_ID env vars are not set.',
+          'No id provided and X-Clawdevbox-Recipe-Instance-Id header / CLAWDEVBOX_RECIPE_INSTANCE_ID env are not set, or workspace cannot be resolved.',
         );
       }
-      const wsInfo = getWorkspace(root, workspaceId);
-      if (!wsInfo) {
-        return structuredError(
-          'WORKSPACE_NOT_FOUND',
-          `Workspace ${workspaceId} not found in registry.`,
-          { id: workspaceId },
-        );
-      }
+      const wsInfo = wsResult.ctx.workspaceInfo;
+      const workspaceId = wsResult.ctx.workspaceId;
       const inst = readRecipeInstance(wsInfo.path, instanceId);
       if (!inst) {
         return structuredError(
@@ -703,12 +693,12 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
           ),
       },
     },
-    async (args) => {
-      const instanceId = args.id ?? process.env.CLAWDEVBOX_RECIPE_INSTANCE_ID;
+    async (args, extra) => {
+      const instanceId = args.id ?? resolveRecipeInstanceId(extra);
       if (!instanceId) {
         return structuredError(
           'MISSING_INSTANCE_ID',
-          'No id provided and CLAWDEVBOX_RECIPE_INSTANCE_ID env var is not set.',
+          'No id provided and X-Clawdevbox-Recipe-Instance-Id header / CLAWDEVBOX_RECIPE_INSTANCE_ID env are not set.',
         );
       }
       if (!ptyHasSession(instanceId)) {
@@ -750,19 +740,19 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
           .string()
           .min(1)
           .optional()
-          .describe('Recipe-instance id. Falls back to CLAWDEVBOX_RECIPE_INSTANCE_ID.'),
+          .describe('Recipe-instance id. Falls back to X-Clawdevbox-Recipe-Instance-Id header / CLAWDEVBOX_RECIPE_INSTANCE_ID env.'),
         signal: z
           .string()
           .optional()
           .describe('Optional POSIX signal name (default: SIGTERM). Ignored on Windows ptys; ConPTY closes the pseudoconsole regardless.'),
       },
     },
-    async (args) => {
-      const instanceId = args.id ?? process.env.CLAWDEVBOX_RECIPE_INSTANCE_ID;
+    async (args, extra) => {
+      const instanceId = args.id ?? resolveRecipeInstanceId(extra);
       if (!instanceId) {
         return structuredError(
           'MISSING_INSTANCE_ID',
-          'No id provided and CLAWDEVBOX_RECIPE_INSTANCE_ID env var is not set.',
+          'No id provided and X-Clawdevbox-Recipe-Instance-Id header / CLAWDEVBOX_RECIPE_INSTANCE_ID env are not set.',
         );
       }
       if (!ptyHasSession(instanceId)) {
@@ -841,13 +831,13 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
         update_meta: z.array(z.record(z.string(), z.unknown())).optional(),
       },
     },
-    async (args) => {
+    async (args, extra) => {
       const instanceId =
-        args.recipe_instance_id ?? process.env.CLAWDEVBOX_RECIPE_INSTANCE_ID;
+        args.recipe_instance_id ?? resolveRecipeInstanceId(extra);
       if (!instanceId) {
         return structuredError(
           'RECIPE_INSTANCE_NOT_FOUND',
-          'recipe_instance_id not provided and CLAWDEVBOX_RECIPE_INSTANCE_ID env var is not set.',
+          'recipe_instance_id not provided and X-Clawdevbox-Recipe-Instance-Id header / CLAWDEVBOX_RECIPE_INSTANCE_ID env are not set.',
         );
       }
       const opts: UpdateStepsOpts = {
@@ -855,7 +845,7 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
         add: args.add as Step[] | undefined,
         remove: args.remove,
         update_meta: args.update_meta as Array<Partial<Step> & { id: string }> | undefined,
-        agent_session_id: process.env.CLAWDEVBOX_AGENT_SESSION_ID ?? null,
+        agent_session_id: resolveAgentSessionId(extra),
       };
       try {
         const db = getDatabase();
@@ -919,13 +909,13 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
           .optional(),
       },
     },
-    async (args) => {
+    async (args, extra) => {
       const instanceId =
-        args.recipe_instance_id ?? process.env.CLAWDEVBOX_RECIPE_INSTANCE_ID;
+        args.recipe_instance_id ?? resolveRecipeInstanceId(extra);
       if (!instanceId) {
         return structuredError(
           'RECIPE_INSTANCE_NOT_FOUND',
-          'recipe_instance_id not provided and CLAWDEVBOX_RECIPE_INSTANCE_ID env var is not set.',
+          'recipe_instance_id not provided and X-Clawdevbox-Recipe-Instance-Id header / CLAWDEVBOX_RECIPE_INSTANCE_ID env are not set.',
         );
       }
       const opts: UpdateStatusOpts = {
@@ -940,7 +930,7 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
         attach_artifact_ids: args.attach_artifact_ids,
         attach_inbox_item_ids: args.attach_inbox_item_ids,
         request_user_input: args.request_user_input as UpdateStatusOpts['request_user_input'],
-        agent_session_id: process.env.CLAWDEVBOX_AGENT_SESSION_ID ?? null,
+        agent_session_id: resolveAgentSessionId(extra),
       };
       try {
         const db = getDatabase();
