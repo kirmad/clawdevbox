@@ -109,6 +109,7 @@ export async function startMainAgent(opts: MainAgentOptions): Promise<MainAgentS
       mode: 'interactive',
       init: { kind: 'new', session_id: mintMainAgentSessionId() },
       role: 'main-agent',
+      agent: 'dev-buddy:dev-buddy',
       workspaceInfo: { id: 'project', path: opts.workspace.projectDir },
       ambientEnv: {
         CLAWDEVBOX_PROJECT_DIR: opts.workspace.projectDir,
