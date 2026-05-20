@@ -1271,16 +1271,36 @@ async function tryInstallService(args: {
   | { ok: false; error: string; logPath: string | null }
 > {
   const service = await import('../service.ts');
-  // If a previous install is still alive, refuse to spawn a second.
+  // If a previous install is still alive, stop it so the new spawn picks up
+  // the freshly-written config + uses whatever bundle this `init` shipped
+  // with. A long-running stale service is the most common "I upgraded but
+  // nothing changed" pitfall — see service.log on a v0.1.5→v0.1.6 upgrade
+  // where the running service kept the old writeMcpJson and the new init
+  // never overwrote the workspace .mcp.json.
   const existing = service.readServiceState(args.globalDir);
   if (existing && service.isProcessAlive(existing.pid)) {
-    return {
-      ok: true,
-      pid: existing.pid,
-      logPath: service.serviceLogPath(args.globalDir),
-      autoStart: null,
-      autoStartError: 'service already running — skipping spawn',
-    };
+    log.info(`Stopping existing service (pid ${existing.pid}) to pick up new config...`);
+    try {
+      if (process.platform === 'win32') {
+        const { spawnSync } = await import('node:child_process');
+        spawnSync('taskkill', ['/PID', String(existing.pid), '/T', '/F'], {
+          stdio: 'ignore',
+          windowsHide: true,
+        });
+      } else {
+        process.kill(existing.pid, 'SIGTERM');
+      }
+      // Give the process a moment to release the port.
+      for (let i = 0; i < 30; i++) {
+        if (!service.isProcessAlive(existing.pid)) break;
+        await new Promise(r => setTimeout(r, 100));
+      }
+    } catch (err) {
+      log.warn(
+        `Could not cleanly stop existing service: ${err instanceof Error ? err.message : String(err)}. ` +
+        `Continuing anyway — the new service may fail to bind the port.`,
+      );
+    }
   }
 
   const here = dirname(fileURLToPath(import.meta.url));

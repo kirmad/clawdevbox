@@ -1,6 +1,6 @@
 {
   "name": "clawdevbox",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "ClawDevbox — a toolkit for running AI coding agents headlessly. MCP server (stdio + Streamable HTTP), interactive CLI for project init, hidden-pty agent runs, browser-based terminal viewer, recipes/skills/plugins/triggers, and an extensible artifact renderer chain.",
   "type": "module",
   "bin": {
