@@ -225,6 +225,44 @@ The loader only needs `id` and `parent_vault.git_url` from this file. Other fiel
 
 ---
 
+## 6.5 Client sync — vault as plugin source
+
+Vault skills/agents must be available to the agent CLI (copilot/agency) as if they were installed marketplace plugins. Each vault directory follows the same layout as a copilot plugin:
+
+```
+<vault-root>/
+├── vault.yaml
+├── skills/<id>/SKILL.md
+├── agents/<id>.agent.md
+├── recipes/<id>/recipe.yaml
+└── ...
+```
+
+This maps directly to the copilot plugin structure (`.claude-plugin/` + `skills/` + `agents/`).
+
+**Sync strategy:** During client sync (at boot and after init), each vault in `config.vaults` is registered as a plugin source in the agent CLI's plugin cache via symlink/junction — exactly like marketplace plugins:
+
+1. For each vault entry, create a symlink at `~/.copilot/installed-plugins/<vault-id>/` → `<vault-path>/`
+2. If the vault doesn't have a `.claude-plugin/plugin.json`, synthesize a minimal one at sync time (in-memory or written to the vault only if it's personal)
+3. The agent CLI then auto-discovers skills/agents from the symlinked directory
+
+**Chain precedence:** When the same skill ID exists in multiple vaults, the leaf vault's version takes precedence (child shadows parent). The agent CLI handles this naturally since plugin-dir order determines load priority — we pass `--plugin-dir` flags in chain order (leaf first).
+
+**At agent spawn time:** The agency-provider already passes `--plugin-dir` for the dev-buddy plugin. Extend this to also pass vault plugin dirs:
+
+```
+--plugin-dir ~/.copilot/installed-plugins/personal
+--plugin-dir ~/.copilot/installed-plugins/feature-crew-vault
+--plugin-dir ~/.copilot/installed-plugins/meetings-vault
+```
+
+**Sync triggers:**
+- `clawdevbox init` (after vault setup)
+- `clawdevbox start` (at boot, during workspace load)
+- `vault sync` command (future, explicit pull + re-sync)
+
+---
+
 ## 7. Files to create/modify
 
 | File | Action |
@@ -235,6 +273,8 @@ The loader only needs `id` and `parent_vault.git_url` from this file. Other fiel
 | `mcp-server/src/server.ts` | Register `paths.get` tool |
 | `mcp-server/src/cli/init.ts` | Add vault setup step after plugin install |
 | `mcp-server/src/cli/init-vault.ts` | New — vault init logic (clone, chain-walk, git init) |
+| `mcp-server/src/cli/vault-sync.ts` | New — symlink vaults into agent CLI plugin cache |
+| `mcp-server/src/agent-clis/shared.ts` | Pass vault `--plugin-dir` flags at spawn |
 | `mcp-server/tests/vault-chain.test.mjs` | Tests for chain loader |
 | `mcp-server/tests/paths-tool.test.mjs` | Tests for paths.get tool |
 
