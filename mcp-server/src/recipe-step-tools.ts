@@ -55,8 +55,14 @@ export interface ToolError {
 }
 
 export class ToolErrorBox extends Error {
-  constructor(public payload: ToolError) {
+  // Note: explicit field declaration + assignment in the body (rather than
+  // a TypeScript parameter property like `constructor(public payload: ...)`)
+  // because Node's --experimental-strip-types mode used by the test runner
+  // does not support parameter property syntax.
+  readonly payload: ToolError;
+  constructor(payload: ToolError) {
     super(payload.message);
+    this.payload = payload;
   }
 }
 

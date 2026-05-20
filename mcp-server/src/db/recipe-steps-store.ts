@@ -89,11 +89,15 @@ const TERMINAL: ReadonlySet<RecipeStepStatus> = new Set(['done', 'failed', 'skip
 
 export class StepTransitionError extends Error {
   code = 'INVALID_STEP_TRANSITION';
-  constructor(
-    public from: RecipeStepStatus,
-    public to: RecipeStepStatus,
-  ) {
+  // Explicit field declarations + body assignment (not TypeScript parameter
+  // properties) because Node's --experimental-strip-types mode used by the
+  // test runner does not support parameter property syntax.
+  readonly from: RecipeStepStatus;
+  readonly to: RecipeStepStatus;
+  constructor(from: RecipeStepStatus, to: RecipeStepStatus) {
     super(`Cannot transition step from ${from} to ${to}`);
+    this.from = from;
+    this.to = to;
   }
 }
 
