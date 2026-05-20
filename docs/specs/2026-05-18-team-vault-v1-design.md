@@ -916,18 +916,201 @@ Local-only. Never enters vault repo. No central aggregation.
 
 ## 16. Memory subsystem (Obsidian-compatible)
 
-Memory in v1.0 is split into two layers, both **Obsidian-compatible markdown folders**. The agent uses existing filesystem tools (`Read`, `Write`, `Edit`, `Grep`, `Glob`) plus `vault.search` for ranked search. **No new MCP tools are added for memory.**
+Memory in v1.0 lives in **the chain** — same model as every other vault primitive. The agent uses existing filesystem tools (`Read`, `Write`, `Edit`, `Grep`, `Glob`) plus `vault.search` for ranked search, and a single `paths.get()` tool to discover where each tier lives on disk. **No new memory-specific MCP tools are added.**
 
-### 16.1 The two layers
+### 16.1 The three tiers — a unified model
 
-| Layer | Location | Purpose | Visibility |
+There are **two surfaces, three tiers in v1.0**:
+
+| Tier | Location | Purpose | Boundary |
 |---|---|---|---|
-| Workspace memory | `<workspace>/.clawdevbox/memory/` | This laptop's project context, daily notes, reflections, decisions, people notes | Local; never crosses the laptop boundary except via explicit `/vault share memory` |
-| Vault memory | `<vault>/memory/` (per the layout in §7.1) | Team-shared memory artifacts | Crosses the chain as a vault primitive |
+| **Workspace** | `<workspace-root>/.clawdevbox/memory/` (under `~/.clawdevbox/workspaces/<ws-id>/.clawdevbox/`, see §16.2) | Task/project-specific context; reflection daily notes; transient working notes | Local to this workspace |
+| **Personal vault** | `~/.clawdevbox/vaults/personal/memory/` | User's preferences, work style, identity ("prefers TypeScript", "uses VS Code", git email, deploy permissions) | Cross-workspace, this user, this laptop. Remote optional. |
+| **Team vault** | `~/.clawdevbox/vaults/<team-vault-id>/memory/` (one per tier in the chain) | Team-wide learnings — deploy strategies, coding standards, anti-patterns | Crosses the team via git PR + auditor (§9) |
 
-Both layers use the **same on-disk conventions**: a folder of `.md` files with optional YAML frontmatter, wikilinks, callouts, and tags per Obsidian Flavored Markdown.
+The same Obsidian-compatible conventions apply to all three tiers. **Personal and team vaults are both "vaults"** — they share §6's multi-vault chain mechanics, §7's primitive kinds, §8's auditor flow, §9's share/endorse/veto. The only differences are:
 
-### 16.2 Conventions: vendored `obsidian-markdown` skill
+- Personal vault's `parent_vault.git_url` defaults to the leaf team vault (or null if user opts out of joining a team)
+- Personal vault's `self.repo` is **null by default** (no remote, local-only commits for history)
+- Workspace is **not a vault** — it has its own `memory/`, `skills/`, `recipes/` folders but no `.vault/audits/votes/disables/` and no auditor lifecycle. Workspace artifacts are promoted to personal vault (or team vault) via `/vault share`.
+
+The chain order from leaf to root:
+
+```
+workspace (leaf, not a vault)
+   ↓
+personal vault
+   ↓
+team vault (leaf-most team tier, e.g., feature-crew-alpha)
+   ↓
+team vault (parent, e.g., meetings)
+   ↓
+... (future org tiers)
+```
+
+Child-overrides-parent applies the whole chain through: workspace shadows personal shadows team-leaf shadows team-parent.
+
+### 16.2 Where things live on disk (acknowledging existing `workspaces-store.ts`)
+
+The existing clawdevbox model (in `mcp-server/src/workspaces-store.ts`) already places workspaces at `~/.clawdevbox/workspaces/<ws-id>/.clawdevbox/`. v1.0 extends this with two new sibling directories under `~/.clawdevbox/`:
+
+```
+~/.clawdevbox/                                  # global root (existing)
+├── workspaces/                                 # existing
+│   ├── index.json                              # existing — workspace registry
+│   └── ws_abc_1234/
+│       └── .clawdevbox/
+│           ├── workspace.json                  # existing
+│           ├── triggers.json                   # existing
+│           ├── recipes/                        # existing
+│           ├── skills/                         # existing
+│           ├── recipe-instances/               # existing
+│           ├── memory/                         # NEW — Obsidian-compatible folder
+│           ├── agents/                         # NEW — workspace-local persona overrides
+│           ├── sync-state.json                 # NEW — for vault chain pull state
+│           ├── outbox/                         # NEW — offline queue
+│           └── .git/                           # NEW — workspace is its own git repo
+├── vaults/                                     # NEW
+│   ├── personal/                               # auto-init on first start
+│   │   ├── vault.yaml
+│   │   ├── CODEOWNERS                          # contains only the user themselves
+│   │   ├── README.md
+│   │   ├── AGENTS.md
+│   │   ├── memory/
+│   │   ├── skills/
+│   │   ├── recipes/
+│   │   ├── triggers/
+│   │   ├── agents/
+│   │   ├── .vault/
+│   │   │   ├── audits/
+│   │   │   ├── votes/
+│   │   │   └── disables/
+│   │   └── .git/                               # local repo; remote optional
+│   ├── feature-crew-alpha/                     # team vault clone
+│   │   ├── ... (same shape as personal)
+│   │   └── .git/                               # clone of remote
+│   └── meetings/                               # team vault clone (parent of feature-crew-alpha)
+│       └── ... (same shape)
+└── plugins/                                    # existing — global plugin install
+    └── dev-buddy/
+        └── ...
+```
+
+The existing `workspace.json` schema gains optional fields:
+
+```json
+{
+  "id": "ws_abc_1234",
+  "name": "my-project",
+  "created_at": 1716158400000,
+  "parent_workspace_id": null,
+  "clawdevbox_workspaces_root": "/Users/kirmadi/.clawdevbox/workspaces",
+
+  "project_path": "/path/to/source-code",     // NEW (optional) — where user's code lives
+  "team_vault": "feature-crew-alpha"          // NEW (optional) — leaf team-vault id
+}
+```
+
+`project_path` records the user's source-code directory (the agent uses it for Read/Write/Grep against the project). `team_vault`, if set, points to the team vault that's the parent of this workspace's personal vault in the chain.
+
+### 16.3 The `paths.get()` MCP tool
+
+A single tool returns every relevant filesystem location for the active session. Agent calls it once at session start and caches the result.
+
+#### How the tool resolves the active workspace
+
+The tool follows the **existing convention** used by `artifact.*`, `recipe.*`, and `workspace.current` (see `mcp-server/src/workspaces-store.ts` and `mcp-server/src/tools/artifact.ts:50-85`):
+
+```
+1. Argument override:        paths.get({ workspace_id: "ws_..." })  ← rare; for cross-workspace lookups
+       ↓ if absent:
+2. Env var:                  CLAWDEVBOX_WORKSPACE_ID
+       ↓ if unset:
+3. Project-dir match:        find workspace whose `path` equals CLAWDEVBOX_PROJECT_DIR
+                             (CLAWDEVBOX_PROJECT_DIR defaults to MCP-server cwd at startup)
+       ↓ if no match:
+4. Structured error:         NO_TARGET_WORKSPACE — agent should prompt user
+                             to either `clawdevbox workspace create` or `cd` into a
+                             registered workspace's project_dir
+```
+
+Steps 1–3 cover essentially every real call. The env-var path (step 2) is the most common: `cli/start.ts:1095` injects `CLAWDEVBOX_WORKSPACE_ID` into the spawned agent process at the moment the user runs `clawdevbox start`, and `recipe-runner.ts:159,212` does the same when a recipe spawns a child session. By the time the agent's first MCP tool call runs, `process.env.CLAWDEVBOX_WORKSPACE_ID` is already set.
+
+The project-dir match (step 3) covers the "long-running MCP server with no spawned agent" case — e.g., when an external client connects to the MCP server directly. The server resolves `CLAWDEVBOX_PROJECT_DIR` (defaults to its cwd) and looks up which registered workspace lives there.
+
+#### Tool signature
+
+```typescript
+paths.get(args?: { workspace_id?: string }) → {
+  workspace: {
+    id: "ws_abc_1234",
+    root: "/Users/kirmadi/.clawdevbox/workspaces/ws_abc_1234/.clawdevbox",
+    memory: ".../memory",
+    skills: ".../skills",
+    recipes: ".../recipes",
+    triggers: ".../triggers.json",        // file (existing convention), not a dir
+    agents: ".../agents",
+    artifacts: ".../recipe-instances",    // existing artifact storage
+    project_path: "/path/to/source-code"  // null if workspace has no associated source
+  },
+  vaults: [
+    {
+      id: "personal",
+      depth: 0,                            // 0 = nearest to workspace
+      root: "/Users/kirmadi/.clawdevbox/vaults/personal",
+      memory: ".../memory",
+      skills: ".../skills",
+      recipes: ".../recipes",
+      triggers: ".../triggers",
+      agents: ".../agents",
+      audits: ".../.vault/audits",
+      votes: ".../.vault/votes",
+      disables: ".../.vault/disables",
+      yaml: ".../vault.yaml",
+      has_remote: false                    // personal is local-only by default
+    },
+    {
+      id: "feature-crew-alpha",
+      depth: 1,
+      root: "/Users/kirmadi/.clawdevbox/vaults/feature-crew-alpha",
+      memory: ".../memory",
+      skills: ".../skills",
+      // ... (same shape)
+      has_remote: true
+    },
+    {
+      id: "meetings",
+      depth: 2,
+      root: "/Users/kirmadi/.clawdevbox/vaults/meetings",
+      // ... (same shape)
+      has_remote: true
+    }
+  ],
+  chain_order: ["workspace", "personal", "feature-crew-alpha", "meetings"],
+  globals: {
+    plugins: "/Users/kirmadi/.clawdevbox/plugins",
+    config: "/Users/kirmadi/.clawdevbox/config.json"
+  }
+}
+```
+
+#### Cache and invalidation
+
+The agent caches the result for the session. Re-call if any of:
+
+- `workspace.json` is rewritten (e.g., user edits `team_vault`)
+- A vault is added (`clawdevbox init --team-vault <url>`) or removed
+- The session is long-lived (>1 hour) and the chain might have shifted
+
+For v1.0 there's no push-invalidation mechanism — the agent re-calls explicitly. v1.1 may add a `paths.changed` event on the MCP server.
+
+The `memory-vault` skill teaches the agent:
+- "Call `paths.get()` once at session start. Cache the result."
+- "Personal preferences (user identity, work style, what they like) → write under `vaults[id=personal].memory/`"
+- "Task-specific notes (the current project, today's decisions) → write under `workspace.memory/`"
+- "Team-shareable learnings → write to `workspace.memory/` first, then `/vault share memory` to promote"
+
+### 16.4 Conventions: vendored `obsidian-markdown` skill
 
 The conventions for writing Obsidian-flavored markdown (wikilinks `[[note]]`, embeds `![[note]]`, callouts `> [!type]`, properties via YAML frontmatter, tags `#tag` or `tags:` array, block IDs `^block-id`, comments `%%hidden%%`, footnotes, etc.) are **vendored from `kepano/obsidian-skills`** into our repo at:
 
@@ -942,48 +1125,74 @@ plugins/dev-buddy/skills/obsidian-markdown/
 
 Vendored (not installed at runtime) so we have a frozen, auditable version. License attribution per upstream. Periodic refresh handled as a normal dependency-update PR.
 
-### 16.3 Folder structure within memory/
+### 16.5 Folder structure within each `memory/`
 
-The agent decides the folder structure per workspace based on what it's collecting. The clawdevbox `memory-vault` skill provides guiding principles + example layouts but does NOT enforce a fixed structure. Example agent-curated layout (illustrative):
+The agent decides the folder structure per tier based on what it's collecting. The clawdevbox `memory-vault` skill provides guiding principles + example layouts but does NOT enforce a fixed structure. Example agent-curated layouts (illustrative):
+
+**Personal vault memory** (cross-workspace user preferences):
+
+```
+~/.clawdevbox/vaults/personal/memory/
+├── identity.md                  # name, email, role
+├── preferences/
+│   ├── languages.md             # prefers TypeScript over JavaScript, etc.
+│   ├── tools.md                 # editor, terminal, shell
+│   └── communication.md         # async-first, prefers writing to meetings
+├── permissions/
+│   └── always-allow-deploy-staging.md
+└── README.md
+```
+
+**Workspace memory** (project/task-specific):
 
 ```
 <workspace>/.clawdevbox/memory/
 ├── daily/
-│   └── 2026-05-19.md          # reflection trigger writes here (§10)
+│   └── 2026-05-19.md            # reflection trigger writes here
+├── project.md                   # this project's quirks, conventions
 ├── decisions/
-│   └── canary-deployment-strategy.md
+│   └── deployment-strategy.md
 ├── people/
-│   └── alice.md
-├── projects/
-│   └── feature-x.md
-├── permissions/
-│   └── deploy-prod-staging.md
-└── README.md                  # agent maintains a high-level vault map
+│   └── alice.md                 # someone met on this project
+└── README.md
 ```
 
-Daily notes follow the canonical `daily/YYYY-MM-DD.md` convention so reflection (§10) can write to them predictably.
+**Team vault memory** (team standards, durable knowledge):
 
-### 16.4 The `memory-vault` skill
+```
+~/.clawdevbox/vaults/feature-crew-alpha/memory/
+├── deploy-canary.md
+├── code-style.md
+└── README.md
+```
+
+Daily notes follow the canonical `daily/YYYY-MM-DD.md` convention so reflection (§10) can write to them predictably. Personal and team vault memory don't have a daily-notes convention by default — they hold durable content.
+
+### 16.6 The `memory-vault` skill
 
 A thin clawdevbox-specific skill at `plugins/dev-buddy/skills/memory-vault/SKILL.md` that:
 
 - Points the agent at the vendored `obsidian-markdown` skill for syntax
-- Defines the memory folder location for the active workspace
+- Tells the agent to call `paths.get()` at session start and explains the three tiers
 - Describes the agent's job as **building a network of information** the agent can manage and retrieve
+- Defines the semantics for each tier (what belongs in personal vs workspace vs team vault)
 - Provides guiding principles for organization (use wikilinks freely; create folders/subfolders as needed; tag for discovery; keep notes atomic)
 - Teaches the **read-before-write** pattern for conflict avoidance (Read returns mtime; agent checks before overwriting)
 - Teaches when to use `Grep` (substring/regex) vs `vault.search` (ranked BM25 with frontmatter filters)
-- Teaches the daily-note convention and how reflection consumes it
-- Defines the promotion path: a workspace memory note can be shared to vault via `/vault share memory` (subject to all the normal share-flow protections in §9)
+- Teaches the daily-note convention for workspace memory and how reflection consumes it
+- Defines the promotion paths:
+  - Workspace memory → personal vault (for cross-project user preferences): `/vault share memory --to personal`
+  - Workspace memory → team vault (for team-shareable learnings): `/vault share memory --to <team-vault-id>` (default leaf team)
+  - Personal vault → team vault: rare — user manually copies the note into a workspace, then `/vault share`
 
-### 16.5 Ranked search across memory
+### 16.7 Ranked search across the chain
 
-`vault.search` (already defined in §11 / §12) is extended to accept a `scope` parameter:
+`vault.search` (defined in §11 / §12) is extended to accept a `scope` parameter:
 
 ```typescript
 vault.search({
   query: string,
-  scope: 'workspace' | 'vault' | 'all',   // default: 'all'
+  scope: 'workspace' | 'personal' | 'team' | 'all',   // default: 'all'
   kind?: 'skill' | 'recipe' | 'memory' | 'trigger' | 'agent',
   tags?: string[],
   frontmatter_filters?: Record<string, any>,
@@ -991,29 +1200,31 @@ vault.search({
 })
 ```
 
-When `scope = 'all'`, hits from both workspace memory and vault memory (across the chain) are returned, distinguished by `vault_id` in the result (`__workspace__` for workspace hits).
+- `scope: 'workspace'` — workspace memory only
+- `scope: 'personal'` — personal vault only
+- `scope: 'team'` — all team vault tiers (excludes personal and workspace)
+- `scope: 'all'` (default) — everything across the chain
 
-The workspace memory folder is indexed in the same Orama DB used by vault primitives. Composite ID: `__workspace__:memory:<relative-path-without-ext>`. Bootstrap on MCP server start; incremental update on local file change (file watcher). The vault.search `where` clause includes `__workspace__` when `scope: 'workspace'` or `'all'`.
+All tiers are indexed in the same Orama DB. Composite IDs:
+- `__workspace__:<kind>:<path>` for workspace
+- `personal:<kind>:<path>` for personal vault
+- `<team-vault-id>:<kind>:<path>` for team vaults
 
-### 16.6 Backlinks via Grep
+Results include the `vault` field so the agent can filter or group.
 
-Backlinks are computed on demand (or cached in `_meta/backlinks.json` if performance demands later). To find backlinks for a note titled `Canary Deployment Strategy` whose file is at `decisions/canary-deployment-strategy.md`:
+### 16.8 Backlinks via Grep
 
-```bash
-Grep -r "\[\[Canary Deployment Strategy(\||\])" .clawdevbox/memory/
-```
+Backlinks are computed on demand. To find backlinks for a note titled `Canary Deployment Strategy`, the agent runs `Grep -r "\[\[Canary Deployment Strategy(\||\])"` against the relevant memory roots from `paths.get()`. The `memory-vault` skill teaches this pattern. No backlinks tool ships in v1.0.
 
-The `memory-vault` skill teaches this pattern. No backlinks tool ships in v1.0.
+### 16.9 Wikilink resolution
 
-### 16.7 Wikilink resolution
+`[[Note Title]]` resolves to the file whose H1 heading is `Note Title` OR whose filename (without `.md`) slug-matches. Slug match uses kebab-case normalization (`Canary Deployment Strategy` ↔ `canary-deployment-strategy.md`). When the same title exists at multiple tiers, **the closer tier wins** (workspace → personal → team-leaf → team-parent), consistent with §6's child-overrides-parent.
 
-`[[Note Title]]` resolves to the file whose H1 heading is `Note Title` OR whose filename (without `.md`) slug-matches. Slug match uses kebab-case normalization (`Canary Deployment Strategy` ↔ `canary-deployment-strategy.md`). When the same title exists in workspace AND vault memory, **workspace wins** (consistent with the leaf-overrides-parent semantics in the multi-vault chain §6).
+Broken wikilinks (titles that don't resolve at any tier) are surfaced by `vault.search` results with a "⚠ broken wikilink target" badge. No automatic repair.
 
-Broken wikilinks (titles that don't resolve) are surfaced by `vault.search` results with a "⚠ broken wikilink target" badge. No automatic repair.
+### 16.10 Reflection writes daily notes
 
-### 16.8 Reflection writes daily notes
-
-The reflection trigger (§10) writes section output into the day's daily note rather than a separate `learnings/` directory. Path: `<workspace>/.clawdevbox/memory/daily/YYYY-MM-DD.md`. The trigger appends a session subsection if the file already exists:
+The reflection trigger (§10) writes section output into the day's daily note rather than a separate `learnings/` directory. Path: `<workspace-root>/.clawdevbox/memory/daily/YYYY-MM-DD.md`. The trigger appends a session subsection if the file already exists:
 
 ```markdown
 # 2026-05-19
@@ -1034,32 +1245,48 @@ The reflection trigger (§10) writes section output into the day's daily note ra
 ...
 ```
 
-EOD `propose-learnings` reads today's daily note for consolidation (instead of grep'ing the old `learnings/<date>/` folder, which no longer exists in v1.0).
+EOD `propose-learnings` reads today's daily note for consolidation.
 
-### 16.9 Migration from old single-file memory.md
+### 16.11 Personal vault auto-init
 
-**Hard cutover.** Existing `<workspace>/.clawdevbox/memory.md` is not auto-migrated. On first start after v1.0:
+On first `clawdevbox start`, if `~/.clawdevbox/vaults/personal/` doesn't exist:
 
-1. `clawdevbox start` detects `memory.md` exists AND `memory/` folder doesn't
-2. Posts a high-priority inbox card: "You have an old memory.md. Move its contents into `memory/` (organize by heading) before continuing. See `memory-vault` skill for the new structure."
+1. Scaffold the vault skeleton (vault.yaml with `self.repo: null`, CODEOWNERS = current git user, empty memory/ skills/ recipes/ triggers/ agents/ + .vault/ subtree)
+2. `git init` — local commits enable history/checkpoints; remote is null by default
+3. Update the workspace's `workspace.json` to set `team_vault` only if the user is also joining a team (`clawdevbox init --team-vault <url>`)
+4. Show one-time tip to user: "Personal vault created at `~/.clawdevbox/vaults/personal/`. Add a remote later with `/vault add-remote personal <git-url>` to back it up."
+
+### 16.12 Workspace as its own git repo
+
+Each workspace at `~/.clawdevbox/workspaces/<ws-id>/.clawdevbox/` is `git init`ed on creation. Auto-commits on artifact writes give checkpoint history. No remote required. Granularity: each `Write` / `Edit` from the agent triggers `git add` + `git commit -m "auto: <op> <relpath>"`. The user can squash periodically via `/vault checkpoint --squash 24h` (deferred to v1.1 — for v1.0, auto-commits accumulate).
+
+### 16.13 Migration from old single-file `memory.md`
+
+**Hard cutover.** Existing `<old-project>/.clawdevbox/memory.md` is not auto-migrated. On first start after v1.0:
+
+1. `clawdevbox start` detects an old `memory.md` (anywhere reachable via existing `workspace.json` references)
+2. Posts a high-priority inbox card: "You have an old memory.md. Move its contents into the appropriate tier — personal preferences to `~/.clawdevbox/vaults/personal/memory/`, project-specific to `<workspace>/.clawdevbox/memory/`. See `memory-vault` skill for guidance."
 3. User manually splits the file (or asks the agent to do it as a one-off task)
 
 No auto-migration in v1.0.
 
-### 16.10 What net code this adds
+### 16.14 What net code this adds
 
 | Item | Size |
 |---|---|
-| `vault.search --scope` extension + Orama index of workspace memory | ~50 LOC |
-| Workspace memory file-watcher → Orama incremental updates | ~40 LOC |
-| Wikilink slug resolver + workspace-wins conflict | ~30 LOC |
+| `paths.get()` MCP tool — discovers workspace + vault paths from chain | ~80 LOC |
+| `vault.search --scope` extension + Orama index of workspace memory + personal vault memory | ~80 LOC |
+| Workspace + personal vault file-watcher → Orama incremental updates | ~50 LOC |
+| Wikilink slug resolver + tier-closeness conflict | ~30 LOC |
+| Personal vault auto-init on first start | ~60 LOC |
+| Workspace `git init` + auto-commit on artifact writes | ~50 LOC |
 | Vendored `obsidian-markdown` skill (kepano upstream) | ~1000 lines markdown (4 files) |
-| New `memory-vault` skill | ~200 lines markdown |
-| `dev-buddy` IDENTITY/SOUL/STANDING_ORDERS/MEMORY-TEMPLATE updates | ~50 lines markdown |
+| New `memory-vault` skill | ~250 lines markdown |
+| `dev-buddy` IDENTITY/SOUL/STANDING_ORDERS/MEMORY-TEMPLATE updates | ~60 lines markdown |
 | `onboard-project` migration-warning step | ~30 LOC |
-| Tests (wikilink resolver, scope filter) | ~80 LOC |
+| Tests (paths.get, wikilink resolver, scope filter, auto-init) | ~120 LOC |
 
-**Net code: ~230 LOC. Net markdown: ~1,250 lines.**
+**Net code: ~500 LOC. Net markdown: ~1,310 lines.**
 
 ---
 
