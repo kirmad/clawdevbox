@@ -26,6 +26,8 @@ import { registerNotifyTools } from './tools/notify.ts';
 import { registerRendererTools } from './tools/renderer.ts';
 import { registerUiTools } from './tools/ui.ts';
 import { discoverTools, registerHostedTools, type HostedToolRegistry } from './tools/hosted.ts';
+import { registerFeedbackTools } from './tools/feedback.ts';
+import { registerPathsTools } from './tools/paths.ts';
 
 export interface BuiltServer {
   server: McpServer;
@@ -50,6 +52,7 @@ export async function buildServer(ws: Workspace): Promise<BuiltServer> {
 
   registerRecipeTools(server, ws);
   registerSkillTools(server, ws);
+  registerFeedbackTools(server, ws);
   registerTriggerTools(server, ws);
   registerPluginTools(server, ws);
   registerWorkspaceTools(server, ws);
@@ -60,6 +63,7 @@ export async function buildServer(ws: Workspace): Promise<BuiltServer> {
   registerRendererTools(server, ws);
   registerNotifyTools(server, ws);
   registerUiTools(server, ws);
+  registerPathsTools(server, ws);
 
   const hostedRegistry = await discoverTools(ws);
   registerHostedTools(server, hostedRegistry, ws);

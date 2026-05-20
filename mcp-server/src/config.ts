@@ -102,6 +102,13 @@ export interface ClawdevboxClientSyncConfig {
   discovered_plugins?: Array<{ provider: string; name: string }>;
 }
 
+export interface VaultEntry {
+  id: string;
+  path: string;
+  kind: 'personal' | 'team';
+  remote: string | null;
+}
+
 export interface ClawdevboxConfig {
   version: typeof CONFIG_VERSION;
   /**
@@ -126,6 +133,8 @@ export interface ClawdevboxConfig {
   default_agent_cli?: string;
   /** Bidirectional plugin sync settings (spec §9). */
   client_sync?: ClawdevboxClientSyncConfig;
+  /** Registered vaults (personal + team). */
+  vaults?: VaultEntry[];
 }
 
 export interface ResolvedConfig {
@@ -166,6 +175,8 @@ export interface ResolvedConfig {
     bidirectionalUninstall: boolean;
     discoveredPlugins: Array<{ provider: string; name: string }>;
   };
+  /** Registered vaults. Empty array when none configured. */
+  vaults: VaultEntry[];
 }
 
 export class ConfigError extends Error {
@@ -468,6 +479,39 @@ function validateConfig(parsed: unknown, source: string): ClawdevboxConfig {
     }
   }
 
+  let vaults: VaultEntry[] | undefined;
+  if (obj.vaults !== undefined) {
+    if (!Array.isArray(obj.vaults)) {
+      throw new ConfigError(`${source}: vaults must be an array`);
+    }
+    vaults = [];
+    for (let i = 0; i < obj.vaults.length; i++) {
+      const v = obj.vaults[i];
+      if (!v || typeof v !== 'object') {
+        throw new ConfigError(`${source}: vaults[${i}] must be an object`);
+      }
+      const ve = v as Record<string, unknown>;
+      if (typeof ve.id !== 'string' || ve.id.length === 0) {
+        throw new ConfigError(`${source}: vaults[${i}].id must be a non-empty string`);
+      }
+      if (typeof ve.path !== 'string' || ve.path.length === 0) {
+        throw new ConfigError(`${source}: vaults[${i}].path must be a non-empty string`);
+      }
+      if (ve.kind !== 'personal' && ve.kind !== 'team') {
+        throw new ConfigError(`${source}: vaults[${i}].kind must be 'personal' or 'team'`);
+      }
+      if (ve.remote !== null && typeof ve.remote !== 'string') {
+        throw new ConfigError(`${source}: vaults[${i}].remote must be a string or null`);
+      }
+      vaults.push({
+        id: ve.id,
+        path: ve.path,
+        kind: ve.kind,
+        remote: (ve.remote as string) ?? null,
+      });
+    }
+  }
+
   return {
     version: CONFIG_VERSION,
     project_dir: obj.project_dir,
@@ -479,6 +523,7 @@ function validateConfig(parsed: unknown, source: string): ClawdevboxConfig {
     cron,
     default_agent_cli,
     client_sync,
+    vaults,
   };
 }
 
@@ -604,6 +649,8 @@ export function resolveConfig(opts: ResolveOptions = {}): ResolvedConfig {
   const clientSyncDiscoveredPlugins =
     layered((c) => c.client_sync?.discovered_plugins) ?? [];
 
+  const vaults: VaultEntry[] = layered((c) => c.vaults) ?? [];
+
   // Pick a representative configPath: prefer project layer when present,
   // otherwise the global layer, otherwise null.
   const configPathUsed = projectCfg
@@ -638,6 +685,7 @@ export function resolveConfig(opts: ResolveOptions = {}): ResolvedConfig {
       bidirectionalUninstall: clientSyncBidirectionalUninstall,
       discoveredPlugins: clientSyncDiscoveredPlugins,
     },
+    vaults,
   };
 }
 

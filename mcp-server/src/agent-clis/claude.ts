@@ -1,6 +1,6 @@
 import { join } from 'node:path';
 import os from 'node:os';
-import { writeMcpJson, probeBinary, cliPluginSync, cliPluginDiscover } from './shared.ts';
+import { writeMcpJson, probeBinary, cliPluginSync, cliPluginDiscover, buildVaultPluginDirArgs } from './shared.ts';
 import type {
   AgentCliProvider,
   AgentHandle,
@@ -43,6 +43,7 @@ export const claudeProvider: AgentCliProvider = {
     if (opts.agent) {
       argv.push('--agent', opts.agent);
     }
+    argv.push(...buildVaultPluginDirArgs(opts.pluginDirs));
     if (opts.mode === 'headless') {
       if (!opts.prompt) throw new Error('claude: headless mode requires opts.prompt');
       argv.push('-p', opts.prompt);

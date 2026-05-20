@@ -52,6 +52,8 @@ export interface SpawnSessionOpts {
   fireId?: string;
   ptyCols?: number;
   ptyRows?: number;
+  /** Vault directories to pass as --plugin-dir flags to the CLI. */
+  pluginDirs?: string[];
 }
 
 export interface AgentHandle {

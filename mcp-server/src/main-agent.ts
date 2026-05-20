@@ -127,6 +127,7 @@ export async function startMainAgent(opts: MainAgentOptions): Promise<MainAgentS
       },
       ptyCols: 120,
       ptyRows: 30,
+      pluginDirs: opts.cfg.vaults.map(v => v.path),
     });
     agentPid = handle.pid ?? null;
 

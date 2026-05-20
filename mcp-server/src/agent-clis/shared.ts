@@ -115,6 +115,21 @@ export function writeMcpJson(
   writeFileAtomic(target, JSON.stringify(config, null, 2) + '\n');
 }
 
+/**
+ * Build --plugin-dir argv entries for vault directories.
+ * Skips paths that don't exist on disk (guard against stale config).
+ */
+export function buildVaultPluginDirArgs(dirs?: string[]): string[] {
+  if (!dirs || dirs.length === 0) return [];
+  const args: string[] = [];
+  for (const dir of dirs) {
+    if (existsSync(dir)) {
+      args.push('--plugin-dir', dir);
+    }
+  }
+  return args;
+}
+
 /** Build the ProviderCtx the kernel hands to a provider for one call. */
 export function buildProviderCtx(ws: Workspace, cfg: ResolvedConfig): ProviderCtx {
   return {

@@ -49,6 +49,7 @@ import type { DetectResult } from '../agent-clis/types.ts';
 import type { Flags } from './index.ts';
 import { probeClientPlugins } from './probe-client-plugins.ts';
 import { runClientPluginProbePrompt } from './init-probe-prompt.ts';
+import { runVaultSetup } from './init-vault.ts';
 import {
   discoverPluginsInDir,
   installPluginFromDir,
@@ -795,6 +796,18 @@ async function runInitInner(flags: Flags): Promise<void> {
       ensureGlobalNodeModulesLink(globalDir);
     }
 
+    // ---- Vault setup --------------------------------------------------------
+    let vaultEntries: import('../config.ts').VaultEntry[] = [];
+    try {
+      const vaultResult = await runVaultSetup(globalDir);
+      vaultEntries = vaultResult.vaults;
+      if (vaultEntries.length > 0) {
+        log.info(`Configured ${vaultEntries.length} vault(s).`);
+      }
+    } catch (err) {
+      log.warn(`Vault setup skipped: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
     // ---- Workspace reload + agent-CLI chooser -----------------------------
     // Plugins were just installed; load a workspace so reloadTypeRegistries
     // picks up their provides.agent_clis[] entries, then ask the user which
@@ -881,6 +894,7 @@ async function runInitInner(flags: Flags): Promise<void> {
       ...(probedSelections.length > 0
         ? { client_sync: { discovered_plugins: probedSelections } }
         : {}),
+      ...(vaultEntries.length > 0 ? { vaults: vaultEntries } : {}),
     };
 
     const written =
