@@ -321,7 +321,7 @@ After a clean auditor verdict on pull, artifacts always merge to disk. Activatio
 |---|---|---|---|
 | skill | Files written | N/A — context only | Agent reads when relevant |
 | recipe | Files written | Invokable | Agent or user calls |
-| memory | Files written | N/A — context only | Agent reads when relevant |
+| memory | Files written into Obsidian-vault folder structure | N/A — context only | Agent reads via Read/Glob/Grep + `vault.search --scope all`. See §16 for the memory subsystem |
 | trigger | Files written | **Inert template** | User or agent runs `/vault schedule <id>` |
 | agent (persona) | Files written | Available in catalog | User or agent invokes via `--persona <id>` per-session |
 
@@ -858,7 +858,7 @@ BM25 + tag/title boosting suffices for ≤500 artifacts.
 
 | Command | Purpose |
 |---|---|
-| `/vault search <q>` | Search chain |
+| `/vault search <q> [--scope workspace\|vault\|all] [--kind <kind>]` | Search chain + workspace memory. Default scope: all |
 | `/vault share <kind>` | Open share-PR |
 | `/vault endorse <id>` | Endorse |
 | `/vault veto <id> <reason>` | Veto |
@@ -914,7 +914,156 @@ Local-only. Never enters vault repo. No central aggregation.
 
 ---
 
-## 16. Privacy
+## 16. Memory subsystem (Obsidian-compatible)
+
+Memory in v1.0 is split into two layers, both **Obsidian-compatible markdown folders**. The agent uses existing filesystem tools (`Read`, `Write`, `Edit`, `Grep`, `Glob`) plus `vault.search` for ranked search. **No new MCP tools are added for memory.**
+
+### 16.1 The two layers
+
+| Layer | Location | Purpose | Visibility |
+|---|---|---|---|
+| Workspace memory | `<workspace>/.clawdevbox/memory/` | This laptop's project context, daily notes, reflections, decisions, people notes | Local; never crosses the laptop boundary except via explicit `/vault share memory` |
+| Vault memory | `<vault>/memory/` (per the layout in §7.1) | Team-shared memory artifacts | Crosses the chain as a vault primitive |
+
+Both layers use the **same on-disk conventions**: a folder of `.md` files with optional YAML frontmatter, wikilinks, callouts, and tags per Obsidian Flavored Markdown.
+
+### 16.2 Conventions: vendored `obsidian-markdown` skill
+
+The conventions for writing Obsidian-flavored markdown (wikilinks `[[note]]`, embeds `![[note]]`, callouts `> [!type]`, properties via YAML frontmatter, tags `#tag` or `tags:` array, block IDs `^block-id`, comments `%%hidden%%`, footnotes, etc.) are **vendored from `kepano/obsidian-skills`** into our repo at:
+
+```
+plugins/dev-buddy/skills/obsidian-markdown/
+├── SKILL.md
+└── references/
+    ├── PROPERTIES.md
+    ├── EMBEDS.md
+    └── CALLOUTS.md
+```
+
+Vendored (not installed at runtime) so we have a frozen, auditable version. License attribution per upstream. Periodic refresh handled as a normal dependency-update PR.
+
+### 16.3 Folder structure within memory/
+
+The agent decides the folder structure per workspace based on what it's collecting. The clawdevbox `memory-vault` skill provides guiding principles + example layouts but does NOT enforce a fixed structure. Example agent-curated layout (illustrative):
+
+```
+<workspace>/.clawdevbox/memory/
+├── daily/
+│   └── 2026-05-19.md          # reflection trigger writes here (§10)
+├── decisions/
+│   └── canary-deployment-strategy.md
+├── people/
+│   └── alice.md
+├── projects/
+│   └── feature-x.md
+├── permissions/
+│   └── deploy-prod-staging.md
+└── README.md                  # agent maintains a high-level vault map
+```
+
+Daily notes follow the canonical `daily/YYYY-MM-DD.md` convention so reflection (§10) can write to them predictably.
+
+### 16.4 The `memory-vault` skill
+
+A thin clawdevbox-specific skill at `plugins/dev-buddy/skills/memory-vault/SKILL.md` that:
+
+- Points the agent at the vendored `obsidian-markdown` skill for syntax
+- Defines the memory folder location for the active workspace
+- Describes the agent's job as **building a network of information** the agent can manage and retrieve
+- Provides guiding principles for organization (use wikilinks freely; create folders/subfolders as needed; tag for discovery; keep notes atomic)
+- Teaches the **read-before-write** pattern for conflict avoidance (Read returns mtime; agent checks before overwriting)
+- Teaches when to use `Grep` (substring/regex) vs `vault.search` (ranked BM25 with frontmatter filters)
+- Teaches the daily-note convention and how reflection consumes it
+- Defines the promotion path: a workspace memory note can be shared to vault via `/vault share memory` (subject to all the normal share-flow protections in §9)
+
+### 16.5 Ranked search across memory
+
+`vault.search` (already defined in §11 / §12) is extended to accept a `scope` parameter:
+
+```typescript
+vault.search({
+  query: string,
+  scope: 'workspace' | 'vault' | 'all',   // default: 'all'
+  kind?: 'skill' | 'recipe' | 'memory' | 'trigger' | 'agent',
+  tags?: string[],
+  frontmatter_filters?: Record<string, any>,
+  limit?: number,
+})
+```
+
+When `scope = 'all'`, hits from both workspace memory and vault memory (across the chain) are returned, distinguished by `vault_id` in the result (`__workspace__` for workspace hits).
+
+The workspace memory folder is indexed in the same Orama DB used by vault primitives. Composite ID: `__workspace__:memory:<relative-path-without-ext>`. Bootstrap on MCP server start; incremental update on local file change (file watcher). The vault.search `where` clause includes `__workspace__` when `scope: 'workspace'` or `'all'`.
+
+### 16.6 Backlinks via Grep
+
+Backlinks are computed on demand (or cached in `_meta/backlinks.json` if performance demands later). To find backlinks for a note titled `Canary Deployment Strategy` whose file is at `decisions/canary-deployment-strategy.md`:
+
+```bash
+Grep -r "\[\[Canary Deployment Strategy(\||\])" .clawdevbox/memory/
+```
+
+The `memory-vault` skill teaches this pattern. No backlinks tool ships in v1.0.
+
+### 16.7 Wikilink resolution
+
+`[[Note Title]]` resolves to the file whose H1 heading is `Note Title` OR whose filename (without `.md`) slug-matches. Slug match uses kebab-case normalization (`Canary Deployment Strategy` ↔ `canary-deployment-strategy.md`). When the same title exists in workspace AND vault memory, **workspace wins** (consistent with the leaf-overrides-parent semantics in the multi-vault chain §6).
+
+Broken wikilinks (titles that don't resolve) are surfaced by `vault.search` results with a "⚠ broken wikilink target" badge. No automatic repair.
+
+### 16.8 Reflection writes daily notes
+
+The reflection trigger (§10) writes section output into the day's daily note rather than a separate `learnings/` directory. Path: `<workspace>/.clawdevbox/memory/daily/YYYY-MM-DD.md`. The trigger appends a session subsection if the file already exists:
+
+```markdown
+# 2026-05-19
+
+## Session abc-def-123 — 11:42
+
+### What I did
+...
+
+### What worked
+...
+
+[remaining sections per §10.2]
+
+---
+
+## Session ghi-jkl-456 — 14:11
+...
+```
+
+EOD `propose-learnings` reads today's daily note for consolidation (instead of grep'ing the old `learnings/<date>/` folder, which no longer exists in v1.0).
+
+### 16.9 Migration from old single-file memory.md
+
+**Hard cutover.** Existing `<workspace>/.clawdevbox/memory.md` is not auto-migrated. On first start after v1.0:
+
+1. `clawdevbox start` detects `memory.md` exists AND `memory/` folder doesn't
+2. Posts a high-priority inbox card: "You have an old memory.md. Move its contents into `memory/` (organize by heading) before continuing. See `memory-vault` skill for the new structure."
+3. User manually splits the file (or asks the agent to do it as a one-off task)
+
+No auto-migration in v1.0.
+
+### 16.10 What net code this adds
+
+| Item | Size |
+|---|---|
+| `vault.search --scope` extension + Orama index of workspace memory | ~50 LOC |
+| Workspace memory file-watcher → Orama incremental updates | ~40 LOC |
+| Wikilink slug resolver + workspace-wins conflict | ~30 LOC |
+| Vendored `obsidian-markdown` skill (kepano upstream) | ~1000 lines markdown (4 files) |
+| New `memory-vault` skill | ~200 lines markdown |
+| `dev-buddy` IDENTITY/SOUL/STANDING_ORDERS/MEMORY-TEMPLATE updates | ~50 lines markdown |
+| `onboard-project` migration-warning step | ~30 LOC |
+| Tests (wikilink resolver, scope filter) | ~80 LOC |
+
+**Net code: ~230 LOC. Net markdown: ~1,250 lines.**
+
+---
+
+## 17. Privacy
 
 Two layers:
 1. Agent self-check at draft time (system-prompt directive)
@@ -924,11 +1073,11 @@ Reflection files: 30d retention, no redaction. User-accepted risk.
 
 ---
 
-## 17. CI surface
+## 18. CI surface
 
 Mechanical only. No LLM. No MCP server.
 
-### 17.1 Checks
+### 18.1 Checks
 
 1. Frontmatter validator — required fields, types, enums per kind
 2. Broken-reference checker — `see: <id>` pointers, `runs: <recipe-id>` in triggers
@@ -943,7 +1092,7 @@ Mechanical only. No LLM. No MCP server.
 11. Audit retention prune (daily commit by CI bot) — delete `.vault/audits/*.md` older than `retention.audits_days`
 12. Branch-up-to-date — relies on GitHub branch protection
 
-### 17.2 CI workflow
+### 18.2 CI workflow
 
 ```yaml
 name: Vault CI
@@ -962,7 +1111,7 @@ jobs:
       - run: clawdevbox-vault-lint
 ```
 
-### 17.3 CODEOWNERS
+### 18.3 CODEOWNERS
 
 ```
 *                     @kirmadi
@@ -983,7 +1132,7 @@ Branch protection: 1 approval, branches up-to-date, no force-push to main.
 
 ---
 
-## 18. Auditor persona
+## 19. Auditor persona
 
 One inline file, ~250 lines: `plugins/dev-buddy/agents/vault-auditor.agent.md`.
 
@@ -1000,9 +1149,9 @@ Same persona file used author-side and consumer-side. Task type (`review_share` 
 
 ---
 
-## 19. Onboarding
+## 20. Onboarding
 
-### 19.1 New vault: `clawdevbox vault init`
+### 20.1 New vault: `clawdevbox vault init`
 
 ```
 $ clawdevbox vault init feature-crew-alpha
@@ -1027,7 +1176,7 @@ Initializing git, pushing to origin/main...
 ✓ Vault created.
 ```
 
-### 19.2 Join existing: `clawdevbox init --team-vault <url>`
+### 20.2 Join existing: `clawdevbox init --team-vault <url>`
 
 ```
 [5/N] Connect to team vault? (y/N) > y
@@ -1056,32 +1205,43 @@ Setup complete.
 
 ---
 
-## 20. Scope, risks, test strategy
+## 21. Scope, risks, test strategy
 
-### 20.1 Scope (v1.0)
+### 21.1 Scope (v1.0)
 
-~2,130 LOC across ~22 files:
+~2,360 LOC + ~1,450 lines of markdown across ~28 files:
 
-- `mcp-server/src/tools/vault-index.ts` — Orama lifecycle, ~250 LOC
-- `mcp-server/src/tools/vault.ts` — 11 `vault.*` MCP tools, ~400 LOC
+**TypeScript (~2,360 LOC):**
+
+- `mcp-server/src/tools/vault-index.ts` — Orama lifecycle (includes workspace memory indexing), ~300 LOC
+- `mcp-server/src/tools/vault.ts` — 11 `vault.*` MCP tools (with `vault.search --scope`), ~430 LOC
 - `mcp-server/src/cli/vault-init.ts` — `clawdevbox vault init`, ~120 LOC
 - `mcp-server/src/cli/vault-repair.ts` — `/vault repair`, ~50 LOC
 - `mcp-server/src/cli/run-recipe.ts` — headless recipe runner for local use, ~80 LOC
 - `mcp-server/src/loader/chain.ts` — chain walk, conflict resolution, ID map, ~150 LOC
+- `mcp-server/src/memory/wikilink-resolver.ts` — `[[note]]` slug match + workspace-wins, ~30 LOC
+- `mcp-server/src/memory/watcher.ts` — workspace memory file-watcher → Orama updates, ~40 LOC
 - `mcp-server/src/sync/pull.ts` — sync-vault-pull recipe orchestration, ~200 LOC
 - `mcp-server/src/sync/force-push-detect.ts` — local detection + high-priority card, ~30 LOC
 - `mcp-server/src/outbox/drain.ts` — outbox processor, ~120 LOC
 - `mcp-server/src/scheduler/trigger-deploy.ts` — per-kind activation on pull, ~80 LOC
 - `mcp-server/src/trigger-kernel/events.ts` — recipe.done event emitter, ~60 LOC
-- `plugins/dev-buddy/agents/vault-auditor.agent.md` — persona file, 250 lines
+- `mcp-server/src/onboard/memory-migration-warning.ts` — old `memory.md` detection card, ~30 LOC
+- `tools/clawdevbox-vault-lint/` — CI tool, ~250 LOC
+- Tests + integration tests (wikilink resolver, scope filter, etc.), ~330 LOC
+
+**Markdown (~1,450 lines):**
+
+- `plugins/dev-buddy/agents/vault-auditor.agent.md` — persona file, ~250 lines
+- `plugins/dev-buddy/skills/obsidian-markdown/` (vendored from `kepano/obsidian-skills`) — ~1,000 lines across 4 files (SKILL.md + references/PROPERTIES.md + references/EMBEDS.md + references/CALLOUTS.md)
+- `plugins/dev-buddy/skills/memory-vault/SKILL.md` — clawdevbox-specific memory guidance, ~200 lines
 - `plugins/dev-buddy/triggers/*.yaml` — 4 built-in triggers
 - `plugins/dev-buddy/recipes/reflect.yaml` + `propose-learnings.yaml` + `sync-vault-pull.yaml` + `drain-outbox.yaml` — 4 recipes
-- `tools/clawdevbox-vault-lint/` — CI tool, ~250 LOC
-- Tests + integration tests, ~250 LOC
+- Updates to existing dev-buddy IDENTITY/SOUL/STANDING_ORDERS/MEMORY-TEMPLATE — ~50 lines
 
 PR strategy: deferred to implementation planning.
 
-### 20.2 Risk register
+### 21.2 Risk register
 
 | Risk | Likelihood | Mitigation |
 |---|---|---|
@@ -1101,7 +1261,7 @@ PR strategy: deferred to implementation planning.
 | Trigger updated mid-active-schedule | Low | Disable old + inbox card per §7.5 |
 | Vote/disable file orphans accumulate | Low | CI orphan scan |
 
-### 20.3 Test strategy
+### 21.3 Test strategy
 
 - **Unit:** frontmatter parser, Orama queries with composite IDs, trigger kernel, audit-report schema, vote-file schema, outbox serialization, sync-state.json transitions, force-push detection
 - **Integration:** end-to-end share flow on local test vault; per-kind activation; offline outbox drain on reconnect
@@ -1110,7 +1270,7 @@ PR strategy: deferred to implementation planning.
 
 ---
 
-## 21. Out of scope for v1.0 (deferred to v1.1+)
+## 22. Out of scope for v1.0 (deferred to v1.1+)
 
 | Feature | Why deferred | Re-add trigger |
 |---|---|---|
@@ -1126,7 +1286,7 @@ PR strategy: deferred to implementation planning.
 
 ---
 
-## 22. References
+## 23. References
 
 - `docs/specs/2026-05-15-skill-feedback-loop-design.md` — within-workspace skill feedback (complementary)
 - `docs/specs/2026-05-14-trigger-kernel-design.md` — trigger primitive (consumed in v1.0)
