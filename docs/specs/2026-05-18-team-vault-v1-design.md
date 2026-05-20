@@ -1019,24 +1019,82 @@ A single tool returns every relevant filesystem location for the active session.
 
 #### How the tool resolves the active workspace
 
-The tool follows the **existing convention** used by `artifact.*`, `recipe.*`, and `workspace.current` (see `mcp-server/src/workspaces-store.ts` and `mcp-server/src/tools/artifact.ts:50-85`):
+The MCP server is long-lived and shared across multiple agent sessions in HTTP mode (`clawdevbox start`'s Streamable HTTP transport). The server's own `process.env.CLAWDEVBOX_WORKSPACE_ID` is fixed at server startup time and **cannot be used to identify the calling agent** in HTTP mode — this is a fundamental property of the transport, not a bug.
+
+The correct mechanism: **each spawned agent's `.mcp.json` includes per-spawn HTTP headers that carry workspace context.** The MCP server's tool handler reads `extra.requestInfo.headers` (provided by the SDK's `RequestHandlerExtra` argument) to identify the calling agent.
+
+##### Per-spawn `.mcp.json`
+
+When `cli/start.ts:1102` (or `recipe-runner.ts`) spawns an agent, `writeMcpJson` in `agent-clis/shared.ts:58-79` writes a `.mcp.json` into the agent's working directory. v1.0 extends this to include workspace-specific headers:
+
+```json
+{
+  "mcpServers": {
+    "clawdevbox": {
+      "type": "http",
+      "url": "http://127.0.0.1:PORT/mcp",
+      "headers": {
+        "Authorization": "Bearer <secret>",
+        "X-Clawdevbox-Workspace-Id": "ws_abc_1234",
+        "X-Clawdevbox-Recipe-Instance-Id": "recipe_inst_xyz_789",
+        "X-Clawdevbox-Project-Dir": "/path/to/source"
+      },
+      "tools": ["*"]
+    }
+  }
+}
+```
+
+The agent CLI (Claude Code, Copilot CLI, etc.) forwards these headers on every MCP request. The headers' values are baked into that particular agent's `.mcp.json` at spawn time — different agent spawns see different headers.
+
+##### Resolution chain (server-side)
 
 ```
 1. Argument override:        paths.get({ workspace_id: "ws_..." })  ← rare; for cross-workspace lookups
        ↓ if absent:
-2. Env var:                  CLAWDEVBOX_WORKSPACE_ID
+2. HTTP header:              X-Clawdevbox-Workspace-Id
+                             (read via extra.requestInfo.headers['x-clawdevbox-workspace-id'])
+       ↓ if absent (stdio mode, no HTTP headers available):
+3. Env var:                  process.env.CLAWDEVBOX_WORKSPACE_ID
+                             (correct in stdio mode because the server is the agent's child process)
        ↓ if unset:
-3. Project-dir match:        find workspace whose `path` equals CLAWDEVBOX_PROJECT_DIR
-                             (CLAWDEVBOX_PROJECT_DIR defaults to MCP-server cwd at startup)
+4. Project-dir match:        find workspace whose `path` equals CLAWDEVBOX_PROJECT_DIR
+                             (or X-Clawdevbox-Project-Dir header in HTTP mode)
        ↓ if no match:
-4. Structured error:         NO_TARGET_WORKSPACE — agent should prompt user
+5. Structured error:         NO_TARGET_WORKSPACE — agent should prompt user
                              to either `clawdevbox workspace create` or `cd` into a
                              registered workspace's project_dir
 ```
 
-Steps 1–3 cover essentially every real call. The env-var path (step 2) is the most common: `cli/start.ts:1095` injects `CLAWDEVBOX_WORKSPACE_ID` into the spawned agent process at the moment the user runs `clawdevbox start`, and `recipe-runner.ts:159,212` does the same when a recipe spawns a child session. By the time the agent's first MCP tool call runs, `process.env.CLAWDEVBOX_WORKSPACE_ID` is already set.
+The HTTP-header path (step 2) is the dominant case in HTTP mode (`clawdevbox start`). Step 3 (env var) is the dominant case in stdio mode (`clawdevbox mcp` spawned as agent's child). The two transports use the same code path; the resolver simply prefers the header when present.
 
-The project-dir match (step 3) covers the "long-running MCP server with no spawned agent" case — e.g., when an external client connects to the MCP server directly. The server resolves `CLAWDEVBOX_PROJECT_DIR` (defaults to its cwd) and looks up which registered workspace lives there.
+##### Shared resolver
+
+A new helper `mcp-server/src/tools/resolve-context.ts` exports:
+
+```typescript
+export interface WorkspaceContext {
+  workspaceId: string;
+  projectDir: string;
+  recipeInstanceId: string | null;
+  source: 'arg' | 'header' | 'env' | 'cwd';
+}
+
+export function resolveWorkspaceContext(
+  extra: RequestHandlerExtra,
+  argsWorkspaceId?: string,
+): WorkspaceContext | { error: StructuredError };
+```
+
+Every tool that today reads `process.env.CLAWDEVBOX_WORKSPACE_ID` directly (`recipe.done`, `recipe.instance_info`, `artifact.*`) **must** be migrated to use `resolveWorkspaceContext`. This fixes a pre-existing latent bug in those tools — they currently fail in HTTP mode when more than one agent shares the server, because they read the server's startup env regardless of who's calling.
+
+##### Verification
+
+Validated empirically (test in session-state):
+- Started an HTTP MCP server in one process
+- Made tool calls from two different "agents" with different `X-Clawdevbox-Workspace-Id` headers
+- Confirmed each call's tool handler saw the calling agent's header via `extra.requestInfo.headers`
+- Confirmed the SDK does NOT pollute or share header state across calls — each request is independent
 
 #### Tool signature
 
@@ -1274,7 +1332,10 @@ No auto-migration in v1.0.
 
 | Item | Size |
 |---|---|
-| `paths.get()` MCP tool — discovers workspace + vault paths from chain | ~80 LOC |
+| `mcp-server/src/context-resolver.ts` — shared `resolveWorkspaceContext()` helper implementing the 5-step chain (arg → header → env → cwd → error) | ~80 LOC |
+| `paths.get()` MCP tool — uses `resolveWorkspaceContext`, returns workspace + all vault tier paths | ~80 LOC |
+| **Migrate `recipe.done`, `recipe.instance_info`, `artifact.*` from `process.env` to `resolveWorkspaceContext`** — fixes pre-existing latent bug in HTTP mode | ~40 LOC |
+| `agent-clis/shared.ts` `writeMcpJson` — add `X-Clawdevbox-Workspace-Id`, `X-Clawdevbox-Recipe-Instance-Id`, `X-Clawdevbox-Project-Dir` headers to per-spawn `.mcp.json` | ~20 LOC |
 | `vault.search --scope` extension + Orama index of workspace memory + personal vault memory | ~80 LOC |
 | Workspace + personal vault file-watcher → Orama incremental updates | ~50 LOC |
 | Wikilink slug resolver + tier-closeness conflict | ~30 LOC |
@@ -1284,9 +1345,11 @@ No auto-migration in v1.0.
 | New `memory-vault` skill | ~250 lines markdown |
 | `dev-buddy` IDENTITY/SOUL/STANDING_ORDERS/MEMORY-TEMPLATE updates | ~60 lines markdown |
 | `onboard-project` migration-warning step | ~30 LOC |
-| Tests (paths.get, wikilink resolver, scope filter, auto-init) | ~120 LOC |
+| Tests (resolve-context all 5 paths, paths.get, wikilink resolver, scope filter, auto-init, header-based workspace resolution) | ~160 LOC |
 
-**Net code: ~500 LOC. Net markdown: ~1,310 lines.**
+**Net code: ~680 LOC. Net markdown: ~1,310 lines.**
+
+The +180 LOC bump over the prior estimate (~500 LOC → ~680 LOC) is for the shared resolver, header injection, and migration of existing tools that were silently relying on broken env-var resolution. This change benefits the codebase beyond the team-vault scope: any future tool that needs to know the calling workspace can use `resolveWorkspaceContext` correctly in both HTTP and stdio modes.
 
 ---
 
