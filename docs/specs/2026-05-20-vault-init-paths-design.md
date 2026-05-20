@@ -74,8 +74,45 @@ Prompt: "Where should your personal vault live?" with choices:
 
 Logic for the chosen path:
 1. If path exists and is a git repo → use as-is, detect remote via `git remote get-url origin`
-2. If path exists but not a git repo → `git init` + `git add -A` + `git commit -m "init personal vault"`
-3. If path doesn't exist → create dir + `git init` + seed with empty `vault.yaml` + commit
+2. If path exists but not a git repo → scaffold + `git init` + `git add -A` + `git commit -m "init personal vault"`
+3. If path doesn't exist → create dir + scaffold + `git init` + commit
+
+**Scaffolding** (applied to any new or empty vault to make it a proper marketplace/plugin):
+
+```
+<vault-root>/
+├── vault.yaml              # id, title, kind
+├── .claude-plugin/
+│   └── plugin.json         # minimal manifest so agent CLI treats it as a plugin
+├── skills/
+├── agents/
+├── recipes/
+├── triggers/
+├── memory/
+└── README.md               # brief description
+```
+
+Minimal `vault.yaml`:
+```yaml
+id: personal
+title: Personal Vault
+description: Personal knowledge, skills, and agents
+tier_label: personal
+```
+
+Minimal `.claude-plugin/plugin.json`:
+```json
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "<vault-id>",
+  "version": "1.0.0",
+  "description": "<vault title> — clawdevbox vault",
+  "author": { "name": "<user>" },
+  "license": "UNLICENSED"
+}
+```
+
+This ensures every vault is immediately recognizable as both a clawdevbox vault (via `vault.yaml`) and a valid agent CLI plugin (via `.claude-plugin/plugin.json`).
 
 The personal vault entry always has `kind: "personal"`.
 
@@ -96,8 +133,9 @@ Prompt: "Do you have a team vault? Enter a git URL or local folder path, or pres
 1. Validate path exists and is a directory
 2. Check if git repo: `git -C <path> rev-parse --is-inside-work-tree`
    - If yes: read remote via `git -C <path> remote get-url origin` (may be null)
-   - If no: `git init` + `git add -A` + `git commit -m "init team vault"`
-3. Derive `id` from folder basename
+   - If no: scaffold (same structure as personal vault but with team-appropriate vault.yaml) + `git init` + `git add -A` + `git commit -m "init team vault"`
+3. If git repo but missing `vault.yaml` or `.claude-plugin/plugin.json`: scaffold the missing pieces, commit
+4. Derive `id` from folder basename
 4. If it has a remote → `kind: "team"`, `remote: <url>`
 5. If no remote → `kind: "team"`, `remote: null`
 6. Read `vault.yaml` → walk parent chain (same as git URL case)
