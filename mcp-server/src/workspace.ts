@@ -499,6 +499,41 @@ export async function reloadTypeRegistries(ws: Workspace): Promise<void> {
       });
     }
 
+  }
+
+  // ---- Load vaults as plugin sources ----------------------------------------
+  // Vaults have `.claude-plugin/plugin.json` and are valid plugin dirs. Load
+  // them so skill.list/read, recipe.list, trigger types, etc. surface vault
+  // content through the standard scope system (scope = `plugin:<vault-id>`).
+  try {
+    const cfgPath = join(ws.globalDir, 'config.json');
+    if (existsSync(cfgPath)) {
+      const cfgRaw = JSON.parse(readFileSync(cfgPath, 'utf8'));
+      const vaults: Array<{ id: string; path: string }> = Array.isArray(cfgRaw?.vaults) ? cfgRaw.vaults : [];
+      for (const vault of vaults) {
+        if (!vault.id || !vault.path || !existsSync(vault.path)) continue;
+        if (ws.plugins.has(vault.id)) continue; // don't shadow installed plugins
+        try {
+          const loaded = await loadPluginFromDir(vault.path);
+          ws.plugins.set(vault.id, {
+            id: vault.id,
+            dir: vault.path,
+            manifest: loaded.manifest,
+            capabilities: loaded.capabilities,
+            agencyJson: loaded.agencyJson,
+            loadErrors: loaded.loadErrors,
+            status: 'enabled',
+          });
+        } catch {
+          // Vault missing manifest or malformed — skip silently.
+        }
+      }
+    }
+  } catch {
+    // Config read failure — skip vault loading gracefully.
+  }
+
+  {
     // Second pass — build the trigger-type registry. We do this after the
     // plugin map is fully populated so collision detection can deterministically
     // pick a winner by plugin-id sort order (matches the recipe shadowing rule).
