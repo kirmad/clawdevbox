@@ -307,7 +307,8 @@ export async function runVaultSetup(globalDir: string): Promise<VaultSetupResult
 
   const teamSource = String(teamInput).trim();
   if (teamSource.length > 0) {
-    const isUrl = teamSource.includes(':') && (teamSource.includes('git') || teamSource.includes('http'));
+    // Detect git URLs vs local paths. Windows drive letters (C:\...) are NOT URLs.
+    const isUrl = /^(https?:\/\/|git@|ssh:\/\/)/.test(teamSource);
     const teamId = deriveVaultIdFromSource(teamSource);
 
     if (isUrl) {
