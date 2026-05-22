@@ -69,17 +69,15 @@ function registerAllBuiltinEntries(ws: Workspace): void {
 }
 
 /**
- * Create a fresh McpServer for a session. Clears and re-populates the registry
- * so each session gets a clean tool set. The meta-tools layer reads from the
- * registry to expose list_tools, learn_tool, run_tool.
+ * Create a fresh McpServer for a session. Re-registers built-in entries
+ * (idempotent — defineTool skips duplicates or overwrites). Hosted tools
+ * persist in the registry from the initial `buildServer()` discovery.
  *
- * Hosted-tool discovery is expensive (plugin tree traversal + module loads),
- * so it MUST be done once via `buildServer` at startup. Per-session servers
- * re-register built-in entries only; hosted tools persist in the registry
- * from the initial discovery.
+ * NOTE: We do NOT clearRegistry() here because that would wipe hosted/plugin
+ * tools discovered at startup. The registry is a shared singleton; builtins
+ * are re-registered to pick up any ws-dependent closures.
  */
 export function createSessionServer(ws: Workspace): McpServer {
-  clearRegistry();
   registerAllBuiltinEntries(ws);
 
   const server = new McpServer(

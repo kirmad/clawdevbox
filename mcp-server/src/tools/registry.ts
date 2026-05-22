@@ -35,13 +35,11 @@ export interface ToolEntry {
 const toolRegistry = new Map<string, ToolEntry>();
 
 /**
- * Register a tool in the global registry. Throws if a tool with the same name
- * is already registered.
+ * Register a tool in the global registry. If a tool with the same name already
+ * exists, it is silently overwritten (allows per-session re-registration of
+ * builtins without clearing the registry).
  */
 export function defineTool(entry: ToolEntry): void {
-  if (toolRegistry.has(entry.name)) {
-    throw new Error(`Tool "${entry.name}" is already registered`);
-  }
   toolRegistry.set(entry.name, entry);
 }
 

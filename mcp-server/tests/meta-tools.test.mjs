@@ -39,8 +39,8 @@ test('registry: defineTool stores entries and getRegistry returns them', async (
   clearRegistry();
 });
 
-test('registry: defineTool rejects duplicate names', async () => {
-  const { defineTool, clearRegistry } = await import('../src/tools/registry.ts');
+test('registry: defineTool allows re-registration (idempotent)', async () => {
+  const { defineTool, clearRegistry, getRegistry } = await import('../src/tools/registry.ts');
   const { z } = await import('zod');
   clearRegistry();
 
@@ -52,7 +52,10 @@ test('registry: defineTool rejects duplicate names', async () => {
     source: 'builtin',
   };
   defineTool(entry);
-  assert.throws(() => defineTool(entry), /already registered/);
+  // Re-registering with same name overwrites silently (no throw)
+  const entry2 = { ...entry, description: 'Second' };
+  defineTool(entry2);
+  assert.equal(getRegistry().get('test.dup').description, 'Second');
   clearRegistry();
 });
 
