@@ -164,7 +164,7 @@ class HarnessServer {
   }
 
   async createWorkspace(sessionId, name) {
-    const res = await this.callTool(sessionId, 'workspace.create', { name });
+    const res = await this.callTool(sessionId, 'run_tool', { tool: 'workspace.create', args: { name } });
     if (!res.result?.structuredContent) {
       throw new Error('workspace.create failed: ' + JSON.stringify(res));
     }
@@ -200,12 +200,12 @@ test('HTTP MCP: per-request X-Clawdevbox-Workspace-Id header drives recipe.done 
     assert.notEqual(wsA.id, wsB.id);
 
     // --- Agent A: artifact.add with header X-Clawdevbox-Workspace-Id: <wsA.id> ---
-    const addA = await h.callTool(sessionId, 'artifact.add', {
+    const addA = await h.callTool(sessionId, 'run_tool', { tool: 'artifact.add', args: {
       id: 'art-from-agent-a',
       type: 'markdown',
       title: 'Agent A artifact',
       files: { 'content.md': '# Hello from A' },
-    }, { 'X-Clawdevbox-Workspace-Id': wsA.id });
+    } }, { 'X-Clawdevbox-Workspace-Id': wsA.id });
     assert.ok(addA.result, `artifact.add for A should succeed; got ${JSON.stringify(addA)}`);
     assert.equal(addA.result.isError, undefined, 'add should not be an error');
     assert.equal(
@@ -215,12 +215,12 @@ test('HTTP MCP: per-request X-Clawdevbox-Workspace-Id header drives recipe.done 
     );
 
     // --- Agent B: artifact.add with a different header ---
-    const addB = await h.callTool(sessionId, 'artifact.add', {
+    const addB = await h.callTool(sessionId, 'run_tool', { tool: 'artifact.add', args: {
       id: 'art-from-agent-b',
       type: 'markdown',
       title: 'Agent B artifact',
       files: { 'content.md': '# Hello from B' },
-    }, { 'X-Clawdevbox-Workspace-Id': wsB.id });
+    } }, { 'X-Clawdevbox-Workspace-Id': wsB.id });
     assert.ok(addB.result);
     assert.equal(
       addB.result.structuredContent?.workspace_id,
@@ -229,12 +229,12 @@ test('HTTP MCP: per-request X-Clawdevbox-Workspace-Id header drives recipe.done 
     );
 
     // --- artifact.list per workspace shows ONLY that workspace's artifacts ---
-    const listA = await h.callTool(sessionId, 'artifact.list', { workspace_id: wsA.id });
+    const listA = await h.callTool(sessionId, 'run_tool', { tool: 'artifact.list', args: { workspace_id: wsA.id } });
     const idsA = listA.result.structuredContent?.artifacts?.map((a) => a.id) ?? [];
     assert.ok(idsA.includes('art-from-agent-a'), 'workspace A should contain agent-A artifact');
     assert.ok(!idsA.includes('art-from-agent-b'), 'workspace A should NOT contain agent-B artifact');
 
-    const listB = await h.callTool(sessionId, 'artifact.list', { workspace_id: wsB.id });
+    const listB = await h.callTool(sessionId, 'run_tool', { tool: 'artifact.list', args: { workspace_id: wsB.id } });
     const idsB = listB.result.structuredContent?.artifacts?.map((a) => a.id) ?? [];
     assert.ok(idsB.includes('art-from-agent-b'), 'workspace B should contain agent-B artifact');
     assert.ok(!idsB.includes('art-from-agent-a'), 'workspace B should NOT contain agent-A artifact');
@@ -245,11 +245,11 @@ test('HTTP MCP: per-request X-Clawdevbox-Workspace-Id header drives recipe.done 
     //     exist. (Before the fix, this would either silently pollute one of
     //     the real workspaces or err with that same code — but the fact that
     //     header-based calls work proves resolution actually uses the header.)
-    const noHeader = await h.callTool(sessionId, 'artifact.add', {
+    const noHeader = await h.callTool(sessionId, 'run_tool', { tool: 'artifact.add', args: {
       id: 'art-no-header',
       type: 'markdown',
       title: 'should fail',
-    }, {});
+    } }, {});
     // Should error because env points at non-existent workspace
     assert.equal(
       noHeader.result?.isError,

@@ -113,12 +113,12 @@ async function withHarness(fn) {
 
 test('trigger.create_template happy path writes template + script and reloads registry', async () => {
   await withHarness(async (h) => {
-    const res = await h.call('trigger.create_template', {
+    const res = await h.call('run_tool', { tool: 'trigger.create_template', args: {
       id: 'local.demo', scope: 'project', runtime: 'tsx',
       description: 'demo trigger',
       script: '// demo script\n',
       parameters: [{ name: 'repo', type: 'string', required: true }],
-    });
+    } });
     assert.ok(!res.isError, JSON.stringify(res));
     assert.equal(res.structuredContent.id, 'local.demo');
     assert.equal(res.structuredContent.scope, 'project');
@@ -126,7 +126,7 @@ test('trigger.create_template happy path writes template + script and reloads re
     const scriptPath = join(h.callerProjectDir, '.clawdevbox', 'trigger-types', 'local.demo', 'trigger.ts');
     assert.ok(existsSync(tplPath));
     assert.ok(existsSync(scriptPath));
-    const list = await h.call('trigger.list_types', { search: 'local.demo' });
+    const list = await h.call('run_tool', { tool: 'trigger.list_types', args: { search: 'local.demo' } });
     const ids = list.structuredContent.trigger_types.map((t) => t.id);
     assert.ok(ids.includes('local.demo'));
   });
@@ -134,9 +134,9 @@ test('trigger.create_template happy path writes template + script and reloads re
 
 test('trigger.create_template rejects non-local. id with VALIDATION_FAILED', async () => {
   await withHarness(async (h) => {
-    const res = await h.call('trigger.create_template', {
+    const res = await h.call('run_tool', { tool: 'trigger.create_template', args: {
       id: 'demo', scope: 'project', runtime: 'tsx', description: 'x', script: '// x\n',
-    });
+    } });
     assert.equal(res.isError, true);
     assert.equal(res.structuredContent.code, 'VALIDATION_FAILED');
   });
@@ -144,15 +144,15 @@ test('trigger.create_template rejects non-local. id with VALIDATION_FAILED', asy
 
 test('trigger.create_template rejects neither/both script + script_file with INVALID_REQUEST', async () => {
   await withHarness(async (h) => {
-    const neither = await h.call('trigger.create_template', {
+    const neither = await h.call('run_tool', { tool: 'trigger.create_template', args: {
       id: 'local.x', scope: 'project', runtime: 'tsx', description: 'x',
-    });
+    } });
     assert.equal(neither.isError, true);
     assert.equal(neither.structuredContent.code, 'INVALID_REQUEST');
-    const both = await h.call('trigger.create_template', {
+    const both = await h.call('run_tool', { tool: 'trigger.create_template', args: {
       id: 'local.x', scope: 'project', runtime: 'tsx', description: 'x',
       script: '// x\n', script_file: '.clawdevbox/trigger-types/whatever.ts',
-    });
+    } });
     assert.equal(both.isError, true);
     assert.equal(both.structuredContent.code, 'INVALID_REQUEST');
   });
@@ -160,13 +160,13 @@ test('trigger.create_template rejects neither/both script + script_file with INV
 
 test('trigger.create_template rejects double-create with TRIGGER_TEMPLATE_EXISTS', async () => {
   await withHarness(async (h) => {
-    const r1 = await h.call('trigger.create_template', {
+    const r1 = await h.call('run_tool', { tool: 'trigger.create_template', args: {
       id: 'local.dup', scope: 'project', runtime: 'tsx', description: 'x', script: '// x\n',
-    });
+    } });
     assert.ok(!r1.isError);
-    const r2 = await h.call('trigger.create_template', {
+    const r2 = await h.call('run_tool', { tool: 'trigger.create_template', args: {
       id: 'local.dup', scope: 'project', runtime: 'tsx', description: 'x', script: '// y\n',
-    });
+    } });
     assert.equal(r2.isError, true);
     assert.equal(r2.structuredContent.code, 'TRIGGER_TEMPLATE_EXISTS');
   });
@@ -174,18 +174,18 @@ test('trigger.create_template rejects double-create with TRIGGER_TEMPLATE_EXISTS
 
 test('trigger.list_templates returns only agent-authored types', async () => {
   await withHarness(async (h) => {
-    await h.call('trigger.create_template', {
+    await h.call('run_tool', { tool: 'trigger.create_template', args: {
       id: 'local.alpha', scope: 'project', runtime: 'tsx',
       description: 'a', script: '// a\n',
-    });
-    await h.call('trigger.create_template', {
+    } });
+    await h.call('run_tool', { tool: 'trigger.create_template', args: {
       id: 'local.beta', scope: 'global', runtime: 'tsx',
       description: 'b', script: '// b\n',
-    });
-    const list = await h.call('trigger.list_templates', {});
+    } });
+    const list = await h.call('run_tool', { tool: 'trigger.list_templates', args: {} });
     const ids = list.structuredContent.trigger_types.map((t) => t.id).sort();
     assert.deepEqual(ids, ['local.alpha', 'local.beta']);
-    const filtered = await h.call('trigger.list_templates', { scope: 'project' });
+    const filtered = await h.call('run_tool', { tool: 'trigger.list_templates', args: { scope: 'project' } });
     const fids = filtered.structuredContent.trigger_types.map((t) => t.id);
     assert.deepEqual(fids, ['local.alpha']);
   });
@@ -193,13 +193,13 @@ test('trigger.list_templates returns only agent-authored types', async () => {
 
 test('trigger.update_template replaces script content and bumps description', async () => {
   await withHarness(async (h) => {
-    await h.call('trigger.create_template', {
+    await h.call('run_tool', { tool: 'trigger.create_template', args: {
       id: 'local.upd', scope: 'project', runtime: 'tsx',
       description: 'first', script: '// v1\n',
-    });
-    const upd = await h.call('trigger.update_template', {
+    } });
+    const upd = await h.call('run_tool', { tool: 'trigger.update_template', args: {
       id: 'local.upd', description: 'second', script: '// v2\n',
-    });
+    } });
     assert.ok(!upd.isError, JSON.stringify(upd));
     const tplPath = join(h.callerProjectDir, '.clawdevbox', 'trigger-types', 'local.upd', 'template.yaml');
     const scriptPath = join(h.callerProjectDir, '.clawdevbox', 'trigger-types', 'local.upd', 'trigger.ts');
@@ -210,10 +210,10 @@ test('trigger.update_template replaces script content and bumps description', as
 
 test('trigger.update_template rejects no-changes call with NO_CHANGES', async () => {
   await withHarness(async (h) => {
-    await h.call('trigger.create_template', {
+    await h.call('run_tool', { tool: 'trigger.create_template', args: {
       id: 'local.nopu', scope: 'project', runtime: 'tsx', description: 'x', script: '// x\n',
-    });
-    const r = await h.call('trigger.update_template', { id: 'local.nopu' });
+    } });
+    const r = await h.call('run_tool', { tool: 'trigger.update_template', args: { id: 'local.nopu' } });
     assert.equal(r.isError, true);
     assert.equal(r.structuredContent.code, 'NO_CHANGES');
   });
@@ -221,7 +221,7 @@ test('trigger.update_template rejects no-changes call with NO_CHANGES', async ()
 
 test('trigger.update_template returns TRIGGER_TEMPLATE_NOT_FOUND for missing id', async () => {
   await withHarness(async (h) => {
-    const r = await h.call('trigger.update_template', { id: 'local.absent', description: 'x' });
+    const r = await h.call('run_tool', { tool: 'trigger.update_template', args: { id: 'local.absent', description: 'x' } });
     assert.equal(r.isError, true);
     assert.equal(r.structuredContent.code, 'TRIGGER_TEMPLATE_NOT_FOUND');
   });
@@ -229,32 +229,32 @@ test('trigger.update_template returns TRIGGER_TEMPLATE_NOT_FOUND for missing id'
 
 test('trigger.delete_template removes the directory and reloads registry', async () => {
   await withHarness(async (h) => {
-    await h.call('trigger.create_template', {
+    await h.call('run_tool', { tool: 'trigger.create_template', args: {
       id: 'local.del', scope: 'project', runtime: 'tsx',
       description: 'x', script: '// x\n',
-    });
+    } });
     const dir = join(h.callerProjectDir, '.clawdevbox', 'trigger-types', 'local.del');
     assert.ok(existsSync(dir));
-    const res = await h.call('trigger.delete_template', { id: 'local.del' });
+    const res = await h.call('run_tool', { tool: 'trigger.delete_template', args: { id: 'local.del' } });
     assert.ok(!res.isError, JSON.stringify(res));
     assert.equal(existsSync(dir), false);
-    const list = await h.call('trigger.list_types', { search: 'local.del' });
+    const list = await h.call('run_tool', { tool: 'trigger.list_types', args: { search: 'local.del' } });
     assert.equal(list.structuredContent.trigger_types.length, 0);
   });
 });
 
 test('trigger.delete_template refuses while a registered instance still references it', async () => {
   await withHarness(async (h) => {
-    await h.call('trigger.create_template', {
+    await h.call('run_tool', { tool: 'trigger.create_template', args: {
       id: 'local.busy', scope: 'project', runtime: 'tsx',
       description: 'x', script: '// x\n',
       parameters: [{ name: 'repo', type: 'string', required: true }],
-    });
-    const reg = await h.call('trigger.register', {
+    } });
+    const reg = await h.call('run_tool', { tool: 'trigger.register', args: {
       type_id: 'local.busy', params: { repo: 'svc' },
-    });
+    } });
     assert.ok(!reg.isError);
-    const del = await h.call('trigger.delete_template', { id: 'local.busy' });
+    const del = await h.call('run_tool', { tool: 'trigger.delete_template', args: { id: 'local.busy' } });
     assert.equal(del.isError, true);
     assert.equal(del.structuredContent.code, 'TRIGGER_TEMPLATE_IN_USE');
     assert.ok(Array.isArray(del.structuredContent.registered_ids));
@@ -263,14 +263,14 @@ test('trigger.delete_template refuses while a registered instance still referenc
 
 test('trigger.delete_template refuses to delete a plugin-shipped TYPE', async () => {
   await withHarness(async (h) => {
-    const res = await h.call('trigger.delete_template', { id: 'ado.new-pr-watcher' });
+    const res = await h.call('run_tool', { tool: 'trigger.delete_template', args: { id: 'ado.new-pr-watcher' } });
     assert.equal(res.isError, true);
     assert.equal(res.structuredContent.code, 'TRIGGER_TEMPLATE_NOT_AUTHORED');
   });
 });
 test('trigger.register XOR(type_id|script|script_file) — neither is INVALID_REQUEST', async () => {
   await withHarness(async (h) => {
-    const r = await h.call('trigger.register', { params: {} });
+    const r = await h.call('run_tool', { tool: 'trigger.register', args: { params: {} } });
     assert.equal(r.isError, true);
     assert.equal(r.structuredContent.code, 'INVALID_REQUEST');
   });
@@ -278,9 +278,9 @@ test('trigger.register XOR(type_id|script|script_file) — neither is INVALID_RE
 
 test('trigger.register with inline script writes _oneoff template + once:true cron:false defaults', async () => {
   await withHarness(async (h) => {
-    const r = await h.call('trigger.register', {
+    const r = await h.call('run_tool', { tool: 'trigger.register', args: {
       script: '// inline\n', runtime: 'tsx',
-    });
+    } });
     assert.ok(!r.isError, JSON.stringify(r));
     assert.equal(r.structuredContent.adhoc, true);
     assert.match(r.structuredContent.template_id, /^local\.oneoff\./);
@@ -294,7 +294,7 @@ test('trigger.register with inline script writes _oneoff template + once:true cr
 
 test('trigger.register with script but no runtime fails RUNTIME_REQUIRED', async () => {
   await withHarness(async (h) => {
-    const r = await h.call('trigger.register', { script: '// x\n' });
+    const r = await h.call('run_tool', { tool: 'trigger.register', args: { script: '// x\n' } });
     assert.equal(r.isError, true);
     assert.equal(r.structuredContent.code, 'RUNTIME_REQUIRED');
   });
@@ -302,9 +302,9 @@ test('trigger.register with script but no runtime fails RUNTIME_REQUIRED', async
 
 test('trigger.register with subscriber_thread_id sets binds_callback_to thread_resume in the auto-template', async () => {
   await withHarness(async (h) => {
-    const r = await h.call('trigger.register', {
+    const r = await h.call('run_tool', { tool: 'trigger.register', args: {
       script: '// hot\n', runtime: 'tsx', subscriber_thread_id: 'thr_abc',
-    });
+    } });
     assert.ok(!r.isError);
     const tplPath = join(h.callerProjectDir, '.clawdevbox', 'trigger-types', '_oneoff',
       r.structuredContent.template_id, 'template.yaml');
@@ -314,11 +314,11 @@ test('trigger.register with subscriber_thread_id sets binds_callback_to thread_r
 
 test('trigger.unregister removes _oneoff dir for one-off registrations', async () => {
   await withHarness(async (h) => {
-    const reg = await h.call('trigger.register', { script: '// once\n', runtime: 'tsx' });
+    const reg = await h.call('run_tool', { tool: 'trigger.register', args: { script: '// once\n', runtime: 'tsx' } });
     assert.ok(!reg.isError);
     const dir = join(h.callerProjectDir, '.clawdevbox', 'trigger-types', '_oneoff', reg.structuredContent.template_id);
     assert.ok(existsSync(dir));
-    const un = await h.call('trigger.unregister', { id: reg.structuredContent.id });
+    const un = await h.call('run_tool', { tool: 'trigger.unregister', args: { id: reg.structuredContent.id } });
     assert.ok(!un.isError);
     assert.equal(existsSync(dir), false);
   });
@@ -340,7 +340,7 @@ await fetch(env.callback_url, {
 });
 process.stdout.write(JSON.stringify({ state: { ok: true } }));
 `;
-    const r = await h.call('trigger.test', { script, runtime: 'tsx', timeout_ms: 30000 });
+    const r = await h.call('run_tool', { tool: 'trigger.test', args: { script, runtime: 'tsx', timeout_ms: 30000 } });
     assert.ok(!r.isError, JSON.stringify(r));
     assert.equal(r.structuredContent.exit_code, 0);
     assert.equal(r.structuredContent.timed_out, false);
@@ -362,11 +362,11 @@ async function readStdin() {
 const env = JSON.parse(await readStdin());
 process.stdout.write(JSON.stringify({ callback: { body: { prompt: 'tpl-test' } } }));
 `;
-    await h.call('trigger.create_template', {
+    await h.call('run_tool', { tool: 'trigger.create_template', args: {
       id: 'local.tpl-test', scope: 'project', runtime: 'tsx',
       description: 'tpl', script,
-    });
-    const r = await h.call('trigger.test', { template_id: 'local.tpl-test', timeout_ms: 30000 });
+    } });
+    const r = await h.call('run_tool', { tool: 'trigger.test', args: { template_id: 'local.tpl-test', timeout_ms: 30000 } });
     assert.ok(!r.isError, JSON.stringify(r));
     assert.equal(r.structuredContent.exit_code, 0);
     assert.equal(r.structuredContent.callbacks.length, 1);
@@ -386,16 +386,16 @@ async function readStdin() {
 const env = JSON.parse(await readStdin());
 process.stdout.write(JSON.stringify({ callback: { body: { prompt: 'reg', state: env.state } } }));
 `;
-    await h.call('trigger.create_template', {
+    await h.call('run_tool', { tool: 'trigger.create_template', args: {
       id: 'local.regtest', scope: 'project', runtime: 'tsx',
       description: 'reg', script,
       parameters: [{ name: 'repo', type: 'string', required: true }],
-    });
-    const reg = await h.call('trigger.register', {
+    } });
+    const reg = await h.call('run_tool', { tool: 'trigger.register', args: {
       type_id: 'local.regtest', params: { repo: 'svc' }, cron: false,
-    });
+    } });
     assert.ok(!reg.isError);
-    const r = await h.call('trigger.test', { id: reg.structuredContent.id, timeout_ms: 30000 });
+    const r = await h.call('run_tool', { tool: 'trigger.test', args: { id: reg.structuredContent.id, timeout_ms: 30000 } });
     assert.ok(!r.isError, JSON.stringify(r));
     assert.equal(r.structuredContent.callbacks[0].body.state.repo, 'svc');
   });
@@ -403,7 +403,7 @@ process.stdout.write(JSON.stringify({ callback: { body: { prompt: 'reg', state: 
 
 test('trigger.test enforces XOR(id|template_id|script)', async () => {
   await withHarness(async (h) => {
-    const r = await h.call('trigger.test', {});
+    const r = await h.call('run_tool', { tool: 'trigger.test', args: {} });
     assert.equal(r.isError, true);
     assert.equal(r.structuredContent.code, 'INVALID_REQUEST');
   });
@@ -412,7 +412,7 @@ test('trigger.test enforces XOR(id|template_id|script)', async () => {
 test('trigger.test honors timeout_ms and reports timed_out', async () => {
   await withHarness(async (h) => {
     const script = `await new Promise(() => {});`;
-    const r = await h.call('trigger.test', { script, runtime: 'tsx', timeout_ms: 800 });
+    const r = await h.call('run_tool', { tool: 'trigger.test', args: { script, runtime: 'tsx', timeout_ms: 800 } });
     assert.ok(!r.isError, JSON.stringify(r));
     assert.equal(r.structuredContent.timed_out, true);
   });

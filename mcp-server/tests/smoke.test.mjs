@@ -172,16 +172,22 @@ test('clawdevbox MCP server smoke', async (t) => {
 
   await h.init();
 
-  await t.test('tools/list registers the full Clawdevbox catalog', async () => {
+  await t.test('tools/list exposes exactly the 3 meta-tools', async () => {
     const tools = await h.listTools();
-    const names = tools.map((x) => x.name);
-    assert.ok(tools.length >= 30, `expected >=30 tools, got ${tools.length}`);
+    const names = tools.map((x) => x.name).sort();
+    assert.deepEqual(names, ['learn_tool', 'list_tools', 'run_tool']);
+  });
+
+  await t.test('list_tools returns the full Clawdevbox catalog', async () => {
+    const res = await h.call('list_tools', {});
+    const parsed = JSON.parse(res.content[0].text);
+    const names = parsed.tools.map((t) => t.name);
+    assert.ok(parsed.count >= 30, `expected >=30 tools, got ${parsed.count}`);
     // Spot-check families
     for (const n of [
       'recipe.list', 'recipe.read', 'recipe.upsert', 'recipe.delete',
       'recipe.update_steps', 'recipe.steps.update_status',
       'skill.list', 'skill.read', 'skill.upsert', 'skill.delete',
-      // New trigger surface (spec §6.1) — types + registered instances split.
       'trigger.list_types', 'trigger.list_registered', 'trigger.register',
       'trigger.unregister', 'trigger.update_params', 'trigger.enable',
       'trigger.disable', 'trigger.fire',
@@ -197,7 +203,7 @@ test('clawdevbox MCP server smoke', async (t) => {
   });
 
   await t.test("recipe.list scope='plugin:ado' returns the two plugin recipes", async () => {
-    const res = await h.call('recipe.list', { scope: 'plugin:ado' });
+    const res = await h.call('run_tool', { tool: 'recipe.list', args: { scope: 'plugin:ado' } });
     const recipes = res.structuredContent?.recipes ?? [];
     assert.equal(recipes.length, 2);
     assert.ok(recipes.every((r) => r.scope === 'plugin:ado'));
@@ -206,7 +212,7 @@ test('clawdevbox MCP server smoke', async (t) => {
   });
 
   await t.test('shadowing: project upsert overrides plugin read', async () => {
-    const original = await h.call('recipe.read', { id: 'pr-review' });
+    const original = await h.call('run_tool', { tool: 'recipe.read', args: { id: 'pr-review' } });
     assert.equal(original.structuredContent?.scope, 'plugin:ado');
 
     const projectShadow = [
@@ -218,34 +224,34 @@ test('clawdevbox MCP server smoke', async (t) => {
       '  - id: 1',
       '    goal: "shadow step"',
     ].join('\n');
-    const up = await h.call('recipe.upsert', {
+    const up = await h.call('run_tool', { tool: 'recipe.upsert', args: {
       id: 'pr-review',
       scope: 'project',
       source: projectShadow,
-    });
+    } });
     assert.ok(!up.isError, JSON.stringify(up));
 
-    const after = await h.call('recipe.read', { id: 'pr-review' });
+    const after = await h.call('run_tool', { tool: 'recipe.read', args: { id: 'pr-review' } });
     assert.equal(after.structuredContent?.scope, 'project');
     assert.equal(after.structuredContent?.parsed?.name, 'PR Review (shadow)');
   });
 
   await t.test('plugin-scope writes are rejected with PLUGIN_SCOPE_READONLY', async () => {
-    const res = await h.call('recipe.upsert', {
+    const res = await h.call('run_tool', { tool: 'recipe.upsert', args: {
       id: 'foo',
       scope: 'plugin:ado',
       source: 'id: foo\nname: foo\ndescription: x\n',
-    });
+    } });
     assert.equal(res.isError, true);
     assert.equal(res.structuredContent?.code, 'PLUGIN_SCOPE_READONLY');
   });
 
   await t.test('recipe.upsert format=yaml writes <id>.yaml (default)', async () => {
-    const res = await h.call('recipe.upsert', {
+    const res = await h.call('run_tool', { tool: 'recipe.upsert', args: {
       id: 'fmt-yaml',
       scope: 'project',
       source: 'id: fmt-yaml\nname: F\ndescription: d\nsteps:\n  - id: s\n    goal: g\n',
-    });
+    } });
     assert.ok(!res.isError, JSON.stringify(res));
     assert.equal(res.structuredContent?.format, 'yaml');
     assert.ok(String(res.structuredContent?.path ?? '').endsWith('.yaml'));
@@ -255,7 +261,7 @@ test('clawdevbox MCP server smoke', async (t) => {
   });
 
   await t.test('recipe.upsert format=json writes <id>.json', async () => {
-    const res = await h.call('recipe.upsert', {
+    const res = await h.call('run_tool', { tool: 'recipe.upsert', args: {
       id: 'fmt-json',
       scope: 'project',
       source: JSON.stringify({
@@ -265,7 +271,7 @@ test('clawdevbox MCP server smoke', async (t) => {
         steps: [{ id: 's', goal: 'g' }],
       }),
       format: 'json',
-    });
+    } });
     assert.ok(!res.isError, JSON.stringify(res));
     assert.equal(res.structuredContent?.format, 'json');
     assert.ok(String(res.structuredContent?.path ?? '').endsWith('.json'));
@@ -274,18 +280,18 @@ test('clawdevbox MCP server smoke', async (t) => {
     assert.equal(existsSync(join(projDir, '.clawdevbox', 'recipes', 'fmt-json.yaml')), false);
 
     // recipe.read should still resolve it.
-    const read = await h.call('recipe.read', { id: 'fmt-json' });
+    const read = await h.call('run_tool', { tool: 'recipe.read', args: { id: 'fmt-json' } });
     assert.ok(!read.isError, JSON.stringify(read));
     assert.equal(read.structuredContent?.parsed?.id, 'fmt-json');
   });
 
   await t.test('recipe.upsert format toggle removes the sibling file', async () => {
     // Start as yaml.
-    await h.call('recipe.upsert', {
+    await h.call('run_tool', { tool: 'recipe.upsert', args: {
       id: 'fmt-toggle',
       scope: 'project',
       source: 'id: fmt-toggle\nname: T\ndescription: d\nsteps:\n  - id: s\n    goal: g\n',
-    });
+    } });
     const projDir = h.tmpRoot;
     const yamlPath = join(projDir, '.clawdevbox', 'recipes', 'fmt-toggle.yaml');
     const jsonPath = join(projDir, '.clawdevbox', 'recipes', 'fmt-toggle.json');
@@ -293,7 +299,7 @@ test('clawdevbox MCP server smoke', async (t) => {
     assert.equal(existsSync(jsonPath), false);
 
     // Now upsert as json — yaml sibling should disappear.
-    const res = await h.call('recipe.upsert', {
+    const res = await h.call('run_tool', { tool: 'recipe.upsert', args: {
       id: 'fmt-toggle',
       scope: 'project',
       source: JSON.stringify({
@@ -303,7 +309,7 @@ test('clawdevbox MCP server smoke', async (t) => {
         steps: [{ id: 's', goal: 'g' }],
       }),
       format: 'json',
-    });
+    } });
     assert.ok(!res.isError, JSON.stringify(res));
     assert.equal(existsSync(yamlPath), false, 'yaml sibling should be removed');
     assert.ok(existsSync(jsonPath));
@@ -311,7 +317,7 @@ test('clawdevbox MCP server smoke', async (t) => {
   });
 
   await t.test('plugin.list shows the ADO plugin', async () => {
-    const res = await h.call('plugin.list', {});
+    const res = await h.call('run_tool', { tool: 'plugin.list', args: {} });
     const plugins = res.structuredContent?.plugins ?? [];
     const ado = plugins.find((p) => p.id === 'ado');
     assert.ok(ado, 'expected ado plugin to be listed');
@@ -319,7 +325,7 @@ test('clawdevbox MCP server smoke', async (t) => {
   });
 
   await t.test('skill.list shows the ADO skills', async () => {
-    const res = await h.call('skill.list', { scope: 'plugin:ado' });
+    const res = await h.call('run_tool', { tool: 'skill.list', args: { scope: 'plugin:ado' } });
     const skills = res.structuredContent?.skills ?? [];
     assert.equal(skills.length, 2);
     const ids = skills.map((s) => s.id).sort();
@@ -328,11 +334,11 @@ test('clawdevbox MCP server smoke', async (t) => {
 
   await t.test('skill.upsert writes skills/<id>/SKILL.md (directory shape)', async () => {
     const id = 'demo-skill';
-    const res = await h.call('skill.upsert', {
+    const res = await h.call('run_tool', { tool: 'skill.upsert', args: {
       id,
       scope: 'project',
       source: '---\nname: demo-skill\ndescription: a demo\n---\nhello body\n',
-    });
+    } });
     assert.ok(!res.isError, JSON.stringify(res));
     const expected = join(h.tmpRoot, '.clawdevbox', 'skills', id, 'SKILL.md');
     assert.equal(res.structuredContent?.path, expected);
@@ -340,32 +346,32 @@ test('clawdevbox MCP server smoke', async (t) => {
     // Legacy flat file must NOT exist
     assert.equal(existsSync(join(h.tmpRoot, '.clawdevbox', 'skills', `${id}.md`)), false);
     // skill.read returns the same source
-    const read = await h.call('skill.read', { id, scope: 'project' });
+    const read = await h.call('run_tool', { tool: 'skill.read', args: { id, scope: 'project' } });
     assert.ok(!read.isError, JSON.stringify(read));
     assert.match(read.structuredContent?.source ?? '', /hello body/);
   });
 
   await t.test('skill.upsert injects frontmatter.name when missing', async () => {
     const id = 'name-injected';
-    const res = await h.call('skill.upsert', {
+    const res = await h.call('run_tool', { tool: 'skill.upsert', args: {
       id,
       scope: 'project',
       source: '---\ndescription: no name field\n---\nbody\n',
-    });
+    } });
     assert.ok(!res.isError, JSON.stringify(res));
     const fileAt = join(h.tmpRoot, '.clawdevbox', 'skills', id, 'SKILL.md');
     const text = readFileSync(fileAt, 'utf8');
     assert.match(text, /name:\s*name-injected/);
-    const read = await h.call('skill.read', { id, scope: 'project' });
+    const read = await h.call('run_tool', { tool: 'skill.read', args: { id, scope: 'project' } });
     assert.equal(read.structuredContent?.frontmatter?.name, id);
   });
 
   await t.test('skill.upsert rejects mismatched frontmatter.name', async () => {
-    const res = await h.call('skill.upsert', {
+    const res = await h.call('run_tool', { tool: 'skill.upsert', args: {
       id: 'wanted-id',
       scope: 'project',
       source: '---\nname: other-id\ndescription: d\n---\nbody\n',
-    });
+    } });
     assert.equal(res.isError, true);
     assert.equal(res.structuredContent?.code, 'NAME_MISMATCH');
   });
@@ -374,11 +380,11 @@ test('clawdevbox MCP server smoke', async (t) => {
     const id = 'demo-skill';
     const target = join(h.tmpRoot, '.clawdevbox', 'skills', id, 'SKILL.md');
     const before = readFileSync(target, 'utf8');
-    const res = await h.call('skill.upsert', {
+    const res = await h.call('run_tool', { tool: 'skill.upsert', args: {
       id,
       scope: 'project',
       source: '---\nname: demo-skill\ndescription: updated\n---\nNEW BODY\n',
-    });
+    } });
     assert.ok(!res.isError);
     const after = readFileSync(target, 'utf8');
     assert.notEqual(before, after);
@@ -397,11 +403,11 @@ test('clawdevbox MCP server smoke', async (t) => {
       'utf8',
     );
     assert.ok(existsSync(legacy));
-    const res = await h.call('skill.upsert', {
+    const res = await h.call('run_tool', { tool: 'skill.upsert', args: {
       id,
       scope: 'project',
       source: '---\nname: legacy-flip\ndescription: new\n---\nnew body\n',
-    });
+    } });
     assert.ok(!res.isError, JSON.stringify(res));
     assert.equal(existsSync(legacy), false, 'legacy flat file should be deleted');
     assert.ok(existsSync(join(skillsRoot, id, 'SKILL.md')));
@@ -414,71 +420,71 @@ test('clawdevbox MCP server smoke', async (t) => {
     // recursive.
     writeFileSync(join(dir, 'helper.md'), 'side', 'utf8');
     assert.ok(existsSync(join(dir, 'helper.md')));
-    const res = await h.call('skill.delete', { id, scope: 'project' });
+    const res = await h.call('run_tool', { tool: 'skill.delete', args: { id, scope: 'project' } });
     assert.ok(!res.isError, JSON.stringify(res));
     assert.equal(existsSync(dir), false, 'skill dir should be removed recursively');
   });
 
   await t.test('skill.delete on unknown id returns NOT_FOUND', async () => {
-    const res = await h.call('skill.delete', { id: 'nope-nada', scope: 'project' });
+    const res = await h.call('run_tool', { tool: 'skill.delete', args: { id: 'nope-nada', scope: 'project' } });
     assert.equal(res.isError, true);
     assert.equal(res.structuredContent?.code, 'NOT_FOUND');
   });
 
   await t.test('inbox + thread + approval round-trip (in-memory stub)', async () => {
-    const up = await h.call('inbox.upsert', {
+    const up = await h.call('run_tool', { tool: 'inbox.upsert', args: {
       id: 'ado:pr:1',
       kind: 'pr_review',
       source: 'ado',
       title: 'PR 1: Fix auth',
-    });
+    } });
     assert.ok(!up.isError);
     assert.equal(up.structuredContent?.item?.id, 'ado:pr:1');
     // New: upsert reports whether the row was created vs updated.
     assert.equal(up.structuredContent?.created, true, 'expected created=true on first upsert');
     // Re-upserting the same id reports created=false.
-    const up2 = await h.call('inbox.upsert', {
+    const up2 = await h.call('run_tool', { tool: 'inbox.upsert', args: {
       id: 'ado:pr:1',
       kind: 'pr_review',
       source: 'ado',
       title: 'PR 1: Fix auth (updated)',
-    });
+    } });
     assert.equal(up2.structuredContent?.created, false, 'expected created=false on re-upsert');
     // Notifications aren't configured in the test harness, so a push attempt
     // surfaces NOTIFICATIONS_DISABLED rather than throwing.
-    const pushCall = await h.call('inbox.upsert', {
+    const pushCall = await h.call('run_tool', { tool: 'inbox.upsert', args: {
       id: 'ado:pr:2',
       kind: 'pr_review',
       source: 'ado',
       title: 'PR 2: refactor',
       notify: true,
-    });
+    } });
     assert.equal(pushCall.structuredContent?.push_error_code, 'NOTIFICATIONS_DISABLED');
     assert.equal(pushCall.structuredContent?.push, null);
 
-    const tsp = await h.call('thread.spawn', {
+    const tsp = await h.call('run_tool', { tool: 'thread.spawn', args: {
       inbox_item_id: 'ado:pr:1',
       prompt: 'Please review PR 1.',
       recipe_id: 'pr-review',
-    });
+    } });
     const threadId = tsp.structuredContent?.thread?.id;
     assert.ok(threadId, 'thread id missing');
 
-    const apr = await h.call('approval.request', {
+    const apr = await h.call('run_tool', { tool: 'approval.request', args: {
       thread_id: threadId,
       question: 'Post the drafted comments?',
       options: [{ value: 'yes' }, { value: 'no' }],
-    });
+    } });
     const approvalId = apr.structuredContent?.approval?.id;
     assert.ok(approvalId);
 
-    const pending = await h.call('approval.list_pending', { thread_id: threadId });
+    const pending = await h.call('run_tool', { tool: 'approval.list_pending', args: { thread_id: threadId } });
     assert.equal(pending.structuredContent?.approvals?.length, 1);
 
-    const resolved = await h.call('approval.resolve', { approval_id: approvalId, answer: 'yes' });
+    const resolved = await h.call('run_tool', { tool: 'approval.resolve', args: { approval_id: approvalId, answer: 'yes' } });
     assert.equal(resolved.structuredContent?.approval?.state, 'resolved');
 
-    const stillPending = await h.call('approval.list_pending', { thread_id: threadId });
+    const stillPending = await h.call('run_tool', { tool: 'approval.list_pending', args: { thread_id: threadId } });
     assert.equal(stillPending.structuredContent?.approvals?.length, 0);
   });
 
@@ -496,7 +502,7 @@ test('clawdevbox MCP server smoke', async (t) => {
   });
 
   await t.test('inbox.upsert accepts the expanded schema (preview/description/attachments/links/labels)', async () => {
-    const upsertRes = await h.call('inbox.upsert', {
+    const upsertRes = await h.call('run_tool', { tool: 'inbox.upsert', args: {
       id: 'ado:pr:99',
       kind: 'pr_review',
       source: 'ado',
@@ -511,7 +517,7 @@ test('clawdevbox MCP server smoke', async (t) => {
       recipe_instance: { id: 'ri_demo_abcd', workspace_id: 'ws-demo' },
       trigger_id: 'ado.new-pr-watcher#auth-svc',
       labels: ['critical', 'ready-to-merge', 'critical'], // duplicate dropped
-    });
+    } });
     assert.ok(!upsertRes.isError);
     const item = upsertRes.structuredContent?.item;
     assert.equal(item?.preview, 'Two lines changed. LGTM modulo a typo in the comments.');
@@ -543,59 +549,59 @@ test('clawdevbox MCP server smoke', async (t) => {
     assert.equal(stored.attachments.length, 2);
 
     // inbox.read returns the body inlined via the sidecar.
-    const readRes = await h.call('inbox.read', { id: 'ado:pr:99' });
+    const readRes = await h.call('run_tool', { tool: 'inbox.read', args: { id: 'ado:pr:99' } });
     assert.ok(!readRes.isError);
     assert.match(readRes.structuredContent?.description ?? '', /Ready to merge/);
 
     // include_body: false skips the sidecar read.
-    const readNoBody = await h.call('inbox.read', { id: 'ado:pr:99', include_body: false });
+    const readNoBody = await h.call('run_tool', { tool: 'inbox.read', args: { id: 'ado:pr:99', include_body: false } });
     assert.equal(readNoBody.structuredContent?.description, null);
 
     // Empty description deletes the sidecar; description_size becomes 0.
-    const clearRes = await h.call('inbox.upsert', {
+    const clearRes = await h.call('run_tool', { tool: 'inbox.upsert', args: {
       id: 'ado:pr:99',
       kind: 'pr_review',
       source: 'ado',
       description: '',
-    });
+    } });
     assert.equal(clearRes.structuredContent?.item?.description_size, 0);
     assert.ok(!existsSync(sidecar), 'sidecar should be deleted after empty description');
 
     // Empty attachments / labels arrays clear those fields.
-    const clearLists = await h.call('inbox.upsert', {
+    const clearLists = await h.call('run_tool', { tool: 'inbox.upsert', args: {
       id: 'ado:pr:99',
       kind: 'pr_review',
       source: 'ado',
       attachments: [],
       labels: [],
-    });
+    } });
     assert.deepEqual(clearLists.structuredContent?.item?.attachments, []);
     assert.deepEqual(clearLists.structuredContent?.item?.labels, []);
 
     // null clears nullable refs.
-    const clearRefs = await h.call('inbox.upsert', {
+    const clearRefs = await h.call('run_tool', { tool: 'inbox.upsert', args: {
       id: 'ado:pr:99',
       kind: 'pr_review',
       source: 'ado',
       recipe_instance: null,
       trigger_id: null,
-    });
+    } });
     assert.equal(clearRefs.structuredContent?.item?.recipe_instance, null);
     assert.equal(clearRefs.structuredContent?.item?.trigger_id, null);
 
     // inbox.list filters by label.
-    const filtered = await h.call('inbox.list', { label: 'critical' });
+    const filtered = await h.call('run_tool', { tool: 'inbox.list', args: { label: 'critical' } });
     const filteredIds = filtered.structuredContent?.items?.map((it) => it.id) ?? [];
     // ado:pr:99's labels were cleared above so it should NOT match. Sanity:
     assert.ok(!filteredIds.includes('ado:pr:99'), 'cleared labels must not match');
   });
 
   await t.test('recipe.upsert validates shape and rejects malformed sources', async () => {
-    const res = await h.call('recipe.upsert', {
+    const res = await h.call('run_tool', { tool: 'recipe.upsert', args: {
       id: 'broken',
       scope: 'project',
       source: 'id: broken\n# missing name and description',
-    });
+    } });
     assert.equal(res.isError, true);
     assert.equal(res.structuredContent?.code, 'VALIDATION_FAILED');
     const paths = res.structuredContent?.errors?.map((e) => e.path) ?? [];
@@ -604,7 +610,7 @@ test('clawdevbox MCP server smoke', async (t) => {
   });
 
   await t.test('trigger.list_types surfaces the ADO plugin trigger types', async () => {
-    const res = await h.call('trigger.list_types', { scope: 'plugin:ado' });
+    const res = await h.call('run_tool', { tool: 'trigger.list_types', args: { scope: 'plugin:ado' } });
     const types = res.structuredContent?.trigger_types ?? [];
     const ids = types.map((t) => t.id).sort();
     assert.deepEqual(ids, [
@@ -623,48 +629,48 @@ test('clawdevbox MCP server smoke', async (t) => {
 
   await t.test('trigger.register + list_registered + update_params + unregister', async () => {
     // Register an instance of ado.new-pr-watcher.
-    const reg = await h.call('trigger.register', {
+    const reg = await h.call('run_tool', { tool: 'trigger.register', args: {
       type_id: 'ado.new-pr-watcher',
       params: { repo: 'auth-svc' },
-    });
+    } });
     assert.ok(!reg.isError, JSON.stringify(reg));
     assert.equal(reg.structuredContent?.id, 'ado.new-pr-watcher#auth-svc');
 
     // list_registered shows it.
-    const list1 = await h.call('trigger.list_registered', {});
+    const list1 = await h.call('run_tool', { tool: 'trigger.list_registered', args: {} });
     const ids1 = (list1.structuredContent?.registered ?? []).map((r) => r.id);
     assert.ok(ids1.includes('ado.new-pr-watcher#auth-svc'));
 
     // update_params — override cron.
-    const upd = await h.call('trigger.update_params', {
+    const upd = await h.call('run_tool', { tool: 'trigger.update_params', args: {
       id: 'ado.new-pr-watcher#auth-svc',
       cron: '*/1 * * * *',
-    });
+    } });
     assert.ok(!upd.isError, JSON.stringify(upd));
     assert.equal(upd.structuredContent?.registered?.cron, '*/1 * * * *');
 
     // disable flips enabled to false.
-    const dis = await h.call('trigger.disable', { id: 'ado.new-pr-watcher#auth-svc' });
+    const dis = await h.call('run_tool', { tool: 'trigger.disable', args: { id: 'ado.new-pr-watcher#auth-svc' } });
     assert.ok(!dis.isError);
-    const list2 = await h.call('trigger.list_registered', { enabled: false });
+    const list2 = await h.call('run_tool', { tool: 'trigger.list_registered', args: { enabled: false } });
     const found = (list2.structuredContent?.registered ?? []).find(
       (r) => r.id === 'ado.new-pr-watcher#auth-svc',
     );
     assert.ok(found, 'expected disabled trigger to show with enabled=false filter');
 
     // unregister removes the row.
-    const un = await h.call('trigger.unregister', { id: 'ado.new-pr-watcher#auth-svc' });
+    const un = await h.call('run_tool', { tool: 'trigger.unregister', args: { id: 'ado.new-pr-watcher#auth-svc' } });
     assert.ok(!un.isError);
-    const list3 = await h.call('trigger.list_registered', {});
+    const list3 = await h.call('run_tool', { tool: 'trigger.list_registered', args: {} });
     const ids3 = (list3.structuredContent?.registered ?? []).map((r) => r.id);
     assert.ok(!ids3.includes('ado.new-pr-watcher#auth-svc'));
   });
 
   await t.test('trigger.register rejects missing required params with PARAM_VALIDATION', async () => {
-    const res = await h.call('trigger.register', {
+    const res = await h.call('run_tool', { tool: 'trigger.register', args: {
       type_id: 'ado.new-pr-watcher',
       params: {}, // repo missing
-    });
+    } });
     assert.equal(res.isError, true);
     assert.equal(res.structuredContent?.code, 'PARAM_VALIDATION');
     const paths = (res.structuredContent?.errors ?? []).map((e) => e.path);
@@ -672,67 +678,67 @@ test('clawdevbox MCP server smoke', async (t) => {
   });
 
   await t.test('trigger.register rejects unknown type_id with TRIGGER_TYPE_NOT_FOUND', async () => {
-    const res = await h.call('trigger.register', {
+    const res = await h.call('run_tool', { tool: 'trigger.register', args: {
       type_id: 'nope.does-not-exist',
       params: {},
-    });
+    } });
     assert.equal(res.isError, true);
     assert.equal(res.structuredContent?.code, 'TRIGGER_TYPE_NOT_FOUND');
   });
 
   await t.test('trigger.register rejects collisions with TRIGGER_ALREADY_REGISTERED', async () => {
-    const r1 = await h.call('trigger.register', {
+    const r1 = await h.call('run_tool', { tool: 'trigger.register', args: {
       type_id: 'ado.new-pr-watcher',
       params: { repo: 'collide-svc' },
-    });
+    } });
     assert.ok(!r1.isError, JSON.stringify(r1));
-    const r2 = await h.call('trigger.register', {
+    const r2 = await h.call('run_tool', { tool: 'trigger.register', args: {
       type_id: 'ado.new-pr-watcher',
       params: { repo: 'collide-svc' },
-    });
+    } });
     assert.equal(r2.isError, true);
     assert.equal(r2.structuredContent?.code, 'TRIGGER_ALREADY_REGISTERED');
     // Cleanup so other subtests start fresh.
-    await h.call('trigger.unregister', { id: 'ado.new-pr-watcher#collide-svc' });
+    await h.call('run_tool', { tool: 'trigger.unregister', args: { id: 'ado.new-pr-watcher#collide-svc' } });
   });
 
   await t.test('trigger.register rejects invalid cron with PARAM_VALIDATION', async () => {
-    const res = await h.call('trigger.register', {
+    const res = await h.call('run_tool', { tool: 'trigger.register', args: {
       type_id: 'ado.new-pr-watcher',
       params: { repo: 'invalid-cron-svc' },
       cron: 'not-a-cron',
-    });
+    } });
     assert.equal(res.isError, true);
     assert.equal(res.structuredContent?.code, 'PARAM_VALIDATION');
   });
 
   await t.test('trigger.register with cron=false stores disabled-cron registration', async () => {
-    const res = await h.call('trigger.register', {
+    const res = await h.call('run_tool', { tool: 'trigger.register', args: {
       type_id: 'ado.comment-watcher',
       params: { repo: 'auth-svc', pr_id: 9001 },
       subscriber_thread_id: 'thr_test',
       cron: false,
-    });
+    } });
     assert.ok(!res.isError, JSON.stringify(res));
     assert.equal(res.structuredContent?.registered?.cron, false);
     assert.equal(res.structuredContent?.registered?.resolved_cron, false);
-    await h.call('trigger.unregister', { id: res.structuredContent.id });
+    await h.call('run_tool', { tool: 'trigger.unregister', args: { id: res.structuredContent.id } });
   });
 
   await t.test('trigger.fire enqueues a DB-backed manual fire row', async () => {
     // Register a trigger with a disabled cron so it only fires when we call.
-    const reg = await h.call('trigger.register', {
+    const reg = await h.call('run_tool', { tool: 'trigger.register', args: {
       type_id: 'ado.new-pr-watcher',
       params: { repo: 'fire-svc' },
       cron: false,
-    });
+    } });
     assert.ok(!reg.isError, JSON.stringify(reg));
     const triggerId = reg.structuredContent.id;
 
-    const fire = await h.call('trigger.fire', {
+    const fire = await h.call('run_tool', { tool: 'trigger.fire', args: {
       id: triggerId,
       payload: { hello: 'world', n: 42 },
-    });
+    } });
     assert.ok(!fire.isError, JSON.stringify(fire));
     assert.equal(fire.structuredContent?.trigger_id, triggerId);
     assert.equal(fire.structuredContent?.status, 'queued');
@@ -755,23 +761,23 @@ test('clawdevbox MCP server smoke', async (t) => {
     assert.equal(payload.hello, 'world');
     assert.equal(payload.n, 42);
 
-    await h.call('trigger.unregister', { id: triggerId });
+    await h.call('run_tool', { tool: 'trigger.unregister', args: { id: triggerId } });
   });
 
   await t.test('trigger.fire returns NOT_FOUND for unknown id', async () => {
-    const res = await h.call('trigger.fire', { id: 'ado.new-pr-watcher#does-not-exist' });
+    const res = await h.call('run_tool', { tool: 'trigger.fire', args: { id: 'ado.new-pr-watcher#does-not-exist' } });
     assert.equal(res.isError, true);
     assert.equal(res.structuredContent?.code, 'NOT_FOUND');
   });
 
   await t.test('trigger.register persists max_attempts + backoff_ms', async () => {
-    const reg = await h.call('trigger.register', {
+    const reg = await h.call('run_tool', { tool: 'trigger.register', args: {
       type_id: 'ado.new-pr-watcher',
       params: { repo: 'retry-svc' },
       cron: false,
       max_attempts: 5,
       backoff_ms: [1000, 5000, 10000],
-    });
+    } });
     assert.ok(!reg.isError, JSON.stringify(reg));
     assert.equal(reg.structuredContent?.registered?.max_attempts, 5);
     assert.deepEqual(reg.structuredContent?.registered?.backoff_ms, [1000, 5000, 10000]);
@@ -786,15 +792,15 @@ test('clawdevbox MCP server smoke', async (t) => {
     assert.equal(row.max_attempts, 5);
     assert.deepEqual(JSON.parse(row.backoff_ms_json), [1000, 5000, 10000]);
 
-    await h.call('trigger.unregister', { id: reg.structuredContent.id });
+    await h.call('run_tool', { tool: 'trigger.unregister', args: { id: reg.structuredContent.id } });
   });
 
   await t.test('trigger.register rejects max_attempts=0', async () => {
-    const res = await h.call('trigger.register', {
+    const res = await h.call('run_tool', { tool: 'trigger.register', args: {
       type_id: 'ado.new-pr-watcher',
       params: { repo: 'reject-ma' },
       max_attempts: 0,
-    });
+    } });
     assert.equal(res.isError, true);
     assert.equal(res.structuredContent?.code, 'PARAM_VALIDATION');
     const paths = (res.structuredContent?.errors ?? []).map((e) => e.path);
@@ -802,11 +808,11 @@ test('clawdevbox MCP server smoke', async (t) => {
   });
 
   await t.test('trigger.register rejects empty backoff_ms array', async () => {
-    const res = await h.call('trigger.register', {
+    const res = await h.call('run_tool', { tool: 'trigger.register', args: {
       type_id: 'ado.new-pr-watcher',
       params: { repo: 'reject-bo' },
       backoff_ms: [],
-    });
+    } });
     assert.equal(res.isError, true);
     assert.equal(res.structuredContent?.code, 'PARAM_VALIDATION');
     const paths = (res.structuredContent?.errors ?? []).map((e) => e.path);
@@ -814,28 +820,28 @@ test('clawdevbox MCP server smoke', async (t) => {
   });
 
   await t.test('trigger.update_params honors max_attempts + backoff_ms', async () => {
-    const reg = await h.call('trigger.register', {
+    const reg = await h.call('run_tool', { tool: 'trigger.register', args: {
       type_id: 'ado.new-pr-watcher',
       params: { repo: 'upd-svc' },
       cron: false,
-    });
+    } });
     assert.ok(!reg.isError, JSON.stringify(reg));
     const id = reg.structuredContent.id;
 
-    const upd = await h.call('trigger.update_params', {
+    const upd = await h.call('run_tool', { tool: 'trigger.update_params', args: {
       id,
       max_attempts: 7,
       backoff_ms: [2000, 4000],
-    });
+    } });
     assert.ok(!upd.isError, JSON.stringify(upd));
     assert.equal(upd.structuredContent?.registered?.max_attempts, 7);
     assert.deepEqual(upd.structuredContent?.registered?.backoff_ms, [2000, 4000]);
 
     // Invalid update should fail.
-    const bad = await h.call('trigger.update_params', { id, max_attempts: -1 });
+    const bad = await h.call('run_tool', { tool: 'trigger.update_params', args: { id, max_attempts: -1 } });
     assert.equal(bad.isError, true);
     assert.equal(bad.structuredContent?.code, 'PARAM_VALIDATION');
 
-    await h.call('trigger.unregister', { id });
+    await h.call('run_tool', { tool: 'trigger.unregister', args: { id } });
   });
 });

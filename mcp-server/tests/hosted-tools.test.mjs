@@ -193,40 +193,38 @@ test('hosted tools — server-level integration', async (t) => {
 
   await h.init();
 
-  await t.test('tools/list includes every ADO hostable tool', async () => {
+  await t.test('tools/list exposes exactly the 3 meta-tools', async () => {
     const tools = await h.listTools();
-    const names = tools.map((x) => x.name);
+    const names = tools.map((x) => x.name).sort();
+    assert.deepEqual(names, ['learn_tool', 'list_tools', 'run_tool']);
+  });
+
+  await t.test('list_tools includes every ADO hostable tool', async () => {
+    const res = await h.call('list_tools', {});
+    const parsed = JSON.parse(res.content[0].text);
+    const names = parsed.tools.map((t) => t.name);
     for (const expected of EXPECTED_ADO_TOOLS) {
       assert.ok(names.includes(expected), `missing hosted tool: ${expected}`);
     }
   });
 
-  await t.test('hosted tool inputSchema is wired through to MCP tools/list', async () => {
-    const tools = await h.listTools();
-    const getPr = tools.find((x) => x.name === 'ado.get_pr');
-    assert.ok(getPr, 'ado.get_pr not found in tools/list');
-    assert.ok(getPr.inputSchema, 'ado.get_pr is missing inputSchema');
-    // The MCP SDK converts zod → JSON Schema. We expect at least the required props to surface.
-    const props = getPr.inputSchema.properties ?? {};
-    assert.ok('repo' in props, 'expected `repo` in inputSchema.properties');
-    assert.ok('pr_id' in props, 'expected `pr_id` in inputSchema.properties');
-  });
-
   await t.test('calling a hosted tool with missing required args returns an error', async () => {
     // pr_id missing → zod fails → MCP error result.
-    const res = await h.call('ado.get_pr', { repo: 'test-repo' });
+    const res = await h.call('run_tool', { tool: 'ado.get_pr', args: { repo: 'test-repo' } });
     assert.equal(res.isError, true, `expected isError=true, got: ${JSON.stringify(res)}`);
   });
 
   await t.test('disabling the plugin un-registers its hosted tools after server restart', async () => {
-    // The current server has tools registered. Confirm.
-    const before = (await h.listTools()).map((x) => x.name);
+    // The current server has tools registered. Confirm via list_tools.
+    const beforeRes = await h.call('list_tools', {});
+    const beforeParsed = JSON.parse(beforeRes.content[0].text);
+    const before = beforeParsed.tools.map((t) => t.name);
     assert.ok(before.includes('ado.get_pr'), 'pre-disable: ado.get_pr expected to be registered');
 
     // Disable — plugin.disable flips the flag in state.json. Discovery only
     // re-runs at boot, so we shutdown + spawn a fresh harness pointing at the
     // same workspace so the disabled flag takes effect.
-    const disable = await h.call('plugin.disable', { id: 'ado' });
+    const disable = await h.call('run_tool', { tool: 'plugin.disable', args: { id: 'ado' } });
     assert.ok(!disable.isError, JSON.stringify(disable));
 
     // Re-list before restart — current process keeps stale registrations.

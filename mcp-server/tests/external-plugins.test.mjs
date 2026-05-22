@@ -280,7 +280,7 @@ test('external clawdevbox-plugins folder install + load', { skip: !existsSync(pl
   await h.init();
 
   await t.test('plugin.list shows all four external plugins', async () => {
-    const result = await h.call('plugin.list', {});
+    const result = await h.call('run_tool', { tool: 'plugin.list', args: {} });
     const plugins = result?.structuredContent?.plugins ?? [];
     const ids = plugins.map((p) => p.id);
     for (const expected of Object.keys(EXPECTED)) {
@@ -291,8 +291,9 @@ test('external clawdevbox-plugins folder install + load', { skip: !existsSync(pl
   });
 
   await t.test('tools/list exposes hostable tools from every plugin', async () => {
-    const tools = await h.listTools();
-    const names = new Set(tools.map((t) => t.name));
+    const res = await h.call('list_tools', {});
+    const parsed = JSON.parse(res.content[0].text);
+    const names = new Set(parsed.tools.map((t) => t.name));
     for (const [id, exp] of Object.entries(EXPECTED)) {
       for (const tool of exp.sampleTools) {
         assert.ok(names.has(tool), `${id} tool ${tool} not in tools/list`);
@@ -301,7 +302,7 @@ test('external clawdevbox-plugins folder install + load', { skip: !existsSync(pl
   });
 
   await t.test('skill.list exposes skills from every plugin', async () => {
-    const result = await h.call('skill.list', {});
+    const result = await h.call('run_tool', { tool: 'skill.list', args: {} });
     const skills = result?.structuredContent?.skills ?? [];
     const ids = new Set(skills.map((s) => s.id));
     for (const [id, exp] of Object.entries(EXPECTED)) {
@@ -312,7 +313,7 @@ test('external clawdevbox-plugins folder install + load', { skip: !existsSync(pl
   });
 
   await t.test('recipe.list exposes recipes from every plugin', async () => {
-    const result = await h.call('recipe.list', {});
+    const result = await h.call('run_tool', { tool: 'recipe.list', args: {} });
     const recipes = result?.structuredContent?.recipes ?? [];
     const ids = new Set(recipes.map((r) => r.id));
     for (const [id, exp] of Object.entries(EXPECTED)) {
@@ -323,7 +324,7 @@ test('external clawdevbox-plugins folder install + load', { skip: !existsSync(pl
   });
 
   await t.test('trigger.list_types exposes types from plugins that ship them', async () => {
-    const result = await h.call('trigger.list_types', {});
+    const result = await h.call('run_tool', { tool: 'trigger.list_types', args: {} });
     const types = result?.structuredContent?.trigger_types ?? [];
     const ids = new Set(types.map((t) => t.id));
     for (const [pluginId, exp] of Object.entries(EXPECTED)) {

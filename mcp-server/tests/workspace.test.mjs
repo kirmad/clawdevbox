@@ -186,9 +186,10 @@ test('workspace + recipe.run surface', async (t) => {
   t.after(() => h.shutdown());
   await h.init();
 
-  await t.test('tools/list registers the four workspace tools and the three recipe-run tools', async () => {
-    const tools = await h.listTools();
-    const names = tools.map((t) => t.name);
+  await t.test('list_tools registers the four workspace tools and the three recipe-run tools', async () => {
+    const res = await h.call('list_tools', {});
+    const parsed = JSON.parse(res.content[0].text);
+    const names = parsed.tools.map((t) => t.name);
     for (const n of [
       'workspace.create',
       'workspace.list',
@@ -206,7 +207,7 @@ test('workspace + recipe.run surface', async (t) => {
   let firstWorkspacePath = null;
 
   await t.test('workspace.create scaffolds the .clawdevbox tree and registers the workspace', async () => {
-    const res = await h.call('workspace.create', { name: 'test-ws' });
+    const res = await h.call('run_tool', { tool: 'workspace.create', args: { name: 'test-ws' } });
     assert.ok(!res.isError, JSON.stringify(res));
     const sc = res.structuredContent;
     assert.ok(typeof sc.id === 'string' && sc.id.startsWith('ws_'), `bad id: ${sc.id}`);
@@ -240,7 +241,7 @@ test('workspace + recipe.run surface', async (t) => {
   });
 
   await t.test('workspace.create with inherit_plugins is a no-op now that plugins are global', async () => {
-    const res = await h.call('workspace.create', { name: 'with-plugins', inherit_plugins: true });
+    const res = await h.call('run_tool', { tool: 'workspace.create', args: { name: 'with-plugins', inherit_plugins: true } });
     assert.ok(!res.isError, JSON.stringify(res));
     const sc = res.structuredContent;
     // Plugins are visible globally — no per-workspace inheritance happens
@@ -259,7 +260,7 @@ test('workspace + recipe.run surface', async (t) => {
     const sourceCustomFile = join(firstWorkspacePath, '.clawdevbox', 'custom-marker.txt');
     writeFileSync(sourceCustomFile, 'hello from source\n', 'utf8');
 
-    const res = await h.call('workspace.create', { name: 'cloned', copy_from: firstWorkspaceId });
+    const res = await h.call('run_tool', { tool: 'workspace.create', args: { name: 'cloned', copy_from: firstWorkspaceId } });
     assert.ok(!res.isError, JSON.stringify(res));
     const sc = res.structuredContent;
     assert.ok(Array.isArray(sc.copied_from_subtrees));
@@ -271,16 +272,16 @@ test('workspace + recipe.run surface', async (t) => {
   });
 
   await t.test('workspace.create rejects inherit_plugins + copy_from together', async () => {
-    const res = await h.call('workspace.create', {
+    const res = await h.call('run_tool', { tool: 'workspace.create', args: {
       inherit_plugins: true,
       copy_from: firstWorkspaceId,
-    });
+    } });
     assert.equal(res.isError, true);
     assert.equal(res.structuredContent?.code, 'INVALID_ARGS');
   });
 
   await t.test('workspace.list returns all created workspaces', async () => {
-    const res = await h.call('workspace.list', {});
+    const res = await h.call('run_tool', { tool: 'workspace.list', args: {} });
     assert.ok(!res.isError);
     const workspaces = res.structuredContent?.workspaces ?? [];
     assert.ok(workspaces.length >= 3, `expected >=3 workspaces, got ${workspaces.length}`);
@@ -288,7 +289,7 @@ test('workspace + recipe.run surface', async (t) => {
   });
 
   await t.test('workspace.get returns full info + counts', async () => {
-    const res = await h.call('workspace.get', { id: firstWorkspaceId });
+    const res = await h.call('run_tool', { tool: 'workspace.get', args: { id: firstWorkspaceId } });
     assert.ok(!res.isError, JSON.stringify(res));
     const sc = res.structuredContent;
     assert.equal(sc.id, firstWorkspaceId);
@@ -300,7 +301,7 @@ test('workspace + recipe.run surface', async (t) => {
   });
 
   await t.test('workspace.get returns WORKSPACE_NOT_FOUND for unknown id', async () => {
-    const res = await h.call('workspace.get', { id: 'ws_nope_dead' });
+    const res = await h.call('run_tool', { tool: 'workspace.get', args: { id: 'ws_nope_dead' } });
     assert.equal(res.isError, true);
     assert.equal(res.structuredContent?.code, 'WORKSPACE_NOT_FOUND');
   });
@@ -309,7 +310,7 @@ test('workspace + recipe.run surface', async (t) => {
     // The harness's CLAWDEVBOX_PROJECT_DIR is the caller dir, which is NOT
     // registered in the workspaces index (we only register workspaces created
     // via workspace.create).
-    const res = await h.call('workspace.current', {});
+    const res = await h.call('run_tool', { tool: 'workspace.current', args: {} });
     assert.ok(!res.isError);
     assert.equal(res.structuredContent?.found, false);
   });
@@ -319,11 +320,11 @@ test('workspace + recipe.run surface', async (t) => {
   let recipeRunWorkspacePath = null;
 
   await t.test('recipe.run echo-stub creates a fresh workspace and an instance file', async () => {
-    const res = await h.call('recipe.run', {
+    const res = await h.call('run_tool', { tool: 'recipe.run', args: {
       id: 'simple-prompt',
       prompt: 'Say hello',
       agent_cli: 'echo-stub',
-    });
+    } });
     assert.ok(!res.isError, JSON.stringify(res));
     const sc = res.structuredContent;
     assert.ok(typeof sc.recipe_instance_id === 'string' && sc.recipe_instance_id.startsWith('ri_'));
@@ -364,12 +365,12 @@ test('workspace + recipe.run surface', async (t) => {
   });
 
   await t.test('recipe.run with explicit workspace_id reuses the existing workspace', async () => {
-    const res = await h.call('recipe.run', {
+    const res = await h.call('run_tool', { tool: 'recipe.run', args: {
       id: 'simple-prompt',
       prompt: 'Second call',
       workspace_id: recipeRunWorkspaceId,
       agent_cli: 'echo-stub',
-    });
+    } });
     assert.ok(!res.isError, JSON.stringify(res));
     const sc = res.structuredContent;
     assert.equal(sc.workspace_id, recipeRunWorkspaceId);
@@ -377,29 +378,29 @@ test('workspace + recipe.run surface', async (t) => {
   });
 
   await t.test('recipe.run rejects unknown recipe ids', async () => {
-    const res = await h.call('recipe.run', {
+    const res = await h.call('run_tool', { tool: 'recipe.run', args: {
       id: 'nope-not-here',
       prompt: 'x',
       agent_cli: 'echo-stub',
-    });
+    } });
     assert.equal(res.isError, true);
     assert.equal(res.structuredContent?.code, 'NOT_FOUND');
   });
 
   await t.test('recipe.run rejects when neither id nor source is given', async () => {
-    const res = await h.call('recipe.run', { prompt: 'x', agent_cli: 'echo-stub' });
+    const res = await h.call('run_tool', { tool: 'recipe.run', args: { prompt: 'x', agent_cli: 'echo-stub' } });
     assert.equal(res.isError, true);
     assert.equal(res.structuredContent?.code, 'INVALID_REQUEST');
     assert.match(res.content?.[0]?.text ?? '', /id.*or.*source/);
   });
 
   await t.test('recipe.run rejects when both id and source are given', async () => {
-    const res = await h.call('recipe.run', {
+    const res = await h.call('run_tool', { tool: 'recipe.run', args: {
       id: 'echo-stub',
       source: 'id: echo-stub\nname: x\ndescription: x\n',
       prompt: 'x',
       agent_cli: 'echo-stub',
-    });
+    } });
     assert.equal(res.isError, true);
     assert.equal(res.structuredContent?.code, 'INVALID_REQUEST');
   });
@@ -410,11 +411,11 @@ test('workspace + recipe.run surface', async (t) => {
       'name: Ad-hoc demo',
       'description: Inline recipe used only for this run.',
     ].join('\n') + '\n';
-    const res = await h.call('recipe.run', {
+    const res = await h.call('run_tool', { tool: 'recipe.run', args: {
       source: adhocSource,
       prompt: 'no-op',
       agent_cli: 'echo-stub',
-    });
+    } });
     assert.equal(res.isError, undefined);
     const sc = res.structuredContent ?? {};
     assert.equal(sc.recipe_id, 'adhoc-demo');
@@ -426,11 +427,11 @@ test('workspace + recipe.run surface', async (t) => {
   });
 
   await t.test('recipe.run with malformed inline source returns VALIDATION_FAILED', async () => {
-    const res = await h.call('recipe.run', {
+    const res = await h.call('run_tool', { tool: 'recipe.run', args: {
       source: 'name: missing-id-field\ndescription: still missing\n',
       prompt: 'x',
       agent_cli: 'echo-stub',
-    });
+    } });
     assert.equal(res.isError, true);
     assert.equal(res.structuredContent?.code, 'VALIDATION_FAILED');
     const paths = (res.structuredContent?.errors ?? []).map((e) => e.path);
@@ -438,11 +439,11 @@ test('workspace + recipe.run surface', async (t) => {
   });
 
   await t.test('recipe.run rejects unknown agent_cli with UNKNOWN_AGENT_CLI', async () => {
-    const res = await h.call('recipe.run', {
+    const res = await h.call('run_tool', { tool: 'recipe.run', args: {
       id: 'simple-prompt',
       prompt: 'x',
       agent_cli: 'not-a-real-provider',
-    });
+    } });
     assert.equal(res.isError, true);
     assert.equal(res.structuredContent?.code, 'UNKNOWN_AGENT_CLI');
     assert.equal(res.structuredContent?.agent_cli, 'not-a-real-provider');
@@ -456,11 +457,11 @@ test('workspace + recipe.run surface', async (t) => {
       'description: references a provider that does not exist.',
       'default_client: not-installed-provider',
     ].join('\n') + '\n';
-    const res = await h.call('recipe.run', {
+    const res = await h.call('run_tool', { tool: 'recipe.run', args: {
       source: adhocSource,
       prompt: 'x',
       agent_cli: 'echo-stub',
-    });
+    } });
     assert.equal(res.isError, true);
     assert.equal(res.structuredContent?.code, 'UNKNOWN_AGENT_CLI');
     assert.equal(res.structuredContent?.default_client, 'not-installed-provider');
@@ -473,11 +474,11 @@ test('workspace + recipe.run surface', async (t) => {
       'description: References a plugin not yet installed.',
       'default_client: future-plugin',
     ].join('\n') + '\n';
-    const res = await h.call('recipe.upsert', {
+    const res = await h.call('run_tool', { tool: 'recipe.upsert', args: {
       id: 'future-plugin-recipe',
       scope: 'project',
       source,
-    });
+    } });
     assert.ok(!res.isError, JSON.stringify(res));
     const warnings = res.structuredContent?.warnings ?? [];
     assert.ok(Array.isArray(warnings));
@@ -502,11 +503,11 @@ test('workspace + recipe.run surface', async (t) => {
       'description: Verifies the agent field flows recipe -> CLI provider.',
       'agent: dev-buddy',
     ].join('\n') + '\n';
-    const res = await h.call('recipe.run', {
+    const res = await h.call('run_tool', { tool: 'recipe.run', args: {
       source,
       prompt: 'e2e ping',
       agent_cli: 'echo-stub',
-    });
+    } });
     assert.ok(!res.isError, JSON.stringify(res));
     const sc = res.structuredContent;
     assert.equal(sc.recipe_id, 'e2e-agent-from-yaml');
@@ -561,12 +562,12 @@ test('workspace + recipe.run surface', async (t) => {
       'description: YAML says one agent; runtime says another.',
       'agent: dev-buddy',
     ].join('\n') + '\n';
-    const res = await h.call('recipe.run', {
+    const res = await h.call('run_tool', { tool: 'recipe.run', args: {
       source,
       prompt: 'e2e override',
       agent_cli: 'echo-stub',
       agent: 'icm-investigator',
-    });
+    } });
     assert.ok(!res.isError, JSON.stringify(res));
     const sc = res.structuredContent;
 
@@ -605,11 +606,11 @@ test('workspace + recipe.run surface', async (t) => {
       'name: E2E no agent',
       'description: No agent field anywhere.',
     ].join('\n') + '\n';
-    const res = await h.call('recipe.run', {
+    const res = await h.call('run_tool', { tool: 'recipe.run', args: {
       source,
       prompt: 'e2e none',
       agent_cli: 'echo-stub',
-    });
+    } });
     assert.ok(!res.isError, JSON.stringify(res));
     const sc = res.structuredContent;
 
@@ -643,11 +644,11 @@ test('workspace + recipe.run surface', async (t) => {
       'description: References an agent not yet registered.',
       'agent: not-installed-agent',
     ].join('\n') + '\n';
-    const res = await h.call('recipe.upsert', {
+    const res = await h.call('run_tool', { tool: 'recipe.upsert', args: {
       id: 'future-agent-recipe',
       scope: 'project',
       source,
-    });
+    } });
     assert.ok(!res.isError, JSON.stringify(res));
     const warnings = res.structuredContent?.warnings ?? [];
     assert.ok(
@@ -661,7 +662,7 @@ test('workspace + recipe.run surface', async (t) => {
   await t.test('recipe.done outside a recipe-run session is rejected', async () => {
     // The harness's MCP server has NO CLAWDEVBOX_RECIPE_INSTANCE_ID env var,
     // so calling recipe.done on it should fail with NOT_IN_RECIPE_INSTANCE.
-    const res = await h.call('recipe.done', { status: 'success' });
+    const res = await h.call('run_tool', { tool: 'recipe.done', args: { status: 'success' } });
     assert.equal(res.isError, true);
     assert.equal(res.structuredContent?.code, 'NOT_IN_RECIPE_INSTANCE');
   });
@@ -721,8 +722,8 @@ test('workspace + recipe.run surface', async (t) => {
 
       child.stdin.write(JSON.stringify({
         jsonrpc: '2.0', id: 2, method: 'tools/call', params: {
-          name: 'recipe.done',
-          arguments: { status: 'success', message: 'all done', result: { score: 42 } },
+          name: 'run_tool',
+          arguments: { tool: 'recipe.done', args: { status: 'success', message: 'all done', result: { score: 42 } } },
         },
       }) + '\n');
       const r = await waitFor(2);
@@ -753,7 +754,7 @@ test('workspace + recipe.run surface', async (t) => {
   });
 
   await t.test('recipe.instance_info round-trips the updated instance', async () => {
-    const res = await h.call('recipe.instance_info', { id: firstInstanceId });
+    const res = await h.call('run_tool', { tool: 'recipe.instance_info', args: { id: firstInstanceId } });
     assert.ok(!res.isError, JSON.stringify(res));
     const sc = res.structuredContent;
     assert.equal(sc.recipe_instance_id, firstInstanceId);
@@ -766,7 +767,7 @@ test('workspace + recipe.run surface', async (t) => {
   await t.test('recipe.instance_info without env vars is rejected', async () => {
     // The harness server has no CLAWDEVBOX_RECIPE_INSTANCE_ID env var, so a
     // call without `id` should fail.
-    const res = await h.call('recipe.instance_info', {});
+    const res = await h.call('run_tool', { tool: 'recipe.instance_info', args: {} });
     assert.equal(res.isError, true);
     assert.equal(res.structuredContent?.code, 'NOT_IN_RECIPE_INSTANCE');
   });
