@@ -9,9 +9,10 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, unlinkSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { dump as yamlDump } from 'js-yaml';
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
+import { defineTool } from './registry.ts';
 import { writeFileAtomic } from '../fs-util.ts';
 import {
   ensureWritableScope,
@@ -39,19 +40,17 @@ const writableScope = z
   .enum(['project', 'global'])
   .or(z.string().regex(/^plugin:[a-z][a-z0-9-]*$/, 'plugin:<id> (will be rejected)'));
 
-export function registerSkillTools(server: McpServer, ws: Workspace): void {
+export function registerSkillEntries(ws: Workspace): void {
   // -- skill.list -----------------------------------------------------------
-  server.registerTool(
-    'skill.list',
-    {
-      description:
-        'List skills across scopes (spec §6.1 + §10.4). Returns id, name, description, scope. Frontmatter parse errors are skipped silently.',
-      inputSchema: {
-        scope: scopeFilter,
-        search: z.string().min(1).optional(),
-      },
-    },
-    async (args) => {
+  defineTool({
+    name: 'skill.list',
+    description:
+      'List skills across scopes (spec §6.1 + §10.4). Returns id, name, description, scope. Frontmatter parse errors are skipped silently.',
+    parameters: z.object({
+      scope: scopeFilter,
+      search: z.string().min(1).optional(),
+    }),
+    handler: async (args) => {
       const scope = (args.scope ?? 'all') as 'project' | 'global' | 'all' | `plugin:${string}`;
       const entries = listAllInScope(ws, scope, 'skill', skillPath);
       const skills = entries.map((e) => {
@@ -77,17 +76,20 @@ export function registerSkillTools(server: McpServer, ws: Workspace): void {
         structuredContent: { skills: filtered, count: filtered.length },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- skill.read -----------------------------------------------------------
-  server.registerTool(
-    'skill.read',
-    {
-      description:
-        'Read a skill by id. Returns the full markdown source plus parsed frontmatter + body split, plus the scope it resolved from.',
-      inputSchema: { id: z.string().min(1), scope: scopeFilter },
-    },
-    async (args) => {
+  defineTool({
+    name: 'skill.read',
+    description:
+      'Read a skill by id. Returns the full markdown source plus parsed frontmatter + body split, plus the scope it resolved from.',
+    parameters: z.object({
+      id: z.string().min(1),
+      scope: scopeFilter,
+    }),
+    handler: async (args) => {
       const idCheck = validateId(args.id);
       if (!idCheck.ok) return structuredError('INVALID_ID', idCheck.message!);
       const scope = (args.scope ?? 'all') as 'project' | 'global' | 'all' | `plugin:${string}`;
@@ -107,21 +109,21 @@ export function registerSkillTools(server: McpServer, ws: Workspace): void {
         },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- skill.upsert ---------------------------------------------------------
-  server.registerTool(
-    'skill.upsert',
-    {
-      description:
-        'Write a skill to project or global scope. Plugin scope is read-only. Frontmatter is validated for shape (name + description required).',
-      inputSchema: {
-        id: z.string().min(1),
-        scope: writableScope,
-        source: z.string().min(1).describe('Full markdown body, including the leading `---` frontmatter block.'),
-      },
-    },
-    async (args) => {
+  defineTool({
+    name: 'skill.upsert',
+    description:
+      'Write a skill to project or global scope. Plugin scope is read-only. Frontmatter is validated for shape (name + description required).',
+    parameters: z.object({
+      id: z.string().min(1),
+      scope: writableScope,
+      source: z.string().min(1).describe('Full markdown body, including the leading `---` frontmatter block.'),
+    }),
+    handler: async (args) => {
       const idCheck = validateId(args.id);
       if (!idCheck.ok) return structuredError('INVALID_ID', idCheck.message!);
       const guard = ensureWritableScope(args.scope);
@@ -171,16 +173,19 @@ export function registerSkillTools(server: McpServer, ws: Workspace): void {
         structuredContent: { id: args.id, scope: args.scope, path: target },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- skill.delete ---------------------------------------------------------
-  server.registerTool(
-    'skill.delete',
-    {
-      description: 'Delete a skill from project or global scope. Plugin scope is read-only.',
-      inputSchema: { id: z.string().min(1), scope: writableScope },
-    },
-    async (args) => {
+  defineTool({
+    name: 'skill.delete',
+    description: 'Delete a skill from project or global scope. Plugin scope is read-only.',
+    parameters: z.object({
+      id: z.string().min(1),
+      scope: writableScope,
+    }),
+    handler: async (args) => {
       const guard = ensureWritableScope(args.scope);
       if (guard) return guard;
       const scope = args.scope as 'project' | 'global';
@@ -204,7 +209,9 @@ export function registerSkillTools(server: McpServer, ws: Workspace): void {
         structuredContent: { id: args.id, scope: args.scope, path: dir },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 }
 
 function safeRead(path: string): string | null {

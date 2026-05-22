@@ -202,7 +202,7 @@ export function serviceLogPath(globalDir: string): string {
 export async function fetchTunnelStatus(args: {
   host: string;
   port: number;
-  token: string;
+  token: string | null;
   timeoutMs?: number;
   intervalMs?: number;
   /** When true, wait until `url` is non-null (or timeout). */
@@ -217,8 +217,10 @@ export async function fetchTunnelStatus(args: {
     try {
       const ctrl = new AbortController();
       const t = setTimeout(() => ctrl.abort(), Math.min(intervalMs * 2, 1000));
+      const headers: Record<string, string> = {};
+      if (args.token) headers.authorization = `Bearer ${args.token}`;
       const res = await fetch(url, {
-        headers: { authorization: `Bearer ${args.token}` },
+        headers,
         signal: ctrl.signal,
       });
       clearTimeout(t);

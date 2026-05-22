@@ -8,8 +8,9 @@
  * agents, memory, etc. without hardcoding paths.
  */
 
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
+import { fileURLToPath } from 'node:url';
+import { defineTool } from './registry.ts';
 import type { Workspace } from '../workspace.ts';
 import { resolveConfig } from '../config.ts';
 import { loadVaultChain, type VaultInfo } from '../vault-chain.ts';
@@ -48,25 +49,25 @@ export function resolvePathsPayload(dirs: { globalDir: string; projectDir: strin
   };
 }
 
-export function registerPathsTools(server: McpServer, ws: Workspace): void {
-  server.registerTool(
-    'paths.get',
-    {
-      description:
-        'Returns resolved installation paths: global dir, project dir, workspaces root, and registered vault chain (ordered leaf→root). Use this to discover vault locations for reading/writing skills, agents, memory.',
-      inputSchema: z.object({
-        workspace_id: z.string().optional().describe('Workspace ID override (uses caller context if omitted).'),
-      }),
-    },
-    async (_args, _extra) => {
+export function registerPathsEntries(ws: Workspace): void {
+  defineTool({
+    name: 'paths.get',
+    description:
+      'Returns resolved installation paths: global dir, project dir, workspaces root, and registered vault chain (ordered leaf→root). Use this to discover vault locations for reading/writing skills, agents, memory.',
+    parameters: z.object({
+      workspace_id: z.string().optional().describe('Workspace ID override (uses caller context if omitted).'),
+    }),
+    handler: async () => {
       const payload = resolvePathsPayload({
         globalDir: ws.globalDir,
         projectDir: ws.projectDir,
       });
-
       return {
         content: [{ type: 'text' as const, text: JSON.stringify(payload, null, 2) }],
       };
     },
-  );
+    examples: [{ description: 'Get all resolved paths', args: {} }],
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 }

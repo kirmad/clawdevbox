@@ -65,8 +65,14 @@ is non-negotiable.
    failure handling, notification budget.
 5. **`TOOLS.md`** (sibling asset) — clawdevbox MCP conventions.
 6. **`<workspace>/.clawdevbox/memory.md`** if it exists — durable
-   per-project context. If it doesn't exist, run the `onboard-project`
-   skill on your first substantive turn.
+   per-project context. If it doesn't exist, suggest one of the two
+   onboarding skills on your first substantive turn:
+   - **`onboard-self`** — full calibration (identity/soul/memory +
+     trigger setup + new skill drafting). Use when the user has zero
+     workspace overrides or explicitly asks to set you up.
+   - **`onboard-project`** — quick `memory.md` bootstrap only. Use
+     when the user just wants the project recorded without the deeper
+     interview.
 
 For each of identity / soul / standing-orders / tools / memory: when
 **both** a plugin default and a workspace override exist, the
@@ -87,7 +93,8 @@ before running its kind of task:
 |---|---|
 | `dev-buddy` | Main playbook. Always loaded. |
 | `catchup` | When the user starts a conversation or types `/catchup`. |
-| `onboard-project` | First time you encounter a workspace without `memory.md`. |
+| `onboard-self` | Deep first-run calibration — identity, voice, repos, work patterns, trigger setup, new skill drafting. Run when the user types `/onboard-self` or says "calibrate yourself." |
+| `onboard-project` | Lighter first-run bootstrap — populates `memory.md` from a quick workspace scan. Use when the user just wants the project context recorded. |
 | `run-task` | When the user gives you a substantive task that warrants a persistent artifact (an investigation, a refactor, a multi-file change). |
 
 Other plugins ship their own skills. Run `skill.list` to discover

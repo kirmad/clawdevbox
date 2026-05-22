@@ -48,7 +48,13 @@ export interface CronApiContext {
   dbPath: string;
   schemaVersion: number;
   service: { pid: number; port: number; started_at: number; version: string };
-  expectedToken: string;
+  /**
+   * Expected bearer token for `/api/*` routes. When null/empty, auth is
+   * disabled — the server is treated as loopback-only and any caller may
+   * hit these endpoints. The per-fire secret used on `/callback/<fire_id>`
+   * is independent of this token.
+   */
+  expectedToken: string | null;
 }
 
 function constantTimeEquals(a: string, b: string): boolean {
@@ -66,10 +72,9 @@ function bearer(req: IncomingMessage): string | null {
 }
 
 function reject401(res: ServerResponse, msg: string): void {
-  res.writeHead(401, {
-    'content-type': 'application/json',
-    'www-authenticate': 'Bearer realm="clawdevbox"',
-  });
+  // No `WWW-Authenticate` header — see start.ts:rejectUnauthorized for
+  // rationale (Copilot CLI's MCP SDK misinterprets it as OAuth required).
+  res.writeHead(401, { 'content-type': 'application/json' });
   res.end(JSON.stringify({ error: { code: 'UNAUTHORIZED', message: msg } }));
 }
 
@@ -188,14 +193,18 @@ export async function handleCronApi(
   }
 
   // ----- bearer auth for all /api/* in this handler -------------------------
-  const token = bearer(req);
-  if (!token) {
-    reject401(res, 'missing bearer token');
-    return true;
-  }
-  if (!constantTimeEquals(token, ctx.expectedToken)) {
-    reject401(res, 'invalid bearer token');
-    return true;
+  // Auth is opt-in: when ctx.expectedToken is null/empty, the server has no
+  // bearer configured and these routes are treated as loopback-only.
+  if (ctx.expectedToken) {
+    const token = bearer(req);
+    if (!token) {
+      reject401(res, 'missing bearer token');
+      return true;
+    }
+    if (!constantTimeEquals(token, ctx.expectedToken)) {
+      reject401(res, 'invalid bearer token');
+      return true;
+    }
   }
 
   // ----- GET /api/cron/status -----------------------------------------------

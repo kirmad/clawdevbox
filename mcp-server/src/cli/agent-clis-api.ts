@@ -40,10 +40,9 @@ function constantTimeEquals(a: string, b: string): boolean {
 }
 
 function reject401(res: ServerResponse, msg: string): void {
-  res.writeHead(401, {
-    'content-type': 'application/json',
-    'www-authenticate': 'Bearer realm="clawdevbox"',
-  });
+  // No `WWW-Authenticate` header — see start.ts:rejectUnauthorized for
+  // rationale (Copilot CLI's MCP SDK misinterprets it as OAuth required).
+  res.writeHead(401, { 'content-type': 'application/json' });
   res.end(JSON.stringify({ error: { code: 'UNAUTHORIZED', message: msg } }));
 }
 
@@ -62,14 +61,18 @@ export async function handleAgentCliApi(
   const url = new URL(req.url ?? '/', 'http://localhost');
   if (req.method !== 'GET' || url.pathname !== '/api/agent-clis') return false;
 
-  const presented = bearer(req);
-  if (!presented) {
-    reject401(res, 'missing bearer token');
-    return true;
-  }
-  if (!expectedToken || !constantTimeEquals(presented, expectedToken)) {
-    reject401(res, 'invalid bearer token');
-    return true;
+  // Auth is opt-in: when expectedToken is null/empty, /api/agent-clis is
+  // treated as loopback-only (matches /mcp and the other /api/* routes).
+  if (expectedToken) {
+    const presented = bearer(req);
+    if (!presented) {
+      reject401(res, 'missing bearer token');
+      return true;
+    }
+    if (!constantTimeEquals(presented, expectedToken)) {
+      reject401(res, 'invalid bearer token');
+      return true;
+    }
   }
 
   const includeInternal = url.searchParams.get('include_internal') === 'true';

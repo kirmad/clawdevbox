@@ -7,9 +7,7 @@
  *   2. Dynamic-importing each tool file (`file://...` ESM import).
  *   3. Validating the module's exported shape — `id`, `description`,
  *      `parameters` (zod), default `execute(args, ctx)`.
- *   4. Registering each as an MCP tool on the Clawdevbox server, with the
- *      tool's zod schema doubling as the inputSchema (the MCP SDK accepts
- *      a zod schema directly and converts to JSON Schema for tools/list).
+ *   4. Registering each tool into the central tool registry via defineTool().
  *   5. At call-time, building a `ToolContext` and routing the request through
  *      the tool's `execute(args, ctx)`. Throws become structured tool errors.
  *
@@ -26,11 +24,11 @@
 import { existsSync, mkdirSync } from 'node:fs';
 import { join, resolve as pathResolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { logger } from '../logger.ts';
 import { z } from 'zod';
 import type { Workspace } from '../workspace.ts';
+import { defineTool } from './registry.ts';
 
 // ============================================================================
 // Public types — also re-exported for the smoke tests.
@@ -99,13 +97,12 @@ const TOOL_ID_PATTERN = /^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$/;
 
 /**
  * Walk every enabled plugin, dynamic-import each `provides.tools[]` entry,
- * and return a registry of valid tools + the errors for invalid ones.
+ * validate, and register into the central tool registry via defineTool().
  *
- * Errors do NOT throw — they go into `registry.errors` so the rest of the
- * server can boot. The renderer's plugin panel surfaces them via plugin.list.
+ * Errors do NOT throw — they go into the returned errors array so the rest of
+ * the server can boot. The renderer's plugin panel surfaces them via plugin.list.
  */
-export async function discoverTools(ws: Workspace): Promise<HostedToolRegistry> {
-  const tools: HostedTool[] = [];
+export async function discoverAndRegisterHostedTools(ws: Workspace): Promise<{ errors: HostedToolError[] }> {
   const errors: HostedToolError[] = [];
   const seenIds = new Set<string>();
 
@@ -159,19 +156,44 @@ export async function discoverTools(ws: Workspace): Promise<HostedToolRegistry> 
         continue;
       }
 
-      tools.push({
-        id: entry.id,
-        plugin_id: plugin.id,
-        file: abs,
+      // Register into the central tool registry
+      const toolId = entry.id;
+      const pluginId = plugin.id;
+      const execute = shapeCheck.execute;
+
+      defineTool({
+        name: toolId,
         description: shapeCheck.description,
         parameters: shapeCheck.parameters,
-        execute: shapeCheck.execute,
+        handler: async (args: unknown, extra?: { signal?: AbortSignal }): Promise<CallToolResult> => {
+          const ctx = buildToolContext({
+            pluginId,
+            ws,
+            signal: extra?.signal ?? new AbortController().signal,
+          });
+          try {
+            const out = await execute(args, ctx);
+            return formatSuccess(toolId, out);
+          } catch (err) {
+            return formatError(toolId, err);
+          }
+        },
+        source: pluginId,
+        sourceFile: abs,
       });
       seenIds.add(entry.id);
     }
   }
 
-  return { tools, errors };
+  // Log discovery errors
+  for (const err of errors) {
+    logger.warn(
+      { pluginId: err.plugin_id, toolId: err.tool_id, file: err.file, err: err.error },
+      'hosted-tool discovery error',
+    );
+  }
+
+  return { errors };
 }
 
 function resolveToolFile(pluginDir: string, relFile: string): string | null {
@@ -224,59 +246,6 @@ function isZodSchema(x: unknown): x is z.ZodTypeAny {
   const hasParse = typeof candidate.parse === 'function' || typeof candidate.safeParse === 'function';
   const hasDef = '_def' in candidate || '_zod' in candidate;
   return hasParse && hasDef;
-}
-
-// ============================================================================
-// Registration — wire each discovered tool into the MCP server.
-// ============================================================================
-
-/**
- * Register every discovered tool as an MCP tool on `server`. Errors from
- * discovery are logged to stderr and surfaced via plugin.list elsewhere.
- *
- * The `ws` argument is needed at call-time to build per-plugin workspace
- * paths (project_dir / plugin_dir / plugin_data_dir).
- */
-export function registerHostedTools(
-  server: McpServer,
-  registry: HostedToolRegistry,
-  ws: Workspace,
-): void {
-  for (const err of registry.errors) {
-    logger.warn(
-      { pluginId: err.plugin_id, toolId: err.tool_id, file: err.file, err: err.error },
-      'hosted-tool discovery error',
-    );
-  }
-  for (const tool of registry.tools) {
-    registerOneHostedTool(server, tool, ws);
-  }
-}
-
-function registerOneHostedTool(server: McpServer, tool: HostedTool, ws: Workspace): void {
-  server.registerTool(
-    tool.id,
-    {
-      description: tool.description,
-      // The MCP SDK accepts a zod object schema directly here; it'll convert
-      // to JSON Schema internally for `tools/list`. For non-object schemas
-      // (rare for tools), we leave it as-is — the SDK handles it.
-      inputSchema: tool.parameters as z.ZodTypeAny,
-    },
-    async (args: unknown, extra: { signal?: AbortSignal }): Promise<CallToolResult> => {
-      const ctx = buildToolContext({
-        pluginId: tool.plugin_id,
-        ws,
-        signal: extra.signal ?? new AbortController().signal,
-      });
-      try {
-        const out = await tool.execute(args, ctx);
-        return formatSuccess(tool.id, out);
-      } catch (err) {
-        return formatError(tool.id, err);
-      }
-    },
-  );
 }
 
 // ============================================================================

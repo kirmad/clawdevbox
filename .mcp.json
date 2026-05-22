@@ -1,16 +1,10 @@
 {
   "mcpServers": {
     "clawdevbox": {
-      "type": "local",
-      "command": "npx",
-      "args": [
-        "-y",
-        "clawdevbox",
-        "mcp"
-      ],
-      "env": {
-        "CLAWDEVBOX_PROJECT_DIR": "C:\\git\\clawdevbox",
-        "CLAWDEVBOX_GLOBAL_DIR": "C:\\Users\\kirmadi\\.clawdevbox"
+      "type": "http",
+      "url": "http://127.0.0.1:5201/mcp",
+      "headers": {
+        "X-Clawdevbox-Project-Dir": "C:\\git\\clawdevbox"
       },
       "tools": [
         "*"

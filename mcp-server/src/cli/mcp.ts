@@ -117,7 +117,7 @@ function forwardedFlags(cfg: EnsureHttpServiceCfg): string[] {
  *   1.5s, reuse it (running=true, started=false).
  * - Otherwise clear any stale state, `spawnDetached` a new
  *   `clawdevbox start --service-runner ...` child, record fresh
- *   `service.json`, then probe `/healthz` for up to 10s.
+ *   `service.json`, then probe `/healthz` for up to 30s.
  *
  * Bootstrap failures are NEVER fatal to the MCP session — `runMcp()`
  * always proceeds so the agent sees the full tool surface. The returned
@@ -171,7 +171,11 @@ export async function ensureHttpServiceRunning(
   const probe = await probeHealth({
     host: cfg.http.host,
     port: cfg.http.port,
-    timeoutMs: 10_000,
+    // 30s matches `start.ts:installAsService` and `init.ts` — cold-starts
+    // with many plugins (each importing zod / heavy deps) + boot-time
+    // plugin sync legitimately take 10–20s on slow disks. 10s was a tight
+    // budget that flaked the `mcp-bootstrap` test under load.
+    timeoutMs: 30_000,
   });
   if (probe.ok) {
     return { running: true, pid, port: cfg.http.port, started: true };
@@ -223,7 +227,7 @@ export async function runMcp(flags: Flags): Promise<void> {
     process.exit(2);
   }
 
-  const { server, hostedRegistry } = await buildServer(ws);
+  const { server, hostedErrors } = await buildServer(ws);
 
   let terminalPort = 0;
   try {
@@ -272,8 +276,7 @@ export async function runMcp(flags: Flags): Promise<void> {
       transport: 'stdio',
       projectDir: ws.projectDir,
       plugins: ws.plugins.size,
-      hostedTools: hostedRegistry.tools.length,
-      hostedErrors: hostedRegistry.errors.length,
+      hostedErrors: hostedErrors.length,
       terminalPort,
     },
     'ready',

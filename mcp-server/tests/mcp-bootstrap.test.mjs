@@ -8,7 +8,7 @@
  * - `ensureHttpServiceRunning` (Task 8.4): bootstraps a detached child
  *   `clawdevbox start --service-runner` when no service.json is present
  *   (or the recorded PID is dead), then probes /healthz until ready or
- *   a 10s deadline expires. Already-healthy service -> no spawn.
+ *   a 30s deadline expires. Already-healthy service -> no spawn.
  *
  * The 8.4 tests spawn real child processes; cleanup kills them in
  * `afterEach`. Tests use 60s timeouts to absorb cold-start latency.

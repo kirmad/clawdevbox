@@ -11,7 +11,6 @@ import { fileURLToPath } from 'node:url';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
-import { zodToJsonSchema } from 'zod-to-json-schema';
 import { getRegistry, type ToolEntry } from './registry.ts';
 
 /**
@@ -95,7 +94,8 @@ export function registerMetaTools(server: McpServer, toolsDir?: string): void {
         }
         let parametersSchema: unknown = null;
         try {
-          parametersSchema = zodToJsonSchema(entry.parameters, { name: entry.name });
+          parametersSchema = (entry.parameters as any).toJSONSchema?.()
+            ?? { note: 'Schema not available in JSON Schema format.' };
         } catch {
           parametersSchema = { note: 'Schema conversion failed. Pass args as a JSON object.' };
         }
@@ -127,7 +127,7 @@ export function registerMetaTools(server: McpServer, toolsDir?: string): void {
           .min(1)
           .describe('The tool name to execute (e.g. "inbox.list", "ado.get_pr").'),
         args: z
-          .record(z.unknown())
+          .record(z.string(), z.unknown())
           .optional()
           .describe(
             "JSON object of arguments matching the tool's parameter schema. Omit or pass {} for no-argument tools.",
@@ -136,7 +136,7 @@ export function registerMetaTools(server: McpServer, toolsDir?: string): void {
     },
     async (
       args: { tool: string; args?: Record<string, unknown> },
-      extra: { signal?: AbortSignal },
+      extra: Record<string, unknown>,
     ): Promise<CallToolResult> => {
       const registry = getRegistry();
       const entry = registry.get(args.tool);
@@ -154,8 +154,8 @@ export function registerMetaTools(server: McpServer, toolsDir?: string): void {
       // Validate args against the tool's zod schema
       const parseResult = entry.parameters.safeParse(args.args ?? {});
       if (!parseResult.success) {
-        const issues = parseResult.error.issues
-          .map((i: { path: (string | number)[]; message: string }) => `${i.path.join('.')}: ${i.message}`)
+        const issues = (parseResult.error.issues as Array<{ path: (string | number | symbol)[]; message: string }>)
+          .map((i) => `${i.path.join('.')}: ${i.message}`)
           .join('; ');
         return {
           isError: true,
@@ -163,7 +163,7 @@ export function registerMetaTools(server: McpServer, toolsDir?: string): void {
         };
       }
       try {
-        const result = await entry.handler(parseResult.data, { signal: extra.signal });
+        const result = await entry.handler(parseResult.data, extra);
         // If handler returns a CallToolResult-shaped object, pass it through
         if (result && typeof result === 'object' && 'content' in (result as object)) {
           return result as CallToolResult;

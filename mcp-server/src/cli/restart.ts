@@ -57,10 +57,14 @@ export async function runRestart(flags: Flags): Promise<void> {
   }
   applyConfigToEnv(cfg);
 
-  if (!cfg.http.token) {
+  // Bearer auth is opt-in (see start.ts) — empty/missing `http.token` means
+  // /mcp and /api/* run unauthenticated. We mirror start.ts's tunnel safety
+  // check: refuse to (re)install if an anonymous tunnel would expose an
+  // unauthenticated server to the public internet.
+  if (!cfg.http.token && cfg.tunnel.kind !== 'none' && cfg.tunnel.allow_anonymous) {
     logger.error(
-      { projectDir: cfg.projectDir },
-      'no bearer token configured — run `clawdevbox init` (or pass --token / set CLAWDEVBOX_TOKEN)',
+      { projectDir: cfg.projectDir, tunnel: cfg.tunnel.kind },
+      'refusing to restart: tunnel.allow_anonymous=true requires a bearer token (set http.token or disable tunnel.allow_anonymous)',
     );
     process.exit(2);
   }

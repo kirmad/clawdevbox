@@ -1,9 +1,9 @@
 /**
  * server.ts
  *
- * Builds the McpServer instance, registers every tool family, and returns
- * the wired-up server plus the hosted-tool registry so callers (stdio + http
- * transports) can report counts in their boot log.
+ * Builds the McpServer instance with the 3 meta-tools (list_tools, learn_tool,
+ * run_tool). All tool families register into the central registry; the meta-tools
+ * layer reads from it to dispatch.
  *
  * No transport is connected here — that's the transport entry's job. This
  * keeps the server reusable across stdio (`clawdevbox mcp`) and Streamable
@@ -13,60 +13,102 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { Workspace } from './workspace.ts';
 import { inbox } from './store.ts';
-import { registerRecipeTools } from './tools/recipe.ts';
-import { registerSkillTools } from './tools/skill.ts';
-import { registerTriggerTools } from './tools/trigger.ts';
-import { registerPluginTools } from './tools/plugin.ts';
-import { registerWorkspaceTools } from './tools/workspace.ts';
-import { registerInboxTools } from './tools/inbox.ts';
-import { registerThreadTools } from './tools/thread.ts';
-import { registerApprovalTools } from './tools/approval.ts';
-import { registerArtifactTools } from './tools/artifact.ts';
-import { registerNotifyTools } from './tools/notify.ts';
-import { registerRendererTools } from './tools/renderer.ts';
-import { registerUiTools } from './tools/ui.ts';
-import { discoverTools, registerHostedTools, type HostedToolRegistry } from './tools/hosted.ts';
-import { registerFeedbackTools } from './tools/feedback.ts';
-import { registerPathsTools } from './tools/paths.ts';
+import { clearRegistry } from './tools/registry.ts';
+import { registerMetaTools } from './tools/meta-tools.ts';
+import { registerRecipeEntries } from './tools/recipe.ts';
+import { registerSkillEntries } from './tools/skill.ts';
+import { registerTriggerEntries } from './tools/trigger.ts';
+import { registerPluginEntries } from './tools/plugin.ts';
+import { registerWorkspaceEntries } from './tools/workspace.ts';
+import { registerInboxEntries } from './tools/inbox.ts';
+import { registerThreadEntries } from './tools/thread.ts';
+import { registerApprovalEntries } from './tools/approval.ts';
+import { registerArtifactEntries } from './tools/artifact.ts';
+import { registerNotifyEntries } from './tools/notify.ts';
+import { registerRendererEntries } from './tools/renderer.ts';
+import { registerUiEntries } from './tools/ui.ts';
+import { registerFeedbackEntries } from './tools/feedback.ts';
+import { registerPathsEntries } from './tools/paths.ts';
+import { discoverAndRegisterHostedTools, type HostedToolError } from './tools/hosted.ts';
 
 export interface BuiltServer {
   server: McpServer;
-  hostedRegistry: HostedToolRegistry;
+  hostedErrors: HostedToolError[];
 }
 
 export const SERVER_NAME = 'clawdevbox';
 export const SERVER_VERSION = '0.1.0';
 
-export const SERVER_INSTRUCTIONS =
-  "Clawdevbox's central MCP surface. Tool families: recipe.* (file-backed; recipe.run/.done/.instance_info manage spawned agent sessions), skill.* (file-backed), trigger.* (file-backed), plugin.* (file-backed + git), workspace.* (file-backed registry of .clawdevbox/ workspaces), inbox.* / thread.* / approval.* (in-process state for this build; SQLite-backed in the next phase), artifact.* (folder-per-id under <workspace>/artifacts/), renderer.* (workspace → plugin → builtin chain).";
+export const SERVER_INSTRUCTIONS = `Clawdevbox MCP surface. All functionality is accessed through three meta-tools: list_tools, learn_tool, run_tool.
+
+IMPORTANT: Before using any tool for the first time in a session, you MUST call learn_tool with that tool's name to understand its parameters, usage patterns, and constraints. Only then should you call run_tool.
+
+Workflow:
+1. list_tools — discover what's available (optionally filter by keyword)
+2. learn_tool — understand how to use specific tools (batch multiple names)
+3. run_tool — execute with correct parameters`;
+
+/**
+ * Register all built-in tool entries into the global registry.
+ */
+function registerAllBuiltinEntries(ws: Workspace): void {
+  registerRecipeEntries(ws);
+  registerSkillEntries(ws);
+  registerFeedbackEntries(ws);
+  registerTriggerEntries(ws);
+  registerPluginEntries(ws);
+  registerWorkspaceEntries(ws);
+  registerInboxEntries(ws);
+  registerThreadEntries();
+  registerApprovalEntries();
+  registerArtifactEntries(ws);
+  registerRendererEntries(ws);
+  registerNotifyEntries(ws);
+  registerUiEntries(ws);
+  registerPathsEntries(ws);
+}
+
+/**
+ * Create a fresh McpServer for a session. Clears and re-populates the registry
+ * so each session gets a clean tool set. The meta-tools layer reads from the
+ * registry to expose list_tools, learn_tool, run_tool.
+ *
+ * Hosted-tool discovery is expensive (plugin tree traversal + module loads),
+ * so it MUST be done once via `buildServer` at startup. Per-session servers
+ * re-register built-in entries only; hosted tools persist in the registry
+ * from the initial discovery.
+ */
+export function createSessionServer(ws: Workspace): McpServer {
+  clearRegistry();
+  registerAllBuiltinEntries(ws);
+
+  const server = new McpServer(
+    { name: SERVER_NAME, version: SERVER_VERSION },
+    { capabilities: { tools: {} }, instructions: SERVER_INSTRUCTIONS },
+  );
+  registerMetaTools(server);
+  return server;
+}
 
 export async function buildServer(ws: Workspace): Promise<BuiltServer> {
   // Bind the inbox to <globalDir>/inbox.json so items survive restarts and
   // stay consistent across the HTTP service and any stdio-MCP clients.
   inbox.bind(ws.globalDir);
 
+  // 1. Register built-in entries
+  clearRegistry();
+  registerAllBuiltinEntries(ws);
+
+  // 2. Discover and register hosted/plugin tools
+  const { errors: hostedErrors } = await discoverAndRegisterHostedTools(ws);
+
+  // 3. Create the MCP server with only 3 meta-tools
   const server = new McpServer(
     { name: SERVER_NAME, version: SERVER_VERSION },
     { capabilities: { tools: {} }, instructions: SERVER_INSTRUCTIONS },
   );
+  registerMetaTools(server);
 
-  registerRecipeTools(server, ws);
-  registerSkillTools(server, ws);
-  registerFeedbackTools(server, ws);
-  registerTriggerTools(server, ws);
-  registerPluginTools(server, ws);
-  registerWorkspaceTools(server, ws);
-  registerInboxTools(server, ws);
-  registerThreadTools(server);
-  registerApprovalTools(server);
-  registerArtifactTools(server, ws);
-  registerRendererTools(server, ws);
-  registerNotifyTools(server, ws);
-  registerUiTools(server, ws);
-  registerPathsTools(server, ws);
-
-  const hostedRegistry = await discoverTools(ws);
-  registerHostedTools(server, hostedRegistry, ws);
-
-  return { server, hostedRegistry };
+  return { server, hostedErrors };
 }
+

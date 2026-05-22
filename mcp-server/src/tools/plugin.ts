@@ -39,7 +39,6 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import { notFound, structuredError, validationError } from '../scope.ts';
@@ -56,6 +55,7 @@ import {
   type PluginEntry,
   type Workspace,
 } from '../workspace.ts';
+import { defineTool } from './registry.ts';
 
 /** Fire-and-forget bidirectional client plugin sync after a mutation. */
 async function fireClientSync(
@@ -213,16 +213,14 @@ function locateHostNodeModules(): string | null {
 import { fileURLToPath } from 'node:url';
 const thisDir = dirname(fileURLToPath(import.meta.url));
 
-export function registerPluginTools(server: McpServer, ws: Workspace): void {
+export function registerPluginEntries(ws: Workspace): void {
   // -- plugin.list ----------------------------------------------------------
-  server.registerTool(
-    'plugin.list',
-    {
-      description:
-        'List installed plugins under `<global_dir>/plugins/*`. Returns id, name, version, description, status, and a one-line provides summary (spec §10.3).',
-      inputSchema: {},
-    },
-    async () => {
+  defineTool({
+    name: 'plugin.list',
+    description:
+      'List installed plugins under `<global_dir>/plugins/*`. Returns id, name, version, description, status, and a one-line provides summary (spec §10.3).',
+    parameters: z.object({}),
+    handler: async () => {
       const plugins = [...ws.plugins.values()].map((p) => ({
         id: p.id,
         name: p.manifest.name,
@@ -237,17 +235,17 @@ export function registerPluginTools(server: McpServer, ws: Workspace): void {
         structuredContent: { plugins, count: plugins.length },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- plugin.read ----------------------------------------------------------
-  server.registerTool(
-    'plugin.read',
-    {
-      description:
-        "Read a plugin's full manifest plus provides listing + install origin (sidecar `<id>.install.json` if present).",
-      inputSchema: { id: z.string().min(1) },
-    },
-    async (args) => {
+  defineTool({
+    name: 'plugin.read',
+    description:
+      "Read a plugin's full manifest plus provides listing + install origin (sidecar `<id>.install.json` if present).",
+    parameters: z.object({ id: z.string().min(1) }),
+    handler: async (args) => {
       const plugin = ws.plugins.get(args.id);
       if (!plugin) return notFound('plugin', args.id);
       const origin = readInstallRecord(ws, args.id);
@@ -263,20 +261,20 @@ export function registerPluginTools(server: McpServer, ws: Workspace): void {
         },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- plugin.install -------------------------------------------------------
-  server.registerTool(
-    'plugin.install',
-    {
-      description:
-        "Install a plugin (spec §10.6). Sources: `git+https://`, `git+ssh://` (cloned with full history into `<global_dir>/plugins/<id>/`, `.git` retained so `plugin.update` can fetch/reset), or an absolute local folder (junctioned at `<global_dir>/plugins/<id>` so edits in the user's folder are picked up live — never copied). `ref` is an optional branch/tag/sha for git sources.",
-      inputSchema: {
-        from: z.string().min(1),
-        ref: z.string().optional(),
-      },
-    },
-    async (args) => {
+  defineTool({
+    name: 'plugin.install',
+    description:
+      "Install a plugin (spec §10.6). Sources: `git+https://`, `git+ssh://` (cloned with full history into `<global_dir>/plugins/<id>/`, `.git` retained so `plugin.update` can fetch/reset), or an absolute local folder (junctioned at `<global_dir>/plugins/<id>` so edits in the user's folder are picked up live — never copied). `ref` is an optional branch/tag/sha for git sources.",
+    parameters: z.object({
+      from: z.string().min(1),
+      ref: z.string().optional(),
+    }),
+    handler: async (args) => {
       const pluginsRoot = globalPluginsDir(ws);
       mkdirSync(pluginsRoot, { recursive: true });
 
@@ -295,17 +293,17 @@ export function registerPluginTools(server: McpServer, ws: Workspace): void {
         `from must be 'git+https://...', 'git+ssh://...', or an absolute existing directory. Got: ${args.from}`,
       );
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- plugin.update --------------------------------------------------------
-  server.registerTool(
-    'plugin.update',
-    {
-      description:
-        'Refresh a git-installed plugin (`git fetch` + `git reset --hard origin/<ref or HEAD>`). For local-folder plugins (junctioned) the user edits the folder directly — there is nothing to pull. Built-in / manual installs error with a clear message.',
-      inputSchema: { id: z.string().min(1) },
-    },
-    async (args) => {
+  defineTool({
+    name: 'plugin.update',
+    description:
+      'Refresh a git-installed plugin (`git fetch` + `git reset --hard origin/<ref or HEAD>`). For local-folder plugins (junctioned) the user edits the folder directly — there is nothing to pull. Built-in / manual installs error with a clear message.',
+    parameters: z.object({ id: z.string().min(1) }),
+    handler: async (args) => {
       const plugin = ws.plugins.get(args.id);
       if (!plugin) return notFound('plugin', args.id);
       const record = readInstallRecord(ws, args.id);
@@ -386,17 +384,17 @@ export function registerPluginTools(server: McpServer, ws: Workspace): void {
         structuredContent: { id: args.id, reset_to: resetTarget, output: reset.stdout?.trim() ?? '' },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- plugin.uninstall -----------------------------------------------------
-  server.registerTool(
-    'plugin.uninstall',
-    {
-      description:
-        "Remove a plugin from `<global_dir>/plugins/<id>/` (unlinks junctions for local installs, rm -rf for real directories) and delete its sidecar install record. Project-scope copies (recipes/skills/triggers in `<projectDir>/.clawdevbox/`) survive (spec §10.5).",
-      inputSchema: { id: z.string().min(1) },
-    },
-    async (args) => {
+  defineTool({
+    name: 'plugin.uninstall',
+    description:
+      "Remove a plugin from `<global_dir>/plugins/<id>/` (unlinks junctions for local installs, rm -rf for real directories) and delete its sidecar install record. Project-scope copies (recipes/skills/triggers in `<projectDir>/.clawdevbox/`) survive (spec §10.5).",
+    parameters: z.object({ id: z.string().min(1) }),
+    handler: async (args) => {
       // Accept by id even if the plugin failed to load — the install record
       // / on-disk entry may still need cleanup.
       const targetDir = pluginDir(ws, args.id);
@@ -439,17 +437,17 @@ export function registerPluginTools(server: McpServer, ws: Workspace): void {
         structuredContent: { id: args.id, dir: targetDir },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- plugin.enable / plugin.disable ---------------------------------------
   for (const action of ['enable', 'disable'] as const) {
-    server.registerTool(
-      `plugin.${action}`,
-      {
-        description: `${action[0].toUpperCase() + action.slice(1)} a plugin globally (flag in <global_dir>/state.json; provides un/re-register on reload). Affects every project on this account.`,
-        inputSchema: { id: z.string().min(1) },
-      },
-      async (args) => {
+    defineTool({
+      name: `plugin.${action}`,
+      description: `${action[0].toUpperCase() + action.slice(1)} a plugin globally (flag in <global_dir>/state.json; provides un/re-register on reload). Affects every project on this account.`,
+      parameters: z.object({ id: z.string().min(1) }),
+      handler: async (args) => {
         const plugin = ws.plugins.get(args.id);
         if (!plugin) return notFound('plugin', args.id);
         const state = readStateFile(ws);
@@ -464,7 +462,9 @@ export function registerPluginTools(server: McpServer, ws: Workspace): void {
           structuredContent: { id: args.id, enabled: action === 'enable' },
         };
       },
-    );
+      source: 'builtin',
+      sourceFile: fileURLToPath(import.meta.url),
+    });
   }
 }
 

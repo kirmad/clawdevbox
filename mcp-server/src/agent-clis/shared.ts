@@ -87,9 +87,21 @@ export function writeMcpJson(
   // schema rejects `streamable-http` with `Invalid literal value`, and Claude
   // Code happily accepts `http` (verified against copilot 1.0.49 and claude
   // 2.1.x). The shape is otherwise identical to MCP spec §6.2.
-  const headers: Record<string, string> = {
-    Authorization: `Bearer ${mcp.secret}`,
-  };
+  //
+  // When `mcp.secret` is empty/whitespace the server is running without
+  // bearer auth (opt-in via empty `http.token`). Emitting
+  // `Authorization: Bearer ` would be confusing and breaks some clients
+  // that validate the header value (e.g. Copilot CLI's MCP HTTP client
+  // gives up after the first 401/SSE-disconnect cycle), so we omit it
+  // entirely. We also `.trim()` to reject whitespace-only secrets like
+  // " " which would otherwise pass a naive truthy check.
+  //
+  // The per-spawn X-Clawdevbox-* headers still identify the calling
+  // agent — they're routing metadata, not auth.
+  const headers: Record<string, string> = {};
+  if (mcp.secret && mcp.secret.trim().length > 0) {
+    headers.Authorization = `Bearer ${mcp.secret}`;
+  }
   if (mcp.workspaceId) headers['X-Clawdevbox-Workspace-Id'] = mcp.workspaceId;
   if (mcp.recipeInstanceId) headers['X-Clawdevbox-Recipe-Instance-Id'] = mcp.recipeInstanceId;
   if (mcp.projectDir) headers['X-Clawdevbox-Project-Dir'] = mcp.projectDir;

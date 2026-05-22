@@ -1,6 +1,6 @@
 ---
 name: onboard-project
-description: One-time first-run setup. Builds `<workspace>/.clawdevbox/memory.md` from a quick workspace scan, asks the user 3 clarifying questions, and optionally enables the heartbeat-pulse and daily-standup background recipes. Idempotent — safe to re-run; it preserves existing memory entries and only fills gaps.
+description: Lighter first-run setup. Builds `<workspace>/.clawdevbox/memory.md` from a quick workspace scan, asks the user 3 clarifying questions, and optionally enables the heartbeat-pulse and daily-standup background recipes. Idempotent — safe to re-run; it preserves existing memory entries and only fills gaps. For the full calibration (identity / soul / repos / new-skill drafting), use `onboard-self` instead.
 ---
 
 # Onboard Project
@@ -8,6 +8,16 @@ description: One-time first-run setup. Builds `<workspace>/.clawdevbox/memory.md
 First-run setup for dev-buddy in a workspace. Goal: a populated
 `<workspace>/.clawdevbox/memory.md` and (optionally) two background
 recipes scheduled.
+
+> **When to use this vs `onboard-self`:** this skill is the
+> lightweight, project-focused bootstrap — quick scan + 3 questions
+> → `memory.md`, plus optional heartbeat/standup triggers. If the
+> user is also asking how to address them, how you should talk, what
+> repos they live in, or wants you to draft new skills for their
+> recurring tasks, run **`onboard-self`** instead — it does
+> everything this skill does *and* the deeper identity/soul/skill
+> setup. The two skills are complementary, not competing: a workspace
+> that ran `onboard-self` doesn't need `onboard-project`.
 
 ## Inputs (ask or infer)
 

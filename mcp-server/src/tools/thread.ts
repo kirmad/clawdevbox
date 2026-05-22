@@ -10,11 +10,12 @@
  * (Clawdevbox desktop app's shell-command IPC, or a future scheduler tool).
  */
 
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import { logger } from '../logger.ts';
 import { notFound, structuredError } from '../scope.ts';
 import { inbox, threads, type ThreadState } from '../store.ts';
+import { defineTool } from './registry.ts';
 
 const threadStateField = z.enum([
   'running',
@@ -27,21 +28,19 @@ const threadStateField = z.enum([
 
 const attributionField = z.enum(['agent', 'user', 'system', 'trigger']).optional();
 
-export function registerThreadTools(server: McpServer): void {
+export function registerThreadEntries(): void {
   // -- thread.spawn ---------------------------------------------------------
-  server.registerTool(
-    'thread.spawn',
-    {
-      description:
-        'Create a thread row (spec §6.1). Does NOT spawn the CLI process — the real scheduler does. Returns the thread id so callers can append_message / read it back.',
-      inputSchema: {
-        inbox_item_id: z.string().min(1),
-        prompt: z.string().min(1),
-        recipe_id: z.string().min(1).optional(),
-        parent_thread_id: z.string().min(1).optional(),
-      },
-    },
-    async (args) => {
+  defineTool({
+    name: 'thread.spawn',
+    description:
+      'Create a thread row (spec §6.1). Does NOT spawn the CLI process — the real scheduler does. Returns the thread id so callers can append_message / read it back.',
+    parameters: z.object({
+      inbox_item_id: z.string().min(1),
+      prompt: z.string().min(1),
+      recipe_id: z.string().min(1).optional(),
+      parent_thread_id: z.string().min(1).optional(),
+    }),
+    handler: async (args) => {
       const item = inbox.read(args.inbox_item_id);
       if (!item) return notFound('inbox_item', args.inbox_item_id);
       const t = threads.spawn({
@@ -55,22 +54,22 @@ export function registerThreadTools(server: McpServer): void {
         structuredContent: { thread: t },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- thread.append_message ------------------------------------------------
-  server.registerTool(
-    'thread.append_message',
-    {
-      description:
-        'Append a message to a thread. The side-terminal agent calls this after every meaningful step so the user sees its progress (spec §12).',
-      inputSchema: {
-        thread_id: z.string().min(1),
-        type: z.string().min(1).describe("Message type — e.g., 'agent_text', 'tool_call', 'tool_result', 'view_emitted'."),
-        payload: z.unknown(),
-        attribution: attributionField,
-      },
-    },
-    async (args) => {
+  defineTool({
+    name: 'thread.append_message',
+    description:
+      'Append a message to a thread. The side-terminal agent calls this after every meaningful step so the user sees its progress (spec §12).',
+    parameters: z.object({
+      thread_id: z.string().min(1),
+      type: z.string().min(1).describe("Message type — e.g., 'agent_text', 'tool_call', 'tool_result', 'view_emitted'."),
+      payload: z.unknown(),
+      attribution: attributionField,
+    }),
+    handler: async (args) => {
       const m = threads.appendMessage(args.thread_id, args.type, args.payload, args.attribution);
       if (!m) return notFound('thread', args.thread_id);
       return {
@@ -78,20 +77,20 @@ export function registerThreadTools(server: McpServer): void {
         structuredContent: { message: m },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- thread.read ----------------------------------------------------------
-  server.registerTool(
-    'thread.read',
-    {
-      description: 'Read a thread row + its messages (optionally since a message id; optionally capped).',
-      inputSchema: {
-        thread_id: z.string().min(1),
-        since_message_id: z.string().min(1).optional(),
-        limit: z.number().int().positive().max(1000).optional(),
-      },
-    },
-    async (args) => {
+  defineTool({
+    name: 'thread.read',
+    description: 'Read a thread row + its messages (optionally since a message id; optionally capped).',
+    parameters: z.object({
+      thread_id: z.string().min(1),
+      since_message_id: z.string().min(1).optional(),
+      limit: z.number().int().positive().max(1000).optional(),
+    }),
+    handler: async (args) => {
       const out = threads.read(args.thread_id, args.since_message_id, args.limit);
       if (!out) return notFound('thread', args.thread_id);
       return {
@@ -104,20 +103,20 @@ export function registerThreadTools(server: McpServer): void {
         structuredContent: out,
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- thread.set_state -----------------------------------------------------
-  server.registerTool(
-    'thread.set_state',
-    {
-      description: 'Transition a thread to a new state.',
-      inputSchema: {
-        thread_id: z.string().min(1),
-        state: threadStateField,
-        reason: z.string().optional(),
-      },
-    },
-    async (args) => {
+  defineTool({
+    name: 'thread.set_state',
+    description: 'Transition a thread to a new state.',
+    parameters: z.object({
+      thread_id: z.string().min(1),
+      state: threadStateField,
+      reason: z.string().optional(),
+    }),
+    handler: async (args) => {
       const t = threads.setState(args.thread_id, args.state as ThreadState);
       if (!t) return notFound('thread', args.thread_id);
       if (args.reason) {
@@ -128,20 +127,20 @@ export function registerThreadTools(server: McpServer): void {
         structuredContent: { thread: t },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- thread.cancel --------------------------------------------------------
-  server.registerTool(
-    'thread.cancel',
-    {
-      description: 'Cancel a thread (and optionally its descendants). The cascade is the only kill switch (mission-memory: no wallclock budgets).',
-      inputSchema: {
-        thread_id: z.string().min(1),
-        recursive: z.boolean().optional(),
-        reason: z.string().optional(),
-      },
-    },
-    async (args) => {
+  defineTool({
+    name: 'thread.cancel',
+    description: 'Cancel a thread (and optionally its descendants). The cascade is the only kill switch (mission-memory: no wallclock budgets).',
+    parameters: z.object({
+      thread_id: z.string().min(1),
+      recursive: z.boolean().optional(),
+      reason: z.string().optional(),
+    }),
+    handler: async (args) => {
       // Make sure thread exists first
       const t = threads.read(args.thread_id);
       if (!t) return notFound('thread', args.thread_id);
@@ -151,17 +150,17 @@ export function registerThreadTools(server: McpServer): void {
         structuredContent: result,
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- thread.wake ----------------------------------------------------------
-  server.registerTool(
-    'thread.wake',
-    {
-      description:
-        'Wake a suspended thread: record a `wake_requested` message and flip the thread state to `running`. The host (Clawdevbox desktop app or external scheduler) is responsible for re-spawning the underlying CLI process — this tool only updates the kernel state and emits the intent so any subscriber can act.',
-      inputSchema: { thread_id: z.string().min(1) },
-    },
-    async (args) => {
+  defineTool({
+    name: 'thread.wake',
+    description:
+      'Wake a suspended thread: record a `wake_requested` message and flip the thread state to `running`. The host (Clawdevbox desktop app or external scheduler) is responsible for re-spawning the underlying CLI process — this tool only updates the kernel state and emits the intent so any subscriber can act.',
+    parameters: z.object({ thread_id: z.string().min(1) }),
+    handler: async (args) => {
       const t = threads.read(args.thread_id);
       if (!t) return notFound('thread', args.thread_id);
       logger.info({ threadId: args.thread_id }, 'thread.wake requested');
@@ -175,5 +174,7 @@ export function registerThreadTools(server: McpServer): void {
         structuredContent: { thread: updated },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 }

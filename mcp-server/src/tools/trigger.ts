@@ -36,8 +36,9 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'no
 import { join, resolve as pathResolve, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomBytes } from 'node:crypto';
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
+import { defineTool } from './registry.ts';
 import { runTriggerScript } from '../trigger-runner.ts';
 import type { TriggerTypeParameter } from '../workspace.ts';
 import { logger } from '../logger.ts';
@@ -176,14 +177,12 @@ function projectType(t: RegisteredTriggerType): Record<string, unknown> {
 // Registration
 // ============================================================================
 
-export function registerTriggerTools(server: McpServer, ws: Workspace): void {
+export function registerTriggerEntries(ws: Workspace): void {
   // -- trigger.list_types ---------------------------------------------------
-  server.registerTool(
-    'trigger.list_types',
-    {
-      description:
-        'List trigger TYPES (capabilities) discovered from enabled plugins (spec §8.2 / §10.4). Each entry carries the parameter schema, default cron, callback binding, and source plugin. Use trigger.register to create a concrete instance from one.',
-      inputSchema: {
+  defineTool({
+    name: 'trigger.list_types',
+    description: 'List trigger TYPES (capabilities) discovered from enabled plugins (spec §8.2 / §10.4). Each entry carries the parameter schema, default cron, callback binding, and source plugin. Use trigger.register to create a concrete instance from one.',
+    parameters: z.object({
         scope: z
           .string()
           .regex(/^plugin:[a-z][a-z0-9-]*$/, 'plugin:<id>')
@@ -194,9 +193,8 @@ export function registerTriggerTools(server: McpServer, ws: Workspace): void {
           .min(1)
           .optional()
           .describe('Substring filter against id or description.'),
-      },
-    },
-    async (args) => {
+      }),
+    handler: async (args) => {
       const all = [...ws.triggerTypes.values()].sort((a, b) => a.id.localeCompare(b.id));
       let filtered = all;
       if (args.scope) {
@@ -225,15 +223,15 @@ export function registerTriggerTools(server: McpServer, ws: Workspace): void {
         },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- trigger.list_registered ----------------------------------------------
-  server.registerTool(
-    'trigger.list_registered',
-    {
-      description:
-        'List REGISTERED trigger instances from `.clawdevbox/triggers.json` (spec §8.3). Each entry shows the bound params, cron resolution (inherited/overridden/disabled), and last-run status. Use trigger.list_types to see available capabilities.',
-      inputSchema: {
+  defineTool({
+    name: 'trigger.list_registered',
+    description: 'List REGISTERED trigger instances from `.clawdevbox/triggers.json` (spec §8.3). Each entry shows the bound params, cron resolution (inherited/overridden/disabled), and last-run status. Use trigger.list_types to see available capabilities.',
+    parameters: z.object({
         enabled: z.boolean().optional(),
         type_id: z.string().min(1).optional().describe('Filter to a single trigger type id.'),
         subscriber_thread_id: z
@@ -241,9 +239,8 @@ export function registerTriggerTools(server: McpServer, ws: Workspace): void {
           .min(1)
           .optional()
           .describe('Filter to hot triggers bound to this thread.'),
-      },
-    },
-    async (args) => {
+      }),
+    handler: async (args) => {
       const file = readTriggersFile(triggersJsonPath(ws));
       let rows = file.registered.map((r) => projectRegistered(r, ws));
       if (args.enabled !== undefined) {
@@ -260,15 +257,15 @@ export function registerTriggerTools(server: McpServer, ws: Workspace): void {
         structuredContent: { registered: rows, count: rows.length },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- trigger.register -----------------------------------------------------
-  server.registerTool(
-    'trigger.register',
-    {
-      description:
-        'Register a trigger instance. Three mutually-exclusive sources: (a) `type_id` for a saved TYPE; (b) `script` for an inline one-off; (c) `script_file` for a file under `.clawdevbox/`. One-off paths default to `once: true`, `cron: false` (manual/webhook only). Validates params against the type schema (where one exists), mints `<type_id>#<key>` (or auto-template id for one-offs), and writes to `triggers.json`.',
-      inputSchema: {
+  defineTool({
+    name: 'trigger.register',
+    description: 'Register a trigger instance. Three mutually-exclusive sources: (a) `type_id` for a saved TYPE; (b) `script` for an inline one-off; (c) `script_file` for a file under `.clawdevbox/`. One-off paths default to `once: true`, `cron: false` (manual/webhook only). Validates params against the type schema (where one exists), mints `<type_id>#<key>` (or auto-template id for one-offs), and writes to `triggers.json`.',
+    parameters: z.object({
         type_id: z.string().min(1).optional(),
         script: z.string().optional(),
         script_file: z.string().optional(),
@@ -283,9 +280,8 @@ export function registerTriggerTools(server: McpServer, ws: Workspace): void {
           .describe('Override the default of 3. Integer in [1, 100].'),
         backoff_ms: z.array(z.number().int()).optional()
           .describe('Override the default of [30000, 120000, 600000]. Non-empty array of integers in [0, 86400000].'),
-      },
-    },
-    async (args) => {
+      }),
+    handler: async (args) => {
       const sources = [args.type_id, args.script, args.script_file].filter((x) => typeof x === 'string').length;
       if (sources !== 1) {
         return structuredError('INVALID_REQUEST',
@@ -409,17 +405,16 @@ export function registerTriggerTools(server: McpServer, ws: Workspace): void {
         },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- trigger.unregister ---------------------------------------------------
-  server.registerTool(
-    'trigger.unregister',
-    {
-      description:
-        'Remove a registered trigger instance by id. For one-off registrations, also drops the auto-template directory under `_oneoff/`. The underlying TYPE stays available for non-oneoff types.',
-      inputSchema: { id: z.string().min(1) },
-    },
-    async (args) => {
+  defineTool({
+    name: 'trigger.unregister',
+    description: 'Remove a registered trigger instance by id. For one-off registrations, also drops the auto-template directory under `_oneoff/`. The underlying TYPE stays available for non-oneoff types.',
+    parameters: z.object({ id: z.string().min(1) }),
+    handler: async (args) => {
       const path = triggersJsonPath(ws);
       const file = readTriggersFile(path);
       const row = file.registered.find((r) => r.id === args.id);
@@ -438,15 +433,15 @@ export function registerTriggerTools(server: McpServer, ws: Workspace): void {
         structuredContent: { id: args.id, removed: 1, oneoff_template_removed: oneoffRemoved },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- trigger.update_params ------------------------------------------------
-  server.registerTool(
-    'trigger.update_params',
-    {
-      description:
-        'Modify the params and/or cron of a registered trigger without unregister/re-register (spec §8.3). Re-validates params against the type schema. The registered id is stable — even when an identity param changes, the id is NOT remitted (use unregister + register if you want a new id).',
-      inputSchema: {
+  defineTool({
+    name: 'trigger.update_params',
+    description: 'Modify the params and/or cron of a registered trigger without unregister/re-register (spec §8.3). Re-validates params against the type schema. The registered id is stable — even when an identity param changes, the id is NOT remitted (use unregister + register if you want a new id).',
+    parameters: z.object({
         id: z.string().min(1),
         params: z
           .record(z.string(), z.unknown())
@@ -460,9 +455,8 @@ export function registerTriggerTools(server: McpServer, ws: Workspace): void {
           .describe('Override the trigger\'s max_attempts. Integer in [1, 100].'),
         backoff_ms: z.array(z.number().int()).optional()
           .describe('Override the trigger\'s backoff_ms ladder. Non-empty array of integers in [0, 86400000].'),
-      },
-    },
-    async (args) => {
+      }),
+    handler: async (args) => {
       const path = triggersJsonPath(ws);
       const file = readTriggersFile(path);
       const idx = file.registered.findIndex((r) => r.id === args.id);
@@ -542,46 +536,66 @@ export function registerTriggerTools(server: McpServer, ws: Workspace): void {
         structuredContent: { id: args.id, registered: projectRegistered(updated, ws) },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- trigger.enable / trigger.disable -------------------------------------
-  for (const action of ['enable', 'disable'] as const) {
-    server.registerTool(
-      `trigger.${action}`,
-      {
-        description: `${action === 'enable' ? 'Enable' : 'Disable'} a registered trigger by flipping its 'enabled' flag (spec §8.3). The registration row stays on disk; disabled triggers are skipped by the cron daemon but can still be fired manually via trigger.fire.`,
-        inputSchema: { id: z.string().min(1) },
-      },
-      async (args) => {
-        const path = triggersJsonPath(ws);
-        const file = readTriggersFile(path);
-        const idx = file.registered.findIndex((r) => r.id === args.id);
-        if (idx < 0) return notFound('registered_trigger', args.id);
-        const next: RegisteredTrigger = { ...file.registered[idx], enabled: action === 'enable' };
-        file.registered[idx] = next;
-        writeTriggersFile(path, file);
-        return {
-          content: [
-            { type: 'text', text: `${action === 'enable' ? 'Enabled' : 'Disabled'} trigger ${args.id}.` },
-          ],
-          structuredContent: { id: args.id, enabled: action === 'enable' },
-        };
-      },
-    );
-  }
+  defineTool({
+    name: 'trigger.enable',
+    description: "Enable a registered trigger by flipping its 'enabled' flag (spec §8.3). The registration row stays on disk; disabled triggers are skipped by the cron daemon but can still be fired manually via trigger.fire.",
+    parameters: z.object({ id: z.string().min(1) }),
+    handler: async (args) => {
+      const path = triggersJsonPath(ws);
+      const file = readTriggersFile(path);
+      const idx = file.registered.findIndex((r) => r.id === args.id);
+      if (idx < 0) return notFound('registered_trigger', args.id);
+      const next: RegisteredTrigger = { ...file.registered[idx], enabled: true };
+      file.registered[idx] = next;
+      writeTriggersFile(path, file);
+      return {
+        content: [
+          { type: 'text', text: `Enabled trigger ${args.id}.` },
+        ],
+        structuredContent: { id: args.id, enabled: true },
+      };
+    },
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
+
+  defineTool({
+    name: 'trigger.disable',
+    description: "Disable a registered trigger by flipping its 'enabled' flag (spec §8.3). The registration row stays on disk; disabled triggers are skipped by the cron daemon but can still be fired manually via trigger.fire.",
+    parameters: z.object({ id: z.string().min(1) }),
+    handler: async (args) => {
+      const path = triggersJsonPath(ws);
+      const file = readTriggersFile(path);
+      const idx = file.registered.findIndex((r) => r.id === args.id);
+      if (idx < 0) return notFound('registered_trigger', args.id);
+      const next: RegisteredTrigger = { ...file.registered[idx], enabled: false };
+      file.registered[idx] = next;
+      writeTriggersFile(path, file);
+      return {
+        content: [
+          { type: 'text', text: `Disabled trigger ${args.id}.` },
+        ],
+        structuredContent: { id: args.id, enabled: false },
+      };
+    },
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- trigger.fire ---------------------------------------------------------
-  server.registerTool(
-    'trigger.fire',
-    {
-      description:
-        'Manually fire a registered trigger by id. Returns a queued run_id and logs the fire intent. A future in-process cron daemon (or external scheduler) handles the actual webhook POST to `/hooks/<id>`. Works regardless of cron state — manual fires always succeed.',
-      inputSchema: {
+  defineTool({
+    name: 'trigger.fire',
+    description: 'Manually fire a registered trigger by id. Returns a queued run_id and logs the fire intent. A future in-process cron daemon (or external scheduler) handles the actual webhook POST to `/hooks/<id>`. Works regardless of cron state — manual fires always succeed.',
+    parameters: z.object({
         id: z.string().min(1),
         payload: z.unknown().optional(),
-      },
-    },
-    async (args) => {
+      }),
+    handler: async (args) => {
       const path = triggersJsonPath(ws);
       const file = readTriggersFile(path);
       const reg = file.registered.find((r) => r.id === args.id);
@@ -611,15 +625,15 @@ export function registerTriggerTools(server: McpServer, ws: Workspace): void {
         },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- trigger.create_template ---------------------------------------------
-  server.registerTool(
-    'trigger.create_template',
-    {
-      description:
-        'Create a new agent-authored trigger TYPE on disk. Persisted as `<scope>/trigger-types/<id>/template.yaml + trigger.<ext>`. Reloads `ws.triggerTypes` so `trigger.register` can immediately consume it. Id must start with `local.`.',
-      inputSchema: {
+  defineTool({
+    name: 'trigger.create_template',
+    description: 'Create a new agent-authored trigger TYPE on disk. Persisted as `<scope>/trigger-types/<id>/template.yaml + trigger.<ext>`. Reloads `ws.triggerTypes` so `trigger.register` can immediately consume it. Id must start with `local.`.',
+    parameters: z.object({
         id: z.string().min(1).describe("Type id; must match /^local\\.[a-z][a-z0-9-]*(\\.[a-z][a-z0-9-]*)*$/."),
         scope: z.enum(['project', 'global']).optional().describe("Default 'project'."),
         description: z.string().min(1),
@@ -632,9 +646,8 @@ export function registerTriggerTools(server: McpServer, ws: Workspace): void {
         binds_callback_to_recipe: z.string().optional(),
         binds_callback_to: z.literal('thread_resume').optional(),
         parameters: z.array(z.record(z.string(), z.unknown())).optional(),
-      },
-    },
-    async (args) => {
+      }),
+    handler: async (args) => {
       const scope = args.scope ?? 'project';
       const hasScript = typeof args.script === 'string';
       const hasFile = typeof args.script_file === 'string';
@@ -688,20 +701,19 @@ export function registerTriggerTools(server: McpServer, ws: Workspace): void {
         },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- trigger.list_templates ----------------------------------------------
-  server.registerTool(
-    'trigger.list_templates',
-    {
-      description:
-        'List agent-authored trigger TYPES (project + global scopes). Equivalent to `trigger.list_types` filtered to scope in {project, global}.',
-      inputSchema: {
+  defineTool({
+    name: 'trigger.list_templates',
+    description: 'List agent-authored trigger TYPES (project + global scopes). Equivalent to `trigger.list_types` filtered to scope in {project, global}.',
+    parameters: z.object({
         scope: z.enum(['project', 'global']).optional(),
         search: z.string().min(1).optional(),
-      },
-    },
-    async (args) => {
+      }),
+    handler: async (args) => {
       const all = [...ws.triggerTypes.values()].sort((a, b) => a.id.localeCompare(b.id));
       let filtered = all.filter((t) => t.scope === 'project' || t.scope === 'global');
       if (args.scope) filtered = filtered.filter((t) => t.scope === args.scope);
@@ -717,15 +729,15 @@ export function registerTriggerTools(server: McpServer, ws: Workspace): void {
         structuredContent: { trigger_types: projected, count: projected.length },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- trigger.update_template --------------------------------------------
-  server.registerTool(
-    'trigger.update_template',
-    {
-      description:
-        'Update an agent-authored trigger template in place (project or global). Manifest fields omitted from the call are preserved; script is replaced only when `script` or `script_file` is supplied. Reloads `ws.triggerTypes` on success.',
-      inputSchema: {
+  defineTool({
+    name: 'trigger.update_template',
+    description: 'Update an agent-authored trigger template in place (project or global). Manifest fields omitted from the call are preserved; script is replaced only when `script` or `script_file` is supplied. Reloads `ws.triggerTypes` on success.',
+    parameters: z.object({
         id: z.string().min(1),
         description: z.string().optional(),
         runtime: z.enum(['node', 'tsx', 'python', 'bash']).optional(),
@@ -737,9 +749,8 @@ export function registerTriggerTools(server: McpServer, ws: Workspace): void {
         binds_callback_to_recipe: z.string().optional(),
         binds_callback_to: z.literal('thread_resume').optional(),
         parameters: z.array(z.record(z.string(), z.unknown())).optional(),
-      },
-    },
-    async (args) => {
+      }),
+    handler: async (args) => {
       const existing = findTemplate(ws, args.id);
       if (!existing) return structuredError('TRIGGER_TEMPLATE_NOT_FOUND',
         `Template ${args.id} not found.`, { id: args.id });
@@ -803,17 +814,16 @@ export function registerTriggerTools(server: McpServer, ws: Workspace): void {
         structuredContent: { id: args.id, scope: existing.scope, path: written.dir },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- trigger.delete_template -------------------------------------------
-  server.registerTool(
-    'trigger.delete_template',
-    {
-      description:
-        'Delete an agent-authored trigger template by id. Refuses to delete plugin-shipped TYPES (use plugin.uninstall) or templates referenced by registered instances (unregister first).',
-      inputSchema: { id: z.string().min(1) },
-    },
-    async (args) => {
+  defineTool({
+    name: 'trigger.delete_template',
+    description: 'Delete an agent-authored trigger template by id. Refuses to delete plugin-shipped TYPES (use plugin.uninstall) or templates referenced by registered instances (unregister first).',
+    parameters: z.object({ id: z.string().min(1) }),
+    handler: async (args) => {
       const existing = findTemplate(ws, args.id);
       if (!existing) {
         const inMap = ws.triggerTypes.get(args.id);
@@ -839,15 +849,15 @@ export function registerTriggerTools(server: McpServer, ws: Workspace): void {
         structuredContent: { id: args.id, scope: existing.scope, removed },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- trigger.test ---------------------------------------------------------
-  server.registerTool(
-    'trigger.test',
-    {
-      description:
-        'Run a trigger script with a synthesized envelope and capture the result. NON-MUTATING — does not write to triggers.json or update state. Three input sources (XOR): `id` (registered instance), `template_id` (saved type, any scope), or `script` + `runtime` (inline). Captures Mode A (stdout `callback.body`) and Mode B (HTTP POST to a fresh ephemeral 127.0.0.1 receiver) callbacks; receiver enforces `Authorization: Bearer <fresh-secret>` like the real /callback/* endpoints. Hard timeout (default 30s).',
-      inputSchema: {
+  defineTool({
+    name: 'trigger.test',
+    description: 'Run a trigger script with a synthesized envelope and capture the result. NON-MUTATING — does not write to triggers.json or update state. Three input sources (XOR): `id` (registered instance), `template_id` (saved type, any scope), or `script` + `runtime` (inline). Captures Mode A (stdout `callback.body`) and Mode B (HTTP POST to a fresh ephemeral 127.0.0.1 receiver) callbacks; receiver enforces `Authorization: Bearer <fresh-secret>` like the real /callback/* endpoints. Hard timeout (default 30s).',
+    parameters: z.object({
         id: z.string().min(1).optional(),
         template_id: z.string().min(1).optional(),
         script: z.string().optional(),
@@ -856,9 +866,8 @@ export function registerTriggerTools(server: McpServer, ws: Workspace): void {
         state: z.record(z.string(), z.unknown()).optional(),
         payload: z.unknown().optional(),
         timeout_ms: z.number().int().positive().max(600000).optional(),
-      },
-    },
-    async (args) => {
+      }),
+    handler: async (args) => {
       const sources = [args.id, args.template_id, args.script].filter((x) => typeof x === 'string').length;
       if (sources !== 1) {
         return structuredError('INVALID_REQUEST',
@@ -1031,5 +1040,7 @@ export function registerTriggerTools(server: McpServer, ws: Workspace): void {
         },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 }

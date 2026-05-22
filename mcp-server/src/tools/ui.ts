@@ -17,8 +17,9 @@
  * `custom` topic, similar to a manual reload).
  */
 
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
+import { defineTool } from './registry.ts';
 import { loadNotificationsConfig } from '../config.ts';
 import { emitChange, type ChangeTopic } from '../event-bus.ts';
 import { sendNotification } from '../notifications.ts';
@@ -35,44 +36,42 @@ const KNOWN_TOPICS = [
   'custom',
 ] as const;
 
-export function registerUiTools(server: McpServer, ws: Workspace): void {
-  server.registerTool(
-    'ui.notify',
-    {
-      description:
-        "Tell the Clawdevbox UI something changed. Fires an SSE 'change' event for the given `topic` (every connected SPA tab refreshes its data for that topic) and OPTIONALLY also fires a browser push notification to subscribed devices. Use this whenever a plugin or trigger script wants the user to notice an event — e.g. a comment landed, an incident fired, an artifact is ready to view. Either `topic` or `push` must be supplied (usually both).",
-      inputSchema: {
-        topic: z
-          .enum(KNOWN_TOPICS)
-          .optional()
-          .describe(
-            'SSE topic the SPA should refresh. Standard topics: inbox, recipes, agent, tunnel, notifications, triggers, approvals. Pass `custom` to fan out a refresh to every panel.',
-          ),
-        push: z
-          .object({
-            title: z.string().min(1).max(120),
-            body: z.string().max(400).optional(),
-            url: z
-              .string()
-              .optional()
-              .describe('Path or absolute URL the SW opens on tap. Defaults to `/`.'),
-            tag: z
-              .string()
-              .max(80)
-              .optional()
-              .describe(
-                'Collapse key — newer notifications with the same tag replace older ones. Default: `clawdevbox`.',
-              ),
-            icon: z.string().optional(),
-            require_interaction: z.boolean().optional(),
-          })
-          .optional()
-          .describe(
-            'When present, also fires a browser push notification to every device subscribed via the home page. Requires `notifications.enabled` + VAPID keys in config.json.',
-          ),
-      },
-    },
-    async (args) => {
+export function registerUiEntries(ws: Workspace): void {
+  defineTool({
+    name: 'ui.notify',
+    description:
+      "Tell the Clawdevbox UI something changed. Fires an SSE 'change' event for the given `topic` (every connected SPA tab refreshes its data for that topic) and OPTIONALLY also fires a browser push notification to subscribed devices. Use this whenever a plugin or trigger script wants the user to notice an event — e.g. a comment landed, an incident fired, an artifact is ready to view. Either `topic` or `push` must be supplied (usually both).",
+    parameters: z.object({
+      topic: z
+        .enum(KNOWN_TOPICS)
+        .optional()
+        .describe(
+          'SSE topic the SPA should refresh. Standard topics: inbox, recipes, agent, tunnel, notifications, triggers, approvals. Pass `custom` to fan out a refresh to every panel.',
+        ),
+      push: z
+        .object({
+          title: z.string().min(1).max(120),
+          body: z.string().max(400).optional(),
+          url: z
+            .string()
+            .optional()
+            .describe('Path or absolute URL the SW opens on tap. Defaults to `/`.'),
+          tag: z
+            .string()
+            .max(80)
+            .optional()
+            .describe(
+              'Collapse key — newer notifications with the same tag replace older ones. Default: `clawdevbox`.',
+            ),
+          icon: z.string().optional(),
+          require_interaction: z.boolean().optional(),
+        })
+        .optional()
+        .describe(
+          'When present, also fires a browser push notification to every device subscribed via the home page. Requires `notifications.enabled` + VAPID keys in config.json.',
+        ),
+    }),
+    handler: async (args) => {
       if (!args.topic && !args.push) {
         return {
           isError: true,
@@ -150,5 +149,7 @@ export function registerUiTools(server: McpServer, ws: Workspace): void {
         },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 }

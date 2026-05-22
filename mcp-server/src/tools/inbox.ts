@@ -18,7 +18,7 @@
  *   - empty string `""` for description → body sidecar deleted
  */
 
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import { loadNotificationsConfig } from '../config.ts';
 import {
@@ -30,6 +30,7 @@ import { sendNotification } from '../notifications.ts';
 import { notFound, structuredError } from '../scope.ts';
 import { inbox, threads, type InboxItem, type InboxState } from '../store.ts';
 import type { Workspace } from '../workspace.ts';
+import { defineTool } from './registry.ts';
 
 const inboxStateField = z.enum(['new', 'open', 'snoozed', 'archived', 'done']);
 const agentToneField = z.enum(['info', 'warn', 'err', 'ok']);
@@ -71,27 +72,25 @@ function clipForPush(s: string): string {
   return t.slice(0, PUSH_BODY_MAX - 1) + '…';
 }
 
-export function registerInboxTools(server: McpServer, ws: Workspace): void {
+export function registerInboxEntries(ws: Workspace): void {
   // -- inbox.list -----------------------------------------------------------
-  server.registerTool(
-    'inbox.list',
-    {
-      description:
-        'List inbox items (metadata only — body content NOT included; fetch a single item with inbox.read for the full description). Optionally filtered by kind/state/label and paginated by cursor.',
-      inputSchema: {
-        kind: z.string().min(1).optional(),
-        state: inboxStateField.optional(),
-        label: z
-          .string()
-          .min(1)
-          .max(LABEL_LEN_MAX)
-          .optional()
-          .describe('Case-insensitive label match. Returns only items whose labels include this value.'),
-        limit: z.number().int().positive().max(500).optional(),
-        cursor: z.string().min(1).optional(),
-      },
-    },
-    async (args) => {
+  defineTool({
+    name: 'inbox.list',
+    description:
+      'List inbox items (metadata only — body content NOT included; fetch a single item with inbox.read for the full description). Optionally filtered by kind/state/label and paginated by cursor.',
+    parameters: z.object({
+      kind: z.string().min(1).optional(),
+      state: inboxStateField.optional(),
+      label: z
+        .string()
+        .min(1)
+        .max(LABEL_LEN_MAX)
+        .optional()
+        .describe('Case-insensitive label match. Returns only items whose labels include this value.'),
+      limit: z.number().int().positive().max(500).optional(),
+      cursor: z.string().min(1).optional(),
+    }),
+    handler: async (args) => {
       const items = inbox.list({
         kind: args.kind,
         state: args.state,
@@ -104,20 +103,20 @@ export function registerInboxTools(server: McpServer, ws: Workspace): void {
         structuredContent: { items, count: items.length },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- inbox.read -----------------------------------------------------------
-  server.registerTool(
-    'inbox.read',
-    {
-      description:
-        'Read a single inbox item INCLUDING the full description body (if any). Pass `include_body: false` to skip the body when you only need metadata.',
-      inputSchema: {
-        id: z.string().min(1),
-        include_body: z.boolean().optional(),
-      },
-    },
-    async (args) => {
+  defineTool({
+    name: 'inbox.read',
+    description:
+      'Read a single inbox item INCLUDING the full description body (if any). Pass `include_body: false` to skip the body when you only need metadata.',
+    parameters: z.object({
+      id: z.string().min(1),
+      include_body: z.boolean().optional(),
+    }),
+    handler: async (args) => {
       const item = inbox.read(args.id);
       if (!item) return notFound('inbox_item', args.id);
       const includeBody = args.include_body !== false;
@@ -142,74 +141,74 @@ export function registerInboxTools(server: McpServer, ws: Workspace): void {
         structuredContent: { item, description },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- inbox.upsert ---------------------------------------------------------
-  server.registerTool(
-    'inbox.upsert',
-    {
-      description:
-        "Create or update an inbox item. Idempotent on `id`. Persisted to `<globalDir>/inbox.json` (metadata) and `<globalDir>/inbox-bodies/` (description bodies). SPA tabs auto-refresh via SSE; on creation (or when `notify: true`) a browser push fires. Supply `title`+`preview` for the card, `description`+`description_format` for the expanded body, `attachments` for clickable artifact chips, `labels` for free-form tag chips, and `recipe_instance`/`trigger_id` to link the item to spawned work. Update semantics: omitted = unchanged; `null` = cleared (for nullable fields); empty `attachments: []` or `labels: []` = cleared; empty `description: \"\"` = body deleted.",
-      inputSchema: {
-        id: z.string().min(1),
-        kind: z.string().min(1),
-        source: z.string().min(1),
-        title: z.string().max(500).optional(),
-        preview: z
-          .string()
-          .max(PREVIEW_MAX)
-          .optional()
-          .describe(`Brief tldr shown on the inbox card. Max ${PREVIEW_MAX} chars.`),
-        description: z
-          .string()
-          .max(DESCRIPTION_MAX)
-          .optional()
-          .describe(
-            `Full body shown when the user expands the card. Max ${DESCRIPTION_MAX / 1024}KB. Stored in a sidecar; pass "" to delete an existing body.`,
-          ),
-        description_format: bodyFormatField
-          .optional()
-          .describe('Body format. Default: markdown.'),
-        attachments: z
-          .array(attachmentSchema)
-          .max(ATTACHMENTS_MAX)
-          .optional()
-          .describe(
-            'Artifact references — each becomes a clickable chip in the SPA detail view that opens the artifact as a tab. Pass `[]` to clear.',
-          ),
-        recipe_instance: refSchema
-          .nullable()
-          .optional()
-          .describe(
-            'Link to a recipe instance (e.g. from recipe.run output). Clicking jumps to the Recipes tab. Pass null to clear.',
-          ),
-        trigger_id: z
-          .string()
-          .min(1)
-          .max(200)
-          .nullable()
-          .optional()
-          .describe(
-            'Link to a registered trigger (e.g. "ado.new-pr-watcher#auth-svc"). Pass null to clear.',
-          ),
-        labels: z
-          .array(labelSchema)
-          .max(LABELS_MAX)
-          .optional()
-          .describe(
-            `Free-form labels/tags shown as chips on the card. Max ${LABELS_MAX} per item, each ≤${LABEL_LEN_MAX} chars. Pass \`[]\` to clear. Duplicates are removed (case-insensitive).`,
-          ),
-        agent_message: z.string().optional(),
-        agent_tone: agentToneField.optional(),
-        notify: z
-          .boolean()
-          .optional()
-          .describe(
-            'Send a browser push to subscribed devices. Default: true on creation, false on update. Set explicitly to force.',
-          ),
-      },
-    },
-    async (args) => {
+  defineTool({
+    name: 'inbox.upsert',
+    description:
+      "Create or update an inbox item. Idempotent on `id`. Persisted to `<globalDir>/inbox.json` (metadata) and `<globalDir>/inbox-bodies/` (description bodies). SPA tabs auto-refresh via SSE; on creation (or when `notify: true`) a browser push fires. Supply `title`+`preview` for the card, `description`+`description_format` for the expanded body, `attachments` for clickable artifact chips, `labels` for free-form tag chips, and `recipe_instance`/`trigger_id` to link the item to spawned work. Update semantics: omitted = unchanged; `null` = cleared (for nullable fields); empty `attachments: []` or `labels: []` = cleared; empty `description: \"\"` = body deleted.",
+    parameters: z.object({
+      id: z.string().min(1),
+      kind: z.string().min(1),
+      source: z.string().min(1),
+      title: z.string().max(500).optional(),
+      preview: z
+        .string()
+        .max(PREVIEW_MAX)
+        .optional()
+        .describe(`Brief tldr shown on the inbox card. Max ${PREVIEW_MAX} chars.`),
+      description: z
+        .string()
+        .max(DESCRIPTION_MAX)
+        .optional()
+        .describe(
+          `Full body shown when the user expands the card. Max ${DESCRIPTION_MAX / 1024}KB. Stored in a sidecar; pass "" to delete an existing body.`,
+        ),
+      description_format: bodyFormatField
+        .optional()
+        .describe('Body format. Default: markdown.'),
+      attachments: z
+        .array(attachmentSchema)
+        .max(ATTACHMENTS_MAX)
+        .optional()
+        .describe(
+          'Artifact references — each becomes a clickable chip in the SPA detail view that opens the artifact as a tab. Pass `[]` to clear.',
+        ),
+      recipe_instance: refSchema
+        .nullable()
+        .optional()
+        .describe(
+          'Link to a recipe instance (e.g. from recipe.run output). Clicking jumps to the Recipes tab. Pass null to clear.',
+        ),
+      trigger_id: z
+        .string()
+        .min(1)
+        .max(200)
+        .nullable()
+        .optional()
+        .describe(
+          'Link to a registered trigger (e.g. "ado.new-pr-watcher#auth-svc"). Pass null to clear.',
+        ),
+      labels: z
+        .array(labelSchema)
+        .max(LABELS_MAX)
+        .optional()
+        .describe(
+          `Free-form labels/tags shown as chips on the card. Max ${LABELS_MAX} per item, each ≤${LABEL_LEN_MAX} chars. Pass \`[]\` to clear. Duplicates are removed (case-insensitive).`,
+        ),
+      agent_message: z.string().optional(),
+      agent_tone: agentToneField.optional(),
+      notify: z
+        .boolean()
+        .optional()
+        .describe(
+          'Send a browser push to subscribed devices. Default: true on creation, false on update. Set explicitly to force.',
+        ),
+    }),
+    handler: async (args) => {
       // ---- handle the description body sidecar BEFORE upserting the item
       // so the description_size metadata is accurate.
       const format: 'markdown' | 'text' = args.description_format ?? 'markdown';
@@ -349,20 +348,20 @@ export function registerInboxTools(server: McpServer, ws: Workspace): void {
         },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- inbox.set_state ------------------------------------------------------
-  server.registerTool(
-    'inbox.set_state',
-    {
-      description: 'Transition an inbox item to a new state; reason is recorded as a message attribution.',
-      inputSchema: {
-        id: z.string().min(1),
-        state: inboxStateField,
-        reason: z.string().optional(),
-      },
-    },
-    async (args) => {
+  defineTool({
+    name: 'inbox.set_state',
+    description: 'Transition an inbox item to a new state; reason is recorded as a message attribution.',
+    parameters: z.object({
+      id: z.string().min(1),
+      state: inboxStateField,
+      reason: z.string().optional(),
+    }),
+    handler: async (args) => {
       const item = inbox.setState(args.id, args.state as InboxState);
       if (!item) return notFound('inbox_item', args.id);
       return {
@@ -370,19 +369,19 @@ export function registerInboxTools(server: McpServer, ws: Workspace): void {
         structuredContent: { item },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- inbox.snooze ---------------------------------------------------------
-  server.registerTool(
-    'inbox.snooze',
-    {
-      description: 'Snooze an inbox item until a unix-ms timestamp.',
-      inputSchema: {
-        id: z.string().min(1),
-        until: z.number().int().positive(),
-      },
-    },
-    async (args) => {
+  defineTool({
+    name: 'inbox.snooze',
+    description: 'Snooze an inbox item until a unix-ms timestamp.',
+    parameters: z.object({
+      id: z.string().min(1),
+      until: z.number().int().positive(),
+    }),
+    handler: async (args) => {
       if (args.until <= Date.now()) {
         return structuredError(
           'INVALID_SNOOZE_TIME',
@@ -396,16 +395,16 @@ export function registerInboxTools(server: McpServer, ws: Workspace): void {
         structuredContent: { item },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- inbox.archive --------------------------------------------------------
-  server.registerTool(
-    'inbox.archive',
-    {
-      description: 'Archive an inbox item (sets state to "archived").',
-      inputSchema: { id: z.string().min(1) },
-    },
-    async (args) => {
+  defineTool({
+    name: 'inbox.archive',
+    description: 'Archive an inbox item (sets state to "archived").',
+    parameters: z.object({ id: z.string().min(1) }),
+    handler: async (args) => {
       const item = inbox.archive(args.id);
       if (!item) return notFound('inbox_item', args.id);
       // Threads attached to an archived inbox item could cascade-terminate;
@@ -417,5 +416,7 @@ export function registerInboxTools(server: McpServer, ws: Workspace): void {
         structuredContent: { item },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 }

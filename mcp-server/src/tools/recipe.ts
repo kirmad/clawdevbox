@@ -12,9 +12,10 @@
 
 import { existsSync, readFileSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { fileURLToPath } from 'node:url';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
+import { defineTool } from './registry.ts';
 import { dump as yamlDump } from 'js-yaml';
 import {
   hasSession as ptyHasSession,
@@ -76,23 +77,20 @@ const writableScope = z
   .or(z.string().regex(/^plugin:[a-z][a-z0-9-]*$/, 'plugin:<id> (will be rejected)'))
   .describe("Write target. Plugin scope is rejected with PLUGIN_SCOPE_READONLY.");
 
-export function registerRecipeTools(server: McpServer, ws: Workspace): void {
+export function registerRecipeEntries(ws: Workspace): void {
   // -- recipe.list ----------------------------------------------------------
-  server.registerTool(
-    'recipe.list',
-    {
-      description:
-        'List recipes across scopes (spec §6.1 + §10.4). Project shadows plugin shadows global on id collision in `all` mode; the listing reports every (id, scope) pair so customizations are visible.',
-      inputSchema: {
+  defineTool({
+    name: 'recipe.list',
+    description: 'List recipes across scopes (spec §6.1 + §10.4). Project shadows plugin shadows global on id collision in `all` mode; the listing reports every (id, scope) pair so customizations are visible.',
+    parameters: z.object({
         scope: scopeFilter,
         search: z
           .string()
           .min(1)
           .optional()
           .describe('Substring filter against id, name, or description.'),
-      },
-    },
-    async (args) => {
+      }),
+    handler: async (args) => {
       const scope = (args.scope ?? 'all') as 'project' | 'global' | 'all' | `plugin:${string}`;
       const entries = listAllInScope(ws, scope, 'recipe', recipePath);
       const recipes = entries.map((e) => {
@@ -128,20 +126,19 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
         structuredContent: { recipes: filtered, count: filtered.length },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- recipe.read ----------------------------------------------------------
-  server.registerTool(
-    'recipe.read',
-    {
-      description:
-        'Read a recipe by id, with scope precedence project → plugin → global (spec §10.4). Returns raw YAML + parsed object + the scope it resolved from.',
-      inputSchema: {
+  defineTool({
+    name: 'recipe.read',
+    description: 'Read a recipe by id, with scope precedence project → plugin → global (spec §10.4). Returns raw YAML + parsed object + the scope it resolved from.',
+    parameters: z.object({
         id: z.string().min(1).describe('Recipe id ([a-z][a-z0-9-]*).'),
         scope: scopeFilter,
-      },
-    },
-    async (args) => {
+      }),
+    handler: async (args) => {
       const idCheck = validateId(args.id);
       if (!idCheck.ok) return structuredError('INVALID_ID', idCheck.message!);
       const scope = (args.scope ?? 'all') as 'project' | 'global' | 'all' | `plugin:${string}`;
@@ -158,15 +155,15 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
         },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- recipe.upsert --------------------------------------------------------
-  server.registerTool(
-    'recipe.upsert',
-    {
-      description:
-        'Write a recipe to project or global scope. Plugin scope is read-only — copy to project to customize (spec §10.6). Shape-validates before disk write (spec §7.4). `format` selects the on-disk encoding: `yaml` (default) writes `<id>.yaml`; `json` writes `<id>.json`. Whichever format you pick, the duplicate-id file in the other format is atomically removed so a recipe always lives in exactly one extension.',
-      inputSchema: {
+  defineTool({
+    name: 'recipe.upsert',
+    description: 'Write a recipe to project or global scope. Plugin scope is read-only — copy to project to customize (spec §10.6). Shape-validates before disk write (spec §7.4). `format` selects the on-disk encoding: `yaml` (default) writes `<id>.yaml`; `json` writes `<id>.json`. Whichever format you pick, the duplicate-id file in the other format is atomically removed so a recipe always lives in exactly one extension.',
+    parameters: z.object({
         id: z.string().min(1).describe('Recipe id; must match [a-z][a-z0-9-]*.'),
         scope: writableScope,
         source: z.string().min(1).describe('Full YAML or JSON body of the recipe.'),
@@ -174,9 +171,8 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
           .enum(['yaml', 'json'])
           .optional()
           .describe("On-disk format. Default 'yaml'."),
-      },
-    },
-    async (args) => {
+      }),
+    handler: async (args) => {
       const idCheck = validateId(args.id);
       if (!idCheck.ok) return structuredError('INVALID_ID', idCheck.message!);
       const guard = ensureWritableScope(args.scope);
@@ -270,19 +266,19 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
         },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- recipe.delete --------------------------------------------------------
-  server.registerTool(
-    'recipe.delete',
-    {
-      description: 'Delete a recipe from project or global scope. Plugin scope is read-only.',
-      inputSchema: {
+  defineTool({
+    name: 'recipe.delete',
+    description: 'Delete a recipe from project or global scope. Plugin scope is read-only.',
+    parameters: z.object({
         id: z.string().min(1),
         scope: writableScope,
-      },
-    },
-    async (args) => {
+      }),
+    handler: async (args) => {
       const guard = ensureWritableScope(args.scope);
       if (guard) return guard;
       const target = recipePath(ws, args.scope as 'project' | 'global', args.id);
@@ -305,15 +301,15 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
         structuredContent: { id: args.id, scope: args.scope, path: target, removed },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- recipe.run -----------------------------------------------------------
-  server.registerTool(
-    'recipe.run',
-    {
-      description:
-        'Spawn a fresh agent CLI session running a recipe in a workspace. Two ways to specify the recipe: (a) `id` — load an already-saved recipe via the scope chain (project→plugin→global); or (b) `source` — pass the recipe YAML inline for an ad-hoc run without persisting it. Exactly one of `id` or `source` is required. Either way, mints a recipe-instance row in `<workspace>/.clawdevbox/recipe-instances/`, writes `.mcp.json` so the spawned CLI sees the Clawdevbox MCP server, then detach-spawns the agent CLI and returns immediately with ids + pid. The spawned agent calls `recipe.done` to signal completion.',
-      inputSchema: {
+  defineTool({
+    name: 'recipe.run',
+    description: 'Spawn a fresh agent CLI session running a recipe in a workspace. Two ways to specify the recipe: (a) `id` — load an already-saved recipe via the scope chain (project→plugin→global); or (b) `source` — pass the recipe YAML inline for an ad-hoc run without persisting it. Exactly one of `id` or `source` is required. Either way, mints a recipe-instance row in `<workspace>/.clawdevbox/recipe-instances/`, writes `.mcp.json` so the spawned CLI sees the Clawdevbox MCP server, then detach-spawns the agent CLI and returns immediately with ids + pid. The spawned agent calls `recipe.done` to signal completion.',
+    parameters: z.object({
         id: z
           .string()
           .min(1)
@@ -361,9 +357,8 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
           .min(1)
           .optional()
           .describe('Recipe-instance id to resume. When set, the agent CLI is spawned with --resume <session_id_of_resume_of> and the new instance is recorded as a continuation.'),
-      },
-    },
-    async (args) => {
+      }),
+    handler: async (args) => {
       // 1. Resolve the recipe — either by id (saved) or by inline source (ad-hoc).
       //    Exactly one of {id, source} must be supplied.
       const hasId = typeof args.id === 'string' && args.id.length > 0;
@@ -547,15 +542,15 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
         },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- recipe.done ----------------------------------------------------------
-  server.registerTool(
-    'recipe.done',
-    {
-      description:
-        'Called by the agent inside a spawned recipe-run session to signal completion. Requires CLAWDEVBOX_RECIPE_INSTANCE_ID and CLAWDEVBOX_WORKSPACE_ID env vars (set automatically by recipe.run). Updates the instance file with status / completed_at / result / message.',
-      inputSchema: {
+  defineTool({
+    name: 'recipe.done',
+    description: 'Called by the agent inside a spawned recipe-run session to signal completion. Requires CLAWDEVBOX_RECIPE_INSTANCE_ID and CLAWDEVBOX_WORKSPACE_ID env vars (set automatically by recipe.run). Updates the instance file with status / completed_at / result / message.',
+    parameters: z.object({
         status: z
           .enum(['success', 'failure', 'cancelled'])
           .optional()
@@ -565,9 +560,8 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
           .optional()
           .describe('Optional structured result the parent can consume.'),
         message: z.string().optional().describe('Optional human summary.'),
-      },
-    },
-    async (args, extra) => {
+      }),
+    handler: async (args, extra) => {
       const instanceId = resolveRecipeInstanceId(extra);
       const wsResult = resolveWorkspaceContext(extra);
       if (!instanceId) {
@@ -613,23 +607,22 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
         },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- recipe.instance_info -------------------------------------------------
-  server.registerTool(
-    'recipe.instance_info',
-    {
-      description:
-        'Read a recipe-run instance by id, or — when no id is passed — by reading CLAWDEVBOX_RECIPE_INSTANCE_ID + CLAWDEVBOX_WORKSPACE_ID env vars inside a spawned session. Returns the full instance row.',
-      inputSchema: {
+  defineTool({
+    name: 'recipe.instance_info',
+    description: 'Read a recipe-run instance by id, or — when no id is passed — by reading CLAWDEVBOX_RECIPE_INSTANCE_ID + CLAWDEVBOX_WORKSPACE_ID env vars inside a spawned session. Returns the full instance row.',
+    parameters: z.object({
         id: z
           .string()
           .min(1)
           .optional()
           .describe('Optional recipe-instance id. When omitted, falls back to env vars.'),
-      },
-    },
-    async (args, extra) => {
+      }),
+    handler: async (args, extra) => {
       const root = resolveWorkspacesRoot();
       let instanceId = args.id;
 
@@ -671,19 +664,19 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
       }
       return successResponse(inst);
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- recipe.view_url ------------------------------------------------------
   // Returns the browser URL that hooks an xterm.js view into the hidden pty
   // session for a running recipe instance. Mirrors the pattern from
   // taskdock's chat-terminal:watch — many viewers can attach to the same
   // session, and each gets a scrollback snapshot followed by live data.
-  server.registerTool(
-    'recipe.view_url',
-    {
-      description:
-        'Return a browser URL that opens an xterm.js viewer attached to the hidden pty running the given recipe instance. Viewers receive a scrollback snapshot, then live data, and can send keystrokes / resize / kill back. Multiple clients may attach simultaneously. Errors if the instance is unknown or already cleaned up.',
-      inputSchema: {
+  defineTool({
+    name: 'recipe.view_url',
+    description: 'Return a browser URL that opens an xterm.js viewer attached to the hidden pty running the given recipe instance. Viewers receive a scrollback snapshot, then live data, and can send keystrokes / resize / kill back. Multiple clients may attach simultaneously. Errors if the instance is unknown or already cleaned up.',
+    parameters: z.object({
         id: z
           .string()
           .min(1)
@@ -691,9 +684,8 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
           .describe(
             'Recipe-instance id. When omitted, falls back to CLAWDEVBOX_RECIPE_INSTANCE_ID (useful from inside a spawned agent).',
           ),
-      },
-    },
-    async (args, extra) => {
+      }),
+    handler: async (args, extra) => {
       const instanceId = args.id ?? resolveRecipeInstanceId(extra);
       if (!instanceId) {
         return structuredError(
@@ -725,17 +717,17 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
         },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- recipe.kill ----------------------------------------------------------
   // Forcibly terminate a running pty session. Marks the instance as cancelled
   // so subsequent recipe.instance_info reads reflect the truth.
-  server.registerTool(
-    'recipe.kill',
-    {
-      description:
-        'Terminate a running recipe pty. Sends a signal to the underlying agent process, marks the recipe instance as cancelled, and disconnects all attached viewers via the regular exit event.',
-      inputSchema: {
+  defineTool({
+    name: 'recipe.kill',
+    description: 'Terminate a running recipe pty. Sends a signal to the underlying agent process, marks the recipe instance as cancelled, and disconnects all attached viewers via the regular exit event.',
+    parameters: z.object({
         id: z
           .string()
           .min(1)
@@ -745,9 +737,8 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
           .string()
           .optional()
           .describe('Optional POSIX signal name (default: SIGTERM). Ignored on Windows ptys; ConPTY closes the pseudoconsole regardless.'),
-      },
-    },
-    async (args, extra) => {
+      }),
+    handler: async (args, extra) => {
       const instanceId = args.id ?? resolveRecipeInstanceId(extra);
       if (!instanceId) {
         return structuredError(
@@ -792,19 +783,18 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
         },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- recipe.list_running ---------------------------------------------------
   // Convenience listing of every pty session currently registered. Useful for
   // dashboards and Playwright tests.
-  server.registerTool(
-    'recipe.list_running',
-    {
-      description:
-        'List every recipe-instance currently holding a live pty session in this MCP server. Returns view_url per entry when the terminal server is running.',
-      inputSchema: {},
-    },
-    async () => {
+  defineTool({
+    name: 'recipe.list_running',
+    description: 'List every recipe-instance currently holding a live pty session in this MCP server. Returns view_url per entry when the terminal server is running.',
+    parameters: z.object({}),
+    handler: async () => {
       const handle = getTerminalServer();
       const items = ptyListSessions().map((s) => ({
         recipe_instance_id: s.instanceId,
@@ -817,21 +807,20 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
         structuredContent: { sessions: items },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
   // -- recipe.update_steps --------------------------------------------------
-  server.registerTool(
-    'recipe.update_steps',
-    {
-      description:
-        'Mutate the step plan of a running recipe instance (spec §10.5). Supports three operations in one call: `add` new steps, `remove` pending steps by step_id, and `update_meta` to patch existing step declarations. All mutations run inside a single DB transaction; any failure rolls everything back. Added triggers on running steps register immediately; removed triggers disable matching auto-declared rows. Defaults `recipe_instance_id` from $CLAWDEVBOX_RECIPE_INSTANCE_ID when omitted.',
-      inputSchema: {
+  defineTool({
+    name: 'recipe.update_steps',
+    description: 'Mutate the step plan of a running recipe instance (spec §10.5). Supports three operations in one call: `add` new steps, `remove` pending steps by step_id, and `update_meta` to patch existing step declarations. All mutations run inside a single DB transaction; any failure rolls everything back. Added triggers on running steps register immediately; removed triggers disable matching auto-declared rows. Defaults `recipe_instance_id` from $CLAWDEVBOX_RECIPE_INSTANCE_ID when omitted.',
+    parameters: z.object({
         recipe_instance_id: z.string().min(1).optional(),
         add: z.array(z.record(z.string(), z.unknown())).optional(),
         remove: z.array(z.string()).optional(),
         update_meta: z.array(z.record(z.string(), z.unknown())).optional(),
-      },
-    },
-    async (args, extra) => {
+      }),
+    handler: async (args, extra) => {
       const instanceId =
         args.recipe_instance_id ?? resolveRecipeInstanceId(extra);
       if (!instanceId) {
@@ -874,15 +863,15 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
         return structuredError('INTERNAL_ERROR', msg);
       }
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- recipe.steps.update_status -------------------------------------------
-  server.registerTool(
-    'recipe.steps.update_status',
-    {
-      description:
-        'Update the status, state, or attachments of a single step in a recipe instance (spec §10.5). Enforces the monotonic transition rule. Entry hook: transitioning into `running` registers the step\'s declared triggers. Exit hook: transitioning into a terminal state (`done`/`failed`/`skipped`) disables auto-declared triggers and cascades the instance to terminal when all siblings are terminal. `request_user_input` atomically transitions to `awaiting_user` and creates a linked inbox item. `state` merges; `state_replace` overwrites (mutually exclusive). Defaults `recipe_instance_id` from $CLAWDEVBOX_RECIPE_INSTANCE_ID when omitted.',
-      inputSchema: {
+  defineTool({
+    name: 'recipe.steps.update_status',
+    description: 'Update the status, state, or attachments of a single step in a recipe instance (spec §10.5). Enforces the monotonic transition rule. Entry hook: transitioning into `running` registers the step\'s declared triggers. Exit hook: transitioning into a terminal state (`done`/`failed`/`skipped`) disables auto-declared triggers and cascades the instance to terminal when all siblings are terminal. `request_user_input` atomically transitions to `awaiting_user` and creates a linked inbox item. `state` merges; `state_replace` overwrites (mutually exclusive). Defaults `recipe_instance_id` from $CLAWDEVBOX_RECIPE_INSTANCE_ID when omitted.',
+    parameters: z.object({
         recipe_instance_id: z.string().min(1).optional(),
         step_id: z.string().min(1),
         status: z
@@ -907,9 +896,8 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
               .optional(),
           })
           .optional(),
-      },
-    },
-    async (args, extra) => {
+      }),
+    handler: async (args, extra) => {
       const instanceId =
         args.recipe_instance_id ?? resolveRecipeInstanceId(extra);
       if (!instanceId) {
@@ -973,7 +961,9 @@ export function registerRecipeTools(server: McpServer, ws: Workspace): void {
         return structuredError('INTERNAL_ERROR', msg);
       }
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 }
 
 // ----------------------------------------------------------------------------

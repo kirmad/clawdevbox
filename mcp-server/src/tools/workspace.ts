@@ -17,8 +17,9 @@
  */
 
 import { existsSync } from 'node:fs';
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
+import { defineTool } from './registry.ts';
 import { structuredError } from '../scope.ts';
 import {
   countWorkspaceContents,
@@ -32,37 +33,35 @@ import {
 } from '../workspaces-store.ts';
 import type { Workspace } from '../workspace.ts';
 
-export function registerWorkspaceTools(server: McpServer, ws: Workspace): void {
+export function registerWorkspaceEntries(ws: Workspace): void {
   // -- workspace.create -----------------------------------------------------
-  server.registerTool(
-    'workspace.create',
-    {
-      description:
-        "Create a new Clawdevbox workspace directory under <workspaces_root>/<id>/ (default <workspaces_root> = $CLAWDEVBOX_WORKSPACES_ROOT || ~/.clawdevbox/workspaces). Scaffolds the .clawdevbox/ tree (recipes/, skills/, triggers.json, workspace.json, recipe-instances/) and registers in the workspace index. Optional: clone an existing workspace's .clawdevbox tree (`copy_from`). `inherit_plugins` is accepted but a no-op — plugins now live in the global store at <global_dir>/plugins/ and are visible to every workspace.",
-      inputSchema: {
-        name: z.string().min(1).optional().describe('Human-readable name (optional).'),
-        parent_workspace_id: z
-          .string()
-          .min(1)
-          .optional()
-          .describe('Parent workspace id, for recipe-run lineage.'),
-        base_path: z
-          .string()
-          .min(1)
-          .optional()
-          .describe('Override the workspaces root for this call (parent dir; workspace goes at <base_path>/<id>).'),
-        inherit_plugins: z
-          .boolean()
-          .optional()
-          .describe("Deprecated no-op. Plugins are global (under <global_dir>/plugins/) and visible to every workspace automatically. Kept for backward compatibility; `inherited_plugins` in the response is always [] now."),
-        copy_from: z
-          .string()
-          .min(1)
-          .optional()
-          .describe('Source workspace id to clone the .clawdevbox/ tree from (except recipe-instances/ and workspace.json). Mutually exclusive with inherit_plugins.'),
-      },
-    },
-    async (args) => {
+  defineTool({
+    name: 'workspace.create',
+    description:
+      "Create a new Clawdevbox workspace directory under <workspaces_root>/<id>/ (default <workspaces_root> = $CLAWDEVBOX_WORKSPACES_ROOT || ~/.clawdevbox/workspaces). Scaffolds the .clawdevbox/ tree (recipes/, skills/, triggers.json, workspace.json, recipe-instances/) and registers in the workspace index. Optional: clone an existing workspace's .clawdevbox tree (`copy_from`). `inherit_plugins` is accepted but a no-op — plugins now live in the global store at <global_dir>/plugins/ and are visible to every workspace.",
+    parameters: z.object({
+      name: z.string().min(1).optional().describe('Human-readable name (optional).'),
+      parent_workspace_id: z
+        .string()
+        .min(1)
+        .optional()
+        .describe('Parent workspace id, for recipe-run lineage.'),
+      base_path: z
+        .string()
+        .min(1)
+        .optional()
+        .describe('Override the workspaces root for this call (parent dir; workspace goes at <base_path>/<id>).'),
+      inherit_plugins: z
+        .boolean()
+        .optional()
+        .describe("Deprecated no-op. Plugins are global (under <global_dir>/plugins/) and visible to every workspace automatically. Kept for backward compatibility; `inherited_plugins` in the response is always [] now."),
+      copy_from: z
+        .string()
+        .min(1)
+        .optional()
+        .describe('Source workspace id to clone the .clawdevbox/ tree from (except recipe-instances/ and workspace.json). Mutually exclusive with inherit_plugins.'),
+    }),
+    handler: async (args) => {
       if (args.inherit_plugins && args.copy_from) {
         return structuredError(
           'INVALID_ARGS',
@@ -107,17 +106,17 @@ export function registerWorkspaceTools(server: McpServer, ws: Workspace): void {
         return structuredError('WORKSPACE_CREATE_FAILED', msg);
       }
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- workspace.list -------------------------------------------------------
-  server.registerTool(
-    'workspace.list',
-    {
-      description:
-        'List all known Clawdevbox workspaces from <workspaces_root>/index.json. Returns id, path, name, created_at, parent_workspace_id for each.',
-      inputSchema: {},
-    },
-    async () => {
+  defineTool({
+    name: 'workspace.list',
+    description:
+      'List all known Clawdevbox workspaces from <workspaces_root>/index.json. Returns id, path, name, created_at, parent_workspace_id for each.',
+    parameters: z.object({}),
+    handler: async () => {
       const root = resolveWorkspacesRoot();
       const workspaces = listWorkspaces(root);
       return {
@@ -129,19 +128,19 @@ export function registerWorkspaceTools(server: McpServer, ws: Workspace): void {
         },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- workspace.get --------------------------------------------------------
-  server.registerTool(
-    'workspace.get',
-    {
-      description:
-        'Read full info for a workspace by id — registry entry plus counts of plugins, recipes, skills, and registered triggers under its .clawdevbox/ tree.',
-      inputSchema: {
-        id: z.string().min(1).describe('Workspace id (ws_<base36-ts>_<4hex>).'),
-      },
-    },
-    async (args) => {
+  defineTool({
+    name: 'workspace.get',
+    description:
+      'Read full info for a workspace by id — registry entry plus counts of plugins, recipes, skills, and registered triggers under its .clawdevbox/ tree.',
+    parameters: z.object({
+      id: z.string().min(1).describe('Workspace id (ws_<base36-ts>_<4hex>).'),
+    }),
+    handler: async (args) => {
       const root = resolveWorkspacesRoot();
       const info = getWorkspace(root, args.id);
       if (!info) {
@@ -173,17 +172,17 @@ export function registerWorkspaceTools(server: McpServer, ws: Workspace): void {
         },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- workspace.current ----------------------------------------------------
-  server.registerTool(
-    'workspace.current',
-    {
-      description:
-        'Resolve the workspace matching the current CLAWDEVBOX_PROJECT_DIR against the registry. Returns the WorkspaceInfo, or { found: false } if the current project_dir is not a registered workspace.',
-      inputSchema: {},
-    },
-    async () => {
+  defineTool({
+    name: 'workspace.current',
+    description:
+      'Resolve the workspace matching the current CLAWDEVBOX_PROJECT_DIR against the registry. Returns the WorkspaceInfo, or { found: false } if the current project_dir is not a registered workspace.',
+    parameters: z.object({}),
+    handler: async () => {
       const root = resolveWorkspacesRoot();
       const info = findWorkspaceByPath(root, ws.projectDir);
       if (!info) {
@@ -214,5 +213,7 @@ export function registerWorkspaceTools(server: McpServer, ws: Workspace): void {
         },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 }

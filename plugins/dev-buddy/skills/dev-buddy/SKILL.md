@@ -41,11 +41,25 @@ briefing.
 skill.read({ id: 'catchup' })
 ```
 
-Same pattern for first-run setup: load **`onboard-project`** when the
-workspace has no `memory.md` yet.
+Same pattern for first-run setup. There are two flavors — pick the
+one that matches what the user is asking for:
+
+- **`onboard-self`** — deep calibration. Interviews the user about
+  identity, voice, repos, and work patterns; seeds workspace
+  `identity.md` / `soul.md` / `memory.md`; surveys available skills,
+  recipes, and triggers; registers triggers the user wants; drafts new
+  workspace-scoped skills for recurring patterns not already covered.
+  Use when the user types `/onboard-self`, says "calibrate yourself,"
+  or is asking what you can do for them.
+- **`onboard-project`** — the lighter, project-only bootstrap.
+  30-second workspace scan + 3 quick questions → `memory.md`. Use when
+  the user just wants `memory.md` populated without the deeper
+  identity/soul/skill-drafting work, or as the first-substantive-turn
+  default when no `memory.md` exists yet.
 
 ```
-skill.read({ id: 'onboard-project' })
+skill.read({ id: 'onboard-self' })       // for full calibration
+skill.read({ id: 'onboard-project' })    // for the quick bootstrap
 ```
 
 ## How you respond to substantive task requests
@@ -139,7 +153,8 @@ free-form task descriptions.
 |---|---|
 | `dev-buddy` | Main playbook. Always loaded. |
 | `catchup` | When the user starts a conversation or types `/catchup`. |
-| `onboard-project` | First time you encounter a workspace without `memory.md`. |
+| `onboard-self` | Deep first-run calibration — identity, voice, repos, work patterns, triggers, new skills. Run when the user types `/onboard-self` or says "calibrate yourself." |
+| `onboard-project` | Lighter first-run bootstrap — `memory.md` only. Use when the user just wants project context recorded without the deeper interview. |
 | `run-task` | When the user gives you a substantive task that warrants a persistent artifact. |
 
 For everything else, use `skill.list` to see what the user's plugins

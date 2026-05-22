@@ -22,6 +22,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import { applyConfigToEnv, ConfigError, resolveConfig, type ResolvedConfig } from '../config.ts';
 import { onChange } from '../event-bus.ts';
 import { renderHomePage, resolveSpaAsset } from '../home-page.ts';
@@ -29,6 +30,7 @@ import { logger } from '../logger.ts';
 import { startMainAgent, getMainAgentStatus } from '../main-agent.ts';
 import { buildProviderCtx } from '../agent-clis/shared.ts';
 import type { Workspace } from '../workspace.ts';
+import { getRegistry } from '../tools/registry.ts';
 import {
   addSubscription,
   listSubscriptions,
@@ -56,7 +58,7 @@ import {
   type RecipeInstance as RecipeInstanceRow,
 } from '../recipe-instances-store.ts';
 import { registerPty } from '../pty-registry.ts';
-import { buildServer } from '../server.ts';
+import { buildServer, createSessionServer } from '../server.ts';
 import {
   fetchTunnelStatus,
   installAutoStart,
@@ -123,11 +125,182 @@ function bearerToken(req: IncomingMessage): string | null {
 }
 
 function rejectUnauthorized(res: ServerResponse, message: string): void {
-  res.writeHead(401, {
-    'content-type': 'application/json',
-    'www-authenticate': 'Bearer realm="clawdevbox"',
-  });
+  // NOTE: we intentionally do NOT emit a `WWW-Authenticate: Bearer` header.
+  // The MCP SDK in Copilot CLI treats that header as "OAuth required" and
+  // attempts protected-resource discovery, which fails for our static
+  // bearer setup. A plain 401 lets clients surface the error directly.
+  res.writeHead(401, { 'content-type': 'application/json' });
   res.end(JSON.stringify({ error: { code: 'UNAUTHORIZED', message } }));
+}
+
+function getSessionIdHeader(req: IncomingMessage): string | undefined {
+  const h = req.headers['mcp-session-id'];
+  if (typeof h === 'string' && h.length > 0) return h;
+  if (Array.isArray(h) && h.length > 0 && typeof h[0] === 'string') return h[0];
+  return undefined;
+}
+
+async function readJsonRpcBody(req: IncomingMessage): Promise<unknown | undefined> {
+  const MAX = 8 * 1024 * 1024; // 8MB — plenty for tool args; ~64KB is typical.
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const c of req) {
+    const buf = c instanceof Buffer ? c : Buffer.from(c as ArrayBufferLike);
+    total += buf.length;
+    if (total > MAX) return undefined;
+    chunks.push(buf);
+  }
+  if (total === 0) return undefined;
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Route an `/mcp` request to the correct per-session transport, creating a
+ * new (server, transport) pair when the client sends a fresh `initialize`
+ * request. Implements the MCP Streamable HTTP spec's session model:
+ *
+ *   - Client `initialize` (POST, no `mcp-session-id` header) → mint a new
+ *     session ID, attach to a fresh `McpServer`, route the initialize body.
+ *   - Subsequent calls (POST / GET SSE / DELETE) carry the issued session
+ *     ID in `mcp-session-id` and are dispatched to the same transport.
+ *   - Unknown session ID → 404 (don't silently mint a new one — that would
+ *     mask client bugs).
+ *
+ * Session lifetime is owned by the SDK transport's lifecycle hooks: when
+ * the client sends DELETE or the transport finalises, we drop the entry
+ * from `transports` so the map doesn't leak.
+ */
+async function handleMcpRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  ws: Workspace,
+  transports: Map<string, StreamableHTTPServerTransport>,
+): Promise<void> {
+  const method = req.method ?? 'GET';
+  const sessionId = getSessionIdHeader(req);
+
+  // Existing session: dispatch to its transport. Any HTTP method is fine —
+  // POST = JSON-RPC call, GET = SSE notification stream, DELETE = terminate.
+  if (sessionId) {
+    const existing = transports.get(sessionId);
+    if (!existing) {
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          error: { code: -32001, message: 'Session not found' },
+          id: null,
+        }),
+      );
+      return;
+    }
+    try {
+      await existing.handleRequest(req, res);
+    } catch (err) {
+      logger.error(
+        { err: err instanceof Error ? err.message : String(err), sessionId },
+        'mcp handler threw',
+      );
+      if (!res.headersSent) {
+        res.writeHead(500, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: { code: 'INTERNAL', message: 'handler error' } }));
+      }
+    }
+    return;
+  }
+
+  // No session ID. The only legitimate request is POST with an `initialize`
+  // body — everything else is a client bug (forgot to include the session
+  // header after init, or terminated then kept calling).
+  if (method !== 'POST') {
+    res.writeHead(400, { 'content-type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        error: { code: -32000, message: 'Bad Request: missing mcp-session-id' },
+        id: null,
+      }),
+    );
+    return;
+  }
+
+  const body = await readJsonRpcBody(req);
+  if (body === undefined) {
+    res.writeHead(400, { 'content-type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        error: { code: -32700, message: 'Parse error: invalid JSON or body too large' },
+        id: null,
+      }),
+    );
+    return;
+  }
+
+  // JSON-RPC batches CANNOT initialize a session (initialize must be a
+  // standalone request per the MCP spec). Reject arrays here so we don't
+  // accidentally mint a session for a batch of regular calls.
+  if (!isInitializeRequest(body)) {
+    res.writeHead(400, { 'content-type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        error: {
+          code: -32000,
+          message: 'Bad Request: missing mcp-session-id and not an initialize request',
+        },
+        id: null,
+      }),
+    );
+    return;
+  }
+
+  const newTransport: StreamableHTTPServerTransport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: () => randomUUID(),
+    onsessioninitialized: (id) => {
+      transports.set(id, newTransport);
+      logger.info({ sessionId: id, sessions: transports.size }, 'mcp session opened');
+    },
+    onsessionclosed: (id) => {
+      transports.delete(id);
+      logger.info({ sessionId: id, sessions: transports.size }, 'mcp session closed (client DELETE)');
+    },
+  });
+
+  newTransport.onclose = () => {
+    if (newTransport.sessionId && transports.delete(newTransport.sessionId)) {
+      logger.info(
+        { sessionId: newTransport.sessionId, sessions: transports.size },
+        'mcp transport closed',
+      );
+    }
+  };
+
+  // Each session gets its own `McpServer`. Tool registration is cheap
+  // (sync attach of handler functions); the heavy hosted-tool discovery
+  // happened once at startup and populates the shared registry.
+  const sessionServer = createSessionServer(ws);
+  await sessionServer.connect(newTransport);
+
+  try {
+    await newTransport.handleRequest(req, res, body);
+  } catch (err) {
+    logger.error(
+      { err: err instanceof Error ? err.message : String(err) },
+      'mcp initialize handler threw',
+    );
+    if (!res.headersSent) {
+      res.writeHead(500, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { code: 'INTERNAL', message: 'handler error' } }));
+    }
+    // If the SDK threw before the session was registered, the new
+    // transport's `onclose` may not fire — best-effort cleanup.
+    if (newTransport.sessionId) transports.delete(newTransport.sessionId);
+  }
 }
 
 function bool(flags: Flags, key: string): boolean {
@@ -155,12 +328,23 @@ export async function runStart(flags: Flags): Promise<void> {
   }
   applyConfigToEnv(cfg);
 
-  if (!cfg.http.token) {
+  // Bearer auth is opt-in: an empty/missing `http.token` disables /mcp and
+  // /api/* auth entirely. This is intentional for local-only setups where
+  // 127.0.0.1 binding + OS-level isolation is sufficient. Refuse the unsafe
+  // combination of "anonymous tunnel + no bearer" — that would expose the
+  // server to the public internet with zero auth.
+  if (!cfg.http.token && cfg.tunnel.kind !== 'none' && cfg.tunnel.allow_anonymous) {
     logger.error(
-      { projectDir: cfg.projectDir },
-      'no bearer token configured — run `clawdevbox init` (or pass --token / set CLAWDEVBOX_TOKEN)',
+      { projectDir: cfg.projectDir, tunnel: cfg.tunnel.kind },
+      'refusing to start: tunnel.allow_anonymous=true requires a bearer token (set http.token or disable tunnel.allow_anonymous)',
     );
     process.exit(2);
+  }
+  if (!cfg.http.token) {
+    logger.warn(
+      { projectDir: cfg.projectDir },
+      'no bearer token configured — /mcp and /api/* are UNAUTHENTICATED (loopback-only protection); set http.token to enable auth',
+    );
   }
 
   // Service install path: spawn a detached child + register OS auto-start
@@ -202,13 +386,22 @@ export async function runStart(flags: Flags): Promise<void> {
     );
   }
 
-  const { server, hostedRegistry } = await buildServer(ws);
+  // Discover hosted tools + register the initial server. The registry
+  // persists for per-session servers; the server returned here is discarded
+  // (each MCP HTTP session gets its own fresh server + transport pair).
+  const { hostedErrors } = await buildServer(ws);
 
-  // Stateful Streamable HTTP — the SDK manages a session per client.
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: () => randomUUID(),
-  });
-  await server.connect(transport);
+  // Per-session MCP transports. The MCP Streamable HTTP spec is stateful:
+  // the SDK's `Server.connect(transport)` binds 1:1, so each client session
+  // needs its own (server, transport) pair. Sessions are keyed by the
+  // `mcp-session-id` response header issued on initialize, then echoed in
+  // every subsequent request header. We tear entries down via three
+  // overlapping hooks (one is enough; the others are safety nets):
+  //   - `onsessionclosed`: client sent DELETE /mcp (explicit termination)
+  //   - `onclose`: underlying transport finalized (covers HTTP close paths)
+  //   - request-handler `.catch` logs but does NOT delete (the transport
+  //     itself decides whether the session is still usable).
+  const mcpTransports = new Map<string, StreamableHTTPServerTransport>();
 
   const expectedToken = cfg.http.token;
   const homePageHtml = renderHomePage({
@@ -233,26 +426,24 @@ export async function runStart(flags: Flags): Promise<void> {
     }
 
     if (isMcpPath(url.pathname)) {
-      const presented = bearerToken(req);
-      if (!presented) {
-        rejectUnauthorized(res, 'missing bearer token');
-        return;
-      }
-      if (!constantTimeEquals(presented, expectedToken)) {
-        rejectUnauthorized(res, 'invalid bearer token');
-        return;
-      }
-      // SDK reads body / writes response itself.
-      transport.handleRequest(req, res).catch((err: unknown) => {
-        logger.error(
-          { err: err instanceof Error ? err.message : String(err) },
-          'mcp handler threw',
-        );
-        if (!res.headersSent) {
-          res.writeHead(500, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ error: { code: 'INTERNAL', message: 'handler error' } }));
+      // Auth is opt-in: when no token is configured, /mcp is open (loopback
+      // protection only). When a token IS set, we DO NOT send a
+      // `WWW-Authenticate: Bearer` header on 401 because Copilot CLI's MCP
+      // SDK interprets that as "OAuth required" and falls into a futile
+      // discovery loop. Plain 401 lets clients see the failure and reuse
+      // the configured static bearer.
+      if (expectedToken) {
+        const presented = bearerToken(req);
+        if (!presented) {
+          rejectUnauthorized(res, 'missing bearer token');
+          return;
         }
-      });
+        if (!constantTimeEquals(presented, expectedToken)) {
+          rejectUnauthorized(res, 'invalid bearer token');
+          return;
+        }
+      }
+      await handleMcpRequest(req, res, ws, mcpTransports);
       return;
     }
 
@@ -735,8 +926,7 @@ export async function runStart(flags: Flags): Promise<void> {
         error: tunnelStatus.error,
       },
       plugins: ws.plugins.size,
-      hostedTools: hostedRegistry.tools.length,
-      hostedErrors: hostedRegistry.errors.length,
+      hostedErrors: hostedErrors.length,
     },
     'ready',
   );
@@ -749,10 +939,13 @@ export async function runStart(flags: Flags): Promise<void> {
   );
 
   // Print a friendly banner to stderr so the user sees it in their terminal.
+  const mcpLine = expectedToken
+    ? `  MCP:        http://${cfg.http.host}:${boundPort}/mcp  (Authorization: Bearer ${maskToken(expectedToken)})\n`
+    : `  MCP:        http://${cfg.http.host}:${boundPort}/mcp  (no bearer auth — loopback only)\n`;
   process.stderr.write(
     `\nclawdevbox ready at http://${cfg.http.host}:${boundPort}\n` +
       `  Home:       http://${cfg.http.host}:${boundPort}/   (Inbox + Main Agent)\n` +
-      `  MCP:        http://${cfg.http.host}:${boundPort}/mcp  (Authorization: Bearer ${maskToken(expectedToken)})\n` +
+      mcpLine +
       `  Terminal:   http://${cfg.http.host}:${boundPort}/terminal/<instance_id>\n` +
       `  Artifacts:  http://${cfg.http.host}:${boundPort}/artifact/<id>\n` +
       `  Health:     http://${cfg.http.host}:${boundPort}/healthz\n` +
@@ -791,7 +984,7 @@ export async function runStart(flags: Flags): Promise<void> {
 function formatTunnelBannerLine(
   t: TunnelStatus,
   localPort: number,
-  token: string,
+  token: string | null,
   allowAnonymous: boolean,
 ): string {
   if (t.kind === 'none') return '';
@@ -805,9 +998,10 @@ function formatTunnelBannerLine(
     ? 'anonymous OK — only /mcp bearer auth gates access'
     : 'private — clients need a devtunnel access token + the /mcp bearer';
   if (t.url) {
+    const mcpAuthSuffix = token ? `  (Authorization: Bearer ${maskToken(token)})` : '  (no bearer auth)';
     return (
       `  Tunnel:     ${t.url}   →   localhost:${localPort}  (${accessNote})\n` +
-      `              public MCP: ${t.url}/mcp  (Authorization: Bearer ${maskToken(token)})\n` +
+      `              public MCP: ${t.url}/mcp${mcpAuthSuffix}\n` +
       (t.inspect_url ? `              inspect:    ${t.inspect_url}\n` : '') +
       (!allowAnonymous
         ? `              get token:  devtunnel token ${t.name ?? '<name>'} -s\n`
@@ -1410,7 +1604,7 @@ export async function listenOrConfirmExisting(
   server: import('node:http').Server,
   host: string,
   port: number,
-  token: string,
+  token: string | null,
 ): Promise<'listening' | 'already-running' | 'conflict'> {
   try {
     await new Promise<void>((resolve, reject) => {
@@ -1425,11 +1619,14 @@ export async function listenOrConfirmExisting(
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code !== 'EADDRINUSE') throw err;
-    // Probe to see if it's our own service.
+    // Probe to see if it's our own service. When no token is configured the
+    // running instance also has no auth, so we omit Authorization here.
     let probe: Response | null = null;
     try {
+      const headers: Record<string, string> = {};
+      if (token) headers.authorization = `Bearer ${token}`;
       probe = await fetch(`http://${host}:${port}/api/cron/status`, {
-        headers: { authorization: `Bearer ${token}` },
+        headers,
         signal: AbortSignal.timeout(2000),
       });
     } catch {

@@ -10,55 +10,54 @@
  * user's phone" → `notify.send({ title, body, url, tag })`.
  */
 
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
+import { defineTool } from './registry.ts';
 import { loadNotificationsConfig } from '../config.ts';
 import { sendNotification } from '../notifications.ts';
 import type { Workspace } from '../workspace.ts';
 
-export function registerNotifyTools(server: McpServer, ws: Workspace): void {
-  server.registerTool(
-    'notify.send',
-    {
-      description:
-        "Send a browser push notification to every device that subscribed via the clawdevbox home page. Requires `notifications.enabled` + a VAPID keypair in the workspace's config.json (`clawdevbox init` mints these). Returns delivery counts. Dead endpoints (404/410) are pruned automatically.",
-      inputSchema: {
-        title: z
-          .string()
-          .min(1)
-          .max(120)
-          .describe('Bold one-liner shown as the notification title.'),
-        body: z
-          .string()
-          .max(400)
-          .optional()
-          .describe('Optional body text shown under the title.'),
-        url: z
-          .string()
-          .optional()
-          .describe(
-            'Path (e.g. `/`) or absolute URL the SW opens when the user taps the notification. Defaults to `/`.',
-          ),
-        tag: z
-          .string()
-          .max(80)
-          .optional()
-          .describe(
-            'Collapse key — newer notifications with the same tag replace older ones (avoids notification spam). Default: `clawdevbox`.',
-          ),
-        icon: z
-          .string()
-          .optional()
-          .describe('Path/URL of an icon override. Default: `/icon.svg`.'),
-        require_interaction: z
-          .boolean()
-          .optional()
-          .describe(
-            'When true, the notification persists until the user dismisses it. Use sparingly — only for genuinely urgent prompts.',
-          ),
-      },
-    },
-    async (args) => {
+export function registerNotifyEntries(ws: Workspace): void {
+  defineTool({
+    name: 'notify.send',
+    description:
+      "Send a browser push notification to every device that subscribed via the clawdevbox home page. Requires `notifications.enabled` + a VAPID keypair in the workspace's config.json (`clawdevbox init` mints these). Returns delivery counts. Dead endpoints (404/410) are pruned automatically.",
+    parameters: z.object({
+      title: z
+        .string()
+        .min(1)
+        .max(120)
+        .describe('Bold one-liner shown as the notification title.'),
+      body: z
+        .string()
+        .max(400)
+        .optional()
+        .describe('Optional body text shown under the title.'),
+      url: z
+        .string()
+        .optional()
+        .describe(
+          'Path (e.g. `/`) or absolute URL the SW opens when the user taps the notification. Defaults to `/`.',
+        ),
+      tag: z
+        .string()
+        .max(80)
+        .optional()
+        .describe(
+          'Collapse key — newer notifications with the same tag replace older ones (avoids notification spam). Default: `clawdevbox`.',
+        ),
+      icon: z
+        .string()
+        .optional()
+        .describe('Path/URL of an icon override. Default: `/icon.svg`.'),
+      require_interaction: z
+        .boolean()
+        .optional()
+        .describe(
+          'When true, the notification persists until the user dismisses it. Use sparingly — only for genuinely urgent prompts.',
+        ),
+    }),
+    handler: async (args) => {
       // Read the merged project+global notifications config so the MCP
       // tool sees the same `enabled` + VAPID keys the HTTP server does.
       const notifications = loadNotificationsConfig({
@@ -104,5 +103,7 @@ export function registerNotifyTools(server: McpServer, ws: Workspace): void {
         structuredContent: { ...result },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 }

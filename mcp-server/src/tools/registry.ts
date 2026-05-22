@@ -22,8 +22,8 @@ export interface ToolEntry {
   description: string;
   /** Zod schema for the tool's input parameters */
   parameters: z.ZodTypeAny;
-  /** The execute function */
-  handler: (args: any, extra?: { signal?: AbortSignal }) => Promise<unknown>;
+  /** The execute function — receives parsed args + extra context from MCP */
+  handler: (args: any, extra?: any) => Promise<unknown>;
   /** Optional structured examples for learn_tool */
   examples?: ToolExample[];
   /** Plugin id (for hosted tools) or 'builtin' */

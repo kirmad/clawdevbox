@@ -22,8 +22,9 @@
  */
 
 import { existsSync } from 'node:fs';
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
+import { defineTool } from './registry.ts';
 import {
   type ArtifactManifest,
   artifactDir,
@@ -92,55 +93,53 @@ function buildViewUrl(artifactId: string): string | null {
 // Registration
 // ============================================================================
 
-export function registerArtifactTools(server: McpServer, ws: Workspace): void {
+export function registerArtifactEntries(ws: Workspace): void {
   // -- artifact.add ---------------------------------------------------------
-  server.registerTool(
-    'artifact.add',
-    {
-      description:
-        "Register an artifact at `<workspace>/artifacts/<id>/` by writing its manifest.json. Canonical flow: an agent skill writes content files into that folder, then calls artifact.add to make it discoverable. Optionally pass `files` to write them inline at the same time. The renderer is picked from `type` (workspace → plugin → built-in chain). Built-in types: `markdown` (content.md), `pr-review` (review.json + walkthrough.json + diffs/*.diff), `walkthrough` (walkthrough.json). Optional `recipe_instance_id` / `step_id` link the artifact to a recipe run for UI grouping. Returns a `view_url`.",
-      inputSchema: {
-        id: z
-          .string()
-          .min(1)
-          .describe('Folder name == artifact id. /^[a-z0-9][a-z0-9._-]*$/i.'),
-        type: z
-          .string()
-          .min(1)
-          .describe('Renderer discriminator. e.g. "markdown" | "pr-review" | "walkthrough".'),
-        title: z.string().min(1).describe('Human-readable title.'),
-        files: z
-          .record(z.string(), z.unknown())
-          .optional()
-          .describe(
-            'Optional inline filename → content map. Strings written as utf-8; objects JSON.stringify(2)d. If your skill already wrote files to the folder, omit this. "manifest.json" is reserved.',
-          ),
-        workspace_id: z
-          .string()
-          .min(1)
-          .optional()
-          .describe(
-            'Target workspace id. Falls back to CLAWDEVBOX_WORKSPACE_ID env, then CLAWDEVBOX_PROJECT_DIR resolution.',
-          ),
-        recipe_instance_id: z
-          .string()
-          .min(1)
-          .optional()
-          .describe(
-            'Optional UI link to a recipe instance. Falls back to CLAWDEVBOX_RECIPE_INSTANCE_ID env if not provided.',
-          ),
-        step_id: z
-          .string()
-          .min(1)
-          .optional()
-          .describe('Optional UI link to a step inside the recipe instance.'),
-        meta: z
-          .record(z.string(), z.unknown())
-          .optional()
-          .describe('Free-form metadata for the renderer.'),
-      },
-    },
-    async (args, extra) => {
+  defineTool({
+    name: 'artifact.add',
+    description:
+      "Register an artifact at `<workspace>/artifacts/<id>/` by writing its manifest.json. Canonical flow: an agent skill writes content files into that folder, then calls artifact.add to make it discoverable. Optionally pass `files` to write them inline at the same time. The renderer is picked from `type` (workspace → plugin → built-in chain). Built-in types: `markdown` (content.md), `pr-review` (review.json + walkthrough.json + diffs/*.diff), `walkthrough` (walkthrough.json). Optional `recipe_instance_id` / `step_id` link the artifact to a recipe run for UI grouping. Returns a `view_url`.",
+    parameters: z.object({
+      id: z
+        .string()
+        .min(1)
+        .describe('Folder name == artifact id. /^[a-z0-9][a-z0-9._-]*$/i.'),
+      type: z
+        .string()
+        .min(1)
+        .describe('Renderer discriminator. e.g. "markdown" | "pr-review" | "walkthrough".'),
+      title: z.string().min(1).describe('Human-readable title.'),
+      files: z
+        .record(z.string(), z.unknown())
+        .optional()
+        .describe(
+          'Optional inline filename → content map. Strings written as utf-8; objects JSON.stringify(2)d. If your skill already wrote files to the folder, omit this. "manifest.json" is reserved.',
+        ),
+      workspace_id: z
+        .string()
+        .min(1)
+        .optional()
+        .describe(
+          'Target workspace id. Falls back to CLAWDEVBOX_WORKSPACE_ID env, then CLAWDEVBOX_PROJECT_DIR resolution.',
+        ),
+      recipe_instance_id: z
+        .string()
+        .min(1)
+        .optional()
+        .describe(
+          'Optional UI link to a recipe instance. Falls back to CLAWDEVBOX_RECIPE_INSTANCE_ID env if not provided.',
+        ),
+      step_id: z
+        .string()
+        .min(1)
+        .optional()
+        .describe('Optional UI link to a step inside the recipe instance.'),
+      meta: z
+        .record(z.string(), z.unknown())
+        .optional()
+        .describe('Free-form metadata for the renderer.'),
+    }),
+    handler: async (args, extra) => {
       try {
         validateArtifactId(args.id);
       } catch (err) {
@@ -218,21 +217,21 @@ export function registerArtifactTools(server: McpServer, ws: Workspace): void {
         },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- artifact.list --------------------------------------------------------
-  server.registerTool(
-    'artifact.list',
-    {
-      description:
-        "List artifacts. By default lists every artifact in every registered workspace; pass workspace_id to narrow, or filter by recipe_instance_id / step_id. Each entry includes the manifest and a view_url.",
-      inputSchema: {
-        workspace_id: z.string().min(1).optional(),
-        recipe_instance_id: z.string().min(1).optional(),
-        step_id: z.string().min(1).optional(),
-      },
-    },
-    async (args) => {
+  defineTool({
+    name: 'artifact.list',
+    description:
+      "List artifacts. By default lists every artifact in every registered workspace; pass workspace_id to narrow, or filter by recipe_instance_id / step_id. Each entry includes the manifest and a view_url.",
+    parameters: z.object({
+      workspace_id: z.string().min(1).optional(),
+      recipe_instance_id: z.string().min(1).optional(),
+      step_id: z.string().min(1).optional(),
+    }),
+    handler: async (args) => {
       const root = resolveWorkspacesRoot();
       const workspaces = args.workspace_id
         ? (() => {
@@ -263,20 +262,20 @@ export function registerArtifactTools(server: McpServer, ws: Workspace): void {
         structuredContent: { artifacts: items },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- artifact.get ---------------------------------------------------------
-  server.registerTool(
-    'artifact.get',
-    {
-      description:
-        'Return the manifest, the list of content files in the folder, and a view_url for a single artifact by id. Searches every registered workspace.',
-      inputSchema: {
-        id: z.string().min(1),
-        workspace_id: z.string().min(1).optional(),
-      },
-    },
-    async (args) => {
+  defineTool({
+    name: 'artifact.get',
+    description:
+      'Return the manifest, the list of content files in the folder, and a view_url for a single artifact by id. Searches every registered workspace.',
+    parameters: z.object({
+      id: z.string().min(1),
+      workspace_id: z.string().min(1).optional(),
+    }),
+    handler: async (args) => {
       const root = resolveWorkspacesRoot();
       const workspaces = args.workspace_id
         ? (() => {
@@ -309,20 +308,20 @@ export function registerArtifactTools(server: McpServer, ws: Workspace): void {
         { id: args.id },
       );
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- artifact.delete ------------------------------------------------------
-  server.registerTool(
-    'artifact.delete',
-    {
-      description:
-        "Remove an artifact folder entirely. Returns deleted=false if the artifact doesn't exist.",
-      inputSchema: {
-        id: z.string().min(1),
-        workspace_id: z.string().min(1).optional(),
-      },
-    },
-    async (args) => {
+  defineTool({
+    name: 'artifact.delete',
+    description:
+      "Remove an artifact folder entirely. Returns deleted=false if the artifact doesn't exist.",
+    parameters: z.object({
+      id: z.string().min(1),
+      workspace_id: z.string().min(1).optional(),
+    }),
+    handler: async (args) => {
       const root = resolveWorkspacesRoot();
       const workspaces = args.workspace_id
         ? (() => {
@@ -347,5 +346,7 @@ export function registerArtifactTools(server: McpServer, ws: Workspace): void {
         structuredContent: { id: args.id, deleted: false },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 }

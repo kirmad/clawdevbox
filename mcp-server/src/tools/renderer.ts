@@ -18,8 +18,9 @@
 
 import { existsSync, mkdirSync, readFileSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
+import { defineTool } from './registry.ts';
 import {
   listAllRendererSources,
   resolveRendererFile,
@@ -31,16 +32,14 @@ import type { Workspace } from '../workspace.ts';
 
 const TYPE_REGEX = /^[a-z0-9][a-z0-9._-]*$/i;
 
-export function registerRendererTools(server: McpServer, ws: Workspace): void {
+export function registerRendererEntries(ws: Workspace): void {
   // -- renderer.list --------------------------------------------------------
-  server.registerTool(
-    'renderer.list',
-    {
-      description:
-        "List every renderer the resolver can see, in precedence order. For each type, the entry with `active: true` is the one served by `/__renderer/<type>.mjs` and used by `artifact.add`. Shadowed entries are included with `active: false` so you can see what you'd be replacing if you wrote a workspace renderer of the same name. Sources are `workspace` | `plugin` | `builtin`.",
-      inputSchema: {},
-    },
-    async () => {
+  defineTool({
+    name: 'renderer.list',
+    description:
+      "List every renderer the resolver can see, in precedence order. For each type, the entry with `active: true` is the one served by `/__renderer/<type>.mjs` and used by `artifact.add`. Shadowed entries are included with `active: false` so you can see what you'd be replacing if you wrote a workspace renderer of the same name. Sources are `workspace` | `plugin` | `builtin`.",
+    parameters: z.object({}),
+    handler: async () => {
       const rows = listAllRendererSources(ws);
       return {
         content: [
@@ -52,19 +51,19 @@ export function registerRendererTools(server: McpServer, ws: Workspace): void {
         structuredContent: { renderers: rows },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- renderer.read --------------------------------------------------------
-  server.registerTool(
-    'renderer.read',
-    {
-      description:
-        'Return the source code of the active renderer for the given type (resolved through workspace → plugin → builtin). Use this to study a renderer before writing a shadow.',
-      inputSchema: {
-        type: z.string().min(1).describe('Renderer type. Same value used for artifact.add type.'),
-      },
-    },
-    async (args) => {
+  defineTool({
+    name: 'renderer.read',
+    description:
+      'Return the source code of the active renderer for the given type (resolved through workspace → plugin → builtin). Use this to study a renderer before writing a shadow.',
+    parameters: z.object({
+      type: z.string().min(1).describe('Renderer type. Same value used for artifact.add type.'),
+    }),
+    handler: async (args) => {
       if (!TYPE_REGEX.test(args.type)) {
         return structuredError('INVALID_TYPE', `Invalid type "${args.type}". Must match ${TYPE_REGEX.source}.`);
       }
@@ -102,20 +101,20 @@ export function registerRendererTools(server: McpServer, ws: Workspace): void {
         },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- renderer.write -------------------------------------------------------
-  server.registerTool(
-    'renderer.write',
-    {
-      description:
-        "Write or overwrite a workspace-level renderer at `<workspace>/.clawdevbox/renderers/<type>.mjs`. The file MUST be a valid ES module with `export default { render(rootElement, ctx) }`. ctx exposes: { manifest, artifactId, fetchFile(name): Promise<string>, fetchFileJson(name): Promise<any>, listFiles(): Promise<string[]> }. A workspace renderer shadows any plugin / builtin renderer of the same type.",
-      inputSchema: {
-        type: z.string().min(1),
-        code: z.string().min(1).describe('Full .mjs source code.'),
-      },
-    },
-    async (args) => {
+  defineTool({
+    name: 'renderer.write',
+    description:
+      "Write or overwrite a workspace-level renderer at `<workspace>/.clawdevbox/renderers/<type>.mjs`. The file MUST be a valid ES module with `export default { render(rootElement, ctx) }`. ctx exposes: { manifest, artifactId, fetchFile(name): Promise<string>, fetchFileJson(name): Promise<any>, listFiles(): Promise<string[]> }. A workspace renderer shadows any plugin / builtin renderer of the same type.",
+    parameters: z.object({
+      type: z.string().min(1),
+      code: z.string().min(1).describe('Full .mjs source code.'),
+    }),
+    handler: async (args) => {
       if (!TYPE_REGEX.test(args.type)) {
         return structuredError('INVALID_TYPE', `Invalid type "${args.type}". Must match ${TYPE_REGEX.source}.`);
       }
@@ -140,17 +139,19 @@ export function registerRendererTools(server: McpServer, ws: Workspace): void {
         },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 
   // -- renderer.delete ------------------------------------------------------
-  server.registerTool(
-    'renderer.delete',
-    {
-      description:
-        "Remove a workspace-level renderer. Falls back to the next source in the chain on next resolve. No-op on plugin / builtin renderers (those aren't writable through this surface).",
-      inputSchema: { type: z.string().min(1) },
-    },
-    async (args) => {
+  defineTool({
+    name: 'renderer.delete',
+    description:
+      "Remove a workspace-level renderer. Falls back to the next source in the chain on next resolve. No-op on plugin / builtin renderers (those aren't writable through this surface).",
+    parameters: z.object({
+      type: z.string().min(1),
+    }),
+    handler: async (args) => {
       if (!TYPE_REGEX.test(args.type)) {
         return structuredError('INVALID_TYPE', `Invalid type "${args.type}". Must match ${TYPE_REGEX.source}.`);
       }
@@ -175,5 +176,7 @@ export function registerRendererTools(server: McpServer, ws: Workspace): void {
         structuredContent: { type: args.type, deleted: true, file_path: filePath },
       };
     },
-  );
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
 }
