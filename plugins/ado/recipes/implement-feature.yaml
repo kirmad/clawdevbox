@@ -1,0 +1,114 @@
+# Clawdevbox recipe template (TaskDock-shape). See spec §6.2.
+#
+# Implements a User Story / Feature / Task work item end-to-end across
+# the resolved repo set: design (gate) → plan (gate) → sub-agent-driven
+# implementation in worktrees → pre-PR review (gate) → live PRs +
+# comment watcher → finalize. Three explicit approval gates; everything
+# else runs unattended.
+#
+# Skill citations are intentional — the recipe does not re-derive
+# content owned by those skills.
+
+id: implement-feature
+name: "Implement an ADO feature work item"
+description: >
+  Implement an ADO User Story / Feature / Task work item across one or
+  more repos. Design + plan + pre-PR are reviewed by the user; the
+  rest runs unattended. Per-repo worktrees + sub-agent-driven
+  implementation; one PR per repo all linked to the WI.
+kind: work_item
+default_client: copilot
+mcp_servers:
+  - ado
+  - clawdevbox
+timeout_minutes: 0
+
+steps:
+  - id: 1
+    goal: >
+      Phase 1 — Setup. Read the WI body, acceptance criteria,
+      attachments, and any linked WIs via `ado.get_work_item({ id,
+      include_relations: true })`. Create / refresh the inbox card via
+      `inbox.create({ kind: 'feature', tag: 'wi-<id>', title:
+      WI.title })`. Transition the WI to `Active` via
+      `ado.update_work_item({ id, state: 'Active' })`. For each repo in
+      `input.repos`, consult the `using-git-worktrees` skill to spin
+      up an isolated worktree on a fresh branch — let the skill name
+      the branch from repo conventions.
+
+  - id: 2
+    goal: >
+      Phase 2 — Design (GATE). Consult the `brainstorming` skill for
+      design shape. Produce `design.md` covering: problem statement,
+      approach, per-repo change shape, identified risks, test
+      strategy. Save as a thread artifact via `artifact.write`.
+      `approval.request` with the artifact attached. Loop on user
+      feedback — revise design.md and re-request approval until the
+      user approves. The approved design is locked in for Phase 3.
+    depends: [1]
+
+  - id: 3
+    goal: >
+      Phase 3 — Plan (GATE). Consult the `writing-plans` skill.
+      Decompose the design into todos in the SQL todo table,
+      partitioned by repo (`description` field carries the repo name
+      and worktree path). Declare cross-repo dependencies via
+      `todo_deps`. Emit `plan.md` mirroring the todo list (one section
+      per repo). `artifact.write` + `approval.request`. Revise on
+      feedback until approved.
+    depends: [2]
+
+  - id: 4
+    goal: >
+      Phase 4 — Implementation. Consult the
+      `subagent-driven-development` skill. Per repo, dispatch sub-agents
+      one ready todo at a time (parallel across repos where the
+      dependency graph allows). Each sub-agent operates in its repo's
+      worktree from Phase 1. After each todo, run the repo-local test
+      slice that covers the change (`test-driven-development` skill
+      governs which tests). On task completion, mark the todo `done` and
+      review the diff before moving on. Run the full repo test suite
+      before declaring the repo's slice complete. If the work reveals
+      the repo set was wrong, post a `thread.append_message` to the
+      triage parent and pause — Phase 0 will re-resolve.
+    depends: [3]
+
+  - id: 5
+    goal: >
+      Phase 5 — Pre-PR (GATE). For each repo, draft a PR title and
+      description. Title format: `[WI <id>] <short-title>`. Description
+      template: summary, what changed (per-file), test plan, WI
+      back-link (use the WI URL — the Artifact Link is set on
+      `ado.create_pr` in step 6, not in the body). Compose one approval
+      card listing all draft PRs side-by-side so the user approves the
+      batch atomically. Revise on feedback.
+    depends: [4]
+
+  - id: 6
+    goal: >
+      Phase 6 — Open + monitor PRs. For each repo, push the worktree
+      branch (auth via the repo's normal git remote config), then
+      `ado.create_pr({ repo, source_ref, target_ref, title,
+      description, work_item_refs: [wi_id], is_draft: false })`. The
+      tool's `work_item_refs` argument auto-links the PR to the WI via
+      Artifact Link — no separate `update_work_item` call needed.
+      Once all PRs are open, `ado.update_work_item({ id, state:
+      'Resolved' })` and post a WI comment via
+      `ado.add_work_item_comment` listing the PR URLs. Register one
+      `ado.comment-watcher` per PR, all bound to the
+      `address-pr-feedback` recipe (`trigger.upsert` with
+      `subscriber_thread_id` so they auto-cleanup with the thread).
+      `thread.set_state('suspended')` so the CLI exits cleanly; the
+      comment watcher reactivates the thread on follow-up.
+    depends: [5]
+
+  - id: 7
+    goal: >
+      Phase 7 — Finalize (re-entered when all PRs reach a terminal
+      state: completed | abandoned). Cleanup worktrees per the
+      `using-git-worktrees` skill. Update `.clawdevbox/repo-registry.md`
+      with anything learned during the run that wasn't already there
+      (new co-change patterns, new area-path → repo mappings, new
+      conventions). `inbox.update` with the final outcome — merged PRs,
+      WI state. `recipe.done({ status: 'success' })`.
+    depends: [6]

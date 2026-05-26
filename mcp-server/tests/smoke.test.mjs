@@ -202,13 +202,19 @@ test('clawdevbox MCP server smoke', async (t) => {
     }
   });
 
-  await t.test("recipe.list scope='plugin:ado' returns the two plugin recipes", async () => {
+  await t.test("recipe.list scope='plugin:ado' returns the registered plugin recipes", async () => {
     const res = await h.call('run_tool', { tool: 'recipe.list', args: { scope: 'plugin:ado' } });
     const recipes = res.structuredContent?.recipes ?? [];
-    assert.equal(recipes.length, 2);
     assert.ok(recipes.every((r) => r.scope === 'plugin:ado'));
     const ids = recipes.map((r) => r.id).sort();
-    assert.deepEqual(ids, ['pr-review', 'respond-to-pr-comment']);
+    assert.deepEqual(ids, [
+      'address-pr-feedback',
+      'fix-bug',
+      'implement-feature',
+      'pr-review',
+      'respond-to-pr-comment',
+      'triage-work-item',
+    ]);
   });
 
   await t.test('shadowing: project upsert overrides plugin read', async () => {
@@ -616,6 +622,7 @@ test('clawdevbox MCP server smoke', async (t) => {
     assert.deepEqual(ids, [
       'ado.comment-watcher',
       'ado.new-pr-watcher',
+      'ado.new-work-item-watcher',
       'ado.pr-pulse-watcher',
     ]);
     // Spot-check schema surfaces.

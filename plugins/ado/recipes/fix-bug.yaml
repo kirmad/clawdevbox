@@ -1,0 +1,92 @@
+# Clawdevbox recipe template (TaskDock-shape). See spec §6.3.
+#
+# Implements a Bug work item end-to-end. Same skeleton as
+# implement-feature minus the design phase — analysis IS the plan for a
+# bug. Two approval gates: analysis, pre-PR. PRs link to the WI and a
+# comment watcher routes follow-up reviewer feedback to
+# address-pr-feedback.
+
+id: fix-bug
+name: "Fix an ADO bug work item"
+description: >
+  Reproduce, root-cause, and fix an ADO Bug across one or more repos.
+  Analysis (root cause + fix shape) and pre-PR are reviewed by the
+  user. Per-repo worktrees; one PR per repo linked to the WI.
+kind: work_item
+default_client: copilot
+mcp_servers:
+  - ado
+  - clawdevbox
+timeout_minutes: 0
+
+steps:
+  - id: 1
+    goal: >
+      Phase 1 — Setup. Read the WI body, repro steps, attached logs,
+      stack traces, and any linked PRs / commits via
+      `ado.get_work_item({ id, include_relations: true })`. Create the
+      inbox card via `inbox.create({ kind: 'bug', tag: 'wi-<id>',
+      title: WI.title })`. Transition the WI to `Active` via
+      `ado.update_work_item({ id, state: 'Active' })`. For each repo
+      in `input.repos`, consult the `using-git-worktrees` skill to
+      create an isolated worktree on a fresh branch.
+
+  - id: 2
+    goal: >
+      Phase 2 — Analysis (GATE). Consult the `systematic-debugging`
+      skill. Attempt to reproduce locally where possible; if not,
+      reason from logs / repro steps in the WI. Bisect to the
+      offending commit when relevant. Identify root cause. Produce
+      `analysis.md` covering: repro recipe, observed vs expected, root
+      cause, blast radius (which repos / services / users), per-repo
+      fix shape, test strategy (regression test required). Save via
+      `artifact.write`. `approval.request` with the artifact — for
+      bugs, analysis IS the plan, so only one gate here. Revise on
+      feedback until approved.
+    depends: [1]
+
+  - id: 3
+    goal: >
+      Phase 3 — Implementation. Consult `test-driven-development`
+      FIRST — write the regression test that reproduces the bug, run
+      it to confirm RED. If the fix spans more than one repo OR more
+      than ~3 distinct touch points, consult
+      `subagent-driven-development` and dispatch per-repo sub-agents.
+      Otherwise apply a straight-line fix in the worktree. Re-run the
+      regression test → GREEN. Run the full repo test suite to verify
+      no regressions. If the fix reveals the repo set was wrong, post a
+      `thread.append_message` to the triage parent and pause.
+    depends: [2]
+
+  - id: 4
+    goal: >
+      Phase 4 — Pre-PR (GATE). For each repo, draft PR title and
+      description. Title format: `[WI <id>] fix: <short-cause>`.
+      Description template: summary of the bug, root cause, what
+      changed (per-file), regression test reference, WI back-link.
+      Compose one approval card listing all draft PRs side-by-side.
+      Revise on feedback.
+    depends: [3]
+
+  - id: 5
+    goal: >
+      Phase 5 — Open + monitor PRs. For each repo, push the worktree
+      branch then `ado.create_pr({ repo, source_ref, target_ref,
+      title, description, work_item_refs: [wi_id], is_draft: false })`
+      — `work_item_refs` auto-links the PR to the WI via Artifact
+      Link. Once all PRs are open, `ado.update_work_item({ id,
+      state: 'Resolved' })` and post a WI comment via
+      `ado.add_work_item_comment` listing the PR URLs and the root
+      cause. Register one `ado.comment-watcher` per PR, all bound to
+      `address-pr-feedback`. `thread.set_state('suspended')`.
+    depends: [4]
+
+  - id: 6
+    goal: >
+      Phase 6 — Finalize (re-entered when all PRs reach terminal
+      state). Cleanup worktrees per `using-git-worktrees`. Update
+      `.clawdevbox/repo-registry.md` with anything learned (new
+      bug-prone areas, new co-change patterns, repro tips worth
+      remembering). `inbox.update` with the final outcome.
+      `recipe.done({ status: 'success' })`.
+    depends: [5]

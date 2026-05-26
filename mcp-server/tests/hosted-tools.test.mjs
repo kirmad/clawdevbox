@@ -52,6 +52,13 @@ const EXPECTED_ADO_TOOLS = [
   'ado.comment_pr',
   'ado.list_iterations',
   'ado.get_pr_status',
+  'ado.get_work_item',
+  'ado.list_work_items',
+  'ado.list_work_item_comments',
+  'ado.add_work_item_comment',
+  'ado.update_work_item',
+  'ado.create_pr',
+  'ado.get_work_item_updates',
 ];
 
 // ----------------------------------------------------------------------------
