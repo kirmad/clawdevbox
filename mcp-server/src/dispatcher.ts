@@ -25,7 +25,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import type { Database } from 'better-sqlite3';
-import { emitChange } from './event-bus.ts';
+import { emitChange, onChange } from './event-bus.ts';
 import { logger } from './logger.ts';
 import {
   attemptDir,
@@ -117,6 +117,13 @@ export class Dispatcher {
   private activeRuns = new Map<string, { secret: string; outDir: string }>();
   private stopped = false;
   private runRecipeFn: ((args: RunRecipeBindingArgs) => Promise<RunRecipeBindingResult>) | null;
+  /**
+   * Unsubscribes the bus listener that wakes pickUp() on 'fires' events.
+   * Without this, manually-enqueued fires (via `trigger.fire`) sit in the
+   * queue until the scheduler's next cron wake — the scheduler's debounced
+   * reschedule only recomputes timer math, it doesn't call pickUp itself.
+   */
+  private unsubscribeFires: (() => void) | null = null;
 
   constructor(db: Database, ws: Workspace, opts: DispatcherOptions = {}) {
     this.db = db;
@@ -130,11 +137,36 @@ export class Dispatcher {
 
   start(): void {
     this.stopped = false;
+    // React to fires-store mutations (enqueueFire, claimNextFire, mark*) so
+    // manually-fired triggers don't have to wait for the next scheduler wake.
+    // claimNextFire is atomic, so re-entrant pickUp() calls are safe.
+    if (!this.unsubscribeFires) {
+      this.unsubscribeFires = onChange((topic) => {
+        if (topic === 'fires' && !this.stopped) {
+          // Defer one tick so the calling transaction has fully committed
+          // before claimNextFire runs in another statement.
+          setImmediate(() => {
+            try {
+              this.pickUp();
+            } catch (err) {
+              logger.warn(
+                { err: err instanceof Error ? err.message : String(err) },
+                'dispatcher: pickUp from fires-bus subscription threw',
+              );
+            }
+          });
+        }
+      });
+    }
     this.pickUp();
   }
 
   async stop(): Promise<void> {
     this.stopped = true;
+    if (this.unsubscribeFires) {
+      this.unsubscribeFires();
+      this.unsubscribeFires = null;
+    }
     const deadline = Date.now() + this.drainMs;
     while (this.inFlight.size > 0 && Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 100));
