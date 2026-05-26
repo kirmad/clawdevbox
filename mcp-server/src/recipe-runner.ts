@@ -210,6 +210,15 @@ export async function runRecipe(opts: RunRecipeOptions): Promise<RunRecipeResult
   const providerCtx = buildProviderCtx(opts.ws, opts.cfg);
   const ptyCols = 120;
   const ptyRows = 30;
+  // Resolve the MCP URL the spawned CLI will connect back to. The dispatcher
+  // (cron / trigger) path and the recipe.run MCP tool both call runRecipe
+  // without setting opts.mcpUrl — falling back to "" writes a malformed
+  // .mcp.json that copilot/claude reject with "url: Invalid url" before they
+  // can even start. Derive it from cfg.http instead.
+  const mcpUrl =
+    opts.mcpUrl && opts.mcpUrl !== ''
+      ? opts.mcpUrl
+      : `http://${opts.cfg.http.host}:${opts.cfg.http.port}/mcp`;
   let pid: number | undefined;
   let spawnError: unknown = null;
   try {
@@ -224,7 +233,7 @@ export async function runRecipe(opts: RunRecipeOptions): Promise<RunRecipeResult
       workspaceInfo: opts.workspaceInfo,
       ambientEnv: spawnEnv,
       mcp: {
-        url: opts.mcpUrl ?? '',
+        url: mcpUrl,
         secret: mcpSecret,
         workspaceId: opts.workspaceInfo.id,
         recipeInstanceId: instanceId,
