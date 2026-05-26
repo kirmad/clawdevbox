@@ -37,6 +37,20 @@ export interface MainAgentStatus {
   exited: boolean;
   agent_cli: string;
   view_url_path: string;
+  /**
+   * When `running === false`, a human-readable explanation of *why* — set on
+   * every transition out of "running":
+   *
+   *   - provider not registered  → `"provider 'X' is not registered (available: …)"`
+   *   - binary detect failed     → `"binary not available: <detect.reason>"`
+   *   - spawnSession threw       → `"provider 'X' spawnSession failed: <msg>"`
+   *   - pty exited post-spawn    → `"process exited (exitCode=N, signal=…)"`
+   *
+   * Banner / UI consumers should prefer this over their own guess-the-cause
+   * heuristics. Unset (`undefined`) when `running === true` OR when no spawn
+   * attempt has been made yet in this process.
+   */
+  not_running_reason?: string;
 }
 
 interface MainAgentOptions {
@@ -50,6 +64,12 @@ interface MainAgentOptions {
 
 let agentPid: number | null = null;
 let agentCliId: string = 'copilot';
+/**
+ * Last known reason `running` is false. Cleared the moment we register a
+ * pty + the spawn promise has resolved. Re-set from the `handle.exited`
+ * continuation when the pty dies later.
+ */
+let notRunningReason: string | null = null;
 
 function mintMainAgentSessionId(): string {
   // Claude Code's --session-id flag REQUIRES a valid UUID (verified against
@@ -62,12 +82,15 @@ function mintMainAgentSessionId(): string {
 
 export function getMainAgentStatus(): MainAgentStatus {
   const session = listSessions().find((s) => s.instanceId === MAIN_AGENT_INSTANCE_ID);
+  const running = session ? !session.exited : false;
+  const exited = session ? session.exited : false;
   return {
     instance_id: MAIN_AGENT_INSTANCE_ID,
-    running: session ? !session.exited : false,
-    exited: session ? session.exited : false,
+    running,
+    exited,
     agent_cli: agentCliId,
     view_url_path: `/terminal/${MAIN_AGENT_INSTANCE_ID}`,
+    not_running_reason: running ? undefined : (notRunningReason ?? undefined),
   };
 }
 
@@ -90,10 +113,16 @@ export async function startMainAgent(opts: MainAgentOptions): Promise<MainAgentS
   agentCliId = providerId;
   const provider = opts.workspace.agentCliProviders.get(providerId);
   if (!provider) {
+    const available = [...opts.workspace.agentCliProviders.keys()];
+    const availableHint = available.length === 0 ? '(none)' : available.join(', ');
+    notRunningReason =
+      `provider '${providerId}' is not registered ` +
+      `(available: ${availableHint}). ` +
+      `Run \`clawdevbox config set default_agent_cli <id>\` or install the providing plugin.`;
     logger.warn(
       {
         providerId,
-        available: [...opts.workspace.agentCliProviders.keys()],
+        available,
       },
       'main-agent: configured provider is not registered; home page agent tab will be empty',
     );
@@ -103,6 +132,37 @@ export async function startMainAgent(opts: MainAgentOptions): Promise<MainAgentS
   const host = opts.host ?? opts.cfg.http.host;
   const port = opts.port ?? opts.cfg.http.port;
   const providerCtx = buildProviderCtx(opts.workspace, opts.cfg);
+
+  // Probe the binary up-front (if the provider exposes `detect`). ConPty /
+  // node-pty on Windows can silently swallow a missing binary by returning
+  // a pty that exits immediately with code 1 — and the user-visible banner
+  // then has to guess at the cause. Detect runs cheaply (~ms) and gives us
+  // a precise "binary not on PATH" diagnosis before we touch the pty.
+  if (provider.detect) {
+    try {
+      const detect = await provider.detect(providerCtx);
+      if (!detect.available) {
+        notRunningReason =
+          `provider '${providerId}' binary not available` +
+          (detect.binary ? ` (binary='${detect.binary}')` : '') +
+          (detect.reason ? `: ${detect.reason}` : '') +
+          '. Install the CLI or set the relevant env var, then run `clawdevbox restart`.';
+        logger.warn(
+          { providerId, detect },
+          'main-agent: provider.detect reports binary unavailable; skipping spawn',
+        );
+        return getMainAgentStatus();
+      }
+    } catch (err) {
+      // Detect itself threw — don't block spawn on that, just log. The
+      // spawn attempt below will surface a more specific reason if it
+      // also fails.
+      logger.warn(
+        { providerId, err: err instanceof Error ? err.message : String(err) },
+        'main-agent: provider.detect threw; proceeding to spawn anyway',
+      );
+    }
+  }
 
   try {
     const handle = await provider.spawnSession(providerCtx, {
@@ -139,7 +199,15 @@ export async function startMainAgent(opts: MainAgentOptions): Promise<MainAgentS
       ipty: handle.pty,
     });
 
+    // Spawn succeeded — clear any stale reason from earlier attempts.
+    notRunningReason = null;
+
     handle.exited.then(({ exitCode, signal }) => {
+      notRunningReason =
+        `provider '${providerId}' process exited` +
+        (exitCode != null ? ` (exitCode=${exitCode})` : '') +
+        (signal ? ` (signal=${signal})` : '') +
+        '. Open the Agent tab to see the terminal scrollback for the last lines before exit.';
       logger.info({ exitCode, signal, pid: agentPid }, 'main-agent: exited');
       agentPid = null;
       emitChange('agent');
@@ -151,11 +219,12 @@ export async function startMainAgent(opts: MainAgentOptions): Promise<MainAgentS
       'main-agent: started',
     );
   } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    notRunningReason = `provider '${providerId}' spawnSession failed: ${msg}`;
     logger.warn(
       {
-        err: err instanceof Error ? err.message : String(err),
+        err: msg,
         providerId,
-        hint: `provider '${providerId}' failed to spawn — check its binary is installed and on PATH`,
       },
       'main-agent: spawn failed; home page will show an empty terminal',
     );

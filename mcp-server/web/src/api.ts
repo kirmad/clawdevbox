@@ -266,6 +266,11 @@ export interface MainAgentStatus {
   running: boolean;
   exited?: boolean;
   exitCode?: number | null;
+  /**
+   * Human-readable reason `running` is false (provider missing, binary not on
+   * PATH, spawn threw, process exited). Absent while running.
+   */
+  not_running_reason?: string;
 }
 
 export function fetchAgentStatus(): Promise<MainAgentStatus> {

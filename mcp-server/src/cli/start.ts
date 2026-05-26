@@ -949,7 +949,14 @@ export async function runStart(flags: Flags): Promise<void> {
       `  Terminal:   http://${cfg.http.host}:${boundPort}/terminal/<instance_id>\n` +
       `  Artifacts:  http://${cfg.http.host}:${boundPort}/artifact/<id>\n` +
       `  Health:     http://${cfg.http.host}:${boundPort}/healthz\n` +
-      `  Main agent: ${mainAgent.running ? `${mainAgent.agent_cli} (running)` : `NOT running — provider '${mainAgent.agent_cli}' not registered or its binary is not on PATH; open / and check the Agent tab`}\n` +
+      `  Main agent: ${
+        mainAgent.running
+          ? `${mainAgent.agent_cli} (running)`
+          : `NOT running — ${
+              mainAgent.not_running_reason ??
+              `reason unknown (check the warn log lines above and the Agent tab at /terminal/main)`
+            }`
+      }\n` +
       tunnelBannerLine +
       `\nPress Ctrl+C to stop.\n`,
   );

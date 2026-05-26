@@ -1,9 +1,5 @@
-[mcps.servers.clawdevbox]
-type = "stdio"
-command = "npx"
-args = ["-y", "clawdevbox", "mcp"]
-tools = ["*"]
-
-[mcps.servers.clawdevbox.env]
-CLAWDEVBOX_PROJECT_DIR = "C:\\git\\clawdevbox"
-CLAWDEVBOX_GLOBAL_DIR = "C:\\Users\\kirmadi\\.clawdevbox"
+[mcps.builtins.clawdevbox]
+auth = "None"
+type = "remote"
+url = "http://127.0.0.1:5201/mcp"
+header = ["X-Clawdevbox-Project-Dir: C:\\git\\clawdevbox"]
