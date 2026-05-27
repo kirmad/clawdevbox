@@ -24,6 +24,7 @@ import { fileURLToPath } from 'node:url';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import { applyConfigToEnv, ConfigError, resolveConfig, type ResolvedConfig } from '../config.ts';
+import { handleTestHook } from '../api-test-hooks.ts';
 import { onChange } from '../event-bus.ts';
 import { renderHomePage, resolveSpaAsset } from '../home-page.ts';
 import { logger } from '../logger.ts';
@@ -423,6 +424,14 @@ export async function runStart(flags: Flags): Promise<void> {
       res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
       res.end('ok');
       return;
+    }
+
+    // Loopback-only test hooks: /api/test/recipe-run, /api/test/trigger-fire,
+    // /api/test/run-e2e, /api/test/agent-clis. Handled before /mcp so they
+    // never see bearer auth.
+    if (url.pathname.startsWith('/api/test/')) {
+      const handled = await handleTestHook(url, req, res, { cfg, ws });
+      if (handled) return;
     }
 
     if (isMcpPath(url.pathname)) {
