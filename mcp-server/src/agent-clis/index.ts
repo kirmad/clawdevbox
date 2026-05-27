@@ -31,6 +31,27 @@ export type {
   DiscoveredPlugin,
   MarketplaceRecord,
   PluginCliBinding,
+  ProviderCapabilities,
+  PromptQueueMode,
+  PromptStrategy,
+  WritePromptOpts,
+  SessionMode,
 } from './types.ts';
 
 export { cliPluginSync, cliPluginDiscover, parsePluginListOutput, parseMarketplaceListOutput, stripAnsi } from './shared.ts';
+
+export {
+  SessionConductor,
+  createSessionConductor,
+  SessionDisposedError,
+  SessionExitedError,
+  SessionTimeoutError,
+  UnsupportedProviderError,
+} from './session-conductor.ts';
+export type {
+  ConductorOpts,
+  ConductorState,
+  DispatchOpts,
+  DispatchResult,
+  DoneSignal,
+} from './session-conductor.ts';

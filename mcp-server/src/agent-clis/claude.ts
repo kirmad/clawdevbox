@@ -5,10 +5,12 @@ import type {
   AgentCliProvider,
   AgentHandle,
   DiscoveredPlugin,
+  ProviderCapabilities,
   ProviderCtx,
   SpawnSessionOpts,
   SyncPluginInventoryOpts,
   SyncReport,
+  WritePromptOpts,
 } from './types.ts';
 
 function resolveBinary(): { file: string; argsPrefix: string[] } {
@@ -20,11 +22,25 @@ function resolveBinary(): { file: string; argsPrefix: string[] } {
 
 const CLAUDE_PLUGIN_CACHE = join(os.homedir(), '.claude', 'plugins', 'cache');
 
+// Empirically derived from files/queue-done-spike/. Claude Code 2.1.138's
+// REPL accepts a single `pty.write(prompt + '\r')` (no 250ms gap required)
+// and has no observable native queue feature — `\x11` has no effect, and
+// `claude --help` shows no queue/enqueue flag. The conductor must buffer
+// follow-up prompts locally and drain them as a coalesced delivery on
+// next idle.
+const claudeCapabilities: ProviderCapabilities = {
+  queueMode: 'none',
+  promptSubmitStrategy: 'bulk-cr',
+  promptReadyRegex: /❯[^\S\n]*$/m,
+  busyIndicators: [/Working/i, /thinking/i],
+};
+
 export const claudeProvider: AgentCliProvider = {
   id: 'claude',
   displayName: 'Anthropic Claude Code',
   description: 'The Anthropic Claude Code CLI (`claude`). Supports headless prompts and resumable sessions.',
   source: 'builtin',
+  capabilities: claudeCapabilities,
 
   async detect(_ctx: ProviderCtx) {
     const { file, argsPrefix } = resolveBinary();
@@ -62,6 +78,13 @@ export const claudeProvider: AgentCliProvider = {
       exited: new Promise((resolveExit) => pty.onExit(({ exitCode, signal }) =>
         resolveExit({ exitCode, signal: signal != null ? String(signal) : undefined }))),
     };
+  },
+
+  async writePrompt(handle: AgentHandle, { text, strategy }: WritePromptOpts): Promise<void> {
+    if (strategy === 'queue') {
+      throw new Error('claude: queue strategy not supported (queueMode is "none"); caller must downgrade to local buffering');
+    }
+    handle.pty.write(text + '\r');
   },
 
   async syncPluginInventory(ctx: ProviderCtx, opts: SyncPluginInventoryOpts): Promise<SyncReport> {

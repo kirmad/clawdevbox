@@ -5,10 +5,12 @@ import type {
   AgentCliProvider,
   AgentHandle,
   DiscoveredPlugin,
+  ProviderCapabilities,
   ProviderCtx,
   SpawnSessionOpts,
   SyncPluginInventoryOpts,
   SyncReport,
+  WritePromptOpts,
 } from './types.ts';
 
 function resolveBinary(): string {
@@ -22,11 +24,30 @@ function resolveBinary(): string {
 // agency wraps copilot — the agency provider sets the same pluginCacheDir.
 const COPILOT_PLUGIN_CACHE = join(os.homedir(), '.copilot', 'installed-plugins');
 
+const SLEEP_BEFORE_COMMIT_MS = 250;
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// Empirically derived from files/queue-done-spike/QUEUE-FINDINGS.md:
+//   * `pty.write(text)` then ~250ms then `pty.write('\r')` reliably submits.
+//   * Same sequence with `\x11` (ASCII DC1 = Ctrl+Q) stages the prompt in
+//     Copilot's native queue instead, FIFO across multiple stacked prompts.
+//   * Visible busy/queue strings on the TUI: `Working`, `Queued (N)`, `[pending]`.
+//   * Prompt-ready glyph: `❯` (U+276F) on a stable tail.
+const copilotCapabilities: ProviderCapabilities = {
+  queueMode: 'ctrl-q',
+  promptSubmitStrategy: 'split-cr-250ms',
+  promptReadyRegex: /❯[^\S\n]*$/m,
+  busyIndicators: [/Working/i, /Queued \(\d+\)/i, /\[pending\]/i],
+};
+
 export const copilotProvider: AgentCliProvider = {
   id: 'copilot',
   displayName: 'GitHub Copilot CLI',
   description: 'The official GitHub Copilot CLI (`copilot`). Supports headless prompts and resumable sessions.',
   source: 'builtin',
+  capabilities: copilotCapabilities,
 
   async detect(_ctx: ProviderCtx) {
     return probeBinary(resolveBinary(), ['--version']);
@@ -64,6 +85,16 @@ export const copilotProvider: AgentCliProvider = {
       exited: new Promise((resolveExit) => pty.onExit(({ exitCode, signal }) =>
         resolveExit({ exitCode, signal: signal != null ? String(signal) : undefined }))),
     };
+  },
+
+  // Empirically validated against Copilot CLI 1.0.55-3 (see
+  // files/queue-done-spike/QUEUE-FINDINGS.md). A single bulk
+  // `pty.write(text + '\r')` only edits the input box; the text and the
+  // commit byte (`\r` or `\x11`) must arrive in separate writes.
+  async writePrompt(handle: AgentHandle, { text, strategy }: WritePromptOpts): Promise<void> {
+    handle.pty.write(text);
+    await sleep(SLEEP_BEFORE_COMMIT_MS);
+    handle.pty.write(strategy === 'queue' ? '\x11' : '\r');
   },
 
   async syncPluginInventory(ctx: ProviderCtx, opts: SyncPluginInventoryOpts): Promise<SyncReport> {

@@ -5,6 +5,69 @@ import type { logger as Logger } from '../logger.ts';
 
 export type SessionMode = 'interactive' | 'headless';
 
+/**
+ * How a provider's interactive REPL can stage a follow-up prompt while the
+ * agent is mid-turn.
+ *
+ * - `ctrl-q`: provider's REPL accepts ASCII DC1 (`\x11`) to enqueue the
+ *   current input box content instead of submitting it. Empirically verified
+ *   for GitHub Copilot CLI and Agency (which wraps Copilot). Drains FIFO.
+ * - `none`: provider has no built-in queue mechanism; the conductor must
+ *   buffer locally and write a coalesced prompt on next idle.
+ */
+export type PromptQueueMode = 'ctrl-q' | 'none';
+
+/**
+ * Caller-supplied hint to `SessionConductor.dispatch`. The conductor
+ * resolves to a concrete byte strategy based on the provider's
+ * `capabilities.queueMode` and the live session state:
+ *
+ * - `submit`: always submit immediately; if the session is busy, buffer
+ *   in the conductor's local queue and drain on next idle.
+ * - `queue`: prefer provider-native queue (Ctrl+Q) when supported; on
+ *   providers without queue support, downgrade to local-buffer (same as
+ *   `submit` while busy) and log a warning.
+ * - `auto` (default): use provider queue when busy and supported, submit
+ *   when idle, buffer locally otherwise.
+ */
+export type PromptStrategy = 'submit' | 'queue' | 'auto';
+
+export interface ProviderCapabilities {
+  /** How follow-up prompts can be staged while the agent is mid-turn. */
+  queueMode: PromptQueueMode;
+  /**
+   * Byte-level submit strategy for the provider's REPL. Empirically
+   * required for Copilot/Agency: a single bulk `pty.write(text + '\r')`
+   * only edits the input box and does not submit; the text and the Enter
+   * byte must arrive in separate writes with a ~250ms gap. Claude accepts
+   * `bulk-cr` (one combined write).
+   */
+  promptSubmitStrategy: 'split-cr-250ms' | 'bulk-cr';
+  /**
+   * Regex matching the visible prompt-ready glyph on a stable terminal
+   * tail. Used by the conductor as a SECONDARY done signal — only after
+   * the tail has been stable for `stableTailMs` and no `busyIndicators`
+   * are present. Multiline anchors recommended.
+   */
+  promptReadyRegex: RegExp;
+  /**
+   * Regexes matching mid-turn busy indicators. While any of these match
+   * the current screen tail, the conductor treats the session as busy
+   * even if other heuristics might otherwise fire.
+   */
+  busyIndicators: RegExp[];
+}
+
+/**
+ * Resolved arguments to `AgentCliProvider.writePrompt`. `strategy` is
+ * narrowed to a concrete operation (no `auto`) — the conductor resolves
+ * the caller's `PromptStrategy` before calling the provider.
+ */
+export interface WritePromptOpts {
+  text: string;
+  strategy: 'submit' | 'queue';
+}
+
 export type SessionInit =
   | { kind: 'new'; session_id: string }
   | { kind: 'resume'; session_id: string };
@@ -96,9 +159,31 @@ export interface AgentCliProvider {
   readonly description: string;
   readonly source: 'builtin' | `plugin:${string}`;
   readonly internal?: boolean;
+  /**
+   * Declarative metadata describing how the provider's interactive REPL
+   * behaves. Required for any provider that will be driven by
+   * `SessionConductor`; providers that only spawn headless sessions may
+   * omit this field. The conductor refuses to wrap a handle whose
+   * provider lacks `capabilities`.
+   */
+  readonly capabilities?: ProviderCapabilities;
   detect?(ctx: ProviderCtx): Promise<DetectResult>;
   setup?(ctx: ProviderCtx, opts: SetupOptions): Promise<void>;
   spawnSession(ctx: ProviderCtx, opts: SpawnSessionOpts): Promise<AgentHandle>;
+  /**
+   * Deliver a prompt to a live interactive session by writing the
+   * provider-specific byte sequence to the pty. Implementations MUST
+   * honor the resolved strategy:
+   *
+   * - `submit`: write the prompt and commit it (e.g. text → Enter).
+   * - `queue`: stage the prompt without starting a new turn (e.g.
+   *   text → Ctrl+Q on Copilot). Providers whose `capabilities.queueMode`
+   *   is `'none'` MUST throw on `strategy: 'queue'` — the conductor only
+   *   calls writePrompt with a strategy the provider supports.
+   *
+   * Required for any provider that will be driven by `SessionConductor`.
+   */
+  writePrompt?(handle: AgentHandle, opts: WritePromptOpts): Promise<void>;
   /**
    * Reconcile the configured CLI's plugin inventory with the given clawdevbox
    * plugin/marketplace state. Idempotent. Uses the CLI's own `plugin install`
