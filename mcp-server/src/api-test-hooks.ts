@@ -10,11 +10,15 @@
  *     hermetic child (complementing `tests/recipe-real-e2e.test.mjs`).
  *
  * Routes
- *   POST /api/test/recipe-run    — forwards to the `recipe.run` MCP tool.
- *   POST /api/test/trigger-fire  — forwards to the `trigger.fire` MCP tool.
- *   POST /api/test/run-e2e       — zero-arg shortcut: runs an inline recipe
- *                                  driven by the e2e-test-runner provider.
- *   GET  /api/test/agent-clis    — lists registered providers (incl. internal).
+ *   POST /api/test/recipe-run        — forwards to the `recipe.run` MCP tool.
+ *   POST /api/test/trigger-fire      — forwards to the `trigger.fire` MCP tool.
+ *   POST /api/test/run-e2e           — zero-arg shortcut: runs an inline recipe
+ *                                      driven by the e2e-test-runner provider.
+ *   POST /api/test/run-trigger-e2e   — zero-arg shortcut: registers an inline
+ *                                      node script trigger and fires it. The
+ *                                      script writes a stable marker so the
+ *                                      caller can verify dispatcher execution.
+ *   GET  /api/test/agent-clis        — lists registered providers (incl. internal).
  *
  * Security: every route refuses non-loopback callers (403). They are NOT
  * bearer-gated — same posture as `/api/inbox` / `/api/recipes` — because
@@ -81,39 +85,56 @@ async function invokeTool(
   args: Record<string, unknown>,
   res: ServerResponse,
 ): Promise<void> {
-  const entry = getRegistry().get(toolName);
-  if (!entry) {
+  const outcome = await callTool(toolName, args);
+  if (outcome.kind === 'not_registered') {
     sendJson(res, 500, {
       error: { code: 'TOOL_NOT_REGISTERED', message: `'${toolName}' is not in the tool registry` },
     });
     return;
   }
-  try {
-    const result = (await entry.handler(args, { source: 'api-test-hook' })) as {
-      content?: unknown;
-      structuredContent?: unknown;
-      isError?: boolean;
-    };
-    if (result?.isError) {
-      sendJson(res, 422, {
-        ok: false,
-        tool: toolName,
-        structuredContent: result.structuredContent ?? null,
-        content: result.content ?? null,
-      });
-      return;
-    }
-    sendJson(res, 200, {
-      ok: true,
-      tool: toolName,
-      structuredContent: result?.structuredContent ?? null,
-      content: result?.content ?? null,
+  if (outcome.kind === 'threw') {
+    sendJson(res, 500, {
+      error: { code: 'TOOL_THREW', tool: toolName, message: outcome.message },
     });
+    return;
+  }
+  const status = outcome.result.isError ? 422 : 200;
+  sendJson(res, status, {
+    ok: !outcome.result.isError,
+    tool: toolName,
+    structuredContent: outcome.result.structuredContent ?? null,
+    content: outcome.result.content ?? null,
+  });
+}
+
+type ToolResult = {
+  content?: unknown;
+  structuredContent?: unknown;
+  isError?: boolean;
+};
+
+type CallOutcome =
+  | { kind: 'ok'; result: ToolResult }
+  | { kind: 'not_registered' }
+  | { kind: 'threw'; message: string };
+
+/**
+ * Lower-level helper: invoke a tool and return the envelope without writing
+ * any HTTP response. Used by composite endpoints (e.g. run-trigger-e2e) that
+ * need to chain calls and decide on a unified response.
+ */
+async function callTool(
+  toolName: string,
+  args: Record<string, unknown>,
+): Promise<CallOutcome> {
+  const entry = getRegistry().get(toolName);
+  if (!entry) return { kind: 'not_registered' };
+  try {
+    const result = (await entry.handler(args, { source: 'api-test-hook' })) as ToolResult;
+    return { kind: 'ok', result };
   } catch (err) {
     logger.error({ tool: toolName, err: (err as Error).message }, 'api-test-hook tool invocation failed');
-    sendJson(res, 500, {
-      error: { code: 'TOOL_THREW', tool: toolName, message: (err as Error).message },
-    });
+    return { kind: 'threw', message: (err as Error).message };
   }
 }
 
@@ -128,6 +149,35 @@ const INLINE_E2E_RECIPE_YAML = [
   'description: Drive the e2e-test-runner provider against the live server.',
   'agent_cli: e2e-test-runner',
   'steps: []',
+  '',
+].join('\n');
+
+/**
+ * Inline node script used by `/api/test/run-trigger-e2e`. Writes a stable
+ * marker to stdout so the caller (or test harness) can prove the dispatcher
+ * picked up the fire and ran the script binding end-to-end.
+ *
+ * Stays minimal on purpose — no MCP roundtrip, no callbacks. The trigger
+ * pipeline is what's under test; the script is just a witness.
+ *
+ * The dispatcher (`trigger-runner.ts`) writes the TriggerEnvelope JSON to
+ * the child's stdin, so we read+parse it from there.
+ */
+const INLINE_TRIGGER_SCRIPT = [
+  "'use strict';",
+  '// Witness script for /api/test/run-trigger-e2e.',
+  '// Dispatcher writes the TriggerEnvelope to stdin; we read it to prove',
+  '// the wiring is intact. stdout/stderr are captured to attempt-N/*.txt.',
+  "let envelopeRaw = '';",
+  "process.stdin.setEncoding('utf8');",
+  "process.stdin.on('data', (chunk) => { envelopeRaw += chunk; });",
+  "process.stdin.on('end', () => {",
+  '  let envelope = {};',
+  '  try { envelope = envelopeRaw ? JSON.parse(envelopeRaw) : {}; } catch (e) { envelope = { __parse_error: String(e) }; }',
+  "  process.stdout.write('TRIGGER_E2E_MARKER trigger_id=' + (envelope.trigger_id || '?') + ' run_id=' + (envelope.run_id || '?') + '\\n');",
+  "  process.stdout.write(JSON.stringify({ state: envelope.state || {}, callback: { body: { ok: true, witness: 'TRIGGER_E2E_MARKER', trigger_id: envelope.trigger_id, run_id: envelope.run_id } } }) + '\\n');",
+  '  process.exit(0);',
+  '});',
   '',
 ].join('\n');
 
@@ -205,6 +255,85 @@ export async function handleTestHook(
       },
       res,
     );
+    return true;
+  }
+
+  // ── POST /api/test/run-trigger-e2e ────────────────────────────────────
+  // Composite demo: register a one-off node script trigger, then fire it.
+  // The script writes TRIGGER_E2E_MARKER to stdout, which the dispatcher
+  // persists to attempt-N/stdout.txt. Returns both envelopes so callers can
+  // chain `fire_id` → poll `triggers.json` / DB to verify completion.
+  if (path === '/api/test/run-trigger-e2e' && req.method === 'POST') {
+    const body = ((await readJsonBody<{ payload?: unknown }>(req, res)) ?? {}) as {
+      payload?: unknown;
+    };
+
+    const registerOutcome = await callTool('trigger.register', {
+      script: INLINE_TRIGGER_SCRIPT,
+      runtime: 'node',
+    });
+    if (registerOutcome.kind !== 'ok' || registerOutcome.result.isError) {
+      sendJson(res, registerOutcome.kind === 'ok' ? 422 : 500, {
+        ok: false,
+        stage: 'register',
+        kind: registerOutcome.kind,
+        structuredContent:
+          registerOutcome.kind === 'ok' ? registerOutcome.result.structuredContent ?? null : null,
+        content:
+          registerOutcome.kind === 'ok' ? registerOutcome.result.content ?? null : null,
+        message:
+          registerOutcome.kind === 'threw' ? registerOutcome.message : 'trigger.register failed',
+      });
+      return true;
+    }
+    const registered = registerOutcome.result.structuredContent as { id?: string } | null;
+    const triggerId = registered?.id;
+    if (typeof triggerId !== 'string' || triggerId.length === 0) {
+      sendJson(res, 500, {
+        ok: false,
+        stage: 'register',
+        message: 'trigger.register did not return structuredContent.id',
+        structuredContent: registerOutcome.result.structuredContent ?? null,
+      });
+      return true;
+    }
+
+    const fireOutcome = await callTool('trigger.fire', {
+      id: triggerId,
+      payload: body.payload ?? { witness: 'TRIGGER_E2E_MARKER' },
+    });
+    if (fireOutcome.kind !== 'ok' || fireOutcome.result.isError) {
+      sendJson(res, fireOutcome.kind === 'ok' ? 422 : 500, {
+        ok: false,
+        stage: 'fire',
+        trigger_id: triggerId,
+        kind: fireOutcome.kind,
+        structuredContent:
+          fireOutcome.kind === 'ok' ? fireOutcome.result.structuredContent ?? null : null,
+        content: fireOutcome.kind === 'ok' ? fireOutcome.result.content ?? null : null,
+        message: fireOutcome.kind === 'threw' ? fireOutcome.message : 'trigger.fire failed',
+      });
+      return true;
+    }
+
+    const fireResult = fireOutcome.result.structuredContent as
+      | { fire_id?: string; trigger_id?: string; status?: string }
+      | null;
+    sendJson(res, 200, {
+      ok: true,
+      stage: 'fire',
+      witness_marker: 'TRIGGER_E2E_MARKER',
+      register: {
+        structuredContent: registerOutcome.result.structuredContent ?? null,
+        content: registerOutcome.result.content ?? null,
+      },
+      fire: {
+        structuredContent: fireOutcome.result.structuredContent ?? null,
+        content: fireOutcome.result.content ?? null,
+      },
+      trigger_id: triggerId,
+      fire_id: fireResult?.fire_id ?? null,
+    });
     return true;
   }
 

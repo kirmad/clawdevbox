@@ -369,3 +369,72 @@ test('api-test-hooks: input validation errors', { timeout: 30_000 }, async () =>
     await svc.cleanup();
   }
 });
+
+// ---------------------------------------------------------------------------
+// Test 5 — POST /api/test/run-trigger-e2e registers an inline node script
+// trigger, fires it, and the dispatcher executes the script. Verified by
+// asserting the witness marker lands in attempt-1/stdout.txt under the fire
+// output dir + the DB fire row reaches a terminal status.
+// ---------------------------------------------------------------------------
+
+test('api-test-hooks: POST /api/test/run-trigger-e2e drives a real trigger end-to-end', { timeout: 120_000 }, async () => {
+  const svc = await spawnKernelService();
+  try {
+    const res = await fetch(`http://127.0.0.1:${svc.port}/api/test/run-trigger-e2e`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ payload: { unit_test: true } }),
+    });
+    const text = await res.text();
+    assert.equal(res.status, 200, `expected 200, got ${res.status}: ${text}`);
+    const body = JSON.parse(text);
+    assert.equal(body.ok, true, `ok flag: ${JSON.stringify(body)}`);
+    assert.equal(body.witness_marker, 'TRIGGER_E2E_MARKER');
+    assert.ok(body.trigger_id, `trigger_id missing: ${JSON.stringify(body)}`);
+    assert.ok(body.fire_id, `fire_id missing: ${JSON.stringify(body)}`);
+    assert.ok(body.register?.structuredContent?.adhoc === true, 'registered as adhoc');
+
+    const fireDir = join(svc.projectDir, '.clawdevbox', 'fires', body.fire_id);
+    const stdoutPath = join(fireDir, 'attempt-1', 'stdout.txt');
+
+    // Wait for the dispatcher to write stdout — proves the script actually ran.
+    const stdoutText = await pollUntil(() => {
+      if (!existsSync(stdoutPath)) return null;
+      const txt = readFileSync(stdoutPath, 'utf8');
+      if (txt.includes('TRIGGER_E2E_MARKER')) return txt;
+      return null;
+    }, AGENT_POLL_TIMEOUT_MS, `fire ${body.fire_id} stdout shows TRIGGER_E2E_MARKER`);
+
+    assert.ok(
+      stdoutText.includes('TRIGGER_E2E_MARKER'),
+      `stdout missing marker; raw:\n${stdoutText}`,
+    );
+    assert.ok(
+      stdoutText.includes(`run_id=${body.fire_id}`),
+      `stdout shows wrong run_id, expected run_id=${body.fire_id}; raw:\n${stdoutText}`,
+    );
+    assert.ok(
+      stdoutText.includes(`trigger_id=${body.trigger_id}`),
+      `stdout shows wrong trigger_id, expected trigger_id=${body.trigger_id}; raw:\n${stdoutText}`,
+    );
+
+    // The fire should also reach a terminal DB status. We don't pin it to
+    // 'success' — some race paths can leave it 'running' briefly even after
+    // stdout has been flushed; the script marker is the authoritative witness.
+    const finalRow = await pollUntil(() => {
+      const db = openDb(svc.globalDir);
+      try {
+        const row = db
+          .prepare('SELECT fire_id, status, attempt FROM fires WHERE fire_id = ?')
+          .get(body.fire_id);
+        if (row && row.status && row.status !== 'queued' && row.status !== 'running') return row;
+        return null;
+      } finally {
+        db.close();
+      }
+    }, AGENT_POLL_TIMEOUT_MS, `fires.${body.fire_id} reaches terminal status`);
+    assert.equal(finalRow.status, 'success', `fire status=${finalRow.status} attempt=${finalRow.attempt}`);
+  } finally {
+    await svc.cleanup();
+  }
+});
