@@ -103,6 +103,25 @@ export interface RunRecipeResult {
 // per-spawn HTTP MCP headers — see writeMcpJson in agent-clis/shared.ts
 // and context-resolver.ts.)
 
+/**
+ * Pretty-print a spawn (file, args[]) into a single command line for
+ * display in the terminal viewer header. Quotes args that contain
+ * whitespace or shell metacharacters; truncates long arrays (prompts
+ * can be many KB) so the header stays readable.
+ */
+function formatCommandLine(file: string, args: string[]): string {
+  const quote = (s: string): string => {
+    if (s.length === 0) return '""';
+    return /[\s"'`$&|;<>(){}\\]/.test(s) ? JSON.stringify(s) : s;
+  };
+  const MAX_ARG_LEN = 80;
+  const truncated = args.map((a) => {
+    if (a.length <= MAX_ARG_LEN) return quote(a);
+    return quote(a.slice(0, MAX_ARG_LEN) + `…[+${a.length - MAX_ARG_LEN} chars]`);
+  });
+  return [quote(file), ...truncated].join(' ');
+}
+
 
 export async function runRecipe(opts: RunRecipeOptions): Promise<RunRecipeResult> {
   // Resolve agent_cli with the same fallback chain as the `recipe.run` tool:
@@ -228,7 +247,26 @@ export async function runRecipe(opts: RunRecipeOptions): Promise<RunRecipeResult
     };
   }
 
-  const providerCtx = buildProviderCtx(opts.ws, opts.cfg);
+  const baseProviderCtx = buildProviderCtx(opts.ws, opts.cfg);
+  // Wrap spawnPty so we can capture (file, args, cwd) from whichever
+  // provider actually launches the pty. Providers are opaque from here —
+  // recipe-runner doesn't know if the binary is `copilot`, `claude`, or
+  // a plugin like `agency`. The wrapper records the *last* invocation
+  // (typical case: providers spawn the agent CLI exactly once) and we
+  // surface that to the pty-registry meta so the terminal viewer can
+  // display the actual command line + cwd in its header.
+  //
+  // Held inside a container so TS doesn't narrow the `let` across the
+  // intervening `await provider.spawnSession(...)` — the assignment
+  // happens inside a callback that isn't part of the synchronous flow.
+  const lastSpawnRef: { value: { file: string; args: string[]; cwd: string } | null } = { value: null };
+  const providerCtx = {
+    ...baseProviderCtx,
+    spawnPty: (file: string, args: string[], ptyOpts: { cwd: string; env: Record<string, string>; cols: number; rows: number; name?: string }) => {
+      lastSpawnRef.value = { file, args: [...args], cwd: ptyOpts.cwd };
+      return baseProviderCtx.spawnPty(file, args, ptyOpts);
+    },
+  };
   const ptyCols = 120;
   const ptyRows = 30;
   // Resolve the MCP URL the spawned CLI will connect back to. The dispatcher
@@ -270,12 +308,23 @@ export async function runRecipe(opts: RunRecipeOptions): Promise<RunRecipeResult
     });
     const ptyProc = handle.pty;
     pid = handle.pid ?? undefined;
+    const lastSpawn = lastSpawnRef.value;
+    const commandLine = lastSpawn
+      ? formatCommandLine(lastSpawn.file, lastSpawn.args)
+      : undefined;
     registerPty({
       instanceId,
       workspaceId: opts.workspaceInfo.id,
       cols: ptyCols,
       rows: ptyRows,
       ipty: ptyProc,
+      meta: {
+        cwd: lastSpawn?.cwd ?? opts.workspaceInfo.path,
+        commandLine,
+        agentCli,
+        sessionId,
+        recipeId: opts.recipeId,
+      },
     });
     ptyProc.onData((data) => {
       logStream.write(data);

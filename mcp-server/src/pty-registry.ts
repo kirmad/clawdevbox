@@ -46,12 +46,39 @@ export type PtyServerEvent =
 
 export type PtySubscriber = (event: PtyServerEvent) => void;
 
+/**
+ * Lightweight metadata captured at spawn time and surfaced in the terminal
+ * viewer header so a human reattaching to a running pty can see WHAT shell
+ * is in the pane, WHERE it was started, and WHICH recipe/session/agent it
+ * belongs to without grepping logs.
+ *
+ * All fields are best-effort — registerPty() takes them as `meta?` and
+ * older call sites (e.g. the playwright fixture) can still register without
+ * meta. The terminal-server then falls back to on-disk recipe-instance state
+ * for archived sessions.
+ */
+export interface PtySessionMeta {
+  /** Working directory the pty was spawned in (absolute path). */
+  cwd?: string;
+  /** Command line as a single human-readable string, e.g. `claude --resume sess_x`. */
+  commandLine?: string;
+  /** Provider id (e.g. `copilot`, `claude`, `agency`). */
+  agentCli?: string;
+  /** Agent session id (recipe.run's sessionId — not the recipe_instance_id). */
+  sessionId?: string;
+  /** Recipe id (slug) if this pty backs a recipe instance. */
+  recipeId?: string;
+  /** Epoch ms when registerPty was called. */
+  startedAt: number;
+}
+
 export interface PtyRegisterOptions {
   instanceId: string;
   workspaceId: string;
   cols: number;
   rows: number;
   ipty: IPty;
+  meta?: Omit<PtySessionMeta, 'startedAt'>;
 }
 
 interface PtySession {
@@ -65,6 +92,7 @@ interface PtySession {
   subscribers: Set<PtySubscriber>;
   exited: boolean;
   exitCode: number | null;
+  meta: PtySessionMeta;
 }
 
 // ============================================================================
@@ -98,6 +126,7 @@ export function registerPty(opts: PtyRegisterOptions): void {
     subscribers: new Set(),
     exited: false,
     exitCode: null,
+    meta: { ...(opts.meta ?? {}), startedAt: Date.now() },
   };
   sessions.set(opts.instanceId, session);
 
@@ -126,6 +155,16 @@ export function registerPty(opts: PtyRegisterOptions): void {
 
 export function hasSession(instanceId: string): boolean {
   return sessions.has(instanceId);
+}
+
+/**
+ * Return the metadata captured at register time for `instanceId`, or null
+ * if the pty has fully exited and been garbage-collected. Used by the
+ * terminal viewer to populate the header with cwd / command / session.
+ */
+export function getSessionMeta(instanceId: string): PtySessionMeta | null {
+  const s = sessions.get(instanceId);
+  return s ? s.meta : null;
 }
 
 export function subscribe(

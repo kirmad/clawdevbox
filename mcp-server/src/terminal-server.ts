@@ -47,10 +47,13 @@ import {
   resizePty,
   subscribe,
   writeToPty,
+  getSessionMeta,
+  type PtySessionMeta,
 } from './pty-registry.ts';
 import { resolveRendererFile } from './renderer-registry.ts';
 import type { Workspace } from './workspace.ts';
 import { listWorkspaces, resolveWorkspacesRoot } from './workspaces-store.ts';
+import { readRecipeInstance } from './recipe-instances-store.ts';
 
 // ============================================================================
 // Server boot
@@ -203,8 +206,9 @@ function handleHttpRequest(req: IncomingMessage, res: ServerResponse): void {
   const ptyMatch = url.pathname.match(/^\/terminal\/([A-Za-z0-9_-]+)\/?$/);
   if (ptyMatch) {
     const instanceId = ptyMatch[1];
+    const meta = resolveTerminalMeta(instanceId);
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-    res.end(renderTerminalHtml(instanceId));
+    res.end(renderTerminalHtml(instanceId, meta));
     return;
   }
 
@@ -493,8 +497,107 @@ function renderArtifactHostHtml(id: string, type: string, title: string): string
 // HTML / xterm.js page
 // ============================================================================
 
-function renderTerminalHtml(instanceId: string): string {
+/**
+ * Resolve the metadata we want to render in the terminal viewer header.
+ *
+ * Source priority:
+ *   1. Live pty-registry meta (set by recipe-runner at register time).
+ *   2. On-disk recipe-instance JSON in any registered workspace (archive
+ *      fallback — pty exited and was GC'd from the registry, but the
+ *      instance file still records agent_cli, session_id, workspace_path,
+ *      log_path, recipe_id).
+ *
+ * Returns null only if neither source has any data. The header still
+ * renders in that case (just with no detail pills).
+ */
+interface TerminalHeaderMeta {
+  cwd?: string;
+  commandLine?: string;
+  agentCli?: string;
+  sessionId?: string;
+  recipeId?: string;
+  startedAt?: number;
+  archived?: boolean;
+  status?: string;
+}
+
+function resolveTerminalMeta(instanceId: string): TerminalHeaderMeta {
+  const live: PtySessionMeta | null = getSessionMeta(instanceId);
+  if (live) {
+    return {
+      cwd: live.cwd,
+      commandLine: live.commandLine,
+      agentCli: live.agentCli,
+      sessionId: live.sessionId,
+      recipeId: live.recipeId,
+      startedAt: live.startedAt,
+    };
+  }
+  // Archive fallback — iterate registered workspaces (same strategy as
+  // readArchivedTerminalLog) and try to load <ws>/.clawdevbox/recipe-instances/<id>.json
+  const candidates: string[] = [];
+  const projectDir = process.env.CLAWDEVBOX_PROJECT_DIR;
+  if (projectDir) candidates.push(projectDir);
+  try {
+    const root = resolveWorkspacesRoot();
+    for (const w of listWorkspaces(root)) candidates.push(w.path);
+  } catch {
+    /* ignore */
+  }
+  for (const wsPath of candidates) {
+    try {
+      const inst = readRecipeInstance(wsPath, instanceId);
+      if (inst) {
+        return {
+          cwd: inst.workspace_path,
+          agentCli: inst.agent_cli,
+          sessionId: inst.session_id,
+          recipeId: inst.recipe_id,
+          archived: true,
+          status: inst.status,
+        };
+      }
+    } catch {
+      /* try next */
+    }
+  }
+  return { archived: true };
+}
+
+function escapeHtmlAttr(s: string): string {
+  return s
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
+
+function renderTerminalHtml(instanceId: string, meta: TerminalHeaderMeta): string {
   const safeId = instanceId.replace(/[^A-Za-z0-9_-]/g, '');
+  // Build the structured detail row (cwd / command / agent / session).
+  // Each field is independently optional — only render pills we actually have.
+  const pills: string[] = [];
+  if (meta.agentCli) {
+    pills.push(`<span class="pill agent" title="agent CLI provider">agent: <code>${escapeHtmlAttr(meta.agentCli)}</code></span>`);
+  }
+  if (meta.sessionId) {
+    pills.push(`<span class="pill session" title="CLI session id (resumable)">session: <code>${escapeHtmlAttr(meta.sessionId)}</code></span>`);
+  }
+  if (meta.recipeId) {
+    pills.push(`<span class="pill recipe" title="recipe id">recipe: <code>${escapeHtmlAttr(meta.recipeId)}</code></span>`);
+  }
+  const detailLines: string[] = [];
+  if (meta.cwd) {
+    detailLines.push(`<div class="detail"><span class="label">cwd</span><code class="path" title="${escapeHtmlAttr(meta.cwd)}">${escapeHtmlAttr(meta.cwd)}</code></div>`);
+  }
+  if (meta.commandLine) {
+    detailLines.push(`<div class="detail"><span class="label">cmd</span><code class="cmd" title="${escapeHtmlAttr(meta.commandLine)}">${escapeHtmlAttr(meta.commandLine)}</code></div>`);
+  }
+  const archivedNotice = meta.archived && !getSessionMeta(instanceId)
+    ? `<span class="pill archived" title="pty has exited; showing archived state">archived${meta.status ? ` · ${escapeHtmlAttr(meta.status)}` : ''}</span>`
+    : '';
+
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -505,22 +608,40 @@ function renderTerminalHtml(instanceId: string): string {
   <style>
     html, body { margin: 0; padding: 0; height: 100%; background: #1e1e1e; color: #d4d4d4; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
     body { display: flex; flex-direction: column; }
-    header { padding: 8px 12px; font-size: 12px; background: #2d2d30; border-bottom: 1px solid #3e3e42; display: flex; gap: 12px; align-items: center; }
+    header { padding: 8px 12px; font-size: 12px; background: #2d2d30; border-bottom: 1px solid #3e3e42; display: flex; flex-direction: column; gap: 6px; }
+    header .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
     header b { color: #fff; }
-    header .status { padding: 2px 8px; border-radius: 4px; background: #0e639c; font-size: 11px; }
+    header .iid { color: #9cdcfe; }
+    header .status { padding: 2px 8px; border-radius: 4px; background: #0e639c; font-size: 11px; color: #fff; }
     header .status.exited { background: #6e6e6e; }
     header button { background: #f14c4c; color: #fff; border: 0; padding: 4px 10px; font-size: 11px; border-radius: 3px; cursor: pointer; margin-left: auto; }
     header button:disabled { background: #6e6e6e; cursor: not-allowed; }
+    header .pill { padding: 2px 8px; border-radius: 4px; background: #3a3d41; font-size: 11px; color: #d4d4d4; white-space: nowrap; }
+    header .pill code { background: transparent; color: #ce9178; font-family: Consolas, "Liberation Mono", Menlo, monospace; }
+    header .pill.agent { background: #0e3a5c; }
+    header .pill.session { background: #3a2a5c; }
+    header .pill.recipe { background: #2d4a2d; }
+    header .pill.archived { background: #6e6e6e; }
+    header .detail { display: flex; gap: 8px; align-items: baseline; font-size: 11px; min-width: 0; }
+    header .detail .label { color: #858585; text-transform: uppercase; letter-spacing: 0.05em; font-size: 10px; min-width: 32px; }
+    header .detail code { font-family: Consolas, "Liberation Mono", Menlo, monospace; color: #d4d4d4; background: #252526; padding: 2px 6px; border-radius: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: calc(100vw - 80px); }
+    header .detail code.path { color: #9cdcfe; }
+    header .detail code.cmd { color: #d7ba7d; }
     #term { flex: 1; padding: 4px; min-height: 0; overflow: auto; }
     .xterm, .xterm-viewport { background: #1e1e1e !important; }
   </style>
 </head>
 <body>
   <header>
-    <b>Clawdevbox</b>
-    <span>recipe instance <code id="iid">${safeId}</code></span>
-    <span class="status" id="status">connecting…</span>
-    <button id="killBtn" title="SIGTERM the pty">Kill</button>
+    <div class="row">
+      <b>Clawdevbox</b>
+      <span>recipe instance <code class="iid" id="iid">${safeId}</code></span>
+      ${pills.join('\n      ')}
+      ${archivedNotice}
+      <span class="status" id="status">connecting…</span>
+      <button id="killBtn" title="SIGTERM the pty">Kill</button>
+    </div>
+    ${detailLines.length > 0 ? detailLines.join('\n    ') : ''}
   </header>
   <div id="term"></div>
   <script type="module">
