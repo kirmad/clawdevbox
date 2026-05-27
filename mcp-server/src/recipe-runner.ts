@@ -18,7 +18,7 @@
  * recipe.done.
  */
 
-import { randomBytes, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { createWriteStream, mkdirSync } from 'node:fs';
 import { resolve as resolvePath } from 'node:path';
 import { registerPty } from './pty-registry.ts';
@@ -32,6 +32,7 @@ import {
 } from './recipe-instances-store.ts';
 import { getDatabase } from './db/index.ts';
 import { buildProviderCtx } from './agent-clis/shared.ts';
+import { parseRecipeSource } from './validators.ts';
 import type { Workspace } from './workspace.ts';
 import type { ResolvedConfig } from './config.ts';
 
@@ -104,7 +105,23 @@ export interface RunRecipeResult {
 
 
 export async function runRecipe(opts: RunRecipeOptions): Promise<RunRecipeResult> {
-  const agentCli: string = opts.agentCli ?? 'copilot';
+  // Resolve agent_cli with the same fallback chain as the `recipe.run` tool:
+  // explicit opts → recipe YAML's `agent_cli` field → cfg.defaultAgentCli →
+  // 'copilot'. The dispatcher's recipe-binding path calls runRecipe without
+  // setting opts.agentCli, so we re-derive from the recipe snapshot here to
+  // honor `agent_cli: e2e-test-runner`-style declarations end-to-end.
+  let recipeAgentCli: string | null = null;
+  try {
+    const parsed = parseRecipeSource(opts.recipeSnapshot);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      const v = (parsed as Record<string, unknown>).agent_cli;
+      if (typeof v === 'string' && v.length > 0) recipeAgentCli = v;
+    }
+  } catch {
+    /* malformed snapshots fall through to the default chain */
+  }
+  const agentCli: string =
+    opts.agentCli ?? recipeAgentCli ?? opts.cfg.defaultAgentCli ?? 'copilot';
   const instanceId = mintRecipeInstanceId();
   // Use a UUID for the session id by default. Claude Code's --session-id
   // requires a valid UUID; Copilot accepts arbitrary strings, so UUIDs work
@@ -115,7 +132,11 @@ export async function runRecipe(opts: RunRecipeOptions): Promise<RunRecipeResult
       ? opts.sessionId
       : randomUUID();
   const isResume = !!opts.resumeOf;
-  const mcpSecret = opts.mcpSecret ?? randomBytes(16).toString('hex');
+  // The bearer the agent uses to call back into /mcp must match the server's
+  // `cfg.http.token` (the only credential the HTTP MCP transport accepts).
+  // `opts.mcpSecret` lets callers override for tests; otherwise we use the
+  // configured http token (which may be empty when bearer auth is disabled).
+  const mcpSecret = opts.mcpSecret ?? opts.cfg.http.token ?? '';
 
   // The agent's .mcp.json is written by the provider's writeMcpJson via the
   // SpawnSessionOpts.mcp object (see agent-clis/shared.ts). That write

@@ -17,11 +17,13 @@ test('workspace registers built-in agent-CLI providers on load', async () => {
     CLAWDEVBOX_GLOBAL_DIR: join(tmp, '.global'),
   });
   assert.ok(ws.agentCliProviders instanceof Map);
-  assert.equal(ws.agentCliProviders.size, 3);
+  assert.equal(ws.agentCliProviders.size, 4);
   assert.ok(ws.agentCliProviders.has('copilot'));
   assert.ok(ws.agentCliProviders.has('claude'));
   assert.ok(ws.agentCliProviders.has('echo-stub'));
+  assert.ok(ws.agentCliProviders.has('e2e-test-runner'));
   assert.equal(ws.agentCliProviders.get('echo-stub')?.internal, true);
+  assert.equal(ws.agentCliProviders.get('e2e-test-runner')?.internal, true);
   assert.deepEqual(ws.agentCliProviderErrors, []);
 });
 

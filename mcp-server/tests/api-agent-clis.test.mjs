@@ -96,7 +96,7 @@ test('GET /api/agent-clis — 200 lists visible providers (copilot + claude); ec
   }
 });
 
-test('GET /api/agent-clis?include_internal=true — includes echo-stub (3 providers)', async () => {
+test('GET /api/agent-clis?include_internal=true — includes echo-stub + e2e-test-runner (4 providers)', async () => {
   const tmp = setupTmpWorkspace();
   const { ws, cfg } = await loadWs(tmp);
   const { server, port } = await startServer(ws, cfg, TOKEN);
@@ -107,9 +107,11 @@ test('GET /api/agent-clis?include_internal=true — includes echo-stub (3 provid
     assert.equal(r.status, 200);
     const body = await r.json();
     const ids = body.providers.map((p) => p.id).sort();
-    assert.deepEqual(ids, ['claude', 'copilot', 'echo-stub']);
+    assert.deepEqual(ids, ['claude', 'copilot', 'e2e-test-runner', 'echo-stub']);
     const echo = body.providers.find((p) => p.id === 'echo-stub');
     assert.equal(echo.internal, true);
+    const e2e = body.providers.find((p) => p.id === 'e2e-test-runner');
+    assert.equal(e2e.internal, true);
   } finally {
     await stopServer(server);
   }
