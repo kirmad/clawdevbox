@@ -118,3 +118,98 @@ test('claude writePrompt rejects queue strategy', async () => {
     /queue strategy not supported/i,
   );
 });
+
+// ---------------------------------------------------------------------------
+// deliverInitialPromptWhenReady: shared helper for interactive seeding
+// ---------------------------------------------------------------------------
+
+import { deliverInitialPromptWhenReady } from '../src/agent-clis/shared.ts';
+
+function fakePty() {
+  const dataListeners = [];
+  const writes = [];
+  return {
+    pty: {
+      write(d) { writes.push({ at: Date.now(), data: d }); },
+      onData(cb) { dataListeners.push(cb); return { dispose() { const i = dataListeners.indexOf(cb); if (i >= 0) dataListeners.splice(i, 1); } }; },
+      onExit() { return { dispose() {} }; },
+      kill() {}, resize() {},
+    },
+    writes,
+    emit(d) { for (const cb of dataListeners.slice()) cb(d); },
+    listenerCount() { return dataListeners.length; },
+  };
+}
+
+test('deliverInitialPromptWhenReady waits for ❯ glyph before submitting', async () => {
+  const m = fakePty();
+  let status = 'pending';
+  const writePrompt = async ({ text, strategy }) => {
+    m.pty.write(text);
+    await new Promise((r) => setTimeout(r, 10));
+    m.pty.write(strategy === 'queue' ? '\x11' : '\r');
+  };
+  deliverInitialPromptWhenReady(m.pty, {
+    text: 'hello',
+    promptReadyRegex: copilotProvider.capabilities.promptReadyRegex,
+    writePrompt,
+    stableMs: 50,
+    timeoutMs: 2000,
+  }).then((r) => { status = `ok:${r}`; }).catch((err) => { status = `err:${err.message}`; });
+
+  // Splash bytes — should not trigger delivery.
+  m.emit('\x1b[2J\x1b[H Loading...\n');
+  await new Promise((r) => setTimeout(r, 80));
+  assert.equal(m.writes.length, 0);
+  assert.equal(status, 'pending');
+
+  // Ready glyph appears; after stableMs the helper writes text + CR.
+  m.emit('\n❯ ');
+  await new Promise((r) => setTimeout(r, 150));
+  assert.equal(m.writes.length, 2);
+  assert.equal(m.writes[0].data, 'hello');
+  assert.equal(m.writes[1].data, '\r');
+  assert.equal(status, 'ok:delivered');
+  assert.equal(m.listenerCount(), 0, 'listener disposed after delivery');
+});
+
+test('deliverInitialPromptWhenReady rejects on timeout if ❯ never appears', async () => {
+  const m = fakePty();
+  const writePrompt = async () => { throw new Error('should not be called'); };
+  await assert.rejects(
+    deliverInitialPromptWhenReady(m.pty, {
+      text: 'unused',
+      promptReadyRegex: copilotProvider.capabilities.promptReadyRegex,
+      writePrompt,
+      stableMs: 50,
+      timeoutMs: 80,
+    }),
+    /timed out/,
+  );
+  assert.equal(m.listenerCount(), 0, 'listener disposed on timeout');
+});
+
+test('deliverInitialPromptWhenReady requires stable tail before submitting', async () => {
+  const m = fakePty();
+  const writePrompt = async ({ text }) => { m.pty.write(text); };
+  const p = deliverInitialPromptWhenReady(m.pty, {
+    text: 'go',
+    promptReadyRegex: copilotProvider.capabilities.promptReadyRegex,
+    writePrompt,
+    stableMs: 100,
+    timeoutMs: 2000,
+  });
+
+  // Emit ❯ but immediately flicker with more bytes before stable window.
+  m.emit('\n❯ ');
+  await new Promise((r) => setTimeout(r, 50));        // < stableMs
+  m.emit('extra noise');
+  await new Promise((r) => setTimeout(r, 50));        // ❯ no longer at tail
+  assert.equal(m.writes.length, 0, 'should not have submitted on flicker');
+
+  // Re-emit a stable ready glyph; helper should now fire.
+  m.emit('\n❯ ');
+  await new Promise((r) => setTimeout(r, 150));
+  assert.equal(m.writes[0]?.data, 'go');
+  await p;
+});

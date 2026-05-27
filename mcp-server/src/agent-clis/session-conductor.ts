@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { logger as defaultLogger } from '../logger.ts';
+import { stripTuiNoise } from './shared.ts';
 import type {
   AgentCliProvider,
   AgentHandle,
@@ -125,14 +126,9 @@ const SCREEN_BUFFER_BYTES_DEFAULT = 65_536;
 const PER_DISPATCH_TIMEOUT_MS_DEFAULT = 600_000;
 const MEANINGFUL_OUTPUT_THRESHOLD_BYTES = 50;
 
-// Aggressive ANSI/control stripper. The narrow CSI-SGR-only stripper in
-// shared.ts is fine for plugin list output; TUI applications use cursor
-// moves, erase-line, OSC, etc. We need to strip ALL of those so the
-// marker text falls back onto contiguous bytes in the rolling buffer.
-const ANSI_STRIP_RE = /\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][0-9A-B]|\x1b[=>]|[\x00-\x08\x0B-\x0C\x0E-\x1F]/g;
-function stripTuiNoise(s: string): string {
-  return s.replace(ANSI_STRIP_RE, '');
-}
+// Aggressive ANSI/control stripping is now shared in `./shared.ts` —
+// the conductor consumes it as `stripTuiNoise`. Kept the import at the
+// top of the file. The previously-inlined regex is removed.
 
 function markerRegexFor(id: string): RegExp {
   // Line-anchored, allows trailing whitespace, multiline mode.

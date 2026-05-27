@@ -1,6 +1,6 @@
 import { join } from 'node:path';
 import os from 'node:os';
-import { writeMcpJson, probeBinary, cliPluginSync, cliPluginDiscover, buildVaultPluginDirArgs } from './shared.ts';
+import { writeMcpJson, probeBinary, cliPluginSync, cliPluginDiscover, buildVaultPluginDirArgs, deliverInitialPromptWhenReady } from './shared.ts';
 import type {
   AgentCliProvider,
   AgentHandle,
@@ -78,13 +78,31 @@ export const copilotProvider: AgentCliProvider = {
       cols: opts.ptyCols ?? 120, rows: opts.ptyRows ?? 30,
     });
 
-    return {
+    const handle: AgentHandle = {
       pid: pty.pid ?? null,
       sessionId: opts.init.session_id,
       pty,
       exited: new Promise((resolveExit) => pty.onExit(({ exitCode, signal }) =>
         resolveExit({ exitCode, signal: signal != null ? String(signal) : undefined }))),
     };
+
+    // Interactive + prompt: copilot's TUI takes a moment to draw its first
+    // ❯ glyph (splash screen, plugin probe, agent slot). Writing bytes
+    // before that point dumps them into a non-existent input box. Wait for
+    // a stable prompt-ready tail, then submit via the byte-correct
+    // writePrompt path. Fire-and-forget — the caller already has the
+    // handle; delivery errors are surfaced via the logger.
+    if (opts.mode === 'interactive' && opts.prompt) {
+      deliverInitialPromptWhenReady(pty, {
+        text: opts.prompt,
+        promptReadyRegex: copilotCapabilities.promptReadyRegex,
+        writePrompt: (o) => copilotProvider.writePrompt!(handle, o),
+      }).catch((err) => {
+        ctx.logger?.warn?.({ err: err?.message ?? String(err), sessionId: handle.sessionId }, 'copilot: initial prompt delivery failed');
+      });
+    }
+
+    return handle;
   },
 
   // Empirically validated against Copilot CLI 1.0.55-3 (see

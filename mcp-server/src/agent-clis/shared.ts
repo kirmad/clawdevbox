@@ -186,6 +186,80 @@ export function stripAnsi(s: string): string {
   return s.replace(ANSI_RE, '');
 }
 
+// Aggressive ANSI/TUI stripper — covers CSI commands, OSC sequences,
+// charset selectors, and most C0 control bytes. Required by the initial-
+// prompt watcher to reliably find the ❯ glyph in the raw pty stream,
+// since the narrow SGR-only `stripAnsi` above leaves cursor moves and
+// erase-line escapes that fragment the searchable buffer.
+const TUI_STRIP_RE = /\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][0-9A-B]|\x1b[=>]|[\x00-\x08\x0B-\x0C\x0E-\x1F]/g;
+export function stripTuiNoise(s: string): string {
+  return s.replace(TUI_STRIP_RE, '');
+}
+
+/**
+ * Watch the pty for the provider's prompt-ready glyph and submit `text`
+ * once the glyph appears AND the screen tail stays stable for `stableMs`.
+ * One-shot: disposes the data listener after delivery or timeout.
+ *
+ * Used by providers' `spawnSession` for interactive sessions that arrive
+ * with an initial prompt — the prompt must be queued until the TUI has
+ * finished its splash screen, otherwise bytes are silently dropped.
+ *
+ * - `stableMs`: defaults to 250ms, matches the empirical mid-render flicker
+ *   window from files/queue-done-spike/.
+ * - `timeoutMs`: defaults to 60s. The promise rejects on timeout so callers
+ *   can log the failure; the pty handle itself remains usable.
+ */
+export interface DeliverInitialPromptOpts {
+  text: string;
+  promptReadyRegex: RegExp;
+  writePrompt: (opts: { text: string; strategy: 'submit' | 'queue' }) => Promise<void>;
+  timeoutMs?: number;
+  stableMs?: number;
+}
+
+export function deliverInitialPromptWhenReady(
+  pty: { onData: (cb: (chunk: string) => void) => { dispose(): void } },
+  opts: DeliverInitialPromptOpts,
+): Promise<'delivered'> {
+  const { text, promptReadyRegex, writePrompt } = opts;
+  const timeoutMs = opts.timeoutMs ?? 60_000;
+  const stableMs = opts.stableMs ?? 250;
+  return new Promise<'delivered'>((resolve, reject) => {
+    let buf = '';
+    let stableTimer: NodeJS.Timeout | null = null;
+    let done = false;
+    const sub = pty.onData((chunk) => {
+      if (done) return;
+      buf = (buf + stripTuiNoise(chunk)).slice(-4096);
+      if (!promptReadyRegex.test(buf)) {
+        if (stableTimer) { clearTimeout(stableTimer); stableTimer = null; }
+        return;
+      }
+      if (stableTimer) clearTimeout(stableTimer);
+      stableTimer = setTimeout(async () => {
+        if (done) return;
+        done = true;
+        try { sub.dispose(); } catch { /* ignore */ }
+        clearTimeout(safetyTimer);
+        try {
+          await writePrompt({ text, strategy: 'submit' });
+          resolve('delivered');
+        } catch (err) {
+          reject(err instanceof Error ? err : new Error(String(err)));
+        }
+      }, stableMs);
+    });
+    const safetyTimer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      if (stableTimer) clearTimeout(stableTimer);
+      try { sub.dispose(); } catch { /* ignore */ }
+      reject(new Error(`initial prompt: timed out after ${timeoutMs}ms waiting for prompt-ready`));
+    }, timeoutMs);
+  });
+}
+
 export function parsePluginListOutput(
   stdout: string,
 ): Array<{ name: string; marketplace: string; version: string }> {

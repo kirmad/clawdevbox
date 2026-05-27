@@ -1,6 +1,6 @@
 import { join } from 'node:path';
 import os from 'node:os';
-import { writeMcpJson, probeBinary, cliPluginSync, cliPluginDiscover, buildVaultPluginDirArgs } from './shared.ts';
+import { writeMcpJson, probeBinary, cliPluginSync, cliPluginDiscover, buildVaultPluginDirArgs, deliverInitialPromptWhenReady } from './shared.ts';
 import type {
   AgentCliProvider,
   AgentHandle,
@@ -71,13 +71,28 @@ export const claudeProvider: AgentCliProvider = {
       cols: opts.ptyCols ?? 120, rows: opts.ptyRows ?? 30,
     });
 
-    return {
+    const handle: AgentHandle = {
       pid: pty.pid ?? null,
       sessionId: opts.init.session_id,
       pty,
       exited: new Promise((resolveExit) => pty.onExit(({ exitCode, signal }) =>
         resolveExit({ exitCode, signal: signal != null ? String(signal) : undefined }))),
     };
+
+    // Interactive + prompt: claude's REPL also draws a splash before the
+    // first ❯ glyph. Same wait-for-ready pattern as copilot. Fire-and-
+    // forget; delivery errors surface via the logger.
+    if (opts.mode === 'interactive' && opts.prompt) {
+      deliverInitialPromptWhenReady(pty, {
+        text: opts.prompt,
+        promptReadyRegex: claudeCapabilities.promptReadyRegex,
+        writePrompt: (o) => claudeProvider.writePrompt!(handle, o),
+      }).catch((err) => {
+        ctx.logger?.warn?.({ err: err?.message ?? String(err), sessionId: handle.sessionId }, 'claude: initial prompt delivery failed');
+      });
+    }
+
+    return handle;
   },
 
   async writePrompt(handle: AgentHandle, { text, strategy }: WritePromptOpts): Promise<void> {
