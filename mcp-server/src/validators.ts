@@ -303,16 +303,6 @@ export function validateRecipeParsed(parsed: unknown): ValidationResult {
               if (t.cron !== undefined && t.cron !== null && t.cron !== false && typeof t.cron !== 'string') {
                 errors.push({ path: `${tp}.cron`, code: 'TYPE', message: 'trigger.cron must be a string, null, or false.' });
               }
-              if (t.binds_callback_to !== undefined && t.binds_callback_to !== 'agent_session_resume') {
-                errors.push({
-                  path: `${tp}.binds_callback_to`,
-                  code: 'INVALID_VALUE',
-                  message: `trigger.binds_callback_to must be 'agent_session_resume'.`,
-                });
-              }
-              if (t.binds_callback_to_recipe !== undefined && !isNonEmptyString(t.binds_callback_to_recipe)) {
-                errors.push({ path: `${tp}.binds_callback_to_recipe`, code: 'TYPE', message: 'trigger.binds_callback_to_recipe must be a non-empty string.' });
-              }
               if (t.once !== undefined && typeof t.once !== 'boolean') {
                 errors.push({ path: `${tp}.once`, code: 'TYPE', message: 'trigger.once must be a boolean.' });
               }
@@ -706,31 +696,6 @@ function validateTriggerTypeEntry(entry: unknown, p: string): ValidationError[] 
   // description (optional but typed)
   if (e.description !== undefined && typeof e.description !== 'string') {
     errors.push({ path: `${p}.description`, code: 'TYPE', message: 'description must be a string.' });
-  }
-
-  // binds_callback_to_recipe and binds_callback_to are mutually exclusive.
-  const hasRecipeBinding = e.binds_callback_to_recipe !== undefined;
-  const hasActionBinding = e.binds_callback_to !== undefined;
-  if (hasRecipeBinding && hasActionBinding) {
-    errors.push({
-      path: p,
-      code: 'MUTUALLY_EXCLUSIVE',
-      message: 'binds_callback_to_recipe and binds_callback_to are mutually exclusive.',
-    });
-  }
-  if (hasRecipeBinding && !isNonEmptyString(e.binds_callback_to_recipe)) {
-    errors.push({
-      path: `${p}.binds_callback_to_recipe`,
-      code: 'TYPE',
-      message: 'binds_callback_to_recipe must be a non-empty string recipe id.',
-    });
-  }
-  if (hasActionBinding && e.binds_callback_to !== 'thread_resume') {
-    errors.push({
-      path: `${p}.binds_callback_to`,
-      code: 'ENUM',
-      message: `binds_callback_to must be 'thread_resume' (got ${JSON.stringify(e.binds_callback_to)}).`,
-    });
   }
 
   // default_cron (optional)

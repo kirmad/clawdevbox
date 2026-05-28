@@ -133,14 +133,12 @@ function registerAutoTrigger(
        id, workspace_id, type, params_json,
        cron_mode, cron_expression, enabled,
        recipe_instance_id, recipe_step_id,
-       binds_callback_to, binds_callback_to_recipe,
        auto_declared, auto_registered_by_step_id,
        expires_at, once, max_attempts, backoff_ms_json,
        registered_at, state_json
      ) VALUES (
        ?, ?, ?, ?,
        ?, ?, 1,
-       ?, ?,
        ?, ?,
        1, ?,
        ?, ?, ?, ?,
@@ -155,8 +153,6 @@ function registerAutoTrigger(
     cron_expression,
     opts.recipe_instance_id,
     opts.recipe_step_id,
-    opts.decl.binds_callback_to ?? null,
-    opts.decl.binds_callback_to_recipe ?? null,
     opts.recipe_step_id,
     opts.decl.expires_at ?? null,
     opts.decl.once ? 1 : 0,

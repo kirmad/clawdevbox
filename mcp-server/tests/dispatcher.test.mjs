@@ -43,10 +43,9 @@ function insertTrigger(db, opts) {
     `INSERT INTO triggers (
        id, workspace_id, type, params_json,
        cron_mode, cron_expression, enabled,
-       binds_callback_to, binds_callback_to_recipe,
        once, max_attempts, backoff_ms_json,
        registered_at, state_json
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     opts.id,
     opts.workspace_id,
@@ -55,8 +54,6 @@ function insertTrigger(db, opts) {
     opts.cron_mode ?? 'disabled',
     opts.cron_expression ?? null,
     opts.enabled === false ? 0 : 1,
-    opts.binds_callback_to ?? null,
-    opts.binds_callback_to_recipe ?? null,
     opts.once ? 1 : 0,
     opts.max_attempts ?? 3,
     JSON.stringify(opts.backoff_ms ?? [10, 10, 10]),
@@ -278,120 +275,6 @@ test('dispatcher: once-trigger success disables trigger row', async () => {
   assert.equal(ok, true);
   const t = db.prepare(`SELECT enabled FROM triggers WHERE id='demo.mode-a#once'`).get();
   assert.equal(t.enabled, 0);
-  db.close();
-});
-
-// ============================================================== resume binding
-
-test('dispatcher: agent_session_resume binding throws and dead-letters', async () => {
-  const db = open();
-  const wsPath = freshTmp('resume');
-  const ws = ensureWorkspace(db, { path: wsPath });
-  const wsObj = makeWs([
-    {
-      id: 'demo.resume',
-      file: 'noop.ts',
-      file_abs: 'noop',
-      runtime: 'tsx',
-      source_plugin_id: 'demo',
-      scope: 'plugin:demo',
-      binds_callback_to: 'agent_session_resume',
-    },
-  ]);
-  insertTrigger(db, {
-    id: 'demo.resume#t',
-    workspace_id: ws.id,
-    type: 'demo.resume',
-    binds_callback_to: 'agent_session_resume',
-    max_attempts: 1,
-    backoff_ms: [10],
-  });
-  const fid = enqueueFireDirect(db, {
-    workspace_id: ws.id,
-    trigger_id: 'demo.resume#t',
-    max_attempts: 1,
-  });
-  const d = new Dispatcher(db, wsObj, { maxConcurrent: 1 });
-  d.start();
-  const ok = await waitFor(() => {
-    const r = db.prepare(`SELECT status, error FROM fires WHERE fire_id = ?`).get(fid);
-    return r && r.status === 'dead';
-  });
-  await d.stop();
-  assert.equal(ok, true);
-  const r = db.prepare(`SELECT error FROM fires WHERE fire_id = ?`).get(fid);
-  assert.ok((r.error || '').includes('agent_session_resume_not_implemented'));
-  db.close();
-});
-
-// =============================================================== recipe binding
-
-test('dispatcher: recipe binding via injected runRecipeFn captures triggerId+fireId', async () => {
-  const db = open();
-  const wsPath = freshTmp('recipe');
-  const ws = ensureWorkspace(db, { path: wsPath });
-  const wsObj = makeWs([
-    {
-      id: 'demo.recipe-bound',
-      file: 'noop.ts',
-      file_abs: 'noop',
-      runtime: 'tsx',
-      source_plugin_id: 'demo',
-      scope: 'plugin:demo',
-      binds_callback_to_recipe: 'simple-prompt',
-    },
-  ]);
-  insertTrigger(db, {
-    id: 'demo.rb#t',
-    workspace_id: ws.id,
-    type: 'demo.recipe-bound',
-    binds_callback_to_recipe: 'simple-prompt',
-    params: { foo: 'bar' },
-    state: { counter: 1 },
-  });
-  const fid = enqueueFireDirect(db, {
-    workspace_id: ws.id,
-    trigger_id: 'demo.rb#t',
-    payload: { event: 'hi' },
-  });
-
-  let captured;
-  const fakeRunRecipe = async (args) => {
-    captured = args;
-    const rid = `ri_fake_${Date.now().toString(36)}`;
-    db.prepare(
-      `INSERT INTO recipe_instances (id, recipe_id, workspace_id, workspace_path, params_json, started_at, status, completed_at, trigger_id, fire_id)
-       VALUES (?, ?, ?, ?, '{}', ?, 'success', ?, ?, ?)`,
-    ).run(rid, args.recipeId, args.workspaceInfo.id, args.workspaceInfo.path, Date.now(), Date.now(), args.triggerId, args.fireId);
-    const sid = `as_fake_${Date.now().toString(36)}`;
-    db.prepare(
-      `INSERT INTO agent_sessions (id, recipe_instance_id, workspace_id, agent_cli, started_at, status)
-       VALUES (?, ?, ?, 'copilot', ?, 'success')`,
-    ).run(sid, rid, args.workspaceInfo.id, Date.now());
-    return { recipe_instance_id: rid, agent_session_id: sid };
-  };
-
-  const d = new Dispatcher(db, wsObj, { maxConcurrent: 1, runRecipeFn: fakeRunRecipe });
-  d.start();
-  const ok = await waitFor(() => {
-    const r = db.prepare(`SELECT status FROM fires WHERE fire_id = ?`).get(fid);
-    return r && r.status === 'success';
-  });
-  await d.stop();
-  assert.equal(ok, true);
-  assert.ok(captured);
-  assert.equal(captured.recipeId, 'simple-prompt');
-  assert.equal(captured.triggerId, 'demo.rb#t');
-  assert.equal(captured.fireId, fid);
-  assert.equal(captured.params.foo, 'bar');
-  assert.deepEqual(captured.params.event, 'hi');
-  assert.deepEqual(captured.params._trigger_state, { counter: 1 });
-  assert.ok(captured.prompt.startsWith(`Triggered by demo.rb#t at `));
-
-  // Fire row should carry recipe_instance_id + agent_session_id back.
-  const row = db.prepare(`SELECT recipe_instance_id, agent_session_id FROM fires WHERE fire_id = ?`).get(fid);
-  assert.ok(row.recipe_instance_id?.startsWith('ri_fake_'));
-  assert.ok(row.agent_session_id?.startsWith('as_fake_'));
   db.close();
 });
 

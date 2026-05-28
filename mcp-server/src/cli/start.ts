@@ -663,8 +663,6 @@ export async function runStart(flags: Flags): Promise<void> {
         accepts_webhook: t.accepts_webhook,
         identity_param: t.identity_param,
         parameters: t.parameters,
-        binds_callback_to_recipe: t.binds_callback_to_recipe,
-        binds_callback_to: t.binds_callback_to,
       }));
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ items, errors: ws.triggerTypeErrors }));
@@ -697,8 +695,6 @@ export async function runStart(flags: Flags): Promise<void> {
           type: r.type,
           source_plugin_id: type?.source_plugin_id ?? null,
           type_description: type?.description ?? null,
-          binds_callback_to_recipe: type?.binds_callback_to_recipe ?? null,
-          binds_callback_to: type?.binds_callback_to ?? null,
           params: r.params,
           cron: r.cron,
           resolved_cron,

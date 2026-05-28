@@ -31,8 +31,6 @@ export interface TriggerDecl {
   type: string;
   params?: Record<string, unknown>;
   cron?: string | null | false;
-  binds_callback_to?: string;
-  binds_callback_to_recipe?: string;
   once?: boolean;
   expires_at?: number;
   max_attempts?: number;
@@ -422,8 +420,6 @@ function diffTriggers(
       type: t.type,
       params: t.params ?? {},
       cron: t.cron ?? null,
-      binds_callback_to: t.binds_callback_to ?? null,
-      binds_callback_to_recipe: t.binds_callback_to_recipe ?? null,
     });
   const oldKeys = new Map(oldDecl.map((t) => [keyOf(t), t]));
   const newKeys = new Map(newDecl.map((t) => [keyOf(t), t]));

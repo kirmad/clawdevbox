@@ -77,18 +77,6 @@ export interface PluginTriggerType {
   file: string;
   /** One-line human description shown in `trigger.list_types`. */
   description?: string;
-  /**
-   * Recipe id the callback should run (mutually exclusive with `binds_callback_to`).
-   * Clawdevbox mints `/callback/recipes/<recipe_id>/run` (or `.../run/<inbox_item_id>`)
-   * when an instance of this type is registered.
-   */
-  binds_callback_to_recipe?: string;
-  /**
-   * Callback action name when not binding to a recipe. The only MVP value is
-   * `thread_resume` (for hot triggers whose registration carries a
-   * `subscriber_thread_id`). Mutually exclusive with `binds_callback_to_recipe`.
-   */
-  binds_callback_to?: 'thread_resume';
   /** Default cron expression. Registrations inherit this when their `cron` is null/absent. */
   default_cron?: string;
   /** Whether the trigger accepts webhook fires (default true). */

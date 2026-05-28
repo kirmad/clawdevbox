@@ -7,11 +7,10 @@
  * `skipped` if another fire for the same trigger is already running —
  * the §6.3 overlap-skip protocol).
  *
- * Each claimed fire is run via `runFire()`. The binding mode is resolved
- * from the trigger TYPE manifest (`ws.triggerTypes`):
- *   - `binds_callback_to_recipe`        → recipe binding (Phase 6.2)
- *   - `binds_callback_to === 'agent_session_resume'` → resume binding stub
- *   - otherwise                          → script binding (Phase 6.3)
+ *
+ * Each claimed fire is run via `runFire()`, which always dispatches to
+ * the script binding. The `binds_callback_to_*` mechanism was removed
+ * on 2026-05-28 (see docs/superpowers/specs/2026-05-28-callback-binding-cleanup-design.md).
  *
  * Outcomes:
  *   - success → markFireSuccess + once-disable
@@ -39,14 +38,7 @@ import {
 } from './db/fires-store.ts';
 import { runTriggerScript } from './trigger-runner.ts';
 import type { TriggerRuntime } from './validators.ts';
-import { recipePath, type RegisteredTriggerType, type Workspace } from './workspace.ts';
-import { resolveRead } from './scope.ts';
-import { runRecipe } from './recipe-runner.ts';
-import { resolveConfig } from './config.ts';
-import { resolveWorkspacesRoot } from './workspaces-store.ts';
-
-/** Error code emitted by the resume-binding stub. Phase 2 will implement it. */
-export const AGENT_SESSION_RESUME_NOT_IMPLEMENTED = 'agent_session_resume_not_implemented';
+import { type RegisteredTriggerType, type Workspace } from './workspace.ts';
 
 function constantTimeEquals(a: string, b: string): boolean {
   if (a.length !== b.length) return false;
@@ -61,8 +53,6 @@ interface TriggerRow {
   type: string;
   params_json: string;
   state_json: string;
-  binds_callback_to: string | null;
-  binds_callback_to_recipe: string | null;
   once: number;
   max_attempts: number;
   backoff_ms_json: string;
@@ -81,20 +71,6 @@ export interface DispatcherStatus {
   dead_count: number;
 }
 
-export interface RunRecipeBindingArgs {
-  recipeId: string;
-  prompt: string;
-  params: Record<string, unknown>;
-  workspaceInfo: { id: string; path: string };
-  triggerId: string;
-  fireId: string;
-}
-
-export interface RunRecipeBindingResult {
-  recipe_instance_id: string;
-  agent_session_id?: string;
-}
-
 export interface DispatcherOptions {
   maxConcurrent?: number;
   drainMs?: number;
@@ -102,8 +78,6 @@ export interface DispatcherOptions {
   callbackUrlBase?: string;
   /** Hard timeout for script binding (default 60s). */
   scriptTimeoutMs?: number;
-  /** Test hook — fake the recipe binding without spawning a real CLI. */
-  runRecipeFn?: (args: RunRecipeBindingArgs) => Promise<RunRecipeBindingResult>;
 }
 
 export class Dispatcher {
@@ -116,7 +90,6 @@ export class Dispatcher {
   private inFlight = new Set<string>();
   private activeRuns = new Map<string, { secret: string; outDir: string }>();
   private stopped = false;
-  private runRecipeFn: ((args: RunRecipeBindingArgs) => Promise<RunRecipeBindingResult>) | null;
   /**
    * Unsubscribes the bus listener that wakes pickUp() on 'fires' events.
    * Without this, manually-enqueued fires (via `trigger.fire`) sit in the
@@ -132,7 +105,6 @@ export class Dispatcher {
     this.drainMs = opts.drainMs ?? 15_000;
     this.callbackUrlBase = opts.callbackUrlBase ?? 'http://127.0.0.1:5201';
     this.scriptTimeoutMs = opts.scriptTimeoutMs ?? 60_000;
-    this.runRecipeFn = opts.runRecipeFn ?? null;
   }
 
   start(): void {
@@ -305,46 +277,17 @@ export class Dispatcher {
         .run(join(wsRow.path, '.clawdevbox', 'fires', fire.fire_id), fire.fire_id);
 
       const typeManifest = this.ws.triggerTypes.get(trigger.type) ?? null;
-      const bindsToRecipe = trigger.binds_callback_to_recipe
-        ?? typeManifest?.binds_callback_to_recipe
-        ?? null;
-      const bindsTo = trigger.binds_callback_to
-        ?? typeManifest?.binds_callback_to
-        ?? null;
-
-      let result: { recipe_instance_id?: string; agent_session_id?: string; exit_code?: number | null };
 
       logger.debug(
-        {
-          fire_id: fire.fire_id,
-          trigger_id: trigger.id,
-          binding: bindsToRecipe
-            ? 'recipe'
-            : bindsTo === 'agent_session_resume'
-              ? 'agent_session_resume'
-              : 'script',
-          attempt: fire.attempt,
-        },
+        { fire_id: fire.fire_id, trigger_id: trigger.id, attempt: fire.attempt },
         'dispatcher: running fire',
       );
 
-      if (bindsToRecipe) {
-        result = await this.runRecipeBinding(fire, trigger, wsRow, bindsToRecipe);
-      } else if (bindsTo === 'agent_session_resume') {
-        // Phase 2 will implement this: spawn a fresh agent CLI process
-        // with --resume <cli_session_id> against the suspended session
-        // recorded by the trigger's recipe_step_id. For Phase 1 we
-        // surface the error so the fire dead-letters cleanly.
-        throw new Error(AGENT_SESSION_RESUME_NOT_IMPLEMENTED);
-      } else {
-        result = await this.runScriptBinding(fire, trigger, outDir, typeManifest);
-      }
+      const result = await this.runScriptBinding(fire, trigger, outDir, typeManifest);
 
       markFireSuccess(this.db, fire.fire_id, {
         duration_ms: Date.now() - startedAt,
         exit_code: result.exit_code ?? 0,
-        recipe_instance_id: result.recipe_instance_id,
-        agent_session_id: result.agent_session_id,
       });
 
       this.db
@@ -435,79 +378,6 @@ export class Dispatcher {
         now,
       );
     emitChange('inbox');
-  }
-
-  // ------------------------------------------------------------------ bindings
-
-  private async runRecipeBinding(
-    fire: FireRow,
-    trigger: TriggerRow,
-    wsRow: WorkspaceRowLite,
-    recipeId: string,
-  ): Promise<{ recipe_instance_id: string; agent_session_id?: string; exit_code: number }> {
-    const params = {
-      ...(JSON.parse(trigger.params_json) as Record<string, unknown>),
-      ...((fire.payload_json ? JSON.parse(fire.payload_json) : {}) as Record<string, unknown>),
-      _trigger_state: JSON.parse(trigger.state_json) as Record<string, unknown>,
-    };
-    const payload = fire.payload_json ? JSON.parse(fire.payload_json) : null;
-    const prompt = `Triggered by ${trigger.id} at ${new Date(fire.scheduled_at).toISOString()}.\nPayload: ${JSON.stringify(payload)}`;
-
-    if (this.runRecipeFn) {
-      const out = await this.runRecipeFn({
-        recipeId,
-        prompt,
-        params,
-        workspaceInfo: { id: wsRow.id, path: wsRow.path },
-        triggerId: trigger.id,
-        fireId: fire.fire_id,
-      });
-      return {
-        recipe_instance_id: out.recipe_instance_id,
-        agent_session_id: out.agent_session_id,
-        exit_code: 0,
-      };
-    }
-
-    // Production path — resolve the recipe via the scope chain and call
-    // the real recipe-runner. The agent CLI is detached (pty.spawn): we
-    // return as soon as the spawn returns a pid, while the agent runs to
-    // completion in the background. The fire row carries the
-    // recipe_instance_id forward so the SPA can stitch the lineage.
-    const hit = resolveRead(this.ws, 'all', 'recipe', recipeId, recipePath);
-    if (!hit) throw new Error(`recipe not found: ${recipeId}`);
-    const workspacesRoot = resolveWorkspacesRoot();
-    const cfg = resolveConfig({ projectDir: this.ws.projectDir, globalDir: this.ws.globalDir });
-    const out = await runRecipe({
-      recipeId,
-      recipeSnapshot: hit.source,
-      isAdhoc: false,
-      prompt,
-      params,
-      workspaceInfo: { id: wsRow.id, path: wsRow.path },
-      triggerId: trigger.id,
-      fireId: fire.fire_id,
-      workspacesRoot,
-      ws: this.ws,
-      cfg,
-    });
-    if (out.spawn_error) {
-      throw new Error(`${out.spawn_error.code}: ${out.spawn_error.message}`);
-    }
-
-    // Find the auto-created agent_session row so we can record it on the fire.
-    const session = this.db
-      .prepare(
-        `SELECT id FROM agent_sessions WHERE recipe_instance_id = ?
-         ORDER BY started_at DESC LIMIT 1`,
-      )
-      .get(out.recipe_instance_id) as { id: string } | undefined;
-
-    return {
-      recipe_instance_id: out.recipe_instance_id,
-      agent_session_id: session?.id,
-      exit_code: 0,
-    };
   }
 
   private async runScriptBinding(

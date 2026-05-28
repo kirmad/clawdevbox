@@ -56,8 +56,6 @@ export interface RegisteredTrigger {
   // New Phase 4 fields — pass-through to the DB columns when present.
   recipe_instance_id?: string;
   recipe_step_id?: string;
-  binds_callback_to?: 'agent_session_resume';
-  binds_callback_to_recipe?: string;
   auto_declared?: boolean;
   auto_registered_by_step_id?: string;
   max_attempts?: number;
@@ -78,8 +76,6 @@ interface TriggerRow {
   enabled: number;
   recipe_instance_id: string | null;
   recipe_step_id: string | null;
-  binds_callback_to: string | null;
-  binds_callback_to_recipe: string | null;
   auto_declared: number;
   auto_registered_by_step_id: string | null;
   expires_at: number | null;
@@ -138,10 +134,6 @@ function rowToRegistered(row: TriggerRow): RegisteredTrigger {
   };
   if (row.recipe_instance_id) reg.recipe_instance_id = row.recipe_instance_id;
   if (row.recipe_step_id) reg.recipe_step_id = row.recipe_step_id;
-  if (row.binds_callback_to)
-    reg.binds_callback_to = row.binds_callback_to as 'agent_session_resume';
-  if (row.binds_callback_to_recipe)
-    reg.binds_callback_to_recipe = row.binds_callback_to_recipe;
   if (row.auto_declared === 1) reg.auto_declared = true;
   if (row.auto_registered_by_step_id)
     reg.auto_registered_by_step_id = row.auto_registered_by_step_id;
@@ -195,7 +187,6 @@ export function writeTriggersFile(path: string, file: TriggersFile): void {
          id, workspace_id, type, params_json,
          cron_mode, cron_expression, enabled,
          recipe_instance_id, recipe_step_id,
-         binds_callback_to, binds_callback_to_recipe,
          auto_declared, auto_registered_by_step_id,
          expires_at, once, max_attempts, backoff_ms_json,
          registered_at, state_json,
@@ -204,7 +195,6 @@ export function writeTriggersFile(path: string, file: TriggersFile): void {
          @id, @workspace_id, @type, @params_json,
          @cron_mode, @cron_expression, @enabled,
          @recipe_instance_id, @recipe_step_id,
-         @binds_callback_to, @binds_callback_to_recipe,
          @auto_declared, @auto_registered_by_step_id,
          @expires_at, @once, @max_attempts, @backoff_ms_json,
          @registered_at, @state_json,
@@ -218,8 +208,6 @@ export function writeTriggersFile(path: string, file: TriggersFile): void {
          enabled = excluded.enabled,
          recipe_instance_id = excluded.recipe_instance_id,
          recipe_step_id = excluded.recipe_step_id,
-         binds_callback_to = excluded.binds_callback_to,
-         binds_callback_to_recipe = excluded.binds_callback_to_recipe,
          auto_declared = excluded.auto_declared,
          auto_registered_by_step_id = excluded.auto_registered_by_step_id,
          expires_at = excluded.expires_at,
@@ -261,8 +249,6 @@ export function writeTriggersFile(path: string, file: TriggersFile): void {
         enabled: r.enabled ? 1 : 0,
         recipe_instance_id: r.recipe_instance_id ?? null,
         recipe_step_id: r.recipe_step_id ?? null,
-        binds_callback_to: r.binds_callback_to ?? null,
-        binds_callback_to_recipe: r.binds_callback_to_recipe ?? null,
         auto_declared: r.auto_declared ? 1 : 0,
         auto_registered_by_step_id: r.auto_registered_by_step_id ?? null,
         expires_at: r.expires_at ?? null,

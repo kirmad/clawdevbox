@@ -62,10 +62,9 @@ function insertTrigger(db, opts) {
     `INSERT INTO triggers (
        id, workspace_id, type, params_json,
        cron_mode, cron_expression, enabled,
-       binds_callback_to, binds_callback_to_recipe,
        once, max_attempts, backoff_ms_json,
        registered_at, state_json
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     opts.id,
     opts.workspace_id,
@@ -74,8 +73,6 @@ function insertTrigger(db, opts) {
     opts.cron_mode ?? 'disabled',
     opts.cron_expression ?? null,
     opts.enabled === false ? 0 : 1,
-    opts.binds_callback_to ?? null,
-    opts.binds_callback_to_recipe ?? null,
     opts.once ? 1 : 0,
     opts.max_attempts ?? 3,
     JSON.stringify(opts.backoff_ms ?? [10, 10, 10]),

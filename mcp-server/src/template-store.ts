@@ -42,8 +42,6 @@ export interface TemplateManifest {
   default_cron?: string;
   identity_param?: string;
   accepts_webhook?: boolean;
-  binds_callback_to_recipe?: string;
-  binds_callback_to?: 'thread_resume';
   parameters?: TriggerTypeParameter[];
 }
 
@@ -161,7 +159,6 @@ export interface OneOffWriteOptions {
   runtime: TriggerRuntime;
   scriptContent: string;
   description?: string;
-  bindsCallbackTo?: 'thread_resume';
 }
 
 export function writeOneOffTemplate(
@@ -178,7 +175,6 @@ export function writeOneOffTemplate(
     description: opts.description ?? `One-off trigger registered at ${new Date().toISOString()}.`,
     parameters: [],
   };
-  if (opts.bindsCallbackTo) manifest.binds_callback_to = opts.bindsCallbackTo;
   writeFileAtomic(join(dir, 'template.yaml'), yamlDump(manifest));
   return { dir, scriptAbs };
 }

@@ -628,7 +628,6 @@ test('clawdevbox MCP server smoke', async (t) => {
     // Spot-check schema surfaces.
     const newPr = types.find((t) => t.id === 'ado.new-pr-watcher');
     assert.ok(newPr, 'ado.new-pr-watcher missing');
-    assert.equal(newPr.binds_callback_to_recipe, 'pr-review');
     assert.equal(newPr.default_cron, '*/5 * * * *');
     assert.equal(newPr.identity_param, 'repo');
     assert.ok(Array.isArray(newPr.parameters) && newPr.parameters.length >= 1);

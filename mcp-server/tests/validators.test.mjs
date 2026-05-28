@@ -203,8 +203,6 @@ test('step.triggers accepts the full optional field set', () => {
           type: 'ado.comment-watcher',
           params: { repo: 'r' },
           cron: '*/30 * * * * *',
-          binds_callback_to: 'agent_session_resume',
-          binds_callback_to_recipe: 'respond-to-pr-comment',
           once: false,
           expires_at: 1234567890,
           max_attempts: 5,
@@ -217,7 +215,7 @@ test('step.triggers accepts the full optional field set', () => {
   assert.equal(r.ok, true, r.ok ? '' : JSON.stringify(r.errors));
 });
 
-test('step.triggers rejects bad binds_callback_to / max_attempts / cron', () => {
+test('step.triggers rejects bad max_attempts / cron', () => {
   const bad = withSteps([
     {
       id: 'a',
@@ -225,7 +223,6 @@ test('step.triggers rejects bad binds_callback_to / max_attempts / cron', () => 
       triggers: [
         {
           type: 't',
-          binds_callback_to: 'bogus',
           max_attempts: 0,
           cron: 42,
         },
@@ -235,7 +232,6 @@ test('step.triggers rejects bad binds_callback_to / max_attempts / cron', () => 
   const r = validateRecipeParsed(bad);
   assert.equal(r.ok, false);
   if (!r.ok) {
-    assert.ok(r.errors.some((e) => e.path === 'steps[0].triggers[0].binds_callback_to'));
     assert.ok(r.errors.some((e) => e.path === 'steps[0].triggers[0].max_attempts'));
     assert.ok(r.errors.some((e) => e.path === 'steps[0].triggers[0].cron'));
   }

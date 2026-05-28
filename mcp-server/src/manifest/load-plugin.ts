@@ -792,12 +792,6 @@ function buildTriggerType(
     file: relFromPlugin(pluginDir, scriptAbs),
     description: typeof sidecar.description === 'string' ? sidecar.description : undefined,
     default_cron: typeof sidecar.default_cron === 'string' ? sidecar.default_cron : undefined,
-    binds_callback_to_recipe:
-      typeof sidecar.binds_callback_to_recipe === 'string'
-        ? (sidecar.binds_callback_to_recipe as string)
-        : undefined,
-    binds_callback_to:
-      sidecar.binds_callback_to === 'thread_resume' ? 'thread_resume' : undefined,
     identity_param:
       typeof sidecar.identity_param === 'string' ? sidecar.identity_param : undefined,
     accepts_webhook:

@@ -300,18 +300,6 @@ test('trigger.register with script but no runtime fails RUNTIME_REQUIRED', async
   });
 });
 
-test('trigger.register with subscriber_thread_id sets binds_callback_to thread_resume in the auto-template', async () => {
-  await withHarness(async (h) => {
-    const r = await h.call('run_tool', { tool: 'trigger.register', args: {
-      script: '// hot\n', runtime: 'tsx', subscriber_thread_id: 'thr_abc',
-    } });
-    assert.ok(!r.isError);
-    const tplPath = join(h.callerProjectDir, '.clawdevbox', 'trigger-types', '_oneoff',
-      r.structuredContent.template_id, 'template.yaml');
-    assert.match(readFileSync(tplPath, 'utf8'), /binds_callback_to:\s*thread_resume/);
-  });
-});
-
 test('trigger.unregister removes _oneoff dir for one-off registrations', async () => {
   await withHarness(async (h) => {
     const reg = await h.call('run_tool', { tool: 'trigger.register', args: { script: '// once\n', runtime: 'tsx' } });

@@ -152,12 +152,6 @@ function projectRegistered(
 
 /** Convert a RegisteredTriggerType to the projection returned by trigger.list_types. */
 function projectType(t: RegisteredTriggerType): Record<string, unknown> {
-  const binding =
-    t.binds_callback_to_recipe !== undefined
-      ? { binds_callback_to_recipe: t.binds_callback_to_recipe }
-      : t.binds_callback_to !== undefined
-        ? { binds_callback_to: t.binds_callback_to }
-        : {};
   return {
     id: t.id,
     source_plugin_id: t.source_plugin_id,
@@ -169,7 +163,6 @@ function projectType(t: RegisteredTriggerType): Record<string, unknown> {
     accepts_webhook: t.accepts_webhook ?? true,
     identity_param: t.identity_param ?? null,
     parameters: t.parameters ?? [],
-    ...binding,
   };
 }
 
@@ -313,7 +306,6 @@ export function registerTriggerEntries(ws: Workspace): void {
           id: oneoffTemplateId,
           runtime: args.runtime as TriggerRuntime,
           scriptContent,
-          bindsCallbackTo: args.subscriber_thread_id ? 'thread_resume' : undefined,
         });
         const loaded = loadOneOffTemplate(ws, oneoffTemplateId);
         if (!loaded) {
@@ -643,8 +635,6 @@ export function registerTriggerEntries(ws: Workspace): void {
         default_cron: z.string().optional(),
         identity_param: z.string().optional(),
         accepts_webhook: z.boolean().optional(),
-        binds_callback_to_recipe: z.string().optional(),
-        binds_callback_to: z.literal('thread_resume').optional(),
         parameters: z.array(z.record(z.string(), z.unknown())).optional(),
       }),
     handler: async (args) => {
@@ -666,8 +656,6 @@ export function registerTriggerEntries(ws: Workspace): void {
       if (args.default_cron !== undefined) manifest.default_cron = args.default_cron;
       if (args.identity_param !== undefined) manifest.identity_param = args.identity_param;
       if (args.accepts_webhook !== undefined) manifest.accepts_webhook = args.accepts_webhook;
-      if (args.binds_callback_to_recipe !== undefined) manifest.binds_callback_to_recipe = args.binds_callback_to_recipe;
-      if (args.binds_callback_to !== undefined) manifest.binds_callback_to = args.binds_callback_to;
       if (Array.isArray(args.parameters)) manifest.parameters = args.parameters as unknown as TemplateManifest['parameters'];
 
       const validation = validateAgentAuthoredTemplate(manifest);
@@ -746,8 +734,6 @@ export function registerTriggerEntries(ws: Workspace): void {
         default_cron: z.string().optional(),
         identity_param: z.string().optional(),
         accepts_webhook: z.boolean().optional(),
-        binds_callback_to_recipe: z.string().optional(),
-        binds_callback_to: z.literal('thread_resume').optional(),
         parameters: z.array(z.record(z.string(), z.unknown())).optional(),
       }),
     handler: async (args) => {
@@ -764,7 +750,7 @@ export function registerTriggerEntries(ws: Workspace): void {
       }
       const manifestKeys: Array<keyof typeof args> = [
         'description', 'runtime', 'default_cron', 'identity_param',
-        'accepts_webhook', 'binds_callback_to_recipe', 'binds_callback_to', 'parameters',
+        'accepts_webhook', 'parameters',
       ];
       const anyManifestChange = manifestKeys.some((k) => args[k] !== undefined);
       if (!hasScript && !hasFile && !anyManifestChange) {
@@ -784,8 +770,6 @@ export function registerTriggerEntries(ws: Workspace): void {
       if (args.default_cron !== undefined) merged.default_cron = args.default_cron;
       if (args.identity_param !== undefined) merged.identity_param = args.identity_param;
       if (args.accepts_webhook !== undefined) merged.accepts_webhook = args.accepts_webhook;
-      if (args.binds_callback_to_recipe !== undefined) merged.binds_callback_to_recipe = args.binds_callback_to_recipe;
-      if (args.binds_callback_to !== undefined) merged.binds_callback_to = args.binds_callback_to;
       if (Array.isArray(args.parameters)) merged.parameters = args.parameters as unknown as TemplateManifest['parameters'];
 
       const validation = validateAgentAuthoredTemplate(merged);
