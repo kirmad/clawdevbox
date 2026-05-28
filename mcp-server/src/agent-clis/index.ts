@@ -38,7 +38,7 @@ export type {
   SessionMode,
 } from './types.ts';
 
-export { cliPluginSync, cliPluginDiscover, parsePluginListOutput, parseMarketplaceListOutput, stripAnsi, stripTuiNoise, deliverInitialPromptWhenReady } from './shared.ts';
+export { writeMcpJson, cliPluginSync, cliPluginDiscover, parsePluginListOutput, parseMarketplaceListOutput, stripAnsi, stripTuiNoise, deliverInitialPromptWhenReady } from './shared.ts';
 export type { DeliverInitialPromptOpts } from './shared.ts';
 
 export {
