@@ -215,4 +215,17 @@ export const migrations: Migration[] = [
       db.exec(V1_SCHEMA);
     },
   },
+  {
+    version: 2,
+    up: (db) => {
+      // F (2026-05-28): drop the binds_callback_to_* mechanism in its
+      // entirety — kernel no longer has any callback-binding modes
+      // beyond script binding. Spec:
+      // docs/superpowers/specs/2026-05-28-callback-binding-cleanup-design.md
+      db.exec(`
+        ALTER TABLE triggers DROP COLUMN binds_callback_to;
+        ALTER TABLE triggers DROP COLUMN binds_callback_to_recipe;
+      `);
+    },
+  },
 ];
