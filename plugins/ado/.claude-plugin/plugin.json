@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "ado",
   "version": "1.0.0",
-  "description": "Recipes, skills, trigger types, and hostable tools for working with Azure DevOps pull requests, comments, and iterations. Bundles three trigger types: a cold 'new PR watcher', a hot 'comment watcher', and a mixed-mode 'PR pulse watcher'.",
+  "description": "Recipes, skills, and hostable tools for working with Azure DevOps pull requests, comments, and iterations.",
   "author": { "name": "Clawdevbox team" },
   "license": "MIT",
   "homepage": "https://github.com/clawdevbox/plugin-ado",
@@ -29,66 +29,6 @@
       { "id": "ado.update_work_item", "file": "tools/update_work_item.ts" },
       { "id": "ado.create_pr", "file": "tools/create_pr.ts" },
       { "id": "ado.get_work_item_updates", "file": "tools/get_work_item_updates.ts" }
-    ],
-    "trigger_types": [
-      {
-        "id": "ado.new-pr-watcher",
-        "file": "triggers/ado-new-pr-watcher.ts",
-        "description": "Detect new PRs in a repo; start a pr-review thread for each via callback. Cold trigger -- ticks on the default cron schedule whether or not any pr-review threads are live. Self-state tracks lastCheckedAt per registration.",
-        "binds_callback_to_recipe": "pr-review",
-        "default_cron": "*/5 * * * *",
-        "identity_param": "repo",
-        "parameters": [
-          { "name": "repo", "type": "string", "required": true, "description": "ADO repo name to watch for new PRs." },
-          { "name": "assigned_to", "type": "string", "required": false, "description": "Filter to PRs assigned to this user (uniqueName)." },
-          { "name": "opened_by", "type": "string", "required": false, "description": "Filter to PRs opened by this user; useful to exclude self-authored PRs." },
-          { "name": "include_drafts", "type": "boolean", "required": false, "default": false, "description": "If false (default), drafts are skipped." }
-        ]
-      },
-      {
-        "id": "ado.comment-watcher",
-        "file": "triggers/ado-comment-watcher.ts",
-        "description": "Wake an existing thread on new PR comments. Hot trigger -- registered per-thread by the pr-review recipe; auto-unregistered when the subscriber thread terminates.",
-        "binds_callback_to": "thread_resume",
-        "default_cron": "*/30 * * * * *",
-        "identity_param": "pr_id",
-        "parameters": [
-          { "name": "repo", "type": "string", "required": true, "description": "ADO repo name containing the PR." },
-          { "name": "pr_id", "type": "integer", "required": true, "description": "PR id to watch comments on." },
-          { "name": "self_user", "type": "string", "required": false, "description": "Filter out comments authored by this user to avoid reply loops." }
-        ]
-      },
-      {
-        "id": "ado.pr-pulse-watcher",
-        "file": "triggers/ado-pr-pulse-watcher.ts",
-        "description": "Mixed Mode A+B watcher -- burst of live events (comments + iterations) for a configurable budget, then a final summary on exit. No default cron -- typically one-shot/manual.",
-        "binds_callback_to": "thread_resume",
-        "identity_param": "pr_id",
-        "parameters": [
-          { "name": "repo", "type": "string", "required": true, "description": "ADO repo name containing the PR." },
-          { "name": "pr_id", "type": "integer", "required": true, "description": "PR id to monitor." },
-          { "name": "max_run_sec", "type": "integer", "required": false, "default": 60, "description": "Total seconds this invocation is allowed to run." },
-          { "name": "poll_interval_sec", "type": "integer", "required": false, "default": 5, "description": "Seconds between polls inside the loop." },
-          { "name": "self_user", "type": "string", "required": false, "description": "Skip events authored by this user." }
-        ]
-      },
-      {
-        "id": "ado.new-work-item-watcher",
-        "file": "triggers/ado-new-work-item-watcher.ts",
-        "description": "Detect new ADO work items in an area; start a triage-work-item thread per WI via callback. Cold trigger -- ticks on the default cron schedule. Self-state tracks lastCheckedAt per registration so each WI fires at most once per state-change.",
-        "binds_callback_to_recipe": "triage-work-item",
-        "default_cron": "*/5 * * * *",
-        "identity_param": "area_path",
-        "parameters": [
-          { "name": "org", "type": "string", "required": true, "description": "ADO organization slug. Defaults to env ADO_ORG if omitted." },
-          { "name": "project", "type": "string", "required": true, "description": "ADO project name." },
-          { "name": "area_path", "type": "string", "required": true, "description": "Area path prefix to watch (matched with 'Under' semantics)." },
-          { "name": "assigned_to", "type": "string", "required": false, "description": "Filter to WIs assigned to this uniqueName. '@me' resolves to the auth identity." },
-          { "name": "work_item_types", "type": "array", "required": false, "default": ["User Story", "Feature", "Bug", "Task"], "description": "Which WI types to surface." },
-          { "name": "states", "type": "array", "required": false, "default": ["New"], "description": "Which states to fire on." },
-          { "name": "exclude_tags", "type": "array", "required": false, "description": "Skip WIs carrying any of these tags." }
-        ]
-      }
     ]
   },
 
