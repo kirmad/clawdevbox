@@ -106,7 +106,6 @@ still carry one will fail to load with `MISSING_MANIFEST`.
         "id": "cfv.audit-watcher",
         "file": "triggers/audit.ts",
         "default_cron": "*/10 * * * *",
-        "binds_callback_to_recipe": "analyze-call",
         "identity_param": "callId",
         "parameters": []
       }
@@ -250,7 +249,6 @@ dynamic-imports into its own process at workspace boot.
     "id": "ado.new-pr-watcher",
     "file": "triggers/new-pr-watcher.mjs",
     "description": "Fires when a new ADO PR matches the query.",
-    "binds_callback_to_recipe": "review-pr",
     "default_cron": "*/5 * * * *",
     "identity_param": "query",
     "parameters": [
@@ -353,7 +351,7 @@ Per-capability conventions:
 |-------------------|---------------|-------------------------------------|-----------------------------------|-------|
 | `recipes`         | `recipes/`    | `<id>.{yaml,yml,json}`              | filename stem                     | files prefixed with `_` or `.` are skipped |
 | `tools`           | `tools/`      | `<id>.{ts,js,py,sh}`                | `<pluginName>.<stem>`             | runtime inferred from extension (`.ts`→`tsx`, `.js`→`node`, `.py`→`python`, `.sh`→`bash`); `_`-prefixed helpers skipped |
-| `trigger_types`   | `triggers/`   | `<id>.{ts,js,py,sh}` + `<id>.trigger.yaml` sidecar | `<pluginName>.<stem>` | sidecar carries `description`, `default_cron`, `binds_callback_to_recipe`, etc.; missing sidecar → `LoadError` scope=`trigger_types`; orphan sidecar (no script) → `LoadError` |
+| `trigger_types`   | `triggers/`   | `<id>.{ts,js,py,sh}` + `<id>.trigger.yaml` sidecar | `<pluginName>.<stem>` | sidecar carries `description`, `default_cron`, etc.; missing sidecar → `LoadError` scope=`trigger_types`; orphan sidecar (no script) → `LoadError` |
 | `agent_clis`      | `agent-clis/` | `<id>.{mjs,js}`                     | filename stem (not namespaced)    | the `.mjs` module's `default export` supplies `displayName`, `description`, etc. |
 | `renderers`       | `renderers/`  | `<type>.{mjs,js}`                   | filename stem (= `artifact.type`) | built-in renderer types cannot be shadowed; cross-plugin collisions resolved by sorted plugin id |
 
@@ -362,7 +360,6 @@ Example trigger sidecar (`triggers/watch.trigger.yaml`):
 ```yaml
 description: Watches a query for new pull requests.
 default_cron: "*/5 * * * *"
-binds_callback_to_recipe: review-pr
 identity_param: query
 accepts_webhook: false
 parameters:
@@ -669,7 +666,6 @@ will load it normally.
         "id": "tiny.cron-pulse",
         "file": "triggers/pulse.mjs",
         "default_cron": "* * * * *",
-        "binds_callback_to_recipe": "log-tick",
         "parameters": []
       }
     ],

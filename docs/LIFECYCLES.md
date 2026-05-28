@@ -112,9 +112,7 @@ Orphan branch:
 
 1. A plugin author declares a TYPE under `provides.trigger_types[]` in their
    `plugin.yaml`. The TYPE carries `id`, `parameters[]`, `default_cron`,
-   `identity_param`, and exactly one of `binds_callback_to_recipe` (run a
-   recipe when fired) or `binds_callback_to: 'thread_resume'` (wake a hot
-   thread).
+   and `identity_param`.
 2. `plugin.install <source>` clones the plugin into
    `<globalDir>/plugins/<id>/`. The TYPE is now on disk but unknown to the
    running server.
@@ -150,12 +148,6 @@ Orphan branch:
    `trigger.update_params({ cron: false })`-ed (the cron-only path skips the
    TYPE schema lookup), but any `params` update fails with
    `TRIGGER_TYPE_NOT_FOUND`.
-
-**Cross-link.** Every TYPE carries either a `binds_callback_to_recipe: <id>`
-field or `binds_callback_to: 'thread_resume'`. When the cron daemon lands, a
-fire on a `binds_callback_to_recipe` trigger will be expected to spawn that
-recipe per fire (via something equivalent to a server-side `recipe.run`).
-Today, that bridge does not exist.
 
 ---
 
@@ -1237,8 +1229,8 @@ sweepers that would consume them.
   writes back to `last_run_at` / `last_run_status` / `last_run_error`. No
   code path loads `file_abs` and executes the trigger script. `expires_at`
   TTLs are not enforced; `once: true` is not honored;
-  `subscriber_thread_id` hot-trigger wake-up is not honored. `binds_callback_to_recipe`
-  links nothing to anything. Everything that calls itself "trigger" today
+  `subscriber_thread_id` hot-trigger wake-up is not honored.
+  Everything that calls itself "trigger" today
   is the registration surface only.
 - **Snoozed inbox items don't auto-unsnooze.** `snoozed_until` is a hint
   the SPA renders; nothing wakes the item when `now > snoozed_until`. The

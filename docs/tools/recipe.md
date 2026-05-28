@@ -681,8 +681,6 @@ interface TriggerDecl {
   type: string;            // registered trigger TYPE id
   params?: Record<string, unknown>;
   cron?: string | null | false;   // three-state, same as trigger.register
-  binds_callback_to?: string;             // e.g. 'thread_resume'
-  binds_callback_to_recipe?: string;      // recipe id to invoke on fire
   once?: boolean;
   expires_at?: number;
   max_attempts?: number;          // per-trigger override; default 3
@@ -713,7 +711,6 @@ interface ArtifactDecl {
     - type: github.pr_comment
       params: { repo: '$repo', pr_number: '$pr_number' }
       cron: false
-      binds_callback_to_recipe: handle-new-pr-comment
       max_attempts: 5
       backoff_ms: [10000, 60000, 300000, 600000, 1800000]
   artifacts:

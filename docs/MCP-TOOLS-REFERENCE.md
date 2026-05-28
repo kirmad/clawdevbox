@@ -1915,8 +1915,6 @@ interface TriggerDecl {
   type: string;            // registered trigger TYPE id
   params?: Record<string, unknown>;
   cron?: string | null | false;   // three-state, same as trigger.register
-  binds_callback_to?: string;             // e.g. 'thread_resume'
-  binds_callback_to_recipe?: string;      // recipe id to invoke on fire
   once?: boolean;
   expires_at?: number;
   max_attempts?: number;          // per-trigger override; default 3
@@ -1947,7 +1945,6 @@ interface ArtifactDecl {
     - type: github.pr_comment
       params: { repo: '$repo', pr_number: '$pr_number' }
       cron: false
-      binds_callback_to_recipe: handle-new-pr-comment
       max_attempts: 5
       backoff_ms: [10000, 60000, 300000, 600000, 1800000]
   artifacts:
@@ -2934,9 +2931,6 @@ absolute path of the trigger script). The TYPE's interesting fields:
 - `identity_param` — drives the `register` id-minting strategy (see below).
 - `accepts_webhook` — informational; the agent reads it to decide whether
   webhook-only firing is supported.
-- `binds_callback_to_recipe` **xor** `binds_callback_to: 'thread_resume'` —
-  what to do when this trigger fires. Mutually exclusive (enforced by the
-  manifest validator).
 
 Registrations are concrete bindings. The fields you don't see on a TYPE that
 appear here: `enabled`, `subscriber_thread_id` (hot-trigger thread binding),
@@ -2977,8 +2971,6 @@ Lists every plugin-declared TYPE the server can see, optionally filtered.
     accepts_webhook: boolean;
     identity_param: string | null;
     parameters: TriggerTypeParameter[];
-    binds_callback_to_recipe?: string;
-    binds_callback_to?: 'thread_resume';
   }>;
   count: number;
   load_errors: Array<{ plugin_id: string; type_id: string; error: string }>;
@@ -3018,8 +3010,6 @@ resolved.
     // by a recipe step — see recipe.steps.update_status):
     recipe_instance_id: string | null;
     recipe_step_id: string | null;
-    binds_callback_to: string | null;
-    binds_callback_to_recipe: string | null;
     auto_declared: boolean;             // true iff the row was inserted by a step entry hook
     auto_registered_by_step_id: string | null;  // recipe_steps.id of the declaring step
     // kernel retry policy (per-trigger overrides; spec §6.2):
@@ -3063,9 +3053,9 @@ Binds a trigger source to concrete `params` and appends a new row to
    `<projectDir>/.clawdevbox/`.
 
 For the one-off paths, `cron` defaults to `false` (manual/webhook only),
-`once` defaults to `true`, `enabled` is `true`, and
-`binds_callback_to: 'thread_resume'` is set on the auto-template when
-`subscriber_thread_id` is supplied.
+`once` defaults to `true`, `enabled` is `true`, and the auto-template is
+configured for hot-trigger thread resume when `subscriber_thread_id` is
+supplied.
 
 **Signature**
 
@@ -3077,7 +3067,7 @@ For the one-off paths, `cron` defaults to `false` (manual/webhook only),
 | `runtime` | `'node' \| 'tsx' \| 'python' \| 'bash'` | required when `script` or `script_file` is supplied | Interpreter the runner spawns. |
 | `params` | `Record<string, unknown>` | no | Concrete values. Validated against the TYPE's `parameters[]` (which is empty for one-offs). |
 | `cron` | `string \| null \| false \| ''` | no | See [cron normalization](#cron-normalization). One-off paths default to `false` when omitted. |
-| `subscriber_thread_id` | `string` (min length 1) | no | Hot-trigger thread binding. For one-offs, also flips the auto-template's `binds_callback_to` to `'thread_resume'`. |
+| `subscriber_thread_id` | `string` (min length 1) | no | Hot-trigger thread binding. For one-offs, configures the auto-template for hot-trigger thread resume. |
 | `expires_at` | `number` (unix-ms) | no | Auto-delete after this timestamp. |
 | `once` | `boolean` | no | Self-delete after the first successful run. Defaults to `true` for one-off registrations, `false` otherwise. |
 | `max_attempts` | `integer` (1..100) | no | Override the kernel default of **3** attempts before a fire is moved to `dead`. Per-trigger; the value is stored on the registration row and read by the dispatcher when scheduling retries (spec §6.2). |
@@ -3277,8 +3267,6 @@ Write a new agent-authored TYPE on disk and load it into `ws.triggerTypes`.
 | `default_cron` | `string` | no | Inherited by registrations whose `cron` is `null`. Validated by `isValidCronExpression` indirectly through the manifest validator. |
 | `identity_param` | `string` | no | Drives id minting in `trigger.register`. |
 | `accepts_webhook` | `boolean` | no | Informational; defaults to `true` in projection. |
-| `binds_callback_to_recipe` | `string` | XOR with `binds_callback_to` | Recipe id to invoke on fire. |
-| `binds_callback_to` | `'thread_resume'` | XOR with `binds_callback_to_recipe` | Resume the subscriber thread instead of invoking a recipe. |
 | `parameters` | `Array<{ name, type, required?, default?, description? }>` | no | TriggerType parameter schema, same shape as plugin-shipped types. |
 
 **Returns** `structuredContent`:
@@ -3298,7 +3286,7 @@ Write a new agent-authored TYPE on disk and load it into `ws.triggerTypes`.
 | Code | Trigger |
 |---|---|
 | `INVALID_REQUEST` | Both or neither of `script` / `script_file` was supplied. |
-| `VALIDATION_FAILED` | Manifest failed `validateAgentAuthoredTemplate` — id pattern, runtime enum, callback-binding XOR, default_cron validity, parameter schema, etc. The `errors[]` array lists `{ path, code, message }`. |
+| `VALIDATION_FAILED` | Manifest failed `validateAgentAuthoredTemplate` — id pattern, runtime enum, default_cron validity, parameter schema, etc. The `errors[]` array lists `{ path, code, message }`. |
 | `TRIGGER_TEMPLATE_EXISTS` | A template with this id already exists in the chosen scope. (To overwrite, use `trigger.update_template`; to move scopes, delete + create.) |
 | `SCRIPT_FILE_OUTSIDE_WORKSPACE` | `script_file` resolved outside `<projectDir>/.clawdevbox/`. |
 | `SCRIPT_FILE_NOT_FOUND` | `script_file` resolved under `.clawdevbox/` but no file exists at that path. |
@@ -3327,8 +3315,6 @@ a template between `project` and `global`, delete it and create it fresh.
 | `default_cron` | `string` | no | Replaces the field. |
 | `identity_param` | `string` | no | Replaces the field. |
 | `accepts_webhook` | `boolean` | no | Replaces the field. |
-| `binds_callback_to_recipe` | `string` | no | Replaces the field. |
-| `binds_callback_to` | `'thread_resume'` | no | Replaces the field. |
 | `parameters` | parameter schema array | no | Replaces the field entirely (not merged). |
 
 **Returns** `{ id, scope, path }`.
@@ -3559,7 +3545,6 @@ surface deliberately returns the raw `resolved_cron` and leaves humanization
 │          "file": "triggers/new-pr-watcher.ts",                      │
 │          "default_cron": "*/5 * * * *",                             │
 │          "identity_param": "repo",                                  │
-│          "binds_callback_to_recipe": "handle-new-pr",               │
 │          "parameters": [                                            │
 │            { "name": "repo", "type": "string", "required": true }   │
 │          ]                                                          │
@@ -3674,8 +3659,8 @@ longer true as of the trigger-kernel work:
 - TTL enforcement: `expires_at` is honored by the scheduler when it
   scans the `triggers` table.
 - Mode-B callbacks land at `POST /callback/<fire_id>` (see
-  [`cron.md`](#cron)); hot-trigger thread resume is wired through
-  `binds_callback_to: 'thread_resume'`.
+  [`cron.md`](#cron)); hot-trigger thread resume is wired through the
+  registration's `subscriber_thread_id`.
 
 `trigger.fire` returns a real `fire_id` you can follow via
 `GET /api/fires/<fire_id>` — the row transitions through
@@ -4030,7 +4015,7 @@ dispatcher does not interpret it.
 ### See also
 
 - [`trigger.*`](#trigger) — MCP tools that register/fire triggers.
-- [`recipe.*`](#recipe) — recipe instances spawn through the same kernel pipeline when a trigger has `binds_callback_to_recipe`.
+- [`recipe.*`](#recipe) — recipe instances spawn through the same kernel pipeline when a trigger fires.
 - Spec §5, §6, §8, §9 in `docs/specs/2026-05-14-trigger-kernel-design.md`.
 
 ---
@@ -6902,7 +6887,7 @@ having to know any of that happened.
 | **Recipe instance** | A row at `<workspace>/.clawdevbox/recipe-instances/<id>.json` recording one spawn of a recipe — id, workspace, prompt, agent CLI, pid, status, snapshot of the recipe YAML, etc. |
 | **Session id** | The agent CLI's own session id. Recipe runs always pass an explicit id (`cdb_<base36>`) so resume is deterministic. |
 | **Skill** | A markdown file with YAML frontmatter at `<scope>/.clawdevbox/skills/<id>.md` (or plugin-shipped). The body is the agent-readable prose; frontmatter holds `name` + `description` + arbitrary extra keys. |
-| **Trigger type** | A plugin-declared capability (`provides.trigger_types[]`): id, parameter schema, default cron, callback binding. Read-only via MCP. |
+| **Trigger type** | A plugin-declared capability (`provides.trigger_types[]`): id, parameter schema, default cron, optional identity param + webhook opt-out. Read-only via MCP. |
 | **Registered trigger** | A concrete `<type>#<key>` instance written to `<projectDir>/.clawdevbox/triggers.json`. Has bound params, cron override, enabled flag, and `last_run_*` audit fields. |
 | **Identity param** | A parameter named in the trigger TYPE's manifest whose value becomes the suffix of the registered instance id (`<type>#<value>`). Falls back to an 8-hex hash of the params object. |
 | **Artifact** | A folder `<workspace>/artifacts/<id>/` containing `manifest.json` plus free-form content files. Rendered by an `.mjs` module resolved through the renderer chain. |

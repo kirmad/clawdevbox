@@ -310,5 +310,5 @@ dispatcher does not interpret it.
 ## See also
 
 - [`trigger.*`](./trigger.md) — MCP tools that register/fire triggers.
-- [`recipe.*`](./recipe.md) — recipe instances spawn through the same kernel pipeline when a trigger has `binds_callback_to_recipe`.
+- [`recipe.*`](./recipe.md) — recipe instances spawn through the same kernel pipeline.
 - Spec §5, §6, §8, §9 in `docs/specs/2026-05-14-trigger-kernel-design.md`.

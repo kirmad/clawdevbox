@@ -265,7 +265,7 @@ GLOSSARY = """## Glossary
 | **Recipe instance** | A row at `<workspace>/.clawdevbox/recipe-instances/<id>.json` recording one spawn of a recipe — id, workspace, prompt, agent CLI, pid, status, snapshot of the recipe YAML, etc. |
 | **Session id** | The agent CLI's own session id. Recipe runs always pass an explicit id (`cdb_<base36>`) so resume is deterministic. |
 | **Skill** | A markdown file with YAML frontmatter at `<scope>/.clawdevbox/skills/<id>.md` (or plugin-shipped). The body is the agent-readable prose; frontmatter holds `name` + `description` + arbitrary extra keys. |
-| **Trigger type** | A plugin-declared capability (`provides.trigger_types[]`): id, parameter schema, default cron, callback binding. Read-only via MCP. |
+| **Trigger type** | A plugin-declared capability (`provides.trigger_types[]`): id, parameter schema, default cron, optional identity param + webhook opt-out. Read-only via MCP. |
 | **Registered trigger** | A concrete `<type>#<key>` instance written to `<projectDir>/.clawdevbox/triggers.json`. Has bound params, cron override, enabled flag, and `last_run_*` audit fields. |
 | **Identity param** | A parameter named in the trigger TYPE's manifest whose value becomes the suffix of the registered instance id (`<type>#<value>`). Falls back to an 8-hex hash of the params object. |
 | **Artifact** | A folder `<workspace>/artifacts/<id>/` containing `manifest.json` plus free-form content files. Rendered by an `.mjs` module resolved through the renderer chain. |

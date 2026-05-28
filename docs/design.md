@@ -47,7 +47,7 @@ The design replaces the prior infrastructure spec's event-sourced kernel, projec
 | **Approval** | A row representing a pending user decision the agent surfaced. The agent's interrupt. |
 | **Artifact** | A file the agent wrote, registered via `artifact.write` (review markdown, postmortem, aggregate). |
 | **Recipe** | A simple YAML file (`name`, `description`, `mcp_servers?`, `steps?: [{id, goal, depends?}]`) that the agent uses as a starting point. TaskDock-shape. The agent picks one matching the goal, reads it, adapts the steps as needed. |
-| **Trigger type** | A *capability* shipped by a plugin (or defined in project scope). Declares a script file, a parameter schema, a default cron, and a callback binding (recipe id or `thread_resume`). Itself doesn't fire — it must be **registered** with concrete param values to become active. See §8.2. |
+| **Trigger type** | A *capability* shipped by a plugin (or defined in project scope). Declares a script file, a parameter schema, a default cron, and (optionally) an identity param + webhook opt-out. Itself doesn't fire — it must be **registered** with concrete param values to become active. See §8.2. |
 | **Registered trigger** | A concrete *instance* of a trigger type, bound to specific param values, an optional cron override (string=override, null=inherit, false=disable cron), and (for hot triggers) a `subscriber_thread_id`. Lives in `.conductor/triggers.json` `registered[]`. See §8.3. |
 | **Skill** | A markdown file with frontmatter that the side-terminal CLI auto-loads as procedural knowledge (Claude Code skills semantics). Living at `.conductor/skills/<id>.md` or in a plugin's `skills/` directory. |
 | **Plugin** | A self-contained directory of recipes, skills, triggers, hostable tools, and MCP server configs that ships as a unit. Lives at `<workspace>/.conductor/plugins/<id>/`. Read-only at runtime — customizations go in `project` scope. |
@@ -349,7 +349,7 @@ Auth: per-launch 32-byte hex secret (Goose copy-fork) in the `Authorization: Bea
 | `plugin.update` | `{ id }` | For git-installed plugins, runs `git pull`; re-validates manifest; reloads. Errors clearly if the plugin wasn't installed from a git source |
 | `plugin.uninstall` | `{ id }` | Removes `.conductor/plugins/<id>/`; reloads. Project-scope overrides survive |
 | `plugin.enable` / `plugin.disable` | `{ id }` | Flag toggle without removing the plugin directory |
-| `trigger.list_types` | `{ scope?, search? }` | List available trigger TYPES (capabilities) discovered from enabled plugins. Returns `{ id, source_plugin_id, scope, description, parameters, default_cron, accepts_webhook, identity_param, binds_callback_to_recipe? | binds_callback_to? }[]`. `scope` filters to `'plugin:<id>'`; omit for all. **`trigger.list_types` + `trigger.list_registered` together replace the prior generic `trigger.list`** — listing capabilities is distinct from listing active instances |
+| `trigger.list_types` | `{ scope?, search? }` | List available trigger TYPES (capabilities) discovered from enabled plugins. Returns `{ id, source_plugin_id, scope, description, parameters, default_cron, accepts_webhook, identity_param }[]`. `scope` filters to `'plugin:<id>'`; omit for all. **`trigger.list_types` + `trigger.list_registered` together replace the prior generic `trigger.list`** — listing capabilities is distinct from listing active instances |
 | `trigger.list_registered` | `{ enabled?, type_id?, subscriber_thread_id? }` | List REGISTERED instances from `.conductor/triggers.json` `registered[]`. Each row carries `params`, `cron` (raw), `resolved_cron` (after inheritance), `enabled`, `subscriber_thread_id`, `state`, `last_run_*` |
 | `trigger.register` | `{ type_id, params, cron?, subscriber_thread_id?, expires_at?, once? }` | Validate `params` against the type's `parameters[]` schema; normalize `cron` (string=override, null=inherit, false/""=disable); mint id (using `identity_param` if declared, else hash of params); append to `registered[]`. Errors: `TRIGGER_TYPE_NOT_FOUND`, `PARAM_VALIDATION`, `TRIGGER_ALREADY_REGISTERED` |
 | `trigger.unregister` | `{ id }` | Remove the registered instance from `registered[]`. The underlying TYPE stays available — re-register to recreate |
@@ -679,7 +679,7 @@ Like Claude Code hooks, the framework owns one thing — the webhook rule + the 
 
 Triggers split cleanly into two concepts:
 
-- A **trigger type** is a *capability* — a script file plus a parameter schema, a default cron, and a callback binding. It's declared by a plugin under `provides.trigger_types[]` (§10.2). A type itself doesn't fire; it's a contract.
+- A **trigger type** is a *capability* — a script file plus a parameter schema and a default cron. It's declared by a plugin under `provides.trigger_types[]` (§10.2). A type itself doesn't fire; it's a contract.
 - A **registered trigger** is a *concrete instance* — a binding of a type to specific param values, persisted in `.conductor/triggers.json` `registered[]`. The cron daemon ticks registered rows; the webhook server mounts `/hooks/<id>` for each one.
 
 A single trigger type (e.g. `ado.new-pr-watcher`) can be registered many times with different params (one per repo). Each registration gets its own webhook path, its own cron timer (if any), and its own persisted `state`.
@@ -695,14 +695,10 @@ A plugin (or project) declares a trigger type with:
 | `id` | yes | Globally unique. Plugin manifests require namespaced ids matching `[a-z][a-z0-9-]*\.[a-z][a-z0-9-]*` (e.g. `ado.new-pr-watcher`) |
 | `file` | yes | Relative path to the trigger script, under the plugin or project directory |
 | `description` | recommended | One-line prose, shown in `trigger.list_types` |
-| `binds_callback_to_recipe` | one-of | Recipe id the callback should invoke. Conductor mints `/callback/recipes/<recipe>/run` (or `.../run/<inbox_item_id>`) per registration |
-| `binds_callback_to` | one-of | Action name (MVP: only `thread_resume`). Conductor mints `/callback/threads/<thread_id>/resume`; requires the registration carry a `subscriber_thread_id` |
 | `default_cron` | no | 5- or 6-field cron expression. Registrations with `cron=null/absent` inherit this; registrations with `cron=<string>` override; registrations with `cron=false` disable cron entirely |
 | `accepts_webhook` | no | Default `true`. When `false`, the type opts out of inbound `/hooks/<id>` mounting (cron-only or manual-only) |
 | `identity_param` | no | Name of the param that uniquely identifies a registered instance. When set, registered-trigger id is `<type_id>#<param[identity_param]>` (URL-encoded). When absent, ids are minted from a SHA-256 hash of the params |
 | `parameters` | no | Array of `{ name, type, required?, description?, default? }`. `type` ∈ `string \| integer \| number \| boolean \| array \| object`. At register-time these are validated against the agent's `params`; defaults are applied; the resolved params become the instance's initial `state` (§8.5) |
-
-`binds_callback_to_recipe` and `binds_callback_to` are **mutually exclusive** — every type declares exactly one callback shape.
 
 ### 8.3 Registration lifecycle
 
@@ -795,27 +791,27 @@ The on-disk shape is a single array of registered instances:
 }
 ```
 
-`cron` is one of: a cron string (override), `null` (inherit the type's `default_cron`), or `false` (cron disabled — webhook/manual-only). The sidecar reads this file at boot, mounts the **inbound webhook** (`/hooks/<id>`) and the **callback URL** appropriate to the type's binding for each row, optionally registers an in-process cron timer (when resolved cron is non-null and non-false), and watches the file for changes (500 ms debounce).
+`cron` is one of: a cron string (override), `null` (inherit the type's `default_cron`), or `false` (cron disabled — webhook/manual-only). The sidecar reads this file at boot, mounts the **inbound webhook** (`/hooks/<id>`) and a **callback URL** per registered trigger, optionally registers an in-process cron timer (when resolved cron is non-null and non-false), and watches the file for changes (500 ms debounce).
 
 **Two URLs per registered trigger:**
 - **Webhook URL** (inbound): `http://localhost:5201/hooks/<registered-id>` — what fires the script. ADO service hooks POST here; the cron daemon self-fires here; the user `curl`s here.
-- **Callback URL** (outbound): a **pre-bound URL** Conductor mints from the type's binding (`binds_callback_to_recipe` or `binds_callback_to`). The URL itself encodes the routing — which thread to resume, which recipe to spawn, which parent to fan out under, which inbox item to attach to. The script doesn't construct it or pass routing fields; it just POSTs `{ prompt, context }`.
+- **Callback URL** (outbound): a **pre-bound URL** Conductor mints at registration time. The URL itself encodes the routing — which thread to resume, which recipe to spawn, which parent to fan out under, which inbox item to attach to. The script doesn't construct it or pass routing fields; it just POSTs `{ prompt, context }`.
 
 Both authenticated with `Authorization: Bearer $CONDUCTOR_MCP_SECRET`.
 
 #### The callback URL — routing baked into the path
 
-Conductor mints a structured URL per registered trigger based on the type's callback binding. The URL has all the routing context — thread ids, recipe ids, parent ids, inbox item ids — embedded as path components. The script gets this URL ready-to-use in its stdin envelope as `callback_url`:
+Conductor mints a structured URL per registered trigger at registration time. The URL has all the routing context — thread ids, recipe ids, parent ids, inbox item ids — embedded as path components. The script gets this URL ready-to-use in its stdin envelope as `callback_url`:
 
-| URL shape | What a POST does | Used by types that bind via |
-|---|---|---|
-| `/callback/threads/<thread_id>/resume` | Append message to thread; wake suspended CLI | `binds_callback_to: thread_resume` (hot triggers — registration carries `subscriber_thread_id`) |
-| `/callback/recipes/<recipe_id>/run` | Spawn fresh thread with that recipe; prompt = first user message | `binds_callback_to_recipe: <recipe-id>` (cold triggers) |
-| `/callback/recipes/<recipe_id>/run/<inbox_item_id>` | Spawn fresh thread, attach to specific inbox item | `binds_callback_to_recipe: <recipe-id>` when the POST body includes `attach_to_inbox_item_id` |
-| `/callback/recipes/default-agent/run` | Spawn fresh thread with the bundled empty-agent recipe; agent extends from prompt | Cold triggers without a specific recipe ("just give the agent this prompt") |
-| `/callback/threads/<parent_thread_id>/spawn-sub/<recipe_id>` | Spawn a child thread with that recipe + `parent_thread_id` set | Fan-out (epic → work items, incident → mitigation runbook) |
-| `/callback/threads/<thread_id>/close-step` | Append a `step_close` message + wake; agent reads prompt to know how to advance | "PR is merged → close monitor step and move on" |
-| `/callback/inbox/<inbox_item_id>/update` | Patch inbox item columns from POST body | "Set agent_message + agent_tone" without involving the agent at all |
+| URL shape | What a POST does |
+|---|---|
+| `/callback/threads/<thread_id>/resume` | Append message to thread; wake suspended CLI |
+| `/callback/recipes/<recipe_id>/run` | Spawn fresh thread with that recipe; prompt = first user message |
+| `/callback/recipes/<recipe_id>/run/<inbox_item_id>` | Spawn fresh thread, attach to specific inbox item |
+| `/callback/recipes/default-agent/run` | Spawn fresh thread with the bundled empty-agent recipe; agent extends from prompt |
+| `/callback/threads/<parent_thread_id>/spawn-sub/<recipe_id>` | Spawn a child thread with that recipe + `parent_thread_id` set |
+| `/callback/threads/<thread_id>/close-step` | Append a `step_close` message + wake; agent reads prompt to know how to advance |
+| `/callback/inbox/<inbox_item_id>/update` | Patch inbox item columns from POST body |
 
 The script's POST body is uniform regardless of URL:
 
@@ -828,7 +824,7 @@ The script's POST body is uniform regardless of URL:
 
 #### The script never has to think about routing
 
-Most triggers have **one** action they perform. The type's `binds_callback_to*` field tells Conductor what action that is, and Conductor mints the matching URL per registration. The script just reads `env.callback_url` and POSTs to it.
+The script just reads `env.callback_url` and POSTs to it.
 
 For a trigger that needs to perform **multiple action kinds** (rare — typically a fan-out case), the type declares each one and the envelope contains a `callback_urls` map:
 
@@ -1136,8 +1132,7 @@ T=2h       Reviewer Bob comments on PR 2401. Two paths can fire:
            Path A (real-time, if ADO is configured to post comments):
              ADO POSTs the comment payload to /hooks/ado.comment-watcher#2401 at T=2h+1s.
              Sidecar spawns the script. Script sees comment in stdin → POSTs
-             to env.callback_url (the resume URL minted from the type's
-             `binds_callback_to: thread_resume` binding).
+             to env.callback_url (the resume URL minted at registration time).
 
            Path B (cron backup, if ADO isn't configured for comments):
              Within 30s, in-process cron self-fires the webhook with empty body.
@@ -1183,7 +1178,7 @@ T=24h+1tick
 
 ### 8.11 Hot triggers — context-bound to a thread
 
-A trigger type whose callback binding is `thread_resume` is a **hot capability** — meaningful only in the context of a live thread. The agent activates it by calling `trigger.register(...)` with `subscriber_thread_id` set:
+A trigger registered with a `subscriber_thread_id` is a **hot trigger** — meaningful only in the context of a live thread. The agent activates it by calling `trigger.register(...)` with `subscriber_thread_id` set:
 
 ```
 trigger.register({
@@ -1651,7 +1646,6 @@ provides:
     - id: ado.new-pr-watcher
       file: triggers/ado-new-pr-watcher.ts
       description: Detect new PRs in a repo; start a pr-review for each via callback.
-      binds_callback_to_recipe: pr-review
       default_cron: "*/5 * * * *"
       identity_param: repo
       parameters:
@@ -1664,7 +1658,6 @@ provides:
     - id: ado.comment-watcher
       file: triggers/ado-comment-watcher.ts
       description: Wake an existing thread on new PR comments.
-      binds_callback_to: thread_resume
       default_cron: "*/30 * * * * *"
       identity_param: pr_id
       parameters:
@@ -1702,7 +1695,7 @@ requires:
 | `homepage` | URL | no | |
 | `provides.skills[]` | array | no | `{ id, file }`; `id` must be unique within this list |
 | `provides.recipes[]` | array | no | `{ id, file }`; loaded as recipes |
-| `provides.trigger_types[]` | array | no | Capability declarations (spec §8.2). Each entry: `{ id, file, description?, binds_callback_to_recipe? \| binds_callback_to?, default_cron?, accepts_webhook?, identity_param?, parameters?: [{name, type, required?, description?, default?}] }`. The agent calls `trigger.register({ type_id, params })` to mint a concrete instance from a type. Type ids must be namespaced (`<plugin>.<verb>`) and globally unique across enabled plugins |
+| `provides.trigger_types[]` | array | no | Capability declarations (spec §8.2). Each entry: `{ id, file, description?, default_cron?, accepts_webhook?, identity_param?, parameters?: [{name, type, required?, description?, default?}] }`. The agent calls `trigger.register({ type_id, params })` to mint a concrete instance from a type. Type ids must be namespaced (`<plugin>.<verb>`) and globally unique across enabled plugins |
 | `provides.tools[]` | array | no | `{ id, file }`; **hostable tools** hosted in-process by the Conductor MCP server (see §10.3). `id` must be namespaced `<plugin>.<verb>` matching `[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*`; `file` is a `.ts` file under the plugin directory exporting the standard hostable-tool shape |
 | `provides.mcp_servers[]` | array | no | `{ id, file }`; **heavyweight** alternative: a separate MCP server process declared via a Continue/Cursor-shape JSON config. Use only when the work doesn't fit a hostable tool (long-running indexer, stateful daemon, foreign binary) |
 | `requires.conductor_version` | semver range | no | Defaults to `*`; mismatch is a load error |
@@ -2019,7 +2012,6 @@ Same shape-only pattern as recipes (§7.4) and triggers (§8). The plugin manife
 - `provides.tools[].file` resolves to a `.ts` (or compiled `.js`) file inside the plugin directory. The runtime additionally validates the module's exported shape (`id` / `description` / `parameters` / default `execute`) at dynamic-import time — manifest validation is path-only, runtime validation is shape.
 - `provides.trigger_types[].id` matches the namespaced pattern `[a-z][a-z0-9-]*\.[a-z][a-z0-9-]*` (kebab-case both halves — e.g., `ado.new-pr-watcher`). Trigger type ids must be unique within the plugin.
 - `provides.trigger_types[].file` is a relative path inside the plugin directory (no `..` escapes).
-- `provides.trigger_types[].binds_callback_to_recipe` and `binds_callback_to` are mutually exclusive; `binds_callback_to` (when set) must equal `thread_resume`.
 - `provides.trigger_types[].default_cron` (when set) is a well-formed 5- or 6-field cron expression.
 - `provides.trigger_types[].parameters[].type` is one of `string \| integer \| number \| boolean \| array \| object`. `default` (when set) must match the declared `type`.
 - `provides.trigger_types[].identity_param` (when set) references a parameter name declared in this type's `parameters[]`.
