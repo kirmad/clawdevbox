@@ -144,17 +144,11 @@ function paramRows() {
       </section>
 
       <section
-        v-if="trigger.binds_callback_to_recipe || trigger.binds_callback_to"
+        v-if="trigger.subscriber_thread_id"
         class="block"
       >
         <div class="block-head"><i class="pi pi-link" /> When it fires</div>
-        <div v-if="trigger.binds_callback_to_recipe">
-          Starts recipe <code>{{ trigger.binds_callback_to_recipe }}</code> for each match.
-        </div>
-        <div v-else-if="trigger.binds_callback_to === 'thread_resume'">
-          Resumes a thread (hot trigger) — bound when registered.
-        </div>
-        <div v-if="trigger.subscriber_thread_id" class="muted">
+        <div class="muted">
           Subscriber thread: <code>{{ trigger.subscriber_thread_id }}</code>
         </div>
       </section>

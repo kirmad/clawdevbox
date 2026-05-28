@@ -210,8 +210,6 @@ export interface RegisteredTrigger {
   type: string;
   source_plugin_id: string | null;
   type_description?: string | null;
-  binds_callback_to_recipe?: string | null;
-  binds_callback_to?: string | null;
   params: Record<string, unknown>;
   cron: string | null | false;
   resolved_cron: string | null | false;
@@ -238,8 +236,6 @@ export interface TriggerType {
   accepts_webhook?: boolean;
   identity_param?: string;
   parameters?: { name: string; type: string; required?: boolean; description?: string; default?: unknown }[];
-  binds_callback_to_recipe?: string;
-  binds_callback_to?: string;
 }
 
 export function fetchTriggerTypes(): Promise<{ items: TriggerType[]; errors: unknown[] }> {
