@@ -24,6 +24,9 @@
  */
 
 import type { IPty } from 'node-pty';
+import type { AgentCliProvider, AgentHandle } from './agent-clis/types.ts';
+import { createSessionConductor, UnsupportedProviderError, type SessionConductor } from './agent-clis/session-conductor.ts';
+import { logger } from './logger.ts';
 
 // ============================================================================
 // Tunables
@@ -79,6 +82,18 @@ export interface PtyRegisterOptions {
   rows: number;
   ipty: IPty;
   meta?: Omit<PtySessionMeta, 'startedAt'>;
+  /**
+   * Provider that spawned this pty. Required for the registry to build a
+   * SessionConductor. When omitted, the session has no conductor and
+   * getConductor(instanceId) returns null. Legacy callers (playwright
+   * fixture, raw test harnesses) can still register without this.
+   */
+  provider?: AgentCliProvider;
+  /**
+   * Agent handle whose .pty is `ipty`. Required iff `provider` is provided —
+   * the conductor needs handle.exited to track the exited state transition.
+   */
+  agentHandle?: AgentHandle;
 }
 
 interface PtySession {
@@ -93,6 +108,7 @@ interface PtySession {
   exited: boolean;
   exitCode: number | null;
   meta: PtySessionMeta;
+  conductor: SessionConductor | null;
 }
 
 // ============================================================================
@@ -127,7 +143,41 @@ export function registerPty(opts: PtyRegisterOptions): void {
     exited: false,
     exitCode: null,
     meta: { ...(opts.meta ?? {}), startedAt: Date.now() },
+    conductor: null,
   };
+
+  let conductor: SessionConductor | null = null;
+  if (opts.provider && opts.agentHandle) {
+    try {
+      conductor = createSessionConductor({
+        handle: opts.agentHandle,
+        provider: opts.provider,
+        role: opts.instanceId,
+      });
+    } catch (err) {
+      // UnsupportedProviderError is expected: provider lacks capabilities
+      // or writePrompt (e.g. echo-stub). The session remains valid for
+      // raw terminal viewing — the caller just can't dispatch through
+      // the conductor API. Anything else is unexpected and worth a log:
+      // the handle could be malformed (closed pty, missing exited
+      // thenable, etc.) and silently returning null hides that.
+      if (err instanceof UnsupportedProviderError) {
+        conductor = null;
+      } else {
+        logger.warn(
+          {
+            instance_id: opts.instanceId,
+            provider_id: opts.provider.id,
+            err: err instanceof Error ? err.message : String(err),
+          },
+          'pty-registry: unexpected error creating SessionConductor; session will have no conductor',
+        );
+        conductor = null;
+      }
+    }
+  }
+  session.conductor = conductor;
+
   sessions.set(opts.instanceId, session);
 
   opts.ipty.onData((data) => {
@@ -140,6 +190,9 @@ export function registerPty(opts: PtyRegisterOptions): void {
   opts.ipty.onExit(({ exitCode, signal }) => {
     session.exited = true;
     session.exitCode = exitCode ?? 0;
+    if (session.conductor) {
+      try { session.conductor.dispose(); } catch { /* idempotent */ }
+    }
     for (const sub of session.subscribers) {
       try { sub({ type: 'exit', exitCode: exitCode ?? 0, signal }); } catch { /* viewer drop */ }
     }
@@ -165,6 +218,17 @@ export function hasSession(instanceId: string): boolean {
 export function getSessionMeta(instanceId: string): PtySessionMeta | null {
   const s = sessions.get(instanceId);
   return s ? s.meta : null;
+}
+
+/**
+ * Return the SessionConductor for `instanceId`, or null if:
+ *  - the session is unknown,
+ *  - the session was registered without a provider+agentHandle pair, or
+ *  - the provider didn't declare capabilities/writePrompt (conductor creation threw).
+ */
+export function getConductor(instanceId: string): SessionConductor | null {
+  const s = sessions.get(instanceId);
+  return s ? s.conductor : null;
 }
 
 export function subscribe(
