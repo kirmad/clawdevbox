@@ -13,30 +13,16 @@
  * `/mcp` Streamable HTTP transport, real `runRecipe` invoking the real
  * `e2e-test-runner` provider that node-pty actually spawns.
  *
- * KNOWN LIMITATIONS OF THE e2e-test-runner FIXTURE
- * ------------------------------------------------
- * The builtin `e2e-test-runner` provider (src/agent-clis/e2e-test-runner.ts)
- * is intentionally narrow: it implements only `detect` + `spawnSession`.
- * It does NOT declare `capabilities` and does NOT export `writePrompt`,
- * so `pty-registry.registerPty` builds the session with `conductor = null`
- * (see UnsupportedProviderError path). Consequences:
- *
- *   1. Test 1 (`/dispatch/<fire_id>`) cannot deliver a prompt mid-session
- *      because `getConductor(<e2e>) === null`. The endpoint correctly
- *      returns 404 `target_unavailable`. Per constraint #8 of the brief
- *      we DOCUMENT this and SKIP the marker assertion — what we verify
- *      instead is that the HTTP layer surfaces the routing outcome
- *      faithfully (the auth check in Test 4 still uses the same fire).
- *
- *   2. Test 3 (`/api/sessions/<id>`) reports `state: 'unknown'` because
- *      no conductor exists. The unit test in `tests/api-sessions.test.mjs`
- *      already permits 'unknown'; we mirror that here.
- *
- * Test 2 (`/spawn/<fire_id>`) is unaffected — `/spawn` only creates a
- * fresh pty via `runRecipe` and returns its ids; it doesn't dispatch
- * into the new pty. The e2e-test-runner consumes its initial prompt
- * via the spawn path and exits with `E2E_MARKER_EXIT_OK` once it
- * completes its MCP roundtrip, which we poll for.
+ * NOTE ON e2e-test-runner CONDUCTOR SUPPORT
+ * ------------------------------------------
+ * The builtin `e2e-test-runner` provider now declares `capabilities`
+ * and `writePrompt`, and its generated script enters a stdin echo loop
+ * in interactive mode. So `pty-registry.registerPty` builds the session
+ * with a real SessionConductor. The dedicated
+ * `tests/dispatch-bytes-e2e.test.mjs` covers the dispatch-bytes path
+ * end-to-end; here we only verify that /dispatch responds 200/ok with
+ * a valid conductor state. We do NOT assert on a prompt-echo marker —
+ * that's covered by the bytes test with a deterministic agent script.
  */
 
 import test from 'node:test';
@@ -338,27 +324,14 @@ test('real-binary e2e: /dispatch, /spawn, /api/sessions against e2e-test-runner'
     note(`Test 1: /dispatch → HTTP ${dispResp.status} body=${JSON.stringify(dispBody)} conductor_present=${conductor !== null}`);
 
     if (conductor === null) {
-      // Documented limitation: the e2e-test-runner provider does not declare
-      // `capabilities`/`writePrompt`, so pty-registry creates the session
-      // with `conductor = null`. /dispatch correctly surfaces this as 404
-      // `target_unavailable`. We assert THAT contract — that the HTTP layer
-      // faithfully reports the underlying routing outcome — and skip the
-      // 200/marker assertions that the brief permits (constraint #8).
-      try {
-        assert.equal(dispResp.status, 404, 'expected 404 when conductor is absent');
-        assert.match(dispBody.error ?? '', /target.unavailable|exited/i, 'expected target_unavailable error message');
-        note('Test 1: PASS (documented skip — conductor unsupported by e2e-test-runner)');
-      } catch (err) { failures.push(`Test 1 (skip-path): ${err.message}`); }
+      failures.push('Test 1: expected conductor to be present now that e2e-test-runner declares capabilities+writePrompt');
     } else {
-      // If a future e2e-test-runner gains conductor support, the original
-      // happy-path assertions kick in automatically.
       try {
         assert.equal(dispResp.status, 200, 'expected 200 from /dispatch happy path');
         assert.equal(dispBody.ok, true);
         assert.equal(typeof dispBody.queued_at, 'number');
         assert.ok(['idle', 'busy', 'starting', 'exited'].includes(dispBody.state), `unexpected state: ${dispBody.state}`);
-        const fullLog = await pollLogForMarker(runner1.log_path, 'E2E_DISPATCH_OK', 30_000);
-        note(`Test 1: marker found (${fullLog.length} bytes)`);
+        note('Test 1: PASS (HTTP-layer ack; dispatch-bytes coverage lives in tests/dispatch-bytes-e2e.test.mjs)');
       } catch (err) {
         const tail = existsSync(runner1.log_path)
           ? readFileSync(runner1.log_path, 'utf8').slice(-2048)

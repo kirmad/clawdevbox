@@ -21,7 +21,14 @@ import { join } from 'node:path';
 import { mkdirSync } from 'node:fs';
 import { writeFileAtomic } from '../fs-util.ts';
 import { writeMcpJson } from './shared.ts';
-import type { AgentCliProvider, AgentHandle, ProviderCtx, SpawnSessionOpts } from './types.ts';
+import type {
+  AgentCliProvider,
+  AgentHandle,
+  ProviderCapabilities,
+  ProviderCtx,
+  SpawnSessionOpts,
+  WritePromptOpts,
+} from './types.ts';
 
 function renderScriptBody(opts: SpawnSessionOpts): string {
   const sessionId = opts.init.session_id;
@@ -183,6 +190,43 @@ async function rpc(url, headers, sessionId, method, params, id) {
       log('DELETE best-effort failed: ' + err.message);
     }
 
+    // ─── interactive-mode stdin echo loop ────────────────────────────
+    // When the spawn was interactive (mode === 'interactive'), don't
+    // exit after recipe.done — stay alive and echo any dispatched
+    // prompts so the dispatch-bytes e2e test can observe them.
+    if (process.env.CLAWDEVBOX_E2E_INTERACTIVE === '1') {
+      process.stdout.write('[e2e-test-runner] READY_FOR_DISPATCH\\n');
+
+      // Read stdin line-by-line. Each line is a dispatched prompt
+      // arriving via SessionConductor → writePrompt → pty.write(text + '\\r').
+      // Node turns the inbound \\r into \\n on Windows ConPTY readback,
+      // so readline should hand us the whole prompt as one line.
+      const readline = require('node:readline');
+      const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+
+      rl.on('line', (line) => {
+        const trimmed = line.replace(/\\r$/, '').trim();
+        if (trimmed.length === 0) return;
+        if (trimmed.startsWith('__EXIT__')) {
+          process.stdout.write('[e2e-test-runner] EXIT_RECEIVED\\n');
+          rl.close();
+          process.stdout.write('E2E_MARKER_EXIT_OK\\n');
+          process.exit(0);
+        }
+        process.stdout.write('[e2e-test-runner] DISPATCH_RX: ' + trimmed + '\\n');
+      });
+
+      // Safety fuse: if no exit signal arrives in 60s, exit anyway.
+      setTimeout(() => {
+        process.stdout.write('[e2e-test-runner] TIMEOUT_60S\\n');
+        process.stdout.write('E2E_MARKER_EXIT_OK\\n');
+        process.exit(0);
+      }, 60_000).unref();
+
+      return; // keep event loop alive via rl + setTimeout
+    }
+    // ─────────────────────────────────────────────────────────────────
+
     process.stdout.write('E2E_MARKER_EXIT_OK\\n');
     process.exit(0);
   } catch (err) {
@@ -201,6 +245,25 @@ export const e2eTestRunnerProvider: AgentCliProvider = {
   source: 'builtin',
   internal: true,
 
+  capabilities: {
+    queueMode: 'none',
+    promptSubmitStrategy: 'bulk-cr',
+    // The agent script prints this marker when it's ready to accept a
+    // dispatched prompt. SessionConductor uses this to transition
+    // starting → idle.
+    promptReadyRegex: /\[e2e-test-runner\] READY_FOR_DISPATCH/m,
+    busyIndicators: [],
+  } satisfies ProviderCapabilities,
+
+  async writePrompt(handle: AgentHandle, { text, strategy }: WritePromptOpts): Promise<void> {
+    if (strategy === 'queue') {
+      throw new Error('e2e-test-runner: queue strategy not supported');
+    }
+    // bulk-cr: single write with trailing CR. The agent's stdin-read
+    // loop splits on \n (LF), and node-pty translates CR to LF on Windows.
+    handle.pty.write(text + '\r');
+  },
+
   async detect(_ctx: ProviderCtx) {
     return { available: true, binary: process.execPath, version: process.version };
   },
@@ -214,6 +277,9 @@ export const e2eTestRunnerProvider: AgentCliProvider = {
     writeMcpJson(ctx, opts.workspaceInfo.path, opts.mcp);
 
     const env = { ...process.env, ...opts.ambientEnv } as Record<string, string>;
+    if (opts.mode === 'interactive') {
+      env.CLAWDEVBOX_E2E_INTERACTIVE = '1';
+    }
     const pty = ctx.spawnPty(process.execPath, [scriptPath], {
       cwd: opts.workspaceInfo.path,
       env,
