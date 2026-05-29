@@ -357,6 +357,9 @@ export function registerRecipeEntries(ws: Workspace): void {
           .min(1)
           .optional()
           .describe('Recipe-instance id to resume. When set, the agent CLI is spawned with --resume <session_id_of_resume_of> and the new instance is recorded as a continuation.'),
+        spawn_mode: z.enum(['interactive', 'headless']).optional().describe(
+          "Spawn mode. 'headless' (default) exits when the prompt is complete. 'interactive' keeps the pty alive, exposing a SessionConductor so external callers can dispatch follow-up prompts.",
+        ),
       }),
     handler: async (args) => {
       // 1. Resolve the recipe — either by id (saved) or by inline source (ad-hoc).
@@ -506,6 +509,7 @@ export function registerRecipeEntries(ws: Workspace): void {
         agent,
         sessionId: args.session_id,
         resumeOf: args.resume_of,
+        spawnMode: args.spawn_mode,
         workspacesRoot,
         ws,
         cfg,
