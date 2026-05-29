@@ -24,7 +24,25 @@ export interface TriggerEnvelope {
   trigger_event_name: 'TriggerFired';
   trigger_id: string;
   run_id: string;
-  callback_url: string;
+  /**
+   * Absolute path to the per-attempt output directory the dispatcher
+   * created BEFORE spawning this script. Scripts may write audit /
+   * observation files here directly via filesystem; the kernel does not
+   * read them. Path shape: <ws>/.clawdevbox/fires/<fire_id>/attempt-<N>/
+   */
+  output_dir: string;
+  /**
+   * URL to POST { prompt: string } to dispatch a prompt to the agent
+   * attached to THIS trigger's subscriber_thread_id. Present only when
+   * the trigger registration has subscriber_thread_id set AND that
+   * thread's pty is live in pty-registry at script-spawn time.
+   */
+  dispatch_url?: string;
+  /**
+   * URL to POST { prompt: string, agent?: string, workspace_id?: string }
+   * to spawn a fresh interactive agent. Always present.
+   */
+  spawn_url: string;
   state: Record<string, unknown>;
   payload: unknown;
 }
@@ -36,7 +54,7 @@ export interface RunOptions {
   callbackSecret: string;
   timeoutMs: number;
   cwd?: string;
-  /** Extra env vars merged into the spawn env (CLAWDEVBOX_MCP_SECRET is set by the runner). */
+  /** Extra env vars merged into the spawn env (CLAWDEVBOX_FIRE_SECRET is set by the runner). */
   env?: Record<string, string>;
 }
 
@@ -86,7 +104,7 @@ export async function runTriggerScript(opts: RunOptions): Promise<RunResult> {
     env: {
       ...process.env,
       ...(opts.env ?? {}),
-      CLAWDEVBOX_MCP_SECRET: opts.callbackSecret,
+      CLAWDEVBOX_FIRE_SECRET: opts.callbackSecret,
     },
     stdio: ['pipe', 'pipe', 'pipe'],
     windowsHide: true,

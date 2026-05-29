@@ -31,7 +31,6 @@
  * Required params missing surface as PARAM_VALIDATION with structured errors.
  */
 
-import { createServer } from 'node:http';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve as pathResolve, sep } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -840,7 +839,7 @@ export function registerTriggerEntries(ws: Workspace): void {
   // -- trigger.test ---------------------------------------------------------
   defineTool({
     name: 'trigger.test',
-    description: 'Run a trigger script with a synthesized envelope and capture the result. NON-MUTATING — does not write to triggers.json or update state. Three input sources (XOR): `id` (registered instance), `template_id` (saved type, any scope), or `script` + `runtime` (inline). Captures Mode A (stdout `callback.body`) and Mode B (HTTP POST to a fresh ephemeral 127.0.0.1 receiver) callbacks; receiver enforces `Authorization: Bearer <fresh-secret>` like the real /callback/* endpoints. Hard timeout (default 30s).',
+    description: 'Run a trigger script with a synthesized envelope and capture the result. NON-MUTATING — does not write to triggers.json or update state. Three input sources (XOR): `id` (registered instance), `template_id` (saved type, any scope), or `script` + `runtime` (inline). Captures stdout/stderr and any observation files the script wrote to envelope.output_dir. Hard timeout (default 30s).',
     parameters: z.object({
         id: z.string().min(1).optional(),
         template_id: z.string().min(1).optional(),
@@ -951,30 +950,8 @@ export function registerTriggerEntries(ws: Workspace): void {
       const payload = args.payload ?? null;
 
       const secret = randomBytes(24).toString('hex');
-      const captures: Array<{ mode: 'A' | 'B'; path: string; method: string; body: unknown; received_at: number }> = [];
-      const httpServer = createServer((req, res) => {
-        let body = '';
-        req.on('data', (c) => { body += c.toString('utf8'); });
-        req.on('end', () => {
-          if (req.headers['authorization'] !== `Bearer ${secret}`) {
-            res.statusCode = 401;
-            res.end(JSON.stringify({ error: 'unauthorized' }));
-            return;
-          }
-          let parsed: unknown;
-          try { parsed = JSON.parse(body); } catch { parsed = body; }
-          captures.push({
-            mode: 'B', path: req.url ?? '/', method: req.method ?? 'POST',
-            body: parsed, received_at: Date.now(),
-          });
-          res.statusCode = 200;
-          res.end(JSON.stringify({ ok: true }));
-        });
-      });
-      await new Promise<void>((r) => httpServer.listen(0, '127.0.0.1', r));
-      const port = (httpServer.address() as { port: number }).port;
+      const tmpOutDir = mkdtempSync(join(tmpdir(), 'cdb-trigger-test-out-'));
       const runId = mintId('run');
-      const callbackUrl = `http://127.0.0.1:${port}/callback/test/${runId}`;
 
       let runResult: Awaited<ReturnType<typeof runTriggerScript>> | null = null;
       try {
@@ -983,34 +960,28 @@ export function registerTriggerEntries(ws: Workspace): void {
           envelope: {
             trigger_event_name: 'TriggerFired',
             trigger_id: resolvedTriggerId, run_id: runId,
-            callback_url: callbackUrl, state, payload,
+            output_dir: tmpOutDir,
+            // Test-mode envelope omits dispatch_url (no live pty target in unit
+            // tests) and uses an empty spawn_url. trigger.test exists to
+            // exercise script logic + observation-file emission, not to
+            // dispatch to live agents.
+            spawn_url: '',
+            state, payload,
           },
           callbackSecret: secret,
           timeoutMs: args.timeout_ms ?? 30000,
         });
       } finally {
-        await new Promise<void>((r) => httpServer.close(() => r()));
         if (tmpScriptDir) {
           try { rmSync(tmpScriptDir, { recursive: true, force: true }); } catch { /* ignore */ }
         }
+        try { rmSync(tmpOutDir, { recursive: true, force: true }); } catch { /* ignore */ }
       }
-
-      // Mode A — extract from stdout_parsed.callback.body if present.
-      const parsed = runResult.stdout_parsed as { callback?: { body?: unknown } } | null;
-      const modeAList: typeof captures = [];
-      if (parsed && typeof parsed === 'object' && parsed.callback && typeof parsed.callback === 'object') {
-        modeAList.push({
-          mode: 'A', path: callbackUrl, method: 'POST',
-          body: (parsed.callback as { body?: unknown }).body ?? null,
-          received_at: Date.now(),
-        });
-      }
-      const callbacks = [...modeAList, ...captures];
 
       return {
         content: [{
           type: 'text',
-          text: `trigger.test (${resolvedTriggerId}): exit=${runResult.exit_code}, timed_out=${runResult.timed_out}, callbacks=${callbacks.length}, ${runResult.duration_ms}ms`,
+          text: `trigger.test (${resolvedTriggerId}): exit=${runResult.exit_code}, timed_out=${runResult.timed_out}, ${runResult.duration_ms}ms`,
         }],
         structuredContent: {
           run_id: runId,
@@ -1020,7 +991,7 @@ export function registerTriggerEntries(ws: Workspace): void {
           stdout: runResult.stdout,
           stderr: runResult.stderr,
           stdout_parsed: runResult.stdout_parsed,
-          callbacks,
+          callbacks: [],
         },
       };
     },

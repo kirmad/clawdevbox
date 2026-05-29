@@ -11,11 +11,13 @@
  *   GET  /api/fires/:fire_id      single fire + on-disk stdout/stderr/callbacks
  *   POST /api/fires/:fire_id/retry  manual requeue of a terminal fire
  *   POST /api/cron/diagnose       force scheduler reschedule
- *   POST /callback/:fire_id       per-fire-secret Mode B callback drop
+ *   POST /dispatch/:fire_id       per-fire bearer — route prompt to subscriber pty
+ *   POST /spawn/:fire_id          per-fire bearer — spawn a fresh agent
+ *   GET  /api/sessions/:instance  introspect a live pty/conductor
  *
  * Auth: all `/api/*` routes require `Authorization: Bearer <token>` matched
- * against `cfg.http.token`. `/callback/:fire_id` uses a per-fire secret
- * minted by the dispatcher when a script binding runs.
+ * against `cfg.http.token`. `/dispatch/:fire_id` and `/spawn/:fire_id` use a
+ * per-fire secret minted by the dispatcher when a script binding runs.
  */
 import {
   closeSync,
@@ -51,8 +53,8 @@ export interface CronApiContext {
   /**
    * Expected bearer token for `/api/*` routes. When null/empty, auth is
    * disabled — the server is treated as loopback-only and any caller may
-   * hit these endpoints. The per-fire secret used on `/callback/<fire_id>`
-   * is independent of this token.
+   * hit these endpoints. The per-fire secret used on `/dispatch/<fire_id>`
+   * and `/spawn/<fire_id>` is independent of this token.
    */
   expectedToken: string | null;
 }
@@ -157,38 +159,61 @@ export async function handleCronApi(
   const path = url.pathname;
   const method = req.method ?? 'GET';
 
-  // ----- /callback/<fire_id> ------------------------------------------------
-  // Per-fire bearer (NOT cfg.http.token) — the dispatcher mints a fresh
-  // secret per script binding and injects it as CLAWDEVBOX_MCP_SECRET.
+  // ----- /dispatch/<fire_id> ------------------------------------------------
+  // Per-fire bearer (CLAWDEVBOX_FIRE_SECRET); routes a prompt into the
+  // SessionConductor for the trigger's subscriber pty.
   {
-    const m = path.match(/^\/callback\/([^/]+)\/?$/);
+    const m = path.match(/^\/dispatch\/([^/]+)\/?$/);
     if (m) {
-      if (method !== 'POST') {
-        sendJson(res, 405, { error: 'method not allowed' });
-        return true;
-      }
+      if (method !== 'POST') { sendJson(res, 405, { error: 'method not allowed' }); return true; }
       const fireId = decodeURIComponent(m[1]!);
       const presented = bearer(req);
-      if (!presented) {
-        reject401(res, 'missing bearer token');
+      if (!presented) { reject401(res, 'missing bearer token'); return true; }
+      const body = (await readJson<{ prompt?: unknown }>(req)) ?? {};
+      if (typeof body.prompt !== 'string' || body.prompt.length === 0) {
+        sendJson(res, 400, { error: 'prompt required (non-empty string)' });
         return true;
       }
-      const body = (await readJson<unknown>(req)) ?? {};
-      const result = ctx.dispatcher.recordCallback(fireId, presented, body);
-      if (result === 'unauthorized') {
-        reject401(res, 'invalid bearer token');
-        return true;
-      }
-      if (result === 'not_found') {
-        sendJson(res, 404, { error: 'fire not found or not in flight', fire_id: fireId });
-        return true;
-      }
-      sendJson(res, 200, { ok: true, received_at: Date.now() });
+      const result = await ctx.dispatcher.dispatchToConductor(fireId, presented, body.prompt);
+      if (result.status === 'not_found_fire')        { sendJson(res, 404, { error: 'fire not found or not in flight', fire_id: fireId }); return true; }
+      if (result.status === 'unauthorized')          { reject401(res, 'invalid bearer token'); return true; }
+      if (result.status === 'no_dispatch_target')    { sendJson(res, 404, { error: 'no dispatch target for this fire' }); return true; }
+      if (result.status === 'target_unavailable')    { sendJson(res, 404, { error: 'dispatch target pty has exited' }); return true; }
+      sendJson(res, 200, { ok: true, queued_at: Date.now(), state: result.state });
       return true;
     }
   }
 
-  if (!path.startsWith('/api/cron/') && !path.startsWith('/api/fires')) {
+  // ----- /spawn/<fire_id> --------------------------------------------------
+  // Per-fire bearer; spawns a fresh interactive agent session via recipe-runner.
+  {
+    const m = path.match(/^\/spawn\/([^/]+)\/?$/);
+    if (m) {
+      if (method !== 'POST') { sendJson(res, 405, { error: 'method not allowed' }); return true; }
+      const fireId = decodeURIComponent(m[1]!);
+      const presented = bearer(req);
+      if (!presented) { reject401(res, 'missing bearer token'); return true; }
+      const body = (await readJson<{ prompt?: unknown; agent?: unknown; workspace_id?: unknown }>(req)) ?? {};
+      if (typeof body.prompt !== 'string' || body.prompt.length === 0) {
+        sendJson(res, 400, { error: 'prompt required (non-empty string)' });
+        return true;
+      }
+      const result = await ctx.dispatcher.spawnFromCallback(
+        fireId,
+        presented,
+        body.prompt,
+        typeof body.agent === 'string' ? body.agent : undefined,
+        typeof body.workspace_id === 'string' ? body.workspace_id : undefined,
+      );
+      if (result.status === 'not_found_fire') { sendJson(res, 404, { error: 'fire not found or not in flight', fire_id: fireId }); return true; }
+      if (result.status === 'unauthorized')   { reject401(res, 'invalid bearer token'); return true; }
+      if (result.status === 'spawn_failed')   { sendJson(res, 500, { error: `spawn failed: ${result.message}` }); return true; }
+      sendJson(res, 200, { ok: true, instance_id: result.instanceId, session_id: result.sessionId });
+      return true;
+    }
+  }
+
+  if (!path.startsWith('/api/cron/') && !path.startsWith('/api/fires') && !path.startsWith('/api/sessions')) {
     return false;
   }
 
@@ -203,6 +228,26 @@ export async function handleCronApi(
     }
     if (!constantTimeEquals(token, ctx.expectedToken)) {
       reject401(res, 'invalid bearer token');
+      return true;
+    }
+  }
+
+  // ----- GET /api/sessions/<instance_id> ----------------------------------
+  {
+    const m = path.match(/^\/api\/sessions\/([^/]+)\/?$/);
+    if (m && method === 'GET') {
+      const { getConductor, hasSession, getSessionMeta } = await import('../pty-registry.ts');
+      const instanceId = decodeURIComponent(m[1]!);
+      if (!hasSession(instanceId)) { sendJson(res, 404, { error: 'session not found' }); return true; }
+      const cond = getConductor(instanceId);
+      const meta = getSessionMeta(instanceId);
+      sendJson(res, 200, {
+        instance_id: instanceId,
+        state: cond?.state ?? 'unknown',
+        queue_depth: cond?.pendingCount() ?? 0,
+        provider_id: meta?.agentCli ?? null,
+        agent_session_id: meta?.sessionId ?? null,
+      });
       return true;
     }
   }

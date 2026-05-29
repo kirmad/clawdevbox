@@ -861,6 +861,7 @@ export async function runStart(flags: Flags): Promise<void> {
     maxConcurrent: cfg.cron.max_concurrent,
     drainMs: cfg.cron.dispatcher_drain_ms,
     callbackUrlBase: `http://${cfg.http.host}:${boundPort}`,
+    defaultAgentCli: cfg.defaultAgentCli ?? 'copilot',
   });
   dispatcher.start();
   const scheduler = new Scheduler(opened.db, dispatcher, ws);

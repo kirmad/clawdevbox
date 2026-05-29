@@ -117,10 +117,6 @@ test('dispatcher: script binding success path writes stdout.txt + marks success'
   assert.equal(ok, true, 'fire should reach success');
   const stdoutPath = join(wsPath, '.clawdevbox', 'fires', fid, 'attempt-1', 'stdout.txt');
   assert.equal(existsSync(stdoutPath), true, 'attempt-1/stdout.txt should exist');
-  const callbacksPath = join(wsPath, '.clawdevbox', 'fires', fid, 'attempt-1', 'callbacks.json');
-  assert.equal(existsSync(callbacksPath), true);
-  const callbacks = JSON.parse(readFileSync(callbacksPath, 'utf8'));
-  assert.equal(callbacks.length, 1, 'mode-a callback should be captured');
   // State should be persisted back.
   const t = db.prepare(`SELECT state_json FROM triggers WHERE id='demo.mode-a#t1'`).get();
   const state = JSON.parse(t.state_json);

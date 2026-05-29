@@ -20,7 +20,7 @@
  * `stop()` is awaitable: stops accepting new picks, drains in-flight up to
  * `drainMs`, marks the survivors `failed/service_shutdown`.
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import type { Database } from 'better-sqlite3';
@@ -78,6 +78,21 @@ export interface DispatcherOptions {
   callbackUrlBase?: string;
   /** Hard timeout for script binding (default 60s). */
   scriptTimeoutMs?: number;
+  /** Provider id used as the spawn default when /spawn/<fire_id> doesn't override. Default 'copilot'. */
+  defaultAgentCli?: string;
+}
+
+interface ActiveRunEntry {
+  secret: string;
+  outDir: string;
+  triggerId: string;
+  dispatchTargetInstanceId?: string;
+  spawnDefaults: {
+    providerId: string;
+    agent?: string;
+    workspaceId: string;
+    workspacePath: string;
+  };
 }
 
 export class Dispatcher {
@@ -87,8 +102,9 @@ export class Dispatcher {
   private drainMs: number;
   private callbackUrlBase: string;
   private scriptTimeoutMs: number;
+  private defaultAgentCli: string;
   private inFlight = new Set<string>();
-  private activeRuns = new Map<string, { secret: string; outDir: string }>();
+  private activeRuns = new Map<string, ActiveRunEntry>();
   private stopped = false;
   /**
    * Unsubscribes the bus listener that wakes pickUp() on 'fires' events.
@@ -105,6 +121,7 @@ export class Dispatcher {
     this.drainMs = opts.drainMs ?? 15_000;
     this.callbackUrlBase = opts.callbackUrlBase ?? 'http://127.0.0.1:5201';
     this.scriptTimeoutMs = opts.scriptTimeoutMs ?? 60_000;
+    this.defaultAgentCli = opts.defaultAgentCli ?? 'copilot';
   }
 
   start(): void {
@@ -203,52 +220,103 @@ export class Dispatcher {
   }
 
   /**
-   * Mode-B callback drop. Validates the bearer against the per-fire secret
-   * minted in `runScriptBinding`, then appends `body` to that attempt's
-   * `callbacks.json` file. The file is a JSON array — we read-modify-write
-   * so concurrent calls atomically grow it.
-   *
-   * Returns:
-   *   - `'not_found'`     no script binding is currently running for this fire
-   *   - `'unauthorized'`  the presented secret doesn't match
-   *   - `'ok'`            body persisted to disk (best-effort)
+   * Dispatch a prompt to the SessionConductor attached to the fire's
+   * subscriber pty. Returns a discriminated union signaling the routing
+   * outcome; the HTTP handler maps each variant to an appropriate response.
    */
-  recordCallback(
+  async dispatchToConductor(
     fire_id: string,
     presentedSecret: string,
-    body: unknown,
-  ): 'ok' | 'unauthorized' | 'not_found' {
+    prompt: string,
+  ): Promise<
+    | { status: 'not_found_fire' }
+    | { status: 'unauthorized' }
+    | { status: 'no_dispatch_target' }
+    | { status: 'target_unavailable' }
+    | { status: 'ok'; state: 'idle' | 'busy' | 'starting' | 'exited' }
+  > {
     const entry = this.activeRuns.get(fire_id);
-    if (!entry) return 'not_found';
-    if (!constantTimeEquals(entry.secret, presentedSecret)) return 'unauthorized';
-    try {
-      const cbPath = join(entry.outDir, 'callbacks.json');
-      let existing: unknown[] = [];
-      if (existsSync(cbPath)) {
-        try {
-          const parsed = JSON.parse(readFileSync(cbPath, 'utf8'));
-          if (Array.isArray(parsed)) existing = parsed;
-        } catch {
-          /* corrupt — overwrite */
-        }
-      } else {
-        mkdirSync(entry.outDir, { recursive: true });
-      }
-      existing.push({
-        mode: 'B',
-        path: `/callback/${fire_id}`,
-        method: 'POST',
-        body,
-        received_at: Date.now(),
-      });
-      writeFileSync(cbPath, JSON.stringify(existing, null, 2));
-    } catch (err) {
+    if (!entry) return { status: 'not_found_fire' };
+    if (!constantTimeEquals(entry.secret, presentedSecret)) return { status: 'unauthorized' };
+    if (!entry.dispatchTargetInstanceId) return { status: 'no_dispatch_target' };
+    const { getConductor } = await import('./pty-registry.ts');
+    const conductor = getConductor(entry.dispatchTargetInstanceId);
+    if (!conductor) return { status: 'target_unavailable' };
+    // Fire-and-forget — we don't await the dispatch's completion (the
+    // queued prompt executes asynchronously in the agent). dispatch()'s
+    // promise resolves on the dispatched prompt's done signal, which may
+    // be many seconds; the HTTP caller only needs the queue ack.
+    conductor.dispatch(prompt, { strategy: 'auto' }).catch((err) => {
       logger.warn(
-        { err: err instanceof Error ? err.message : String(err), fire_id },
-        'dispatcher: callback write failed',
+        { fire_id, err: err instanceof Error ? err.message : String(err) },
+        'dispatcher: dispatchToConductor — conductor.dispatch rejected',
       );
+    });
+    return { status: 'ok', state: conductor.state };
+  }
+
+  /**
+   * Spawn a fresh interactive agent session via recipe-runner with the
+   * supplied prompt. Optional body fields can override the trigger's
+   * configured defaults. Returns the new instance_id + sessionId on
+   * success.
+   */
+  async spawnFromCallback(
+    fire_id: string,
+    presentedSecret: string,
+    prompt: string,
+    agentOverride?: string,
+    workspaceIdOverride?: string,
+  ): Promise<
+    | { status: 'not_found_fire' }
+    | { status: 'unauthorized' }
+    | { status: 'spawn_failed'; message: string }
+    | { status: 'ok'; instanceId: string; sessionId: string }
+  > {
+    const entry = this.activeRuns.get(fire_id);
+    if (!entry) return { status: 'not_found_fire' };
+    if (!constantTimeEquals(entry.secret, presentedSecret)) return { status: 'unauthorized' };
+
+    const { runRecipe } = await import('./recipe-runner.ts');
+    const { resolveConfig } = await import('./config.ts');
+    const { resolveWorkspacesRoot } = await import('./workspaces-store.ts');
+
+    const cfg = resolveConfig({ projectDir: this.ws.projectDir, globalDir: this.ws.globalDir });
+    const workspacesRoot = resolveWorkspacesRoot();
+    const agent = agentOverride ?? entry.spawnDefaults.agent;
+    const workspaceInfo =
+      workspaceIdOverride
+        ? this.resolveWorkspaceById(workspaceIdOverride) ?? { id: entry.spawnDefaults.workspaceId, path: entry.spawnDefaults.workspacePath }
+        : { id: entry.spawnDefaults.workspaceId, path: entry.spawnDefaults.workspacePath };
+
+    try {
+      const result = await runRecipe({
+        recipeId: null,
+        recipeSnapshot: '',
+        isAdhoc: true,
+        prompt,
+        spawnMode: 'interactive',
+        workspaceInfo,
+        agentCli: entry.spawnDefaults.providerId,
+        agent,
+        workspacesRoot,
+        ws: this.ws,
+        cfg,
+        triggerId: entry.triggerId,
+        fireId: fire_id,
+      });
+      if (result.spawn_error) {
+        return { status: 'spawn_failed', message: `${result.spawn_error.code}: ${result.spawn_error.message}` };
+      }
+      return { status: 'ok', instanceId: result.recipe_instance_id, sessionId: result.session_id };
+    } catch (err) {
+      return { status: 'spawn_failed', message: err instanceof Error ? err.message : String(err) };
     }
-    return 'ok';
+  }
+
+  private resolveWorkspaceById(id: string): { id: string; path: string } | null {
+    const row = this.db.prepare('SELECT id, path FROM workspaces WHERE id = ?').get(id) as { id: string; path: string } | undefined;
+    return row ?? null;
   }
 
   private async runFire(fire: FireRow): Promise<void> {
@@ -389,14 +457,46 @@ export class Dispatcher {
     if (!typeManifest) throw new Error(`trigger type not found: ${trigger.type}`);
     const runtime = ((typeManifest as unknown as { runtime?: TriggerRuntime }).runtime ?? 'tsx') as TriggerRuntime;
     const callbackSecret = randomBytes(16).toString('hex');
-    const callbackUrl = `${this.callbackUrlBase}/callback/${fire.fire_id}`;
-    // Register the per-fire secret + outDir so /callback/<fire_id> can
-    // validate the bearer and append the body to attempt-N/callbacks.json
-    // while the script is running.
-    this.activeRuns.set(fire.fire_id, { secret: callbackSecret, outDir });
+    const baseUrl = this.callbackUrlBase;
+    const dispatchUrl = `${baseUrl}/dispatch/${fire.fire_id}`;
+    const spawnUrl = `${baseUrl}/spawn/${fire.fire_id}`;
+
+    const wsRow = this.db
+      .prepare(`SELECT id, path FROM workspaces WHERE id = ?`)
+      .get(fire.workspace_id) as WorkspaceRowLite | undefined;
+    if (!wsRow) throw new Error(`workspace not found: ${fire.workspace_id}`);
 
     const state = (JSON.parse(trigger.state_json) as Record<string, unknown>) || {};
+
+    // Resolve dispatch target from the trigger's stashed subscriber thread id
+    // (if any), but only if that pty is live in pty-registry right now.
+    let dispatchTargetInstanceId: string | undefined;
+    try {
+      const subscriberThreadId = state.__subscriber_thread_id;
+      if (typeof subscriberThreadId === 'string') {
+        const { hasSession } = await import('./pty-registry.ts');
+        if (hasSession(subscriberThreadId)) {
+          dispatchTargetInstanceId = subscriberThreadId;
+        }
+      }
+    } catch { /* malformed state — skip dispatch routing */ }
     delete (state as Record<string, unknown>).__subscriber_thread_id;
+
+    const spawnDefaults: ActiveRunEntry['spawnDefaults'] = {
+      providerId: this.defaultAgentCli,
+      agent: 'dev-buddy:dev-buddy',
+      workspaceId: wsRow.id,
+      workspacePath: wsRow.path,
+    };
+
+    this.activeRuns.set(fire.fire_id, {
+      secret: callbackSecret,
+      outDir,
+      triggerId: trigger.id,
+      dispatchTargetInstanceId,
+      spawnDefaults,
+    });
+
     const payload = fire.payload_json ? JSON.parse(fire.payload_json) : null;
 
     const result = await runTriggerScript({
@@ -406,7 +506,9 @@ export class Dispatcher {
         trigger_event_name: 'TriggerFired',
         trigger_id: trigger.id,
         run_id: fire.fire_id,
-        callback_url: callbackUrl,
+        output_dir: outDir,
+        dispatch_url: dispatchTargetInstanceId ? dispatchUrl : undefined,
+        spawn_url: spawnUrl,
         state,
         payload,
       },
@@ -424,34 +526,9 @@ export class Dispatcher {
       );
     }
 
-    // Mode A callback extraction. Mode B callbacks were already appended
-    // to callbacks.json by /callback/<fire_id> in real time — read them
-    // first so we don't clobber them.
-    let callbacks: Array<{ mode: 'A' | 'B'; body: unknown; received_at: number; [k: string]: unknown }> = [];
-    try {
-      const cbPath = join(outDir, 'callbacks.json');
-      if (existsSync(cbPath)) {
-        const parsed = JSON.parse(readFileSync(cbPath, 'utf8'));
-        if (Array.isArray(parsed)) callbacks = parsed;
-      }
-    } catch {
-      /* best-effort */
-    }
     const parsed = result.stdout_parsed as
-      | { callback?: { body?: unknown }; state?: unknown }
+      | { state?: unknown }
       | null;
-    if (parsed && parsed.callback && typeof parsed.callback === 'object') {
-      callbacks.push({
-        mode: 'A',
-        body: (parsed.callback as { body?: unknown }).body ?? null,
-        received_at: Date.now(),
-      });
-    }
-    try {
-      writeFileSync(join(outDir, 'callbacks.json'), JSON.stringify(callbacks, null, 2));
-    } catch {
-      /* best-effort */
-    }
 
     if (result.timed_out) throw new Error('script_timeout');
     if (result.exit_code !== 0) {
