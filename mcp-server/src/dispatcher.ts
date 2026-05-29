@@ -39,6 +39,7 @@ import {
 import { runTriggerScript } from './trigger-runner.ts';
 import type { TriggerRuntime } from './validators.ts';
 import { type RegisteredTriggerType, type Workspace } from './workspace.ts';
+import type { runRecipe as RunRecipeFn } from './recipe-runner.ts';
 
 function constantTimeEquals(a: string, b: string): boolean {
   if (a.length !== b.length) return false;
@@ -80,9 +81,15 @@ export interface DispatcherOptions {
   scriptTimeoutMs?: number;
   /** Provider id used as the spawn default when /spawn/<fire_id> doesn't override. Default 'copilot'. */
   defaultAgentCli?: string;
+  /**
+   * Test seam — overrides the runRecipe import used by spawnFromCallback.
+   * Production callers leave this undefined; tests inject a stub to avoid
+   * pty.spawn + filesystem writes.
+   */
+  runRecipeFn?: typeof RunRecipeFn;
 }
 
-interface ActiveRunEntry {
+export interface ActiveRunEntry {
   secret: string;
   outDir: string;
   triggerId: string;
@@ -103,6 +110,7 @@ export class Dispatcher {
   private callbackUrlBase: string;
   private scriptTimeoutMs: number;
   private defaultAgentCli: string;
+  private runRecipeFn: typeof RunRecipeFn | null;
   private inFlight = new Set<string>();
   private activeRuns = new Map<string, ActiveRunEntry>();
   private stopped = false;
@@ -122,6 +130,7 @@ export class Dispatcher {
     this.callbackUrlBase = opts.callbackUrlBase ?? 'http://127.0.0.1:5201';
     this.scriptTimeoutMs = opts.scriptTimeoutMs ?? 60_000;
     this.defaultAgentCli = opts.defaultAgentCli ?? 'copilot';
+    this.runRecipeFn = opts.runRecipeFn ?? null;
   }
 
   start(): void {
@@ -220,6 +229,17 @@ export class Dispatcher {
   }
 
   /**
+   * Test seam — register an active-run entry as if a script binding had
+   * just kicked off. Production code path is `runScriptBinding`, which
+   * calls this method internally. Tests use it directly to exercise
+   * `/dispatch/<fire_id>` and `/spawn/<fire_id>` without spinning up a
+   * real trigger script.
+   */
+  recordActiveRun(fireId: string, entry: ActiveRunEntry): void {
+    this.activeRuns.set(fireId, entry);
+  }
+
+  /**
    * Dispatch a prompt to the SessionConductor attached to the fire's
    * subscriber pty. Returns a discriminated union signaling the routing
    * outcome; the HTTP handler maps each variant to an appropriate response.
@@ -277,7 +297,9 @@ export class Dispatcher {
     if (!entry) return { status: 'not_found_fire' };
     if (!constantTimeEquals(entry.secret, presentedSecret)) return { status: 'unauthorized' };
 
-    const { runRecipe } = await import('./recipe-runner.ts');
+    const { runRecipe } = this.runRecipeFn
+      ? { runRecipe: this.runRecipeFn }
+      : await import('./recipe-runner.ts');
     const { resolveConfig } = await import('./config.ts');
     const { resolveWorkspacesRoot } = await import('./workspaces-store.ts');
 
@@ -489,7 +511,7 @@ export class Dispatcher {
       workspacePath: wsRow.path,
     };
 
-    this.activeRuns.set(fire.fire_id, {
+    this.recordActiveRun(fire.fire_id, {
       secret: callbackSecret,
       outDir,
       triggerId: trigger.id,
