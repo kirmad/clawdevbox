@@ -748,6 +748,20 @@ Once registered, a row can be fired five ways:
 
 ### 8.5 Stdin envelope at fire time
 
+> **Implementation note (2026-05-29).** The §8.5–§8.10 sections below describe
+> the **original conceptual design** — a single `callback_url` per registered
+> trigger with the routing baked into the path, Mode-A vs Mode-B response
+> protocols, and a Claude-Code-style stdout JSON envelope (`callback`,
+> `continue`, `decision`, etc.). The shipped implementation has since
+> diverged. The current envelope contract — `output_dir` + `dispatch_url?` +
+> `spawn_url`, per-fire `CLAWDEVBOX_FIRE_SECRET`, and the
+> `POST /dispatch/<fire_id>` + `POST /spawn/<fire_id>` + `GET /api/sessions/<id>`
+> endpoints — is the source of truth for trigger authors. See
+> [`docs/tools/trigger.md`](./tools/trigger.md#trigger-envelope-contract) and
+> [`docs/tools/cron.md`](./tools/cron.md#endpoints). The original prose below
+> is retained as a historical design record; do not rely on the URL shapes,
+> response fields, or env-var names in §§8.5–8.10 for new work.
+
 The stdin envelope (full shape in §8.6 below) merges the registration's `state` with everything the script needs to act. The type's `parameters[]` defines the **initial state shape** — at `trigger.register` time, the resolved params (with defaults applied) seed `state` so the first fire reads them under their declared names. Subsequent fires update `state` via the script's stdout, so additional fields accumulate (e.g., `lastCheckedAt` cursors). The script reads `env.state.<param-name>` directly — no separate `params` envelope field is necessary.
 
 ### 8.6 Configuration: `.conductor/triggers.json`

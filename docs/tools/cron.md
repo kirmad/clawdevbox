@@ -91,7 +91,8 @@ Every fire produces a directory under the workspace:
 ├── attempt-1/
 │   ├── stdout.txt        ← trigger-runner stdout capture
 │   ├── stderr.txt        ← trigger-runner stderr capture
-│   └── callbacks.json    ← appended by POST /callback/<fire_id> (Mode B)
+│   └── ...               ← any observation files the trigger script wrote
+│                            into envelope.output_dir (kernel does not read)
 ├── attempt-2/
 │   └── ...
 ```
@@ -105,8 +106,8 @@ picks a specific one.
 | Surface | Auth | Source |
 |---|---|---|
 | `GET /healthz` | none | — |
-| `GET /api/cron/*`, `GET /api/fires*`, `POST /api/cron/*`, `POST /api/fires/*/retry` | `Authorization: Bearer <token>` | `cfg.http.token` (the service-wide token from `config.json` or `CLAWDEVBOX_TOKEN`). |
-| `POST /callback/:fire_id` | `Authorization: Bearer <secret>` | A **per-fire** secret minted by the dispatcher when it launches a script binding. The secret is injected into the script process as `CLAWDEVBOX_MCP_SECRET` and is only valid while the fire is in flight. |
+| `GET /api/cron/*`, `GET /api/fires*`, `POST /api/cron/*`, `POST /api/fires/*/retry`, `GET /api/sessions/:id` | `Authorization: Bearer <token>` | `cfg.http.token` (the service-wide token from `config.json` or `CLAWDEVBOX_TOKEN`). |
+| `POST /dispatch/:fire_id`, `POST /spawn/:fire_id` | `Authorization: Bearer <secret>` | A **per-fire** secret minted by the dispatcher when it launches a script binding. The secret is injected into the script process as `CLAWDEVBOX_FIRE_SECRET` and is only valid while the fire is in flight. |
 
 Bearer comparisons are constant-time. Missing/wrong tokens return `401`
 with `WWW-Authenticate: Bearer realm="clawdevbox"`.
@@ -277,33 +278,120 @@ suspected. Returns the post-reschedule scheduler status.
 
 **Errors:** `401`; `500` (`{ error: <message> }`) if the reschedule throws.
 
-### `POST /callback/:fire_id`
+### `POST /dispatch/:fire_id`
 
 **Auth:** `Authorization: Bearer <per-fire-secret>`. The secret is the
-`CLAWDEVBOX_MCP_SECRET` value injected into the trigger script process by
-the dispatcher when it spawned this fire. It is **not** the global
+`CLAWDEVBOX_FIRE_SECRET` value injected into the trigger script process
+by the dispatcher when it spawned this fire. It is **not** the global
 `cfg.http.token`.
 
-Used by trigger scripts running in **Mode B** to post their result back to
-the kernel asynchronously (for long-running webhook-style work). The body
-is appended to `attempt-N/callbacks.json` and stored verbatim — the
-dispatcher does not interpret it.
+Routes a prompt into the `SessionConductor` attached to the trigger's
+`subscriber_thread_id`. The dispatcher records the target instance id
+at script-spawn time only when that pty is live in `pty-registry`; if
+no live target exists, `dispatch_url` is omitted from the envelope and
+calls to this endpoint return 404.
 
-**Body:** any JSON. 1 MiB max.
+**Body:**
+
+```json
+{ "prompt": "Look at the new comment on PR 2401." }
+```
+
+`prompt` is required (non-empty string). 1 MiB max body.
 
 **Response (200):**
 
 ```json
-{ "ok": true, "received_at": 1715534803000 }
+{ "ok": true, "queued_at": 1715534803000, "state": "running" }
+```
+
+`state` is the conductor's post-enqueue state (e.g. `'running'`,
+`'awaiting_user'`).
+
+**Errors:**
+
+| Code | Trigger |
+|---|---|
+| `400` | `prompt` missing or not a non-empty string. |
+| `401` | Bearer missing or doesn't match the per-fire secret. |
+| `404` | `{ error: 'fire not found or not in flight' }`, `{ error: 'no dispatch target for this fire' }` (registration has no subscriber pty), or `{ error: 'dispatch target pty has exited' }` (subscriber was live at spawn but died since). |
+| `405` | Method other than POST. |
+
+### `POST /spawn/:fire_id`
+
+**Auth:** `Authorization: Bearer <per-fire-secret>` — same per-fire
+`CLAWDEVBOX_FIRE_SECRET` as `/dispatch`. Always available — the
+dispatcher emits `spawn_url` on every envelope.
+
+Spawns a fresh interactive agent session via the recipe runner (ad-hoc,
+no recipe binding). Used when the trigger has no subscriber pty bound,
+or when the script always wants a clean session.
+
+**Body:**
+
+```json
+{
+  "prompt": "Review PR 2401.",
+  "agent": "dev-buddy:dev-buddy",
+  "workspace_id": "ws_..."
+}
+```
+
+| Field | Required | Default |
+|---|---|---|
+| `prompt` | yes | — |
+| `agent` | no | Dispatcher's `defaultAgentCli` (e.g. `'copilot'`). |
+| `workspace_id` | no | The fire's workspace. |
+
+**Response (200):**
+
+```json
+{ "ok": true, "instance_id": "ri_...", "session_id": "cdb_..." }
 ```
 
 **Errors:**
 
 | Code | Trigger |
 |---|---|
-| `401` | Bearer missing or doesn't match the per-fire secret (also returned once the fire is no longer in flight). |
-| `404` | `{ error: 'fire not found or not in flight', fire_id }`. |
+| `400` | `prompt` missing or not a non-empty string. |
+| `401` | Bearer missing or doesn't match the per-fire secret. |
+| `404` | `{ error: 'fire not found or not in flight' }`. |
 | `405` | Method other than POST. |
+| `500` | `{ error: 'spawn failed: <message>' }` (recipe-runner failure). |
+
+### `GET /api/sessions/:instance_id`
+
+**Auth:** Bearer required (service token, same as `/api/cron/*`).
+
+Introspect the live `SessionConductor` for a recipe instance / spawned
+agent — useful for the SPA, debugging, and any caller that wants to
+poll for a session's state without subscribing to SSE.
+
+**Response (200):**
+
+```json
+{
+  "instance_id": "ri_...",
+  "state": "running",
+  "queue_depth": 0,
+  "provider_id": "copilot",
+  "agent_session_id": "cdb_..."
+}
+```
+
+| Field | Description |
+|---|---|
+| `state` | Conductor state (`'running'`, `'awaiting_user'`, `'idle'`, or `'unknown'` if no conductor is bound). |
+| `queue_depth` | Pending prompts queued for delivery to the agent. |
+| `provider_id` | Agent CLI identifier (e.g. `'copilot'`, `'claude'`, `'dev-buddy:dev-buddy'`). |
+| `agent_session_id` | The CLI's own session id (the `cdb_*` value passed via `--name` / `--session-id`). |
+
+**Errors:**
+
+| Code | Trigger |
+|---|---|
+| `401` | Bearer missing/invalid. |
+| `404` | `{ error: 'session not found' }` — no live conductor for that instance. |
 
 ---
 

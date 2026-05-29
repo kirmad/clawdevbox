@@ -2799,7 +2799,8 @@ trigger-kernel work, `trigger.fire` is **no longer a metadata stub** — it
 enqueues a real row into the `fires` table, the dispatcher claims it, and
 outputs land on disk under `<workspace>/.clawdevbox/fires/<fire_id>/`. See
 [`cron.md`](#cron) for the kernel control plane (`/api/cron/*`,
-`/api/fires/*`, `/callback/<fire_id>`) and the fire lifecycle diagram.
+`/api/fires/*`, `/dispatch/<fire_id>`, `/spawn/<fire_id>`,
+`/api/sessions/<id>`) and the fire lifecycle diagram.
 
 The surface is now **thirteen** MCP tools — the eight original metadata
 tools plus five added in Phases 3-5 for agent-authored templates and
@@ -3222,7 +3223,7 @@ the same as cron — manual fires always run.
 | Param | Type | Required | Description |
 |---|---|---|---|
 | `id` | `string` (min length 1) | **yes** | Registered-instance id. |
-| `payload` | `unknown` | no | Free-form data forwarded into the trigger script's stdin envelope (Mode A) and re-presented in the `/callback/<fire_id>` URL contract (Mode B). |
+| `payload` | `unknown` | no | Free-form data forwarded into the trigger script's stdin envelope as `payload`. The script reads it off stdin alongside `state` and the dispatch / spawn URLs. |
 
 **Returns** `structuredContent`:
 
@@ -3389,10 +3390,13 @@ No errors — this tool is read-only over the in-memory registry.
 
 #### `trigger.test`
 
-Run a trigger script with a synthesized envelope and capture both Mode A
-(stdout `callback.body`) and Mode B (HTTP POST) callbacks. **Non-mutating:**
-does not write to `triggers.json`, does not update `last_run_*`, does not
-touch `ws.triggerTypes`. Three mutually-exclusive sources (XOR):
+Run a trigger script with a synthesized envelope and capture stdout,
+stderr, and any observation files the script wrote into the envelope's
+`output_dir`. **Non-mutating:** does not write to `triggers.json`, does
+not update `last_run_*`, does not touch `ws.triggerTypes`, and does NOT
+spawn or dispatch to a live conductor (`dispatch_url` is omitted from
+the test envelope and `spawn_url` is set to an empty string). Three
+mutually-exclusive sources (XOR):
 
 1. `id` — a registered instance from `triggers.json` (params/state default
    from the row).
@@ -3401,9 +3405,9 @@ touch `ws.triggerTypes`. Three mutually-exclusive sources (XOR):
 3. `script` + `runtime` — an inline script.
 
 This is currently the **only** MCP tool that actually spawns a trigger
-script (`trigger.fire` is still a metadata stub). It uses
-`trigger-runner.ts` — the same runner the cron daemon will adopt when it
-ships.
+script (`trigger.fire` enqueues but the dispatcher does the work). It uses
+`trigger-runner.ts` — the same runner the in-process dispatcher uses in
+production.
 
 **Signature**
 
@@ -3429,13 +3433,9 @@ ships.
   stdout: string;            // captured raw stdout
   stderr: string;            // captured raw stderr
   stdout_parsed: unknown;    // last JSON object on stdout, or null
-  callbacks: Array<{
-    mode: 'A' | 'B';         // A = stdout `callback.body`; B = HTTP POST
-    path: string;            // request URL (B) or the synthesized callback_url (A)
-    method: string;          // 'POST' for both today
-    body: unknown;
-    received_at: number;     // unix-ms
-  }>;
+  callbacks: [];             // always empty — kept for response-shape compat
+                             // with older callers; the legacy Mode-A/Mode-B
+                             // callback model no longer exists.
 }
 ```
 
@@ -3459,23 +3459,192 @@ ships.
    non-mutating — the tmp dir is `rmSync`ed on completion (success **or**
    error). For `python` / `bash` runtimes the original script path is used
    in place.
-3. Mint a fresh per-run `Bearer <secret>` (24-byte random hex) and start an
-   ephemeral receiver bound to `127.0.0.1:0`. The receiver enforces
-   `Authorization: Bearer <secret>` (returns 401 otherwise) — same contract
-   as the production `/callback/*` endpoints. The synthesized
-   `callback_url` is `http://127.0.0.1:<port>/callback/test/<run_id>`.
+3. Create a fresh `mkdtemp` `output_dir` and mint a per-run
+   `CLAWDEVBOX_FIRE_SECRET` (24-byte random hex) used by the runner.
+   `trigger.test` does **not** start an HTTP receiver — `dispatch_url` is
+   omitted entirely from the synthesized envelope and `spawn_url` is set
+   to an empty string. The tool exercises script logic and observation-file
+   emission, not live agent dispatch.
 4. Call `runTriggerScript(...)` with the envelope `{ trigger_event_name:
-   'TriggerFired', trigger_id, run_id, callback_url, state, payload }` on
-   stdin and `callbackSecret`. Honor `timeout_ms`.
-5. After the script exits (or times out), shut the receiver down. Mode A
-   captures are reconstructed from `stdout_parsed.callback.body`; Mode B
-   captures come from the receiver's request log. Both lists are merged into
-   `callbacks[]` (Mode A first).
+   'TriggerFired', trigger_id, run_id, output_dir, spawn_url: '',
+   state, payload }` on stdin. Honor `timeout_ms`.
+5. After the script exits (or times out), capture stdout/stderr/parsed JSON,
+   then `rmSync` the tmp `output_dir`. `callbacks` in the response is
+   always `[]`.
 
 > **Note on the `package.json` sidecar.** This is an implementation detail
 > to support ESM + top-level await for `tsx`/`node` scripts. The agent
 > doesn't see it: the original script file on disk is **not** modified,
 > and the tmp directory is cleaned up before this tool returns.
+
+### Trigger envelope contract
+
+Every fire — manual, cron, webhook — invokes the trigger script with a
+single JSON object on stdin and one bootstrap env var. The contract is
+identical for `trigger.test` (with the live-dispatch fields stubbed out)
+and for production fires through the dispatcher.
+
+#### stdin envelope (`TriggerEnvelope`)
+
+```ts
+interface TriggerEnvelope {
+  trigger_event_name: 'TriggerFired';
+  trigger_id: string;
+  run_id: string;
+  /**
+   * Absolute path to the per-attempt output directory the dispatcher
+   * created BEFORE spawning this script. The script may write audit /
+   * observation files here directly via the filesystem; the kernel does
+   * not interpret them. Path shape:
+   *   <ws>/.clawdevbox/fires/<fire_id>/attempt-<N>/
+   */
+  output_dir: string;
+  /**
+   * URL to POST `{ prompt: string }` to dispatch a prompt to the agent
+   * attached to THIS trigger's `subscriber_thread_id`. Present only when
+   * the trigger registration has `subscriber_thread_id` set AND that
+   * thread's pty is live in `pty-registry` at script-spawn time.
+   * Authenticated with `Authorization: Bearer ${CLAWDEVBOX_FIRE_SECRET}`.
+   */
+  dispatch_url?: string;
+  /**
+   * URL to POST `{ prompt: string, agent?: string, workspace_id?: string }`
+   * to spawn a fresh interactive agent. Always present.
+   * Authenticated with `Authorization: Bearer ${CLAWDEVBOX_FIRE_SECRET}`.
+   */
+  spawn_url: string;
+  /** Last persisted state for this registration (defaults to {} on first run). */
+  state: Record<string, unknown>;
+  /** Free-form payload supplied by the firer (manual `trigger.fire` arg, webhook body, etc.). */
+  payload: unknown;
+}
+```
+
+#### env var
+
+| Env var | Description |
+|---|---|
+| `CLAWDEVBOX_FIRE_SECRET` | Per-fire bearer secret minted by the dispatcher and injected into the script process. Use it in the `Authorization: Bearer <secret>` header on every `dispatch_url` / `spawn_url` POST. The secret is only valid while the fire is in flight; once the script exits the dispatcher invalidates it. |
+
+#### sample trigger scripts
+
+The three snippets below share a tiny `readStdin()` helper. Trigger scripts
+run under `tsx` (Node), so use the Node-portable async-iterator idiom rather
+than the web `Response`/`Bun.stdin` shapes:
+
+```ts
+async function readStdin(): Promise<string> {
+  let raw = '';
+  for await (const chunk of process.stdin) raw += chunk;
+  return raw;
+}
+```
+
+Write a structured observation to `output_dir` (no dispatch, no spawn):
+
+```ts
+// .clawdevbox/trigger-types/local.pr-watcher/trigger.ts
+import { writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+async function readStdin(): Promise<string> {
+  let raw = '';
+  for await (const chunk of process.stdin) raw += chunk;
+  return raw;
+}
+
+const env = JSON.parse(await readStdin());
+
+const observed = {
+  observed_at: Date.now(),
+  trigger_id: env.trigger_id,
+  state: env.state,
+  payload: env.payload,
+};
+writeFileSync(join(env.output_dir, 'observation.json'), JSON.stringify(observed, null, 2));
+process.stdout.write(JSON.stringify({ ok: true }) + '\n');
+```
+
+Forward a prompt to the live subscriber agent via `dispatch_url`:
+
+```ts
+// Fires only when a subscriber pty is live; the dispatcher omits
+// dispatch_url otherwise, so always feature-detect.
+const env = JSON.parse(await readStdin());
+
+if (env.dispatch_url) {
+  const resp = await fetch(env.dispatch_url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${process.env.CLAWDEVBOX_FIRE_SECRET}`,
+    },
+    body: JSON.stringify({
+      prompt: `New comment on PR ${env.payload.pr_id}:\n\n${env.payload.body}`,
+    }),
+  });
+  if (!resp.ok) throw new Error(`dispatch failed: ${resp.status} ${await resp.text()}`);
+}
+```
+
+Spawn a fresh interactive agent via `spawn_url` (e.g. when no live
+subscriber exists or the trigger always wants a clean session):
+
+```ts
+const env = JSON.parse(await readStdin());
+
+const resp = await fetch(env.spawn_url, {
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${process.env.CLAWDEVBOX_FIRE_SECRET}`,
+  },
+  body: JSON.stringify({
+    prompt: `Review PR ${env.payload.pr_id} in ${env.state.repo}.`,
+    // Optional — falls back to dispatcher's defaultAgentCli.
+    agent: 'dev-buddy:dev-buddy',
+    // Optional — falls back to the firing workspace.
+    workspace_id: env.state.target_workspace_id,
+  }),
+});
+
+const body = await resp.json();
+// body = { ok: true, instance_id, session_id }
+```
+
+#### Migration from the legacy callback envelope
+
+Before PR #3 (live-agent dispatch) the envelope contained
+`callback_url` and the dispatcher mounted a single `POST /callback/<fire_id>`
+endpoint that recorded the body to `attempt-N/callbacks.json`. Scripts ran in
+one of two modes — Mode A (return a `callback` object on stdout, the
+dispatcher forwarded it) or Mode B (the script POSTed live during its run).
+
+| Concept | Legacy | Current |
+|---|---|---|
+| Bootstrap env var | `CLAWDEVBOX_MCP_SECRET` | `CLAWDEVBOX_FIRE_SECRET` |
+| Envelope routing field | `callback_url` (single URL, Conductor parsed the path to choose action) | `output_dir` + `dispatch_url?` + `spawn_url` (separate explicit URLs per action) |
+| Inbound endpoint | `POST /callback/<fire_id>` (Mode B), Mode A delivered via stdout JSON | `POST /dispatch/<fire_id>` (route prompt to live subscriber pty) and `POST /spawn/<fire_id>` (spawn fresh agent). Both per-fire bearer. |
+| Introspection | none | `GET /api/sessions/<instance_id>` (server-token bearer) |
+| Persisted artifacts | `attempt-N/callbacks.json` plus stdout/stderr | `attempt-N/{stdout,stderr}.txt`; the script writes whatever it wants under `output_dir` |
+| Stdout response mode | `{ state, callback, continue, suppressOutput, … }` interpreted by Conductor | Plain stdout/stderr captured to disk; the kernel does not parse it. Persisted state is updated by other tools (`trigger.update_params`, etc.) — scripts no longer mutate state via stdout. |
+
+Trigger authors migrating from the legacy contract should:
+
+1. Rename every read of `process.env.CLAWDEVBOX_MCP_SECRET` →
+   `process.env.CLAWDEVBOX_FIRE_SECRET`.
+2. Replace `env.callback_url` reads with one of:
+   - **Write an observation file** under `env.output_dir` (the most common
+     case — the dispatcher persists it; another agent or tool can read it
+     out of `<workspace>/.clawdevbox/fires/<fire_id>/attempt-N/`).
+   - **POST `{ prompt }` to `env.dispatch_url`** when you want the running
+     subscriber pty to handle the event (feature-detect — the field is
+     undefined when no live pty is bound).
+   - **POST `{ prompt, agent?, workspace_id? }` to `env.spawn_url`** when
+     you want a fresh interactive agent for this fire.
+3. Stop emitting `{ callback: ... }` or `{ continue: false }` on stdout —
+   the dispatcher no longer parses stdout. Plain logs are fine; structured
+   results belong in `output_dir`.
 
 ### Lifecycle: agent-authored templates
 
@@ -3486,7 +3655,7 @@ The typical author-then-deploy flow:
      id="local.my-trigger", runtime="tsx",
      description="...", script="...")
 2. trigger.test(template_id="local.my-trigger")
-     → confirm captured Mode A/B callbacks match expectations
+     → confirm stdout / stderr / observation files in output_dir match expectations
 3. trigger.register(type_id="local.my-trigger", params={...})
      → live registration
 4. (optionally) trigger.update_template(id="local.my-trigger", script="// v2")
@@ -3658,9 +3827,13 @@ longer true as of the trigger-kernel work:
   ladder and dead-letter to the inbox after `max_attempts`.
 - TTL enforcement: `expires_at` is honored by the scheduler when it
   scans the `triggers` table.
-- Mode-B callbacks land at `POST /callback/<fire_id>` (see
-  [`cron.md`](#cron)); hot-trigger thread resume is wired through the
-  registration's `subscriber_thread_id`.
+- The trigger script receives an envelope with `output_dir`,
+  `dispatch_url?` (only when a subscriber pty is live), and `spawn_url`
+  on stdin. POSTing `{ prompt }` to `dispatch_url` routes the prompt
+  into the conductor for the subscriber thread; POSTing `{ prompt,
+  agent?, workspace_id? }` to `spawn_url` spawns a fresh interactive
+  agent. Both endpoints require the per-fire `CLAWDEVBOX_FIRE_SECRET`
+  injected into the script's environment (see [`cron.md`](#cron)).
 
 `trigger.fire` returns a real `fire_id` you can follow via
 `GET /api/fires/<fire_id>` — the row transitions through
@@ -3796,7 +3969,8 @@ Every fire produces a directory under the workspace:
 ├── attempt-1/
 │   ├── stdout.txt        ← trigger-runner stdout capture
 │   ├── stderr.txt        ← trigger-runner stderr capture
-│   └── callbacks.json    ← appended by POST /callback/<fire_id> (Mode B)
+│   └── ...               ← any observation files the trigger script wrote
+│                            into envelope.output_dir (kernel does not read)
 ├── attempt-2/
 │   └── ...
 ```
@@ -3810,8 +3984,8 @@ picks a specific one.
 | Surface | Auth | Source |
 |---|---|---|
 | `GET /healthz` | none | — |
-| `GET /api/cron/*`, `GET /api/fires*`, `POST /api/cron/*`, `POST /api/fires/*/retry` | `Authorization: Bearer <token>` | `cfg.http.token` (the service-wide token from `config.json` or `CLAWDEVBOX_TOKEN`). |
-| `POST /callback/:fire_id` | `Authorization: Bearer <secret>` | A **per-fire** secret minted by the dispatcher when it launches a script binding. The secret is injected into the script process as `CLAWDEVBOX_MCP_SECRET` and is only valid while the fire is in flight. |
+| `GET /api/cron/*`, `GET /api/fires*`, `POST /api/cron/*`, `POST /api/fires/*/retry`, `GET /api/sessions/:id` | `Authorization: Bearer <token>` | `cfg.http.token` (the service-wide token from `config.json` or `CLAWDEVBOX_TOKEN`). |
+| `POST /dispatch/:fire_id`, `POST /spawn/:fire_id` | `Authorization: Bearer <secret>` | A **per-fire** secret minted by the dispatcher when it launches a script binding. The secret is injected into the script process as `CLAWDEVBOX_FIRE_SECRET` and is only valid while the fire is in flight. |
 
 Bearer comparisons are constant-time. Missing/wrong tokens return `401`
 with `WWW-Authenticate: Bearer realm="clawdevbox"`.
@@ -3982,40 +4156,127 @@ suspected. Returns the post-reschedule scheduler status.
 
 **Errors:** `401`; `500` (`{ error: <message> }`) if the reschedule throws.
 
-#### `POST /callback/:fire_id`
+#### `POST /dispatch/:fire_id`
 
 **Auth:** `Authorization: Bearer <per-fire-secret>`. The secret is the
-`CLAWDEVBOX_MCP_SECRET` value injected into the trigger script process by
-the dispatcher when it spawned this fire. It is **not** the global
+`CLAWDEVBOX_FIRE_SECRET` value injected into the trigger script process
+by the dispatcher when it spawned this fire. It is **not** the global
 `cfg.http.token`.
 
-Used by trigger scripts running in **Mode B** to post their result back to
-the kernel asynchronously (for long-running webhook-style work). The body
-is appended to `attempt-N/callbacks.json` and stored verbatim — the
-dispatcher does not interpret it.
+Routes a prompt into the `SessionConductor` attached to the trigger's
+`subscriber_thread_id`. The dispatcher records the target instance id
+at script-spawn time only when that pty is live in `pty-registry`; if
+no live target exists, `dispatch_url` is omitted from the envelope and
+calls to this endpoint return 404.
 
-**Body:** any JSON. 1 MiB max.
+**Body:**
+
+```json
+{ "prompt": "Look at the new comment on PR 2401." }
+```
+
+`prompt` is required (non-empty string). 1 MiB max body.
 
 **Response (200):**
 
 ```json
-{ "ok": true, "received_at": 1715534803000 }
+{ "ok": true, "queued_at": 1715534803000, "state": "running" }
+```
+
+`state` is the conductor's post-enqueue state (e.g. `'running'`,
+`'awaiting_user'`).
+
+**Errors:**
+
+| Code | Trigger |
+|---|---|
+| `400` | `prompt` missing or not a non-empty string. |
+| `401` | Bearer missing or doesn't match the per-fire secret. |
+| `404` | `{ error: 'fire not found or not in flight' }`, `{ error: 'no dispatch target for this fire' }` (registration has no subscriber pty), or `{ error: 'dispatch target pty has exited' }` (subscriber was live at spawn but died since). |
+| `405` | Method other than POST. |
+
+#### `POST /spawn/:fire_id`
+
+**Auth:** `Authorization: Bearer <per-fire-secret>` — same per-fire
+`CLAWDEVBOX_FIRE_SECRET` as `/dispatch`. Always available — the
+dispatcher emits `spawn_url` on every envelope.
+
+Spawns a fresh interactive agent session via the recipe runner (ad-hoc,
+no recipe binding). Used when the trigger has no subscriber pty bound,
+or when the script always wants a clean session.
+
+**Body:**
+
+```json
+{
+  "prompt": "Review PR 2401.",
+  "agent": "dev-buddy:dev-buddy",
+  "workspace_id": "ws_..."
+}
+```
+
+| Field | Required | Default |
+|---|---|---|
+| `prompt` | yes | — |
+| `agent` | no | Dispatcher's `defaultAgentCli` (e.g. `'copilot'`). |
+| `workspace_id` | no | The fire's workspace. |
+
+**Response (200):**
+
+```json
+{ "ok": true, "instance_id": "ri_...", "session_id": "cdb_..." }
 ```
 
 **Errors:**
 
 | Code | Trigger |
 |---|---|
-| `401` | Bearer missing or doesn't match the per-fire secret (also returned once the fire is no longer in flight). |
-| `404` | `{ error: 'fire not found or not in flight', fire_id }`. |
+| `400` | `prompt` missing or not a non-empty string. |
+| `401` | Bearer missing or doesn't match the per-fire secret. |
+| `404` | `{ error: 'fire not found or not in flight' }`. |
 | `405` | Method other than POST. |
+| `500` | `{ error: 'spawn failed: <message>' }` (recipe-runner failure). |
+
+#### `GET /api/sessions/:instance_id`
+
+**Auth:** Bearer required (service token, same as `/api/cron/*`).
+
+Introspect the live `SessionConductor` for a recipe instance / spawned
+agent — useful for the SPA, debugging, and any caller that wants to
+poll for a session's state without subscribing to SSE.
+
+**Response (200):**
+
+```json
+{
+  "instance_id": "ri_...",
+  "state": "running",
+  "queue_depth": 0,
+  "provider_id": "copilot",
+  "agent_session_id": "cdb_..."
+}
+```
+
+| Field | Description |
+|---|---|
+| `state` | Conductor state (`'running'`, `'awaiting_user'`, `'idle'`, or `'unknown'` if no conductor is bound). |
+| `queue_depth` | Pending prompts queued for delivery to the agent. |
+| `provider_id` | Agent CLI identifier (e.g. `'copilot'`, `'claude'`, `'dev-buddy:dev-buddy'`). |
+| `agent_session_id` | The CLI's own session id (the `cdb_*` value passed via `--name` / `--session-id`). |
+
+**Errors:**
+
+| Code | Trigger |
+|---|---|
+| `401` | Bearer missing/invalid. |
+| `404` | `{ error: 'session not found' }` — no live conductor for that instance. |
 
 ---
 
 ### See also
 
 - [`trigger.*`](#trigger) — MCP tools that register/fire triggers.
-- [`recipe.*`](#recipe) — recipe instances spawn through the same kernel pipeline when a trigger fires.
+- [`recipe.*`](#recipe) — recipe instances spawn through the same kernel pipeline.
 - Spec §5, §6, §8, §9 in `docs/specs/2026-05-14-trigger-kernel-design.md`.
 
 ---
