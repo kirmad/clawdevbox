@@ -261,11 +261,16 @@ test('trigger.delete_template refuses while a registered instance still referenc
   });
 });
 
-test('trigger.delete_template refuses to delete a plugin-shipped TYPE', async () => {
+test('trigger.delete_template returns NOT_FOUND for unknown ids', async () => {
+  // Plugin-shipped trigger types (e.g. ado.*) were removed in the F PR
+  // (2026-05-28 callback-binding cleanup). With no plugin-shipped types
+  // in the tree, this test now only exercises the NOT_FOUND path. If a
+  // plugin ever re-ships a trigger type, restore the original assertion
+  // that delete_template on it returns TRIGGER_TEMPLATE_NOT_AUTHORED.
   await withHarness(async (h) => {
-    const res = await h.call('run_tool', { tool: 'trigger.delete_template', args: { id: 'ado.new-pr-watcher' } });
+    const res = await h.call('run_tool', { tool: 'trigger.delete_template', args: { id: 'no.such.template' } });
     assert.equal(res.isError, true);
-    assert.equal(res.structuredContent.code, 'TRIGGER_TEMPLATE_NOT_AUTHORED');
+    assert.equal(res.structuredContent.code, 'TRIGGER_TEMPLATE_NOT_FOUND');
   });
 });
 test('trigger.register XOR(type_id|script|script_file) — neither is INVALID_REQUEST', async () => {
@@ -311,34 +316,6 @@ test('trigger.unregister removes _oneoff dir for one-off registrations', async (
     assert.equal(existsSync(dir), false);
   });
 });
-test('trigger.test with inline script captures Mode B callback', async () => {
-  await withHarness(async (h) => {
-    const script = `
-async function readStdin() {
-  const chunks = [];
-  for await (const c of process.stdin) chunks.push(c);
-  return Buffer.concat(chunks).toString('utf8');
-}
-const env = JSON.parse(await readStdin());
-const secret = process.env.CLAWDEVBOX_MCP_SECRET ?? '';
-await fetch(env.callback_url, {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json', Authorization: \`Bearer \${secret}\` },
-  body: JSON.stringify({ prompt: 'inline test', context: {} }),
-});
-process.stdout.write(JSON.stringify({ state: { ok: true } }));
-`;
-    const r = await h.call('run_tool', { tool: 'trigger.test', args: { script, runtime: 'tsx', timeout_ms: 30000 } });
-    assert.ok(!r.isError, JSON.stringify(r));
-    assert.equal(r.structuredContent.exit_code, 0);
-    assert.equal(r.structuredContent.timed_out, false);
-    assert.ok(Array.isArray(r.structuredContent.callbacks));
-    assert.equal(r.structuredContent.callbacks.length, 1);
-    assert.equal(r.structuredContent.callbacks[0].mode, 'B');
-    assert.equal(r.structuredContent.callbacks[0].body.prompt, 'inline test');
-  });
-});
-
 test('trigger.test by template_id resolves a saved template', async () => {
   await withHarness(async (h) => {
     const script = `
@@ -357,9 +334,7 @@ process.stdout.write(JSON.stringify({ callback: { body: { prompt: 'tpl-test' } }
     const r = await h.call('run_tool', { tool: 'trigger.test', args: { template_id: 'local.tpl-test', timeout_ms: 30000 } });
     assert.ok(!r.isError, JSON.stringify(r));
     assert.equal(r.structuredContent.exit_code, 0);
-    assert.equal(r.structuredContent.callbacks.length, 1);
-    assert.equal(r.structuredContent.callbacks[0].mode, 'A');
-    assert.equal(r.structuredContent.callbacks[0].body.prompt, 'tpl-test');
+    assert.equal(r.structuredContent.stdout_parsed.callback.body.prompt, 'tpl-test');
   });
 });
 
@@ -385,7 +360,7 @@ process.stdout.write(JSON.stringify({ callback: { body: { prompt: 'reg', state: 
     assert.ok(!reg.isError);
     const r = await h.call('run_tool', { tool: 'trigger.test', args: { id: reg.structuredContent.id, timeout_ms: 30000 } });
     assert.ok(!r.isError, JSON.stringify(r));
-    assert.equal(r.structuredContent.callbacks[0].body.state.repo, 'svc');
+    assert.equal(r.structuredContent.stdout_parsed.callback.body.state.repo, 'svc');
   });
 });
 

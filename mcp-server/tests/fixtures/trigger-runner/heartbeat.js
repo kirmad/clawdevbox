@@ -2,8 +2,8 @@ let body = '';
 process.stdin.on('data', (c) => { body += c.toString('utf8'); });
 process.stdin.on('end', async () => {
   const env = JSON.parse(body);
-  const secret = process.env.CLAWDEVBOX_MCP_SECRET || '';
-  const res = await fetch(env.callback_url, {
+  const secret = process.env.CLAWDEVBOX_FIRE_SECRET || '';
+  const res = await fetch(env.spawn_url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${secret}` },
     body: JSON.stringify({ prompt: 'node tick', context: { run_id: env.run_id } }),

@@ -1,9 +1,9 @@
 import json, os, sys, urllib.request
 
 env = json.loads(sys.stdin.read())
-secret = os.environ.get("CLAWDEVBOX_MCP_SECRET", "")
+secret = os.environ.get("CLAWDEVBOX_FIRE_SECRET", "")
 req = urllib.request.Request(
-    env["callback_url"],
+    env["spawn_url"],
     data=json.dumps({"prompt": "python tick", "context": {"run_id": env["run_id"]}}).encode(),
     headers={"Content-Type": "application/json", "Authorization": f"Bearer {secret}"},
     method="POST",

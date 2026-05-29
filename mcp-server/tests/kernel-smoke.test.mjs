@@ -8,15 +8,19 @@
  * verifies the whole bootstrap → kernel → HTTP API stack works
  * end-to-end against the same process tree we ship.
  *
- * Tasks 10.3 (recipe step API), 10.4 (MCP bootstrap), and 10.5
- * (Mode-B callback) are intentionally NOT duplicated here — they are
- * each covered by a dedicated test file already:
+ * Tasks 10.3 (recipe step API) and 10.4 (MCP bootstrap) are
+ * intentionally NOT duplicated here — they are each covered by a
+ * dedicated test file already:
  *   - 10.3 → tests/recipe-step-tools.test.mjs (in-process harness; spec §10.5)
  *   - 10.4 → tests/mcp-bootstrap.test.mjs    (real spawn of `start --service-runner`)
- *   - 10.5 → tests/callback-api.test.mjs     (POST /callback/<fire_id>)
+ *
+ * (Task 10.5's legacy POST /callback/<fire_id> route was removed in
+ * PR #3 of the trigger-live-agent-dispatch series and replaced with
+ * /dispatch and /spawn; see dispatcher.test.mjs + the new dispatch/
+ * spawn route tests.)
  *
  * The kernel-internal mechanics (claim, retry ladder, overlap-skip,
- * dead-letter, /callback) are covered by dispatcher.test.mjs,
+ * dead-letter) are covered by dispatcher.test.mjs,
  * scheduler.test.mjs, db-stores.test.mjs, and cron-api.test.mjs against
  * in-memory or in-process surfaces. What's missing — and what this file
  * fills — is "does the wiring actually come up when you run the real
@@ -358,10 +362,9 @@ test(
 // directory BEFORE spawning so a real script binding can fire.
 // ---------------------------------------------------------------------------
 
-test('kernel smoke: phases 10.3/10.4/10.5 covered by sibling test files (todo marker)', () => {
+test('kernel smoke: phases 10.3/10.4 covered by sibling test files (todo marker)', () => {
   // No-op marker so the test report makes the coverage delegation explicit.
   // 10.3 → recipe-step-tools.test.mjs
   // 10.4 → mcp-bootstrap.test.mjs
-  // 10.5 → callback-api.test.mjs
   assert.ok(true);
 });

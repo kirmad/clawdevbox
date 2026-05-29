@@ -1,7 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { dirname, resolve } from 'node:path';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
@@ -48,15 +50,24 @@ async function startReceiver(secret) {
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   const port = server.address().port;
   return {
-    url: `http://127.0.0.1:${port}/callback/test/abc`,
+    url: `http://127.0.0.1:${port}/spawn/test-abc`,
     calls,
     stop: () => new Promise((r) => server.close(() => r())),
   };
 }
 
-test('runner: Mode B-only script captures one POSTed callback', async () => {
+function freshOutDir() {
+  return mkdtempSync(join(tmpdir(), 'cdb-trigger-runner-out-'));
+}
+
+function cleanOutDir(dir) {
+  try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+}
+
+test('runner: script POSTs to spawn_url with one captured request', async () => {
   const { runTriggerScript } = await import('../src/trigger-runner.ts');
   const recv = await startReceiver('secret-mode-b');
+  const outDir = freshOutDir();
   try {
     const result = await runTriggerScript({
       scriptPath: resolve(fixturesDir, 'heartbeat-mode-b.ts'),
@@ -64,7 +75,7 @@ test('runner: Mode B-only script captures one POSTed callback', async () => {
       envelope: {
         trigger_event_name: 'TriggerFired',
         trigger_id: 'test', run_id: 'run_modeb',
-        callback_url: recv.url, state: {}, payload: null,
+        output_dir: outDir, spawn_url: recv.url, state: {}, payload: null,
       },
       callbackSecret: 'secret-mode-b',
       timeoutMs: 30000,
@@ -74,12 +85,14 @@ test('runner: Mode B-only script captures one POSTed callback', async () => {
     assert.equal(recv.calls[0].body.prompt, 'mode-b heartbeat');
   } finally {
     await recv.stop();
+    cleanOutDir(outDir);
   }
 });
 
-test('runner: Mode A-only script — stdout has callback object, no Mode B captures', async () => {
+test('runner: stdout-only script — parsed stdout exposes callback object, no POST', async () => {
   const { runTriggerScript } = await import('../src/trigger-runner.ts');
   const recv = await startReceiver('secret-a');
+  const outDir = freshOutDir();
   try {
     const result = await runTriggerScript({
       scriptPath: resolve(fixturesDir, 'heartbeat-mode-a.ts'),
@@ -87,7 +100,7 @@ test('runner: Mode A-only script — stdout has callback object, no Mode B captu
       envelope: {
         trigger_event_name: 'TriggerFired',
         trigger_id: 'test', run_id: 'run_modea',
-        callback_url: recv.url, state: {}, payload: null,
+        output_dir: outDir, spawn_url: recv.url, state: {}, payload: null,
       },
       callbackSecret: 'secret-a',
       timeoutMs: 30000,
@@ -98,12 +111,14 @@ test('runner: Mode A-only script — stdout has callback object, no Mode B captu
     assert.equal(result.stdout_parsed.callback.body.prompt, 'mode-a heartbeat');
   } finally {
     await recv.stop();
+    cleanOutDir(outDir);
   }
 });
 
-test('runner: Mode A+B — stdout has Mode A, receiver has Mode B', async () => {
+test('runner: script can both POST to spawn_url AND emit stdout reply', async () => {
   const { runTriggerScript } = await import('../src/trigger-runner.ts');
   const recv = await startReceiver('secret-ab');
+  const outDir = freshOutDir();
   try {
     const result = await runTriggerScript({
       scriptPath: resolve(fixturesDir, 'heartbeat-mode-ab.ts'),
@@ -111,7 +126,7 @@ test('runner: Mode A+B — stdout has Mode A, receiver has Mode B', async () => 
       envelope: {
         trigger_event_name: 'TriggerFired',
         trigger_id: 'test', run_id: 'run_ab',
-        callback_url: recv.url, state: {}, payload: null,
+        output_dir: outDir, spawn_url: recv.url, state: {}, payload: null,
       },
       callbackSecret: 'secret-ab',
       timeoutMs: 30000,
@@ -122,12 +137,14 @@ test('runner: Mode A+B — stdout has Mode A, receiver has Mode B', async () => 
     assert.equal(result.stdout_parsed.callback.body.prompt, 'mode-a leg');
   } finally {
     await recv.stop();
+    cleanOutDir(outDir);
   }
 });
 
 test('runner: bad bearer token gets 401, captures empty', async () => {
   const { runTriggerScript } = await import('../src/trigger-runner.ts');
   const recv = await startReceiver('right-secret');
+  const outDir = freshOutDir();
   try {
     const result = await runTriggerScript({
       scriptPath: resolve(fixturesDir, 'heartbeat-bad-auth.ts'),
@@ -135,7 +152,7 @@ test('runner: bad bearer token gets 401, captures empty', async () => {
       envelope: {
         trigger_event_name: 'TriggerFired',
         trigger_id: 'test', run_id: 'run_bad',
-        callback_url: recv.url, state: {}, payload: null,
+        output_dir: outDir, spawn_url: recv.url, state: {}, payload: null,
       },
       callbackSecret: 'right-secret',
       timeoutMs: 30000,
@@ -145,12 +162,14 @@ test('runner: bad bearer token gets 401, captures empty', async () => {
     assert.match(result.stdout, /received 401/);
   } finally {
     await recv.stop();
+    cleanOutDir(outDir);
   }
 });
 
 test('runner: timeout kills the process and reports timed_out', async () => {
   const { runTriggerScript } = await import('../src/trigger-runner.ts');
   const recv = await startReceiver('any');
+  const outDir = freshOutDir();
   try {
     const result = await runTriggerScript({
       scriptPath: resolve(fixturesDir, 'sleep-forever.ts'),
@@ -158,7 +177,7 @@ test('runner: timeout kills the process and reports timed_out', async () => {
       envelope: {
         trigger_event_name: 'TriggerFired',
         trigger_id: 'test', run_id: 'run_to',
-        callback_url: recv.url, state: {}, payload: null,
+        output_dir: outDir, spawn_url: recv.url, state: {}, payload: null,
       },
       callbackSecret: 'any',
       timeoutMs: 800,
@@ -167,12 +186,14 @@ test('runner: timeout kills the process and reports timed_out', async () => {
     assert.notEqual(result.exit_code, 0);
   } finally {
     await recv.stop();
+    cleanOutDir(outDir);
   }
 });
 
 test('runner: node runtime', { skip: !hasCmd('node') }, async () => {
   const { runTriggerScript } = await import('../src/trigger-runner.ts');
   const recv = await startReceiver('node-secret');
+  const outDir = freshOutDir();
   try {
     const result = await runTriggerScript({
       scriptPath: resolve(fixturesDir, 'heartbeat.js'),
@@ -180,18 +201,19 @@ test('runner: node runtime', { skip: !hasCmd('node') }, async () => {
       envelope: {
         trigger_event_name: 'TriggerFired',
         trigger_id: 'test', run_id: 'run_node',
-        callback_url: recv.url, state: {}, payload: null,
+        output_dir: outDir, spawn_url: recv.url, state: {}, payload: null,
       },
       callbackSecret: 'node-secret', timeoutMs: 30000,
     });
     assert.equal(result.exit_code, 0, `stderr: ${result.stderr}`);
     assert.equal(recv.calls.length, 1);
-  } finally { await recv.stop(); }
+  } finally { await recv.stop(); cleanOutDir(outDir); }
 });
 
 test('runner: python runtime', { skip: !hasCmd(process.platform === 'win32' ? 'python' : 'python3') }, async () => {
   const { runTriggerScript } = await import('../src/trigger-runner.ts');
   const recv = await startReceiver('py-secret');
+  const outDir = freshOutDir();
   try {
     const result = await runTriggerScript({
       scriptPath: resolve(fixturesDir, 'heartbeat.py'),
@@ -199,18 +221,19 @@ test('runner: python runtime', { skip: !hasCmd(process.platform === 'win32' ? 'p
       envelope: {
         trigger_event_name: 'TriggerFired',
         trigger_id: 'test', run_id: 'run_py',
-        callback_url: recv.url, state: {}, payload: null,
+        output_dir: outDir, spawn_url: recv.url, state: {}, payload: null,
       },
       callbackSecret: 'py-secret', timeoutMs: 30000,
     });
     assert.equal(result.exit_code, 0, `stderr: ${result.stderr}`);
     assert.equal(recv.calls.length, 1);
-  } finally { await recv.stop(); }
+  } finally { await recv.stop(); cleanOutDir(outDir); }
 });
 
 test('runner: bash runtime', { skip: !runtimeUsable('bash', '--version') }, async () => {
   const { runTriggerScript } = await import('../src/trigger-runner.ts');
   const recv = await startReceiver('bash-secret');
+  const outDir = freshOutDir();
   try {
     const result = await runTriggerScript({
       scriptPath: resolve(fixturesDir, 'heartbeat.sh'),
@@ -218,11 +241,11 @@ test('runner: bash runtime', { skip: !runtimeUsable('bash', '--version') }, asyn
       envelope: {
         trigger_event_name: 'TriggerFired',
         trigger_id: 'test', run_id: 'run_bash',
-        callback_url: recv.url, state: {}, payload: null,
+        output_dir: outDir, spawn_url: recv.url, state: {}, payload: null,
       },
       callbackSecret: 'bash-secret', timeoutMs: 30000,
     });
     assert.equal(result.exit_code, 0, `stderr: ${result.stderr}`);
     assert.equal(recv.calls.length, 1);
-  } finally { await recv.stop(); }
+  } finally { await recv.stop(); cleanOutDir(outDir); }
 });

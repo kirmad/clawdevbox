@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 BODY=$(cat)
-URL=$(printf '%s' "$BODY" | python -c "import sys,json; print(json.load(sys.stdin)['callback_url'])")
+URL=$(printf '%s' "$BODY" | python -c "import sys,json; print(json.load(sys.stdin)['spawn_url'])")
 RUN=$(printf '%s' "$BODY" | python -c "import sys,json; print(json.load(sys.stdin)['run_id'])")
 curl -fsS -X POST "$URL" \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer ${CLAWDEVBOX_MCP_SECRET}" \
+  -H "Authorization: Bearer ${CLAWDEVBOX_FIRE_SECRET}" \
   -d "{\"prompt\":\"bash tick\",\"context\":{\"run_id\":\"${RUN}\"}}" >/dev/null
 echo '{"state":{"bash":true}}'
