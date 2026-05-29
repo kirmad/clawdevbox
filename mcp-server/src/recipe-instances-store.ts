@@ -278,7 +278,7 @@ function readStepsFromDb(db: Database, recipe_instance_id: string): RecipeStep[]
  * Upsert the DB row for an instance and mirror steps + the latest
  * agent-session metadata. Idempotent — safe to call on every write.
  */
-function upsertInstanceToDb(db: Database, instance: RecipeInstance): void {
+function upsertInstanceToDb(db: Database, instance: RecipeInstance, opts?: { interactive?: boolean }): void {
   const ws = ensureWorkspace(db, { path: instance.workspace_path });
   const snapshotPath = recipeSnapshotPath(instance.workspace_path, instance.id);
 
@@ -366,8 +366,8 @@ function upsertInstanceToDb(db: Database, instance: RecipeInstance): void {
         db.prepare(
           `INSERT INTO agent_sessions (
              id, cli_session_id, recipe_instance_id, workspace_id,
-             agent_cli, pid, started_at, status
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, 'running')`,
+             agent_cli, pid, started_at, status, interactive
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?)`,
         ).run(
           sid,
           instance.session_id ?? null,
@@ -376,6 +376,7 @@ function upsertInstanceToDb(db: Database, instance: RecipeInstance): void {
           instance.agent_cli || 'unknown',
           instance.pid ?? null,
           instance.started_at,
+          opts?.interactive ? 1 : 0,
         );
       }
     }
@@ -501,7 +502,7 @@ export function readRecipeInstance(
   return rowToInstance(conn, row, workspacePath);
 }
 
-export function writeRecipeInstance(workspacePath: string, instance: RecipeInstance): void {
+export function writeRecipeInstance(workspacePath: string, instance: RecipeInstance, opts?: { interactive?: boolean }): void {
   // 1. Atomic file write (legacy primary).
   writeFileAtomic(
     recipeInstancePath(workspacePath, instance.id),
@@ -524,7 +525,7 @@ export function writeRecipeInstance(workspacePath: string, instance: RecipeInsta
   const conn = safeDb();
   if (conn) {
     try {
-      upsertInstanceToDb(conn, instance);
+      upsertInstanceToDb(conn, instance, opts);
     } catch {
       // The file write is the source of truth in Phase 4; never let a
       // DB hiccup mask a successful disk write to callers.

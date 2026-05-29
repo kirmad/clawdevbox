@@ -37,14 +37,29 @@ import type { Workspace } from './workspace.ts';
 import type { ResolvedConfig } from './config.ts';
 
 export interface RunRecipeOptions {
-  /** Resolved recipe id (after scope-chain lookup). */
-  recipeId: string;
-  /** Raw YAML snapshot to record on the instance row. */
+  /**
+   * Resolved recipe id (after scope-chain lookup), OR null for ad-hoc
+   * sessions that don't load a recipe. When null, `isAdhoc` must be true.
+   */
+  recipeId: string | null;
+  /**
+   * Raw YAML snapshot to record on the instance row. Required when
+   * recipeId is non-null; ignored (use empty string) for ad-hoc sessions.
+   */
   recipeSnapshot: string;
-  /** True when the recipe was supplied inline (no saved file). */
+  /** True when the recipe was supplied inline (no saved file) OR when this is an ad-hoc no-recipe session. */
   isAdhoc?: boolean;
   /** First user message handed to the spawned agent. */
   prompt: string;
+  /**
+   * 'headless' (default) preserves current behavior — provider spawns with
+   * --print/-p, agent exits on completion. 'interactive' keeps the pty
+   * alive after the first turn; opts.prompt becomes the seed prompt
+   * delivered via deliverInitialPromptWhenReady (already in the provider).
+   * Interactive runs register a SessionConductor in pty-registry for
+   * downstream dispatch via /dispatch/<fire_id> or in-process callers.
+   */
+  spawnMode?: 'interactive' | 'headless';
   /** Optional structured params recorded on the instance. */
   params?: Record<string, unknown>;
   /** Workspace to run in (already resolved/created by the caller). */
@@ -130,14 +145,16 @@ export async function runRecipe(opts: RunRecipeOptions): Promise<RunRecipeResult
   // setting opts.agentCli, so we re-derive from the recipe snapshot here to
   // honor `agent_cli: e2e-test-runner`-style declarations end-to-end.
   let recipeAgentCli: string | null = null;
-  try {
-    const parsed = parseRecipeSource(opts.recipeSnapshot);
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      const v = (parsed as Record<string, unknown>).agent_cli;
-      if (typeof v === 'string' && v.length > 0) recipeAgentCli = v;
+  if (opts.recipeId !== null) {
+    try {
+      const parsed = parseRecipeSource(opts.recipeSnapshot);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        const v = (parsed as Record<string, unknown>).agent_cli;
+        if (typeof v === 'string' && v.length > 0) recipeAgentCli = v;
+      }
+    } catch {
+      /* malformed snapshots fall through to the default chain */
     }
-  } catch {
-    /* malformed snapshots fall through to the default chain */
   }
   const agentCli: string =
     opts.agentCli ?? recipeAgentCli ?? opts.cfg.defaultAgentCli ?? 'copilot';
@@ -167,10 +184,16 @@ export async function runRecipe(opts: RunRecipeOptions): Promise<RunRecipeResult
   // doesn't reflect the calling agent in multi-agent HTTP scenarios.
 
   // 2. Write the instance row (file + DB) before spawning.
+  const isAdhoc = opts.isAdhoc === true || opts.recipeId === null;
+  const recipeIdResolved = opts.recipeId ?? `__adhoc_${instanceId}`;
+  const recipeSnapshot = opts.recipeId === null ? '' : opts.recipeSnapshot;
+  const spawnMode: 'interactive' | 'headless' =
+    opts.spawnMode === 'interactive' ? 'interactive' : 'headless';
+
   const instance: RecipeInstance = {
     id: instanceId,
-    recipe_id: opts.recipeId,
-    recipe_snapshot: opts.recipeSnapshot,
+    recipe_id: recipeIdResolved,
+    recipe_snapshot: recipeSnapshot,
     workspace_id: opts.workspaceInfo.id,
     workspace_path: opts.workspaceInfo.path,
     prompt: opts.prompt,
@@ -186,7 +209,7 @@ export async function runRecipe(opts: RunRecipeOptions): Promise<RunRecipeResult
     resume_of: opts.resumeOf ?? null,
     parent_recipe_instance_id: opts.parentRecipeInstanceId ?? null,
   };
-  writeRecipeInstance(opts.workspaceInfo.path, instance);
+  writeRecipeInstance(opts.workspaceInfo.path, instance, { interactive: spawnMode === 'interactive' });
 
   // Patch the DB row with trigger_id + fire_id (writeRecipeInstance doesn't
   // know about lineage — the dispatcher path needs these to thread back).
@@ -231,8 +254,8 @@ export async function runRecipe(opts: RunRecipeOptions): Promise<RunRecipeResult
     writeRecipeInstance(opts.workspaceInfo.path, failed);
     return {
       recipe_instance_id: instanceId,
-      recipe_id: opts.recipeId,
-      adhoc: opts.isAdhoc ?? false,
+      recipe_id: recipeIdResolved,
+      adhoc: isAdhoc,
       workspace_id: opts.workspaceInfo.id,
       workspace_path: opts.workspaceInfo.path,
       attach_to_inbox_item_id: opts.attachToInboxItemId ?? null,
@@ -282,7 +305,7 @@ export async function runRecipe(opts: RunRecipeOptions): Promise<RunRecipeResult
   let spawnError: unknown = null;
   try {
     const handle = await provider.spawnSession(providerCtx, {
-      mode: 'headless',
+      mode: spawnMode,
       init: isResume
         ? { kind: 'resume', session_id: sessionId }
         : { kind: 'new', session_id: sessionId },
@@ -323,8 +346,10 @@ export async function runRecipe(opts: RunRecipeOptions): Promise<RunRecipeResult
         commandLine,
         agentCli,
         sessionId,
-        recipeId: opts.recipeId,
+        recipeId: recipeIdResolved,
       },
+      provider: spawnMode === 'interactive' ? provider : undefined,
+      agentHandle: spawnMode === 'interactive' ? handle : undefined,
     });
     ptyProc.onData((data) => {
       logStream.write(data);
@@ -365,8 +390,8 @@ export async function runRecipe(opts: RunRecipeOptions): Promise<RunRecipeResult
     writeRecipeInstance(opts.workspaceInfo.path, failed);
     return {
       recipe_instance_id: instanceId,
-      recipe_id: opts.recipeId,
-      adhoc: opts.isAdhoc ?? false,
+      recipe_id: recipeIdResolved,
+      adhoc: isAdhoc,
       workspace_id: opts.workspaceInfo.id,
       workspace_path: opts.workspaceInfo.path,
       attach_to_inbox_item_id: opts.attachToInboxItemId ?? null,
@@ -395,8 +420,8 @@ export async function runRecipe(opts: RunRecipeOptions): Promise<RunRecipeResult
 
   return {
     recipe_instance_id: instanceId,
-    recipe_id: opts.recipeId,
-    adhoc: opts.isAdhoc ?? false,
+    recipe_id: recipeIdResolved,
+    adhoc: isAdhoc,
     workspace_id: opts.workspaceInfo.id,
     workspace_path: opts.workspaceInfo.path,
     attach_to_inbox_item_id: opts.attachToInboxItemId ?? null,
