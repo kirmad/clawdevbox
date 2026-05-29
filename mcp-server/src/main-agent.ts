@@ -197,6 +197,8 @@ export async function startMainAgent(opts: MainAgentOptions): Promise<MainAgentS
       cols: 120,
       rows: 30,
       ipty: handle.pty,
+      provider,
+      agentHandle: handle,
     });
 
     // Spawn succeeded — clear any stale reason from earlier attempts.
