@@ -26,6 +26,7 @@
 import type { IPty } from 'node-pty';
 import type { AgentCliProvider, AgentHandle } from './agent-clis/types.ts';
 import { createSessionConductor, UnsupportedProviderError, type SessionConductor } from './agent-clis/session-conductor.ts';
+import { emitChange } from './event-bus.ts';
 import { logger } from './logger.ts';
 
 // ============================================================================
@@ -179,6 +180,7 @@ export function registerPty(opts: PtyRegisterOptions): void {
   session.conductor = conductor;
 
   sessions.set(opts.instanceId, session);
+  emitChange('sessions');
 
   opts.ipty.onData((data) => {
     appendToBuffer(session, data);
@@ -196,11 +198,13 @@ export function registerPty(opts: PtyRegisterOptions): void {
     for (const sub of session.subscribers) {
       try { sub({ type: 'exit', exitCode: exitCode ?? 0, signal }); } catch { /* viewer drop */ }
     }
+    emitChange('sessions');
     setTimeout(() => {
       // Drop the session only if no one is still hanging on.
       const s = sessions.get(opts.instanceId);
       if (s && s.exited && s.subscribers.size === 0) {
         sessions.delete(opts.instanceId);
+        emitChange('sessions');
       }
     }, EXIT_RETAIN_MS);
   });

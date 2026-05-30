@@ -879,6 +879,7 @@ export async function runStart(flags: Flags): Promise<void> {
       version: ownVersion,
     },
     expectedToken,
+    ws,
   };
   logger.info(
     {

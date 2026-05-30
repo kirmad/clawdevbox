@@ -167,6 +167,13 @@ export interface AgentCliProvider {
    * provider lacks `capabilities`.
    */
   readonly capabilities?: ProviderCapabilities;
+  /**
+   * Whether this provider supports resuming a prior CLI session (typically
+   * via `--resume <session_id>`). When false (or absent), the Terminals
+   * Panel UI disables the [Resume] button and the /api/sessions/<id>/resume
+   * endpoint returns 422.
+   */
+  readonly supportsResume?: boolean;
   detect?(ctx: ProviderCtx): Promise<DetectResult>;
   setup?(ctx: ProviderCtx, opts: SetupOptions): Promise<void>;
   spawnSession(ctx: ProviderCtx, opts: SpawnSessionOpts): Promise<AgentHandle>;

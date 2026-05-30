@@ -147,3 +147,59 @@ export function findResumeTarget(
     .get(recipe_step_id) as AgentSessionRow | undefined;
   return row ?? null;
 }
+
+export interface ListAllSessionsOpts {
+  /**
+   * Exclusive upper bound on `started_at` for paginating archived rows
+   * (descending order). Pass the previous page's `next_since` cursor
+   * (which is the oldest row's `started_at`) to fetch the next page of
+   * older rows. When 0 or undefined, no upper bound is applied.
+   */
+  since?: number;
+  /** Page size (default 50, max 200). */
+  limit?: number;
+}
+
+/**
+ * List recent agent_sessions rows for the Terminals Panel.
+ *
+ * Live rows (status='running') are always included regardless of `since`
+ * so the Active section is never paginated out. Archived rows are filtered
+ * by `started_at < since` (when since>0) and ordered newest-first; the
+ * caller dedupes against the live pty-registry by `recipe_instance_id`.
+ */
+export function listAllSessions(
+  db: Database,
+  opts: ListAllSessionsOpts = {},
+): AgentSessionRow[] {
+  const limit = Math.min(Math.max(opts.limit ?? 50, 1), 200);
+  const since = opts.since ?? 0;
+  return db
+    .prepare(
+      `SELECT * FROM agent_sessions
+       WHERE (status = 'running')
+          OR (? = 0)
+          OR (started_at < ?)
+       ORDER BY (status = 'running') DESC, started_at DESC
+       LIMIT ?`,
+    )
+    .all(since, since, limit) as AgentSessionRow[];
+}
+
+/**
+ * Mark the archived agent_sessions row whose recipe_instance_id = oldInstanceId
+ * as having been resumed into newInstanceId. The UI uses this to render a
+ * "Resumed as <new-id>" badge on the original archived row.
+ */
+export function markResumedInto(
+  db: Database,
+  oldInstanceId: string,
+  newInstanceId: string,
+): void {
+  db.prepare(
+    `UPDATE agent_sessions
+       SET resumed_into_instance_id = ?
+     WHERE recipe_instance_id = ?`,
+  ).run(newInstanceId, oldInstanceId);
+  emitChange('sessions');
+}

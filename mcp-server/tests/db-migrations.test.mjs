@@ -187,3 +187,15 @@ test('migration V2 is idempotent when applied via runMigrations', async () => {
   assert.ok(!cols.includes('binds_callback_to_recipe'));
   db.close();
 });
+
+test('migration V3 adds agent_sessions.resumed_into_instance_id column', async () => {
+  const { runMigrations: runMigs } = await import('../src/db/index.ts');
+  const db = new BetterSqlite3(':memory:');
+  db.pragma('foreign_keys = ON');
+  runMigs(db);
+  const cols = db.prepare(`PRAGMA table_info(agent_sessions)`).all().map((c) => c.name);
+  assert.ok(cols.includes('resumed_into_instance_id'), 'V3 should add resumed_into_instance_id');
+  const max = db.prepare(`SELECT MAX(version) AS v FROM schema_version`).get();
+  assert.ok(max.v >= 3, `expected schema_version >= 3, got ${max.v}`);
+  db.close();
+});

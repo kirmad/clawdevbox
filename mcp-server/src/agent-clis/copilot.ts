@@ -48,6 +48,7 @@ export const copilotProvider: AgentCliProvider = {
   description: 'The official GitHub Copilot CLI (`copilot`). Supports headless prompts and resumable sessions.',
   source: 'builtin',
   capabilities: copilotCapabilities,
+  supportsResume: true,
 
   async detect(_ctx: ProviderCtx) {
     return probeBinary(resolveBinary(), ['--version']);

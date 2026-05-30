@@ -41,6 +41,7 @@ export const claudeProvider: AgentCliProvider = {
   description: 'The Anthropic Claude Code CLI (`claude`). Supports headless prompts and resumable sessions.',
   source: 'builtin',
   capabilities: claudeCapabilities,
+  supportsResume: true,
 
   async detect(_ctx: ProviderCtx) {
     const { file, argsPrefix } = resolveBinary();

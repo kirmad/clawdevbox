@@ -58,6 +58,7 @@ export const echoStubProvider: AgentCliProvider = {
   description: 'A no-network test fixture provider. Writes a small artifact and exits successfully.',
   source: 'builtin',
   internal: true,
+  supportsResume: false,
 
   async detect(_ctx: ProviderCtx) {
     return { available: true, binary: process.execPath, version: process.version };

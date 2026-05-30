@@ -40,6 +40,8 @@ import {
 } from '../db/fires-store.ts';
 import type { Dispatcher } from '../dispatcher.ts';
 import type { Scheduler } from '../scheduler.ts';
+import type { Workspace } from '../workspace.ts';
+import type { runRecipe as RunRecipeFn } from '../recipe-runner.ts';
 
 const MAX_OUTPUT_BYTES = 1024 * 1024;
 
@@ -57,6 +59,20 @@ export interface CronApiContext {
    * and `/spawn/<fire_id>` is independent of this token.
    */
   expectedToken: string | null;
+  /**
+   * Workspace whose `agentCliProviders` registry is consulted by
+   * `/api/sessions/<id>/resume` and which is passed through to
+   * `runRecipe`. Optional for backward compat with legacy callers /
+   * test harnesses that don't exercise the resume endpoint.
+   */
+  ws?: Workspace;
+  /**
+   * Test seam — override the resume endpoint's call into `runRecipe`.
+   * Production wiring leaves this unset; tests inject a stub that
+   * records the call and returns a deterministic result without
+   * spawning a real pty.
+   */
+  runRecipeFn?: typeof RunRecipeFn;
 }
 
 function constantTimeEquals(a: string, b: string): boolean {
@@ -228,6 +244,190 @@ export async function handleCronApi(
     }
     if (!constantTimeEquals(token, ctx.expectedToken)) {
       reject401(res, 'invalid bearer token');
+      return true;
+    }
+  }
+
+  // ----- GET /api/sessions (list) ------------------------------------------
+  // Must come BEFORE the singular /api/sessions/<id> route — otherwise the
+  // singular regex would swallow `/api/sessions` (matching empty id) and
+  // shadow this handler.
+  if (path === '/api/sessions' && method === 'GET') {
+    const status = (url.searchParams.get('status') ?? 'all') as 'active' | 'archived' | 'all';
+    const since = Number(url.searchParams.get('since') ?? 0) || 0;
+    const limit = Math.min(Math.max(Number(url.searchParams.get('limit') ?? 50) || 50, 1), 200);
+    const { listSessions, getConductor, getSessionMeta } = await import('../pty-registry.ts');
+    const { listAllSessions } = await import('../db/agent-sessions-store.ts');
+    const db = ctx.db;
+
+    // Live rows from pty-registry — these win for state/queue_depth.
+    const liveRaw = listSessions();
+    const liveIds = new Set(liveRaw.map((s) => s.instanceId));
+    const live = liveRaw.map((s) => {
+      const cond = getConductor(s.instanceId);
+      const meta = getSessionMeta(s.instanceId);
+      return {
+        instance_id: s.instanceId,
+        live: true as const,
+        state: (cond?.state ?? (s.exited ? 'exited' : 'unknown')) as string,
+        queue_depth: cond?.pendingCount() ?? 0,
+        provider_id: meta?.agentCli ?? null,
+        recipe_id: meta?.recipeId ?? null,
+        cli_session_id: meta?.sessionId ?? null,
+        workspace_id: s.workspaceId,
+        started_at: meta?.startedAt ?? 0,
+        ended_at: null as number | null,
+      };
+    });
+
+    // Archived rows from agent_sessions; filter out anything already in
+    // `live` so the dedupe key (instance_id) only carries the
+    // authoritative live entry.
+    const archivedAll = listAllSessions(db, { since, limit });
+    const archived = archivedAll
+      .filter((row) => !liveIds.has(row.recipe_instance_id ?? ''))
+      .map((row) => ({
+        instance_id: row.recipe_instance_id ?? row.id,
+        live: false as const,
+        state: 'archived' as const,
+        queue_depth: 0,
+        provider_id: row.agent_cli,
+        recipe_id: null as string | null,
+        cli_session_id: row.cli_session_id,
+        workspace_id: row.workspace_id,
+        started_at: row.started_at,
+        ended_at: row.ended_at,
+      }));
+
+    // Join archived rows with recipe_instances to get recipe_id for labels.
+    const archivedInstanceIds = archived.map((a) => a.instance_id).filter(Boolean);
+    let recipeMap: Record<string, string> = {};
+    if (archivedInstanceIds.length > 0) {
+      const placeholders = archivedInstanceIds.map(() => '?').join(',');
+      const rows = db
+        .prepare(`SELECT id, recipe_id FROM recipe_instances WHERE id IN (${placeholders})`)
+        .all(...archivedInstanceIds) as Array<{ id: string; recipe_id: string }>;
+      recipeMap = Object.fromEntries(rows.map((r) => [r.id, r.recipe_id]));
+    }
+
+    const enrich = (item: typeof live[number] | typeof archived[number]) => {
+      const recipeId = item.recipe_id ?? recipeMap[item.instance_id] ?? null;
+      const kind: 'main' | 'recipe' | 'adhoc' =
+        item.instance_id === 'main'
+          ? 'main'
+          : (recipeId && recipeId.startsWith('__adhoc_'))
+            ? 'adhoc'
+            : 'recipe';
+      const label =
+        kind === 'main' ? 'Main Agent'
+          : kind === 'adhoc' ? `Spawn ${item.instance_id.slice(-8)}`
+          : recipeId ?? item.instance_id;
+      return { ...item, recipe_id: recipeId, kind, label };
+    };
+
+    const items: unknown[] = [];
+    if (status === 'all' || status === 'active') items.push(...live.map(enrich));
+    if (status === 'all' || status === 'archived') items.push(...archived.map(enrich));
+
+    // Pagination cursor: use the OLDEST row pulled by listAllSessions
+    // (before dedup), not the post-dedup `archived` array. Otherwise, when
+    // dedup removes archived rows that are also live, `archived.length`
+    // may be < `limit` even though more pages exist in the DB. The cursor
+    // is exclusive (`started_at < since` in the next query), so passing
+    // the oldest row's exact started_at moves the next page strictly past it.
+    const nextSince = archivedAll.length === limit && archivedAll.length > 0
+      ? archivedAll[archivedAll.length - 1]!.started_at
+      : undefined;
+
+    sendJson(res, 200, { items, ...(nextSince !== undefined ? { next_since: nextSince } : {}) });
+    return true;
+  }
+
+  // ----- POST /api/sessions/<instance_id>/resume ----------------------------
+  {
+    const m = path.match(/^\/api\/sessions\/([^/]+)\/resume\/?$/);
+    if (m && method === 'POST') {
+      const instanceId = decodeURIComponent(m[1]!);
+      const { hasSession } = await import('../pty-registry.ts');
+      if (hasSession(instanceId)) {
+        sendJson(res, 400, { error: 'session is currently live; resume not applicable' });
+        return true;
+      }
+      const db = ctx.db;
+      const row = db
+        .prepare('SELECT * FROM agent_sessions WHERE recipe_instance_id = ? OR id = ?')
+        .get(instanceId, instanceId) as Record<string, unknown> | undefined;
+      if (!row) { sendJson(res, 404, { error: 'session not found' }); return true; }
+
+      if (!ctx.ws) {
+        sendJson(res, 500, { error: 'workspace not available in this server context' });
+        return true;
+      }
+      const provider = ctx.ws.agentCliProviders.get(String(row.agent_cli));
+      if (!provider) {
+        sendJson(res, 422, { error: `provider not registered: ${row.agent_cli}` });
+        return true;
+      }
+      if (!provider.supportsResume) {
+        sendJson(res, 422, { error: `provider '${row.agent_cli}' does not support --resume` });
+        return true;
+      }
+      if (!row.cli_session_id) {
+        sendJson(res, 422, { error: 'session has no cli_session_id; cannot resume' });
+        return true;
+      }
+
+      // Look up the original recipe_id (if any) for ad-hoc detection.
+      let originalRecipeId: string | null = null;
+      if (row.recipe_instance_id) {
+        const ri = db
+          .prepare('SELECT recipe_id FROM recipe_instances WHERE id = ?')
+          .get(row.recipe_instance_id) as { recipe_id?: string } | undefined;
+        originalRecipeId = ri?.recipe_id ?? null;
+      }
+      const isAdhoc = originalRecipeId !== null && originalRecipeId.startsWith('__adhoc_');
+
+      const wsRow = db
+        .prepare('SELECT id, path FROM workspaces WHERE id = ?')
+        .get(row.workspace_id) as { id: string; path: string } | undefined;
+      if (!wsRow) {
+        sendJson(res, 500, { error: `workspace not found: ${row.workspace_id}` });
+        return true;
+      }
+
+      try {
+        const { runRecipe } = await import('../recipe-runner.ts');
+        const { resolveConfig } = await import('../config.ts');
+        const { resolveWorkspacesRoot } = await import('../workspaces-store.ts');
+        const cfg = resolveConfig({ projectDir: ctx.ws.projectDir, globalDir: ctx.ws.globalDir });
+        const runFn = ctx.runRecipeFn ?? runRecipe;
+        const result = await runFn({
+          recipeId: isAdhoc ? null : originalRecipeId,
+          recipeSnapshot: '',
+          isAdhoc,
+          prompt: '',
+          spawnMode: 'interactive',
+          resumeOf: String(row.cli_session_id),
+          workspaceInfo: { id: wsRow.id, path: wsRow.path },
+          agentCli: String(row.agent_cli),
+          workspacesRoot: resolveWorkspacesRoot(),
+          ws: ctx.ws,
+          cfg,
+        });
+        if (result.spawn_error) {
+          sendJson(res, 500, { error: `spawn failed: ${result.spawn_error.code}: ${result.spawn_error.message}` });
+          return true;
+        }
+        const { markResumedInto } = await import('../db/agent-sessions-store.ts');
+        markResumedInto(db, instanceId, result.recipe_instance_id);
+        sendJson(res, 200, {
+          ok: true,
+          new_instance_id: result.recipe_instance_id,
+          session_id: result.session_id,
+        });
+      } catch (err) {
+        sendJson(res, 500, { error: `spawn failed: ${err instanceof Error ? err.message : String(err)}` });
+      }
       return true;
     }
   }

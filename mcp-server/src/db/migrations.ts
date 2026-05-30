@@ -228,4 +228,15 @@ export const migrations: Migration[] = [
       `);
     },
   },
+  {
+    version: 3,
+    up: (db) => {
+      // PR #terminals-panel: track which spawn resumed an archived session
+      // so the UI can render "Resumed as <new-id>" badges on the original row.
+      // Spec: docs/superpowers/specs/2026-05-30-terminals-panel-design.md
+      db.exec(`
+        ALTER TABLE agent_sessions ADD COLUMN resumed_into_instance_id TEXT;
+      `);
+    },
+  },
 ];

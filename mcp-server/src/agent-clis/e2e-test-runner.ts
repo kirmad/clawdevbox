@@ -244,6 +244,7 @@ export const e2eTestRunnerProvider: AgentCliProvider = {
     "Internal test-only provider. Spawns a node script that performs a real HTTP MCP roundtrip (initialize → inbox.upsert → recipe.update_steps → recipe.done) against the clawdevbox MCP server. Used by tests/recipe-real-e2e.test.mjs.",
   source: 'builtin',
   internal: true,
+  supportsResume: false,
 
   capabilities: {
     queueMode: 'none',
