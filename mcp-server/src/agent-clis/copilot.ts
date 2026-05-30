@@ -110,7 +110,18 @@ export const copilotProvider: AgentCliProvider = {
   // files/queue-done-spike/QUEUE-FINDINGS.md). A single bulk
   // `pty.write(text + '\r')` only edits the input box; the text and the
   // commit byte (`\r` or `\x11`) must arrive in separate writes.
+  //
+  // For `strategy: 'submit'` we prepend `\x15` (Ctrl+U, "kill input line")
+  // to drop any lingering bytes a previous dispatch may have left in the
+  // input box (e.g. a `/exit` that was wrapped with `[SYSTEM: ...]\n\n`
+  // before we added the slash-command auto-skip). Ctrl+U is a no-op on an
+  // empty input box, so it's safe to always include. For `strategy: 'queue'`
+  // (Ctrl+Q) the input box is committed to Copilot's native queue and a
+  // fresh box opens; no clear is needed.
   async writePrompt(handle: AgentHandle, { text, strategy }: WritePromptOpts): Promise<void> {
+    if (strategy === 'submit') {
+      handle.pty.write('\x15');
+    }
     handle.pty.write(text);
     await sleep(SLEEP_BEFORE_COMMIT_MS);
     handle.pty.write(strategy === 'queue' ? '\x11' : '\r');

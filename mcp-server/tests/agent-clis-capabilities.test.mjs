@@ -86,17 +86,18 @@ function fakeHandle() {
   };
 }
 
-test('copilot writePrompt submit writes text then CR with ~250ms gap', async () => {
+test('copilot writePrompt submit writes Ctrl+U then text then CR with ~250ms gap', async () => {
   const { handle, writes } = fakeHandle();
   await copilotProvider.writePrompt(handle, { text: 'hello world', strategy: 'submit' });
-  assert.equal(writes.length, 2);
-  assert.equal(writes[0].data, 'hello world');
-  assert.equal(writes[1].data, '\r');
-  const gap = writes[1].at - writes[0].at;
+  assert.equal(writes.length, 3);
+  assert.equal(writes[0].data, '\x15');
+  assert.equal(writes[1].data, 'hello world');
+  assert.equal(writes[2].data, '\r');
+  const gap = writes[2].at - writes[1].at;
   assert.ok(gap >= 200, `expected ~250ms gap, got ${gap}ms`);
 });
 
-test('copilot writePrompt queue writes text then DC1 (Ctrl+Q)', async () => {
+test('copilot writePrompt queue writes text then DC1 (Ctrl+Q) without Ctrl+U', async () => {
   const { handle, writes } = fakeHandle();
   await copilotProvider.writePrompt(handle, { text: 'follow up', strategy: 'queue' });
   assert.equal(writes.length, 2);
@@ -104,11 +105,12 @@ test('copilot writePrompt queue writes text then DC1 (Ctrl+Q)', async () => {
   assert.equal(writes[1].data, '\x11');
 });
 
-test('claude writePrompt submit writes text+CR as a single bulk write', async () => {
+test('claude writePrompt submit clears input with Ctrl+U then writes text+CR', async () => {
   const { handle, writes } = fakeHandle();
   await claudeProvider.writePrompt(handle, { text: 'do thing', strategy: 'submit' });
-  assert.equal(writes.length, 1);
-  assert.equal(writes[0].data, 'do thing\r');
+  assert.equal(writes.length, 2);
+  assert.equal(writes[0].data, '\x15');
+  assert.equal(writes[1].data, 'do thing\r');
 });
 
 test('claude writePrompt rejects queue strategy', async () => {

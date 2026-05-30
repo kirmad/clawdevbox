@@ -100,6 +100,9 @@ export const claudeProvider: AgentCliProvider = {
     if (strategy === 'queue') {
       throw new Error('claude: queue strategy not supported (queueMode is "none"); caller must downgrade to local buffering');
     }
+    // Clear any lingering input from a prior dispatch (e.g. a slash command
+    // that left stray newlines). Ctrl+U is a no-op on an empty input box.
+    handle.pty.write('\x15');
     handle.pty.write(text + '\r');
   },
 
