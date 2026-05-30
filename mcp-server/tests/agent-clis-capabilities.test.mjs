@@ -59,8 +59,17 @@ test('claude busy indicators match Working and thinking', () => {
   assert.ok(indicators.some((re) => re.test('thinking...')));
 });
 
-test('claude promptReadyRegex matches trailing ❯ glyph', () => {
+test('claude promptReadyRegex matches ❯ followed by space (input bar)', () => {
   assert.ok(claudeProvider.capabilities.promptReadyRegex.test('foo\n❯ \n'));
+});
+
+test('claude promptReadyRegex matches ❯ followed by NBSP + status bar (real claude 2.1.138 layout)', () => {
+  // Real claude TUI emits the input bar as a single line:
+  //   "═══...═══❯\u00a0   Model: Opus 4.7 | Ctx Used: 0.0% | ..."
+  // The old `/❯[^\S\n]*$/m` regex never matched because the status text
+  // breaks the trailing-whitespace condition. The new regex must.
+  const realLayout = '\u2500\u2500\u2500\u2500\u2500❯\u00a0   Model: Opus 4.7 | Ctx Used: 0.0%';
+  assert.ok(claudeProvider.capabilities.promptReadyRegex.test(realLayout));
 });
 
 // ---------------------------------------------------------------------------

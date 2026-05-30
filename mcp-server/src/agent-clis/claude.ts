@@ -28,10 +28,20 @@ const CLAUDE_PLUGIN_CACHE = join(os.homedir(), '.claude', 'plugins', 'cache');
 // `claude --help` shows no queue/enqueue flag. The conductor must buffer
 // follow-up prompts locally and drain them as a coalesced delivery on
 // next idle.
+//
+// promptReadyRegex notes:
+//   Claude's input bar layout is `═══...═══❯\u00a0   Model: Opus 4.7 | ...`
+//   on a SINGLE line — i.e. the prompt glyph is followed by a non-breaking
+//   space (NBSP, U+00A0) and then the status bar. The previous regex
+//   `/❯[^\S\n]*$/m` required the line to END in whitespace after `❯`
+//   which never matched (status bar text breaks the trailing-whitespace
+//   condition). New regex matches `❯` followed by NBSP or regular space
+//   ANYWHERE — that's specific enough since claude only emits `❯` as the
+//   input bar cursor. Discovered via debug-claude-glyph probe.
 const claudeCapabilities: ProviderCapabilities = {
   queueMode: 'none',
   promptSubmitStrategy: 'bulk-cr',
-  promptReadyRegex: /❯[^\S\n]*$/m,
+  promptReadyRegex: /❯[ \u00a0]/,
   busyIndicators: [/Working/i, /thinking/i],
 };
 
