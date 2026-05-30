@@ -100,9 +100,12 @@ export const claudeProvider: AgentCliProvider = {
     if (strategy === 'queue') {
       throw new Error('claude: queue strategy not supported (queueMode is "none"); caller must downgrade to local buffering');
     }
-    // Clear any lingering input from a prior dispatch (e.g. a slash command
-    // that left stray newlines). Ctrl+U is a no-op on an empty input box.
-    handle.pty.write('\x15');
+    // Send ESC alone with a 200ms gap so it's processed as a standalone
+    // keystroke (otherwise terminals interpret `ESC <byte>` as `Alt+<byte>`).
+    // ESC both dismisses any overlay/modal from a prior slash-command AND
+    // clears the input box, so it replaces the prior `\x15` (Ctrl+U).
+    handle.pty.write('\x1b');
+    await new Promise((r) => setTimeout(r, 200));
     handle.pty.write(text + '\r');
   },
 

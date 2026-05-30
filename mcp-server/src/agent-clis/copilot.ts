@@ -111,16 +111,29 @@ export const copilotProvider: AgentCliProvider = {
   // `pty.write(text + '\r')` only edits the input box; the text and the
   // commit byte (`\r` or `\x11`) must arrive in separate writes.
   //
-  // For `strategy: 'submit'` we prepend `\x15` (Ctrl+U, "kill input line")
-  // to drop any lingering bytes a previous dispatch may have left in the
-  // input box (e.g. a `/exit` that was wrapped with `[SYSTEM: ...]\n\n`
-  // before we added the slash-command auto-skip). Ctrl+U is a no-op on an
-  // empty input box, so it's safe to always include. For `strategy: 'queue'`
-  // (Ctrl+Q) the input box is committed to Copilot's native queue and a
-  // fresh box opens; no clear is needed.
+  // For `strategy: 'submit'` we prepend `\x1b` (ESC) and wait long enough
+  // for it to be processed as a STANDALONE key. ESC serves two purposes
+  // at once:
+  //   1. Dismisses any modal/overlay opened by a prior slash-command
+  //      (e.g. `/help` opens a help overlay that swallows subsequent
+  //      input until ESC closes it — discovered by the dispatch-storm
+  //      stress test).
+  //   2. In normal input mode, ESC clears any lingering bytes in the
+  //      input box, replacing the role formerly played by `\x15` (Ctrl+U).
+  //
+  // Critically the ESC must be sent ALONE — if we follow it immediately
+  // with another byte, terminals interpret `ESC <byte>` as `Alt+<byte>`
+  // (a single Meta-prefixed key), so the overlay never dismisses. A
+  // 200ms gap is enough for copilot to process the ESC as a single
+  // keystroke. The ESC is a no-op on a clean idle prompt, so it's safe
+  // to always include.
+  //
+  // For `strategy: 'queue'` (Ctrl+Q) the input box is committed to
+  // Copilot's native queue and a fresh box opens; no clear is needed.
   async writePrompt(handle: AgentHandle, { text, strategy }: WritePromptOpts): Promise<void> {
     if (strategy === 'submit') {
-      handle.pty.write('\x15');
+      handle.pty.write('\x1b');
+      await sleep(200);
     }
     handle.pty.write(text);
     await sleep(SLEEP_BEFORE_COMMIT_MS);
