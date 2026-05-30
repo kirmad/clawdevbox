@@ -8,7 +8,7 @@
 //      MCP URL injected via `window.__CLAWDEVBOX__`.
 //   2. Inbox tab shows the empty state.
 //   3. Recipes tab shows the empty state.
-//   4. Main Agent tab attaches xterm via /terminal/main/ws — the badge
+//   4. Terminals tab attaches xterm via /terminal/main/ws — the badge
 //      stays connected and the terminal element appears.
 //   5. Push pill goes to "off" (no VAPID keys in the temp config).
 //   6. Tunnel pill says "off" (no devtunnel configured).
@@ -182,7 +182,7 @@ test('SPA mounts and renders sidebar + tabs', async () => {
   await expect(page.getByRole('tab', { name: /Inbox/i })).toBeVisible();
   await expect(page.getByRole('tab', { name: /Recipes/i })).toBeVisible();
   await expect(page.getByRole('tab', { name: /Triggers/i })).toBeVisible();
-  await expect(page.getByRole('tab', { name: /Main Agent/i })).toBeVisible();
+  await expect(page.getByRole('tab', { name: /Terminals/i })).toBeVisible();
 
   // Open the Details drawer to see sidebar contents.
   await page.getByLabel('Details').click();

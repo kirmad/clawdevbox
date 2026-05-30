@@ -414,6 +414,7 @@ export async function runStart(flags: Flags): Promise<void> {
   // The request handler closure reads `cronApiCtx` per-request, so by the
   // time the listener is actually accepting requests it's been assigned.
   let cronApiCtx: CronApiContext | null = null;
+  let testHookDispatcher: Dispatcher | null = null;
 
   const serviceStartedAt = Date.now();
   const ownVersion = readOwnVersion();
@@ -430,7 +431,7 @@ export async function runStart(flags: Flags): Promise<void> {
     // /api/test/run-e2e, /api/test/agent-clis. Handled before /mcp so they
     // never see bearer auth.
     if (url.pathname.startsWith('/api/test/')) {
-      const handled = await handleTestHook(url, req, res, { cfg, ws });
+      const handled = await handleTestHook(url, req, res, { cfg, ws, db: opened.db, getDispatcher: () => testHookDispatcher });
       if (handled) return;
     }
 
@@ -863,6 +864,7 @@ export async function runStart(flags: Flags): Promise<void> {
     callbackUrlBase: `http://${cfg.http.host}:${boundPort}`,
     defaultAgentCli: cfg.defaultAgentCli ?? 'copilot',
   });
+  testHookDispatcher = dispatcher;
   dispatcher.start();
   const scheduler = new Scheduler(opened.db, dispatcher, ws);
   scheduler.start();

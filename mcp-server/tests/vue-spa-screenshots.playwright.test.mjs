@@ -144,9 +144,9 @@ test('Desktop 1280×800 — Recipes', async () => {
   });
 });
 
-test('Desktop 1280×800 — Main Agent', async () => {
-  await shoot({ width: 1280, height: 800 }, 'desktop-agent', async (page) => {
-    await page.getByRole('tab', { name: /Main Agent/i }).click();
+test('Desktop 1280×800 — Terminals', async () => {
+  await shoot({ width: 1280, height: 800 }, 'desktop-terminals', async (page) => {
+    await page.getByRole('tab', { name: /Terminals/i }).click();
     await page.waitForTimeout(600); // xterm attach
   });
 });
@@ -162,9 +162,9 @@ test('Mobile 390×844 — Recipes', async () => {
   });
 });
 
-test('Mobile 390×844 — Main Agent', async () => {
-  await shoot({ width: 390, height: 844 }, 'mobile-agent', async (page) => {
-    await page.getByRole('tab', { name: /Main Agent/i }).click();
+test('Mobile 390×844 — Terminals', async () => {
+  await shoot({ width: 390, height: 844 }, 'mobile-terminals', async (page) => {
+    await page.getByRole('tab', { name: /Terminals/i }).click();
     await page.waitForTimeout(600);
   });
 });

@@ -229,29 +229,14 @@ export async function handleCronApi(
     }
   }
 
-  if (!path.startsWith('/api/cron/') && !path.startsWith('/api/fires') && !path.startsWith('/api/sessions')) {
-    return false;
-  }
-
-  // ----- bearer auth for all /api/* in this handler -------------------------
-  // Auth is opt-in: when ctx.expectedToken is null/empty, the server has no
-  // bearer configured and these routes are treated as loopback-only.
-  if (ctx.expectedToken) {
-    const token = bearer(req);
-    if (!token) {
-      reject401(res, 'missing bearer token');
-      return true;
-    }
-    if (!constantTimeEquals(token, ctx.expectedToken)) {
-      reject401(res, 'invalid bearer token');
-      return true;
-    }
-  }
-
-  // ----- GET /api/sessions (list) ------------------------------------------
-  // Must come BEFORE the singular /api/sessions/<id> route — otherwise the
-  // singular regex would swallow `/api/sessions` (matching empty id) and
-  // shadow this handler.
+  // -- /api/sessions* routes are loopback-only (no bearer required) ---------
+  // Matches the convention of /api/recipes, /api/inbox, /api/triggers, etc.
+  // The SPA consumes these without a bearer; bearer-gated routes below are
+  // for the /api/cron/* + /api/fires* maintenance surface.
+  //
+  // The list endpoint MUST come BEFORE the singular /api/sessions/<id> route
+  // because the singular regex `/^\/api\/sessions\/([^/]+)\/?$/` would
+  // otherwise match `/api/sessions` (empty id) and shadow it.
   if (path === '/api/sessions' && method === 'GET') {
     const status = (url.searchParams.get('status') ?? 'all') as 'active' | 'archived' | 'all';
     const since = Number(url.searchParams.get('since') ?? 0) || 0;

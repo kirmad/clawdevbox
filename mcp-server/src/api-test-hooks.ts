@@ -26,10 +26,15 @@
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { Database } from 'better-sqlite3';
+import { randomBytes } from 'node:crypto';
 import type { ResolvedConfig } from './config.ts';
 import type { Workspace } from './workspace.ts';
+import type { Dispatcher } from './dispatcher.ts';
 import { getRegistry } from './tools/registry.ts';
 import { logger } from './logger.ts';
+import { ensureWorkspace } from './db/workspaces-store.ts';
+import { readIndex, writeIndex, initClawdevboxTree, resolveWorkspacesRoot } from './workspaces-store.ts';
 
 const LOOPBACK_ADDRS = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
 
@@ -184,6 +189,9 @@ const INLINE_TRIGGER_SCRIPT = [
 export interface TestHookCtx {
   cfg: ResolvedConfig;
   ws: Workspace;
+  db?: Database;
+  /** Lazy getter — dispatcher is constructed AFTER the HTTP server binds. */
+  getDispatcher?: () => Dispatcher | null;
 }
 
 /**
@@ -334,6 +342,107 @@ export async function handleTestHook(
       trigger_id: triggerId,
       fire_id: fireResult?.fire_id ?? null,
     });
+    return true;
+  }
+
+  // ── POST /api/test/record-active-run ──────────────────────────────────
+  // Test-only: directly inject an activeRuns entry into the dispatcher so
+  // /spawn/<fire_id> and /dispatch/<fire_id> accept the per-fire bearer
+  // without needing a real trigger script to fire. Used by the
+  // terminals-panel-e2e playwright test. Also inserts a fires row +
+  // ensures the workspace is registered, so spawnFromCallback's
+  // workspace lookup succeeds.
+  //
+  // Body: { fire_id, secret, workspace_id?, workspace_path,
+  //         provider_id?, dispatch_target_instance_id? }
+  // Returns 200 { ok: true, fire_id, secret } on success.
+  if (path === '/api/test/record-active-run' && req.method === 'POST') {
+    const body = (await readJsonBody<{
+      fire_id?: string;
+      secret?: string;
+      workspace_id?: string;
+      workspace_path?: string;
+      provider_id?: string;
+      dispatch_target_instance_id?: string | null;
+    }>(req, res)) ?? null;
+    if (body == null) return true;
+    if (!body.fire_id || !body.secret || !body.workspace_path) {
+      sendJson(res, 400, {
+        error: { code: 'INVALID_REQUEST', message: 'fire_id, secret, workspace_path are required' },
+      });
+      return true;
+    }
+    const dispatcher = _ctx.getDispatcher?.();
+    const db = _ctx.db;
+    if (!dispatcher || !db) {
+      sendJson(res, 503, {
+        error: { code: 'NOT_READY', message: 'dispatcher or db not available' },
+      });
+      return true;
+    }
+
+    // Ensure workspace exists in BOTH the DB AND the on-disk index.
+    // The DB row is required by spawnFromCallback's workspace lookup;
+    // the on-disk index is required by context-resolver when the spawned
+    // agent's MCP requests carry x-clawdevbox-workspace-id header (which
+    // recipe.done validates).
+    const wsRow = ensureWorkspace(db, { path: body.workspace_path });
+    const workspaceId = body.workspace_id ?? wsRow.id;
+    try {
+      const workspacesRoot = resolveWorkspacesRoot();
+      const idx = readIndex(workspacesRoot);
+      if (!idx.workspaces[workspaceId]) {
+        idx.workspaces[workspaceId] = {
+          id: workspaceId,
+          path: body.workspace_path,
+          name: null,
+          parent_workspace_id: null,
+          created_at: Date.now(),
+        };
+        writeIndex(workspacesRoot, idx);
+        initClawdevboxTree({
+          workspacePath: body.workspace_path,
+          info: idx.workspaces[workspaceId],
+          workspacesRoot,
+        });
+      }
+    } catch (err) {
+      logger.warn(
+        { err: err instanceof Error ? err.message : String(err), workspaceId },
+        'record-active-run: on-disk index write failed (continuing)',
+      );
+    }
+
+    // Insert a synthetic fires row so the /spawn handler's downstream
+    // marker write (if any) doesn't FK-fail. The row is enough for
+    // dispatcher.activeRuns to flow; status='running' to mirror an
+    // in-flight script binding.
+    try {
+      db.prepare(
+        `INSERT INTO fires (fire_id, workspace_id, source, status, attempt, max_attempts, scheduled_at)
+         VALUES (?, ?, 'manual', 'running', 1, 1, ?)
+         ON CONFLICT(fire_id) DO NOTHING`,
+      ).run(body.fire_id, workspaceId, Date.now());
+    } catch (err) {
+      logger.warn(
+        { fire_id: body.fire_id, err: err instanceof Error ? err.message : String(err) },
+        'record-active-run: fires INSERT failed (continuing)',
+      );
+    }
+
+    dispatcher.recordActiveRun(body.fire_id, {
+      secret: body.secret,
+      outDir: body.workspace_path,
+      triggerId: 'test-trigger',
+      dispatchTargetInstanceId: body.dispatch_target_instance_id ?? undefined,
+      spawnDefaults: {
+        providerId: body.provider_id ?? 'e2e-test-runner',
+        workspaceId,
+        workspacePath: body.workspace_path,
+      },
+    });
+
+    sendJson(res, 200, { ok: true, fire_id: body.fire_id, secret: body.secret, workspace_id: workspaceId });
     return true;
   }
 
