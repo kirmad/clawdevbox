@@ -11,6 +11,8 @@ import {
   fetchAgentStatus,
   fetchApprovals,
   fetchInbox,
+  fetchSessions,
+  resumeSession,
   fetchInboxItem,
   fetchPushStatus,
   fetchPushVapid,
@@ -31,6 +33,7 @@ import {
   type PushVapidInfo,
   type RecipeInstance,
   type RegisteredTrigger,
+  type Session,
   type TunnelStatus,
 } from '../api';
 
@@ -105,6 +108,14 @@ interface State {
    */
   pendingMobileDetailRestore: string | null;
   activeTab: string;
+  terminals: {
+    items: Session[];
+    selectedInstanceId: string | null;
+    archiveSince: number;
+    archiveCursor: number | undefined;
+    archiveExpanded: boolean;
+    loading: boolean;
+  };
 }
 
 export const useUiStore = defineStore('ui', {
@@ -141,6 +152,14 @@ export const useUiStore = defineStore('ui', {
     fullscreenPaneId: null,
     pendingMobileDetailRestore: null,
     activeTab: 'inbox',
+    terminals: {
+      items: [],
+      selectedInstanceId: null,
+      archiveSince: 0,
+      archiveCursor: undefined,
+      archiveExpanded: false,
+      loading: false,
+    },
   }),
   getters: {
     pushReady: (s) => s.push.enabledOnServer && !!s.push.publicKey,
@@ -616,6 +635,51 @@ export const useUiStore = defineStore('ui', {
     },
     setActiveTab(key: string): void {
       this.activeTab = key;
+    },
+
+    // --- terminals --------------------------------------------------------
+    async refreshTerminals(opts: { status?: 'all'|'active'|'archived'; since?: number } = {}): Promise<void> {
+      this.terminals.loading = true;
+      try {
+        const status = opts.status ?? (this.terminals.archiveExpanded ? 'all' : 'all');
+        const res = await fetchSessions({ status, since: opts.since, limit: 50 });
+        // For an "active-only" refresh (e.g. from a 'sessions' topic event),
+        // merge: replace live entries, keep archived as-is.
+        if (status === 'active') {
+          const archived = this.terminals.items.filter((i) => !i.live);
+          this.terminals.items = [...res.items, ...archived];
+        } else {
+          this.terminals.items = res.items;
+          this.terminals.archiveCursor = res.next_since;
+        }
+        if (!this.terminals.selectedInstanceId && this.terminals.items.length > 0) {
+          // Prefer main, else first live, else first overall.
+          const main = this.terminals.items.find((i) => i.instance_id === 'main');
+          const firstLive = this.terminals.items.find((i) => i.live);
+          this.terminals.selectedInstanceId = (main ?? firstLive ?? this.terminals.items[0]!).instance_id;
+        }
+      } finally {
+        this.terminals.loading = false;
+      }
+    },
+
+    selectTerminal(instanceId: string): void {
+      this.terminals.selectedInstanceId = instanceId;
+    },
+
+    async resumeTerminal(instanceId: string): Promise<void> {
+      const r = await resumeSession(instanceId);
+      this.terminals.selectedInstanceId = r.new_instance_id;
+      // Optimistic — the 'sessions' topic event will refresh authoritatively.
+      await this.refreshTerminals({ status: 'all' });
+    },
+
+    async loadMoreArchive(): Promise<void> {
+      if (!this.terminals.archiveCursor) return;
+      const res = await fetchSessions({ status: 'archived', since: this.terminals.archiveCursor, limit: 50 });
+      // Append (archive is sorted desc; older items go to the end).
+      this.terminals.items = [...this.terminals.items, ...res.items];
+      this.terminals.archiveCursor = res.next_since;
     },
 
     // --- realtime ---------------------------------------------------------

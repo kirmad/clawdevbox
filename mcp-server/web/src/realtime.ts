@@ -10,7 +10,7 @@ export function setupRealtime(): () => void {
   const store = useUiStore();
   let es: EventSource | null = null;
   const timers: Record<string, number | null> = {
-    inbox: null, recipes: null, agent: null, tunnel: null, triggers: null, approvals: null,
+    inbox: null, recipes: null, agent: null, tunnel: null, triggers: null, approvals: null, sessions: null,
   };
 
   function schedule(topic: keyof typeof timers, fn: () => void | Promise<void>): void {
@@ -43,6 +43,7 @@ export function setupRealtime(): () => void {
       if (t === 'tunnel')    schedule('tunnel', () => store.refreshTunnel());
       if (t === 'triggers')  schedule('triggers', () => store.refreshTriggers());
       if (t === 'approvals') schedule('approvals', () => store.refreshApprovals());
+      if (t === 'sessions')  schedule('sessions', () => store.refreshTerminals({ status: 'active' }));
       // 'notifications' is handled separately via refreshPush — most
       // pages don't need to react to it here.
     });

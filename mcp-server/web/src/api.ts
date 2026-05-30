@@ -337,3 +337,52 @@ export async function postPushTest(): Promise<{ ok: boolean; error?: string }> {
   const res = await fetch('/api/push/test', { method: 'POST' });
   return (await res.json()) as { ok: boolean; error?: string };
 }
+
+// -- Sessions / Terminals ----------------------------------------------------
+
+export interface Session {
+  instance_id: string;
+  kind: 'main' | 'recipe' | 'adhoc';
+  state: 'starting' | 'idle' | 'busy' | 'exited' | 'archived' | 'unknown';
+  provider_id: string | null;
+  cli_session_id: string | null;
+  recipe_id: string | null;
+  label: string;
+  started_at: number;
+  ended_at: number | null;
+  live: boolean;
+  queue_depth: number;
+  workspace_id: string;
+}
+
+export interface FetchSessionsResponse {
+  items: Session[];
+  next_since?: number;
+}
+
+export function fetchSessions(opts: { status?: 'all'|'active'|'archived'; since?: number; limit?: number } = {}): Promise<FetchSessionsResponse> {
+  const p = new URLSearchParams();
+  if (opts.status) p.set('status', opts.status);
+  if (opts.since !== undefined) p.set('since', String(opts.since));
+  if (opts.limit !== undefined) p.set('limit', String(opts.limit));
+  return fetchJson(`/api/sessions${p.toString() ? '?' + p.toString() : ''}`);
+}
+
+export interface ResumeSessionResponse {
+  ok: true;
+  new_instance_id: string;
+  session_id: string;
+}
+
+export async function resumeSession(instanceId: string): Promise<ResumeSessionResponse> {
+  const res = await fetch(`/api/sessions/${encodeURIComponent(instanceId)}/resume`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: '{}',
+  });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => '');
+    throw new Error(`resume failed: ${res.status} ${txt.slice(0, 200)}`);
+  }
+  return (await res.json()) as ResumeSessionResponse;
+}
