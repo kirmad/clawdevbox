@@ -93,6 +93,32 @@ export class UnsupportedProviderError extends Error {
   }
 }
 
+/**
+ * Thrown when a dispatch is rejected because the conductor saw the
+ * provider's abort indicator (e.g. copilot's "ctrl+c again to exit"
+ * hint) while the dispatch was in flight. The caller can use this to
+ * distinguish a real LLM-failure from a user-aborted turn.
+ */
+export class SessionAbortedError extends Error {
+  constructor(reason = 'dispatch aborted (ctrl+c)') {
+    super(reason);
+    this.name = 'SessionAbortedError';
+  }
+}
+
+// Substring (case-insensitive scan via lowercase tail) that copilot prints
+// to the screen after the user presses Ctrl+C once: "ctrl+c again to exit".
+// Agency wraps copilot so the same hint appears there. Claude prints a
+// similar hint ("press Ctrl-C again"); we match the leading "ctrl+c" +
+// "again" pair to cover both.
+const ABORT_HINT_RE = /ctrl\+c again|ctrl-c again|press ctrl\+c again/i;
+
+// Slash-command detection: prompts starting with `/<letter>` are CLI
+// commands (e.g. `/exit`, `/help`, `/clear`). Wrapping them with the
+// done-marker [SYSTEM: ...] block corrupts the command parser; they must
+// be submitted as-is and completion detected via prompt-ready instead.
+const SLASH_COMMAND_RE = /^\s*\/[a-zA-Z]/;
+
 interface PendingDispatch {
   text: string;
   withMarker: boolean;
@@ -209,10 +235,17 @@ export class SessionConductor extends EventEmitter {
     if (this.disposed || this._state === 'exited') {
       return Promise.reject(this._state === 'exited' ? new SessionExitedError(null) : new SessionDisposedError());
     }
+    // Auto-skip the done-marker for slash-commands (caller can still force
+    // it on by passing withMarker:true). Wrapping a /help or /exit with the
+    // [SYSTEM: ...] block makes copilot's CLI command parser see garbage
+    // after the command (e.g. `/exit ---` → "Invalid argument"). See Bug A
+    // notes in conductor-reliability.playwright.test.mjs.
+    const isSlashCommand = SLASH_COMMAND_RE.test(text);
+    const withMarker = opts.withMarker !== undefined ? opts.withMarker : !isSlashCommand;
     return new Promise<DispatchResult>((resolve, reject) => {
       const pending: PendingDispatch = {
         text,
-        withMarker: opts.withMarker !== false,
+        withMarker,
         callerStrategy: opts.strategy ?? 'auto',
         timeoutMs: opts.timeoutMs ?? this.opts.timeoutMs,
         resolve,
@@ -362,6 +395,19 @@ export class SessionConductor extends EventEmitter {
     const a = this.active;
     a.totalBytes += chunk.length;
     a.lastByteAt = now;
+
+    // Abort detection: if the provider printed its "ctrl+c again to exit"
+    // hint, the user (or a script) interrupted the current turn. Reject
+    // the active dispatch with SessionAbortedError instead of waiting for
+    // a false-positive prompt-ready signal from the redrawn input box.
+    if (ABORT_HINT_RE.test(chunk) || ABORT_HINT_RE.test(this.tail())) {
+      this.active = null;
+      this.clearActiveTimers(a);
+      a.reject(new SessionAbortedError());
+      this.transitionState('idle');
+      this.maybeStartNext();
+      return;
+    }
 
     // Marker check: only after the prompt-echo window has passed, only
     // for the marker we expect for THIS dispatch, only in the screen tail.
