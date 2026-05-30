@@ -1,6 +1,7 @@
 import { join } from 'node:path';
 import os from 'node:os';
 import { writeMcpJson, probeBinary, cliPluginSync, cliPluginDiscover, buildVaultPluginDirArgs, deliverInitialPromptWhenReady } from './shared.ts';
+import { trustCopilotWorkspace } from '../trust-workspace.ts';
 import type {
   AgentCliProvider,
   AgentHandle,
@@ -58,6 +59,13 @@ export const copilotProvider: AgentCliProvider = {
     const bin = resolveBinary();
     writeMcpJson(ctx, opts.workspaceInfo.path, opts.mcp);
     const mcpPath = join(opts.workspaceInfo.path, '.mcp.json');
+
+    // Pre-trust the workspace in copilot's config so we never hit the
+    // "Do you trust the files in this folder?" modal on first launch
+    // in a new directory. `--yolo` does NOT bypass the trust modal — it
+    // only enables tool permissions. Idempotent: only writes if the
+    // workspace isn't already trusted (directly or via a parent entry).
+    trustCopilotWorkspace(opts.workspaceInfo.path);
 
     // Use `--session-id <uuid>` for BOTH new and resume. Per `copilot --help`:
     //   --session-id <id>    Resume an existing session or task by ID, or set

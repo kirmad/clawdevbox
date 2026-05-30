@@ -40,6 +40,7 @@ export type {
 
 export { writeMcpJson, cliPluginSync, cliPluginDiscover, parsePluginListOutput, parseMarketplaceListOutput, stripAnsi, stripTuiNoise, deliverInitialPromptWhenReady } from './shared.ts';
 export type { DeliverInitialPromptOpts } from './shared.ts';
+export { trustCopilotWorkspace } from '../trust-workspace.ts';
 
 export {
   SessionConductor,
