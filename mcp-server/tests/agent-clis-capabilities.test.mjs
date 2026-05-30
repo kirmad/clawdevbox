@@ -86,18 +86,20 @@ function fakeHandle() {
   };
 }
 
-test('copilot writePrompt submit writes Ctrl+U then text then CR with ~250ms gap', async () => {
+test('copilot writePrompt submit writes ESC (200ms gap) then text then CR with ~250ms gap', async () => {
   const { handle, writes } = fakeHandle();
   await copilotProvider.writePrompt(handle, { text: 'hello world', strategy: 'submit' });
   assert.equal(writes.length, 3);
-  assert.equal(writes[0].data, '\x15');
+  assert.equal(writes[0].data, '\x1b');
   assert.equal(writes[1].data, 'hello world');
   assert.equal(writes[2].data, '\r');
-  const gap = writes[2].at - writes[1].at;
-  assert.ok(gap >= 200, `expected ~250ms gap, got ${gap}ms`);
+  const escGap = writes[1].at - writes[0].at;
+  assert.ok(escGap >= 150, `expected ~200ms ESC gap, got ${escGap}ms`);
+  const submitGap = writes[2].at - writes[1].at;
+  assert.ok(submitGap >= 200, `expected ~250ms submit gap, got ${submitGap}ms`);
 });
 
-test('copilot writePrompt queue writes text then DC1 (Ctrl+Q) without Ctrl+U', async () => {
+test('copilot writePrompt queue writes text then DC1 (Ctrl+Q) without ESC', async () => {
   const { handle, writes } = fakeHandle();
   await copilotProvider.writePrompt(handle, { text: 'follow up', strategy: 'queue' });
   assert.equal(writes.length, 2);
@@ -105,12 +107,14 @@ test('copilot writePrompt queue writes text then DC1 (Ctrl+Q) without Ctrl+U', a
   assert.equal(writes[1].data, '\x11');
 });
 
-test('claude writePrompt submit clears input with Ctrl+U then writes text+CR', async () => {
+test('claude writePrompt submit dismisses overlays with ESC (200ms gap) then writes text+CR', async () => {
   const { handle, writes } = fakeHandle();
   await claudeProvider.writePrompt(handle, { text: 'do thing', strategy: 'submit' });
   assert.equal(writes.length, 2);
-  assert.equal(writes[0].data, '\x15');
+  assert.equal(writes[0].data, '\x1b');
   assert.equal(writes[1].data, 'do thing\r');
+  const escGap = writes[1].at - writes[0].at;
+  assert.ok(escGap >= 150, `expected ~200ms ESC gap, got ${escGap}ms`);
 });
 
 test('claude writePrompt rejects queue strategy', async () => {
