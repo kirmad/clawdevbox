@@ -24,6 +24,7 @@
  */
 
 import type { IPty } from 'node-pty';
+import { spawnSync } from 'node:child_process';
 import type { AgentCliProvider, AgentHandle } from './agent-clis/types.ts';
 import { createSessionConductor, UnsupportedProviderError, type SessionConductor } from './agent-clis/session-conductor.ts';
 import { emitChange } from './event-bus.ts';
@@ -294,6 +295,54 @@ export function killPty(instanceId: string, signal?: string): boolean {
     return false;
   }
   return true;
+}
+
+/**
+ * Force-kill the pty AND its entire descendant process tree.
+ *
+ * `ipty.kill()` alone is insufficient on Windows for agents that spawn
+ * wrapping processes (e.g. `agency.exe` spawns `copilot.exe` which spawns
+ * more `agency.exe` helpers). ConPTY tears down the pipe, but the child
+ * tree can outlive the pty, holding session-file locks that surface later
+ * as "Session in use" modals on the next spawn.
+ *
+ * On Windows we use `taskkill /T /F /PID <pid>` (recursive force-kill).
+ * On POSIX we fall back to `ipty.kill()` (which by default sends SIGHUP to
+ * the process group via the pty controller, killing descendants).
+ */
+function killPtyTree(s: PtySession): void {
+  const pid = s.ipty.pid;
+  if (process.platform === 'win32' && typeof pid === 'number' && pid > 0) {
+    try {
+      spawnSync('taskkill', ['/T', '/F', '/PID', String(pid)], {
+        windowsHide: true,
+        timeout: 5000,
+      });
+    } catch (err) {
+      logger.warn(
+        { instanceId: s.instanceId, pid, err: err instanceof Error ? err.message : String(err) },
+        'pty-registry: taskkill failed, falling back to ipty.kill()',
+      );
+      try { s.ipty.kill(); } catch { /* ignore */ }
+    }
+  } else {
+    try { s.ipty.kill(); } catch { /* ignore */ }
+  }
+}
+
+/**
+ * Walk all live sessions and kill their pty trees. Returns the number of
+ * sessions that were killed. Called from the shutdown handler in start.ts
+ * to prevent orphan agent processes from outliving clawdevbox.
+ */
+export function killAllSessions(): number {
+  let killed = 0;
+  for (const s of sessions.values()) {
+    if (s.exited) continue;
+    killPtyTree(s);
+    killed++;
+  }
+  return killed;
 }
 
 export function listSessions(): { instanceId: string; workspaceId: string; exited: boolean }[] {
