@@ -1,7 +1,7 @@
 <script setup lang="ts">
 /**
- * Top-level SPA shell. Owns the three primary tabs (Inbox / Recipes /
- * Main Agent), plus a closable tab per opened artifact.
+ * Top-level SPA shell. Owns the four primary tabs (Inbox / Recipes /
+ * Triggers / Terminals), plus a closable tab per opened artifact.
  *
  * Layout (consistent across viewports):
  *   - Top: slim header with brand, compact tunnel/live status, and an
@@ -23,7 +23,7 @@ import InboxPanel from './components/InboxPanel.vue';
 import InboxDetailPanel from './components/InboxDetailPanel.vue';
 import RecipesPanel from './components/RecipesPanel.vue';
 import TriggersPanel from './components/TriggersPanel.vue';
-import AgentPanel from './components/AgentPanel.vue';
+import TerminalsPanel from './components/TerminalsPanel.vue';
 import ArtifactPanel from './components/ArtifactPanel.vue';
 
 const store = useUiStore();
@@ -109,7 +109,7 @@ const agentBadgeSeverity = computed(() =>
             <Badge v-if="store.triggers.length > 0" :value="store.triggers.length" severity="secondary" />
           </Tab>
           <Tab value="agent">
-            <i class="pi pi-play" /> Main Agent
+            <i class="pi pi-window-maximize" /> Terminals
           </Tab>
           <Tab v-for="tab in store.inboxTabs" :key="tab.id" :value="`inbox-detail:${tab.id}`">
             <i class="pi pi-envelope" /> {{ tab.title || tab.id }}
@@ -143,7 +143,7 @@ const agentBadgeSeverity = computed(() =>
           <TabPanel value="inbox"><InboxPanel /></TabPanel>
           <TabPanel value="recipes"><RecipesPanel /></TabPanel>
           <TabPanel value="triggers"><TriggersPanel /></TabPanel>
-          <TabPanel value="agent"><AgentPanel /></TabPanel>
+          <TabPanel value="agent"><TerminalsPanel /></TabPanel>
           <TabPanel v-for="tab in store.inboxTabs" :key="tab.id" :value="`inbox-detail:${tab.id}`">
             <InboxDetailPanel
               :item-id="tab.id"
