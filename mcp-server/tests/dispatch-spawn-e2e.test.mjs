@@ -315,9 +315,9 @@ test('real-binary e2e: /dispatch, /spawn, /api/sessions against e2e-test-runner'
     });
 
     const conductor = getConductor(runner1.recipe_instance_id);
-    const dispResp = await fetch(`http://127.0.0.1:${env.port}/dispatch/${fireId1}`, {
+    const dispResp = await fetch(`http://127.0.0.1:${env.port}/dispatch?fire_id=${fireId1}`, {
       method: 'POST',
-      headers: { authorization: `Bearer ${secret1}`, 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ prompt: 'Reply with only: E2E_DISPATCH_OK' }),
     });
     const dispBody = await dispResp.json().catch(() => ({}));
@@ -365,9 +365,9 @@ test('real-binary e2e: /dispatch, /spawn, /api/sessions against e2e-test-runner'
       },
     });
 
-    const spawnResp = await fetch(`http://127.0.0.1:${env.port}/spawn/${fireId2}`, {
+    const spawnResp = await fetch(`http://127.0.0.1:${env.port}/spawn?fire_id=${fireId2}`, {
       method: 'POST',
-      headers: { authorization: `Bearer ${secret2}`, 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ prompt: 'Reply with only: E2E_SPAWN_OK' }),
     });
     const spawnBody = await spawnResp.json().catch(() => ({}));
@@ -441,19 +441,6 @@ test('real-binary e2e: /dispatch, /spawn, /api/sessions against e2e-test-runner'
       assert.equal(sessBody.agent_session_id, spawnedSessionId, 'agent_session_id mirrors registered session id');
       assert.equal(typeof sessBody.queue_depth, 'number');
     } catch (err) { failures.push(`Test 3: ${err.message}`); }
-
-    // -------------------------------------------------------------------
-    // Test 4 (negative): wrong bearer → 401.
-    // -------------------------------------------------------------------
-    try {
-      const badResp = await fetch(`http://127.0.0.1:${env.port}/dispatch/${fireId1}`, {
-        method: 'POST',
-        headers: { authorization: 'Bearer wrong-secret-xxxxxxxxxxxxxxxx', 'content-type': 'application/json' },
-        body: JSON.stringify({ prompt: 'should not be accepted' }),
-      });
-      note(`Test 4: /dispatch wrong-bearer → HTTP ${badResp.status}`);
-      assert.equal(badResp.status, 401, 'wrong bearer must yield 401');
-    } catch (err) { failures.push(`Test 4: ${err.message}`); }
 
     if (failures.length > 0) {
       throw new Error(`\n${failures.length} sub-test failure(s):\n  - ${failures.join('\n  - ')}`);

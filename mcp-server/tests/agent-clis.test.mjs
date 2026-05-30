@@ -91,10 +91,11 @@ for (const row of MATRIX) {
       ?? (process.platform === 'win32' ? 'copilot.exe' : 'copilot');
     assert.equal(c.file, expectedBin);
 
-    const sessionFlag = row.kind === 'new'
-      ? `--name=${row.sessionId}`
-      : `--resume=${row.sessionId}`;
+    const sessionFlag = `--session-id=${row.sessionId}`;
     assert.ok(c.args.includes(sessionFlag), `args missing ${sessionFlag}: ${c.args.join(' ')}`);
+
+    // --yolo is always present (autonomous tool permissions for dispatched prompts).
+    assert.ok(c.args.includes('--yolo'), `args missing --yolo: ${c.args.join(' ')}`);
 
     const mcpIdx = c.args.indexOf('--additional-mcp-config');
     assert.ok(mcpIdx >= 0, 'should include --additional-mcp-config');
@@ -103,13 +104,14 @@ for (const row of MATRIX) {
     assert.ok(mcpVal.endsWith('.mcp.json'), `expected .mcp.json path, got ${mcpVal}`);
 
     if (row.mode === 'headless') {
-      assert.ok(c.args.includes('--allow-all-tools'), 'headless missing --allow-all-tools');
+      // --yolo supersedes --allow-all-tools; both work but yolo is the
+      // canonical superset (also allows paths + urls).
+      assert.ok(!c.args.includes('--allow-all-tools'), 'headless should now use --yolo only');
       const pIdx = c.args.indexOf('-p');
       assert.ok(pIdx >= 0, 'headless missing -p');
       assert.equal(c.args[pIdx + 1], row.prompt);
     } else {
       assert.ok(!c.args.includes('-p'), 'interactive must not include -p');
-      assert.ok(!c.args.includes('--allow-all-tools'), 'interactive must not include --allow-all-tools');
     }
 
     assert.equal(handle.sessionId, row.sessionId);

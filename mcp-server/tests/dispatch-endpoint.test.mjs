@@ -1,10 +1,10 @@
 /**
- * dispatch-endpoint.test.mjs — covers POST /dispatch/<fire_id>.
+ * dispatch-endpoint.test.mjs — covers POST /dispatch.
  *
- * Spins up an http.Server bound to handleCronApi, registers a fake pty +
- * conductor in pty-registry, seeds an activeRuns entry on the Dispatcher
- * via the recordActiveRun test seam, then hits the endpoint with every
- * permutation of routing failure described in Task 3.7.
+ * No auth. Two routing modes:
+ *   1. ?fire_id=<id> → resolve via dispatcher.activeRuns
+ *   2. ?instance_id=<id> → direct conductor lookup, no fire required
+ *   3. body.instance_id / body.fire_id → same as query
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -99,7 +99,6 @@ function makeCtx(db, dispatcher) {
     dbPath: ':memory:',
     schemaVersion: 1,
     service: { pid: 1, port: 5201, started_at: 0, version: '0.0.0' },
-    // /dispatch + /spawn use per-fire secrets, not expectedToken.
     expectedToken: null,
   };
 }
@@ -121,9 +120,8 @@ function registerFakeConductorPty(instanceId) {
   return { pty, resolveExit };
 }
 
-function seedActiveRun(dispatcher, fireId, { secret = 'fire-secret-xyz', dispatchTargetInstanceId } = {}) {
+function seedActiveRun(dispatcher, fireId, { dispatchTargetInstanceId } = {}) {
   dispatcher.recordActiveRun(fireId, {
-    secret,
     outDir: 'C:/tmp/out',
     triggerId: 't1',
     dispatchTargetInstanceId,
@@ -136,19 +134,18 @@ function seedActiveRun(dispatcher, fireId, { secret = 'fire-secret-xyz', dispatc
   });
 }
 
-test('POST /dispatch/<fire_id> — happy path: queues prompt on conductor and returns 200', async () => {
+test('POST /dispatch?fire_id — happy path: queues prompt on conductor and returns 200', async () => {
   const db = openDb();
   const dispatcher = new Dispatcher(db, makeWs(), { maxConcurrent: 1 });
-  const { ctx } = { ctx: makeCtx(db, dispatcher) };
-  const { server, port } = await startServer(ctx);
+  const { server, port } = await startServer(makeCtx(db, dispatcher));
   const instanceId = 'disp-happy-1';
   registerFakeConductorPty(instanceId);
   seedActiveRun(dispatcher, 'fire-happy', { dispatchTargetInstanceId: instanceId });
 
   try {
-    const r = await fetch(`http://127.0.0.1:${port}/dispatch/fire-happy`, {
+    const r = await fetch(`http://127.0.0.1:${port}/dispatch?fire_id=fire-happy`, {
       method: 'POST',
-      headers: { authorization: 'Bearer fire-secret-xyz', 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ prompt: 'go' }),
     });
     assert.equal(r.status, 200);
@@ -156,7 +153,6 @@ test('POST /dispatch/<fire_id> — happy path: queues prompt on conductor and re
     assert.equal(body.ok, true);
     assert.equal(typeof body.queued_at, 'number');
     assert.ok(['idle', 'busy', 'starting', 'exited'].includes(body.state));
-    // The dispatched prompt must have landed in the conductor's queue.
     const cond = getConductor(instanceId);
     assert.ok(cond);
     assert.equal(cond.pendingCount(), 1);
@@ -167,20 +163,24 @@ test('POST /dispatch/<fire_id> — happy path: queues prompt on conductor and re
   }
 });
 
-test('POST /dispatch/<fire_id> — wrong bearer returns 401', async () => {
+test('POST /dispatch?instance_id — direct routing without a fire works', async () => {
   const db = openDb();
   const dispatcher = new Dispatcher(db, makeWs(), { maxConcurrent: 1 });
   const { server, port } = await startServer(makeCtx(db, dispatcher));
-  const instanceId = 'disp-401-1';
+  const instanceId = 'disp-direct-1';
   registerFakeConductorPty(instanceId);
-  seedActiveRun(dispatcher, 'fire-401', { dispatchTargetInstanceId: instanceId });
+
   try {
-    const r = await fetch(`http://127.0.0.1:${port}/dispatch/fire-401`, {
+    const r = await fetch(`http://127.0.0.1:${port}/dispatch?instance_id=${instanceId}`, {
       method: 'POST',
-      headers: { authorization: 'Bearer wrong-secret', 'content-type': 'application/json' },
-      body: JSON.stringify({ prompt: 'nope' }),
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ prompt: 'go direct' }),
     });
-    assert.equal(r.status, 401);
+    assert.equal(r.status, 200);
+    const body = await r.json();
+    assert.equal(body.ok, true);
+    const cond = getConductor(instanceId);
+    assert.equal(cond.pendingCount(), 1);
   } finally {
     if (hasSession(instanceId)) killPty(instanceId);
     await stopServer(server);
@@ -188,14 +188,35 @@ test('POST /dispatch/<fire_id> — wrong bearer returns 401', async () => {
   }
 });
 
-test('POST /dispatch/<fire_id> — unknown fire returns 404 with fire-not-found message', async () => {
+test('POST /dispatch — instance_id in body also works', async () => {
+  const db = openDb();
+  const dispatcher = new Dispatcher(db, makeWs(), { maxConcurrent: 1 });
+  const { server, port } = await startServer(makeCtx(db, dispatcher));
+  const instanceId = 'disp-bodyid-1';
+  registerFakeConductorPty(instanceId);
+
+  try {
+    const r = await fetch(`http://127.0.0.1:${port}/dispatch`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ prompt: 'go bodyid', instance_id: instanceId }),
+    });
+    assert.equal(r.status, 200);
+  } finally {
+    if (hasSession(instanceId)) killPty(instanceId);
+    await stopServer(server);
+    db.close();
+  }
+});
+
+test('POST /dispatch — unknown fire returns 404 fire-not-found', async () => {
   const db = openDb();
   const dispatcher = new Dispatcher(db, makeWs(), { maxConcurrent: 1 });
   const { server, port } = await startServer(makeCtx(db, dispatcher));
   try {
-    const r = await fetch(`http://127.0.0.1:${port}/dispatch/no-such-fire`, {
+    const r = await fetch(`http://127.0.0.1:${port}/dispatch?fire_id=no-such-fire`, {
       method: 'POST',
-      headers: { authorization: 'Bearer anything', 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ prompt: 'go' }),
     });
     assert.equal(r.status, 404);
@@ -207,16 +228,15 @@ test('POST /dispatch/<fire_id> — unknown fire returns 404 with fire-not-found 
   }
 });
 
-test('POST /dispatch/<fire_id> — no dispatch target returns 404', async () => {
+test('POST /dispatch — no dispatch target returns 404', async () => {
   const db = openDb();
   const dispatcher = new Dispatcher(db, makeWs(), { maxConcurrent: 1 });
   const { server, port } = await startServer(makeCtx(db, dispatcher));
-  // No dispatchTargetInstanceId.
   seedActiveRun(dispatcher, 'fire-nodisp', { dispatchTargetInstanceId: undefined });
   try {
-    const r = await fetch(`http://127.0.0.1:${port}/dispatch/fire-nodisp`, {
+    const r = await fetch(`http://127.0.0.1:${port}/dispatch?fire_id=fire-nodisp`, {
       method: 'POST',
-      headers: { authorization: 'Bearer fire-secret-xyz', 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ prompt: 'go' }),
     });
     assert.equal(r.status, 404);
@@ -228,16 +248,15 @@ test('POST /dispatch/<fire_id> — no dispatch target returns 404', async () => 
   }
 });
 
-test('POST /dispatch/<fire_id> — target pty gone returns 404 target_unavailable', async () => {
+test('POST /dispatch — target pty gone returns 404 target_unavailable', async () => {
   const db = openDb();
   const dispatcher = new Dispatcher(db, makeWs(), { maxConcurrent: 1 });
   const { server, port } = await startServer(makeCtx(db, dispatcher));
-  // Point at an instance that was never registered.
   seedActiveRun(dispatcher, 'fire-gone', { dispatchTargetInstanceId: 'ghost-instance' });
   try {
-    const r = await fetch(`http://127.0.0.1:${port}/dispatch/fire-gone`, {
+    const r = await fetch(`http://127.0.0.1:${port}/dispatch?fire_id=fire-gone`, {
       method: 'POST',
-      headers: { authorization: 'Bearer fire-secret-xyz', 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ prompt: 'go' }),
     });
     assert.equal(r.status, 404);
@@ -249,7 +268,7 @@ test('POST /dispatch/<fire_id> — target pty gone returns 404 target_unavailabl
   }
 });
 
-test('POST /dispatch/<fire_id> — missing prompt returns 400', async () => {
+test('POST /dispatch — missing prompt returns 400', async () => {
   const db = openDb();
   const dispatcher = new Dispatcher(db, makeWs(), { maxConcurrent: 1 });
   const { server, port } = await startServer(makeCtx(db, dispatcher));
@@ -257,9 +276,9 @@ test('POST /dispatch/<fire_id> — missing prompt returns 400', async () => {
   registerFakeConductorPty(instanceId);
   seedActiveRun(dispatcher, 'fire-400', { dispatchTargetInstanceId: instanceId });
   try {
-    const r = await fetch(`http://127.0.0.1:${port}/dispatch/fire-400`, {
+    const r = await fetch(`http://127.0.0.1:${port}/dispatch?fire_id=fire-400`, {
       method: 'POST',
-      headers: { authorization: 'Bearer fire-secret-xyz', 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json' },
       body: JSON.stringify({}),
     });
     assert.equal(r.status, 400);
@@ -272,12 +291,29 @@ test('POST /dispatch/<fire_id> — missing prompt returns 400', async () => {
   }
 });
 
-test('GET /dispatch/<fire_id> — non-POST method returns 405', async () => {
+test('POST /dispatch — missing both fire_id and instance_id returns 400', async () => {
   const db = openDb();
   const dispatcher = new Dispatcher(db, makeWs(), { maxConcurrent: 1 });
   const { server, port } = await startServer(makeCtx(db, dispatcher));
   try {
-    const r = await fetch(`http://127.0.0.1:${port}/dispatch/whatever`, { method: 'GET' });
+    const r = await fetch(`http://127.0.0.1:${port}/dispatch`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ prompt: 'orphan' }),
+    });
+    assert.equal(r.status, 400);
+  } finally {
+    await stopServer(server);
+    db.close();
+  }
+});
+
+test('GET /dispatch — non-POST method returns 405', async () => {
+  const db = openDb();
+  const dispatcher = new Dispatcher(db, makeWs(), { maxConcurrent: 1 });
+  const { server, port } = await startServer(makeCtx(db, dispatcher));
+  try {
+    const r = await fetch(`http://127.0.0.1:${port}/dispatch?fire_id=whatever`, { method: 'GET' });
     assert.equal(r.status, 405);
   } finally {
     await stopServer(server);

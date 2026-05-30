@@ -55,8 +55,7 @@ async function recordActiveRun(targetInstanceId) {
 
 async function spawnFreshCopilot(seedPrompt) {
   const { fireId, secret } = await recordActiveRun(null);
-  const spawnRes = await postJson(`/spawn/${fireId}`, { prompt: seedPrompt },
-    { Authorization: `Bearer ${secret}` });
+  const spawnRes = await postJson(`/spawn?fire_id=${fireId}`, { prompt: seedPrompt });
   if (spawnRes.status !== 200) throw new Error(`/spawn failed: ${spawnRes.raw}`);
   return { instanceId: spawnRes.body.instance_id };
 }
@@ -104,8 +103,7 @@ async function waitForSubstring(instanceId, substr, maxSec = 90) {
 async function cleanupSession(instanceId) {
   try {
     const { fireId, secret } = await recordActiveRun(instanceId);
-    await postJson(`/dispatch/${fireId}`, { prompt: '/exit' },
-      { Authorization: `Bearer ${secret}` }).catch(() => {});
+    await postJson(`/dispatch?fire_id=${fireId}`, { prompt: '/exit' }).catch(() => {});
   } catch {}
 }
 
@@ -150,8 +148,7 @@ test('STRESS: 10 mixed dispatches (LLM + slash) on same copilot pty all succeed'
       const d = dispatches[i];
       const t0 = Date.now();
       const { fireId, secret } = await recordActiveRun(instanceId);
-      const res = await postJson(`/dispatch/${fireId}`, { prompt: d.prompt },
-        { Authorization: `Bearer ${secret}` });
+      const res = await postJson(`/dispatch?fire_id=${fireId}`, { prompt: d.prompt });
       expect(res.status, `dispatch #${i + 1} (${d.kind}): ${res.raw}`).toBe(200);
       console.log(`[storm] #${i + 1} (${d.kind}) accepted, state=${res.body.state}`);
 

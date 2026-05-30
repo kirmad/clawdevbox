@@ -51,10 +51,9 @@ export interface RunOptions {
   scriptPath: string;
   runtime: TriggerRuntime;
   envelope: TriggerEnvelope;
-  callbackSecret: string;
   timeoutMs: number;
   cwd?: string;
-  /** Extra env vars merged into the spawn env (CLAWDEVBOX_FIRE_SECRET is set by the runner). */
+  /** Extra env vars merged into the spawn env. */
   env?: Record<string, string>;
 }
 
@@ -104,7 +103,6 @@ export async function runTriggerScript(opts: RunOptions): Promise<RunResult> {
     env: {
       ...process.env,
       ...(opts.env ?? {}),
-      CLAWDEVBOX_FIRE_SECRET: opts.callbackSecret,
     },
     stdio: ['pipe', 'pipe', 'pipe'],
     windowsHide: true,

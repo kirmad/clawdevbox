@@ -60,9 +60,9 @@ async function recordActiveRun(targetInstanceId) {
 
 async function spawnFreshCopilot(seedPrompt) {
   const { fireId, secret } = await recordActiveRun(null);
-  const spawnRes = await postJson(`/spawn/${fireId}`, {
+  const spawnRes = await postJson(`/spawn?fire_id=${fireId}`, {
     prompt: seedPrompt,
-  }, { Authorization: `Bearer ${secret}` });
+  });
   if (spawnRes.status !== 200) throw new Error(`/spawn failed: ${spawnRes.raw}`);
   return {
     fireId,
@@ -120,8 +120,7 @@ async function waitForSubstring(instanceId, substr, maxSec = 90) {
 async function cleanupSession(instanceId) {
   try {
     const { fireId, secret } = await recordActiveRun(instanceId);
-    await postJson(`/dispatch/${fireId}`, { prompt: '/exit' },
-      { Authorization: `Bearer ${secret}` }).catch(() => {});
+    await postJson(`/dispatch?fire_id=${fireId}`, { prompt: '/exit' }).catch(() => {});
   } catch { /* ignore */ }
 }
 
@@ -151,9 +150,9 @@ test('bug C: 3 sequential dispatches on same copilot pty all get responses', asy
       const canary = `CR_DISP${i}_` + Math.random().toString(36).slice(2, 8).toUpperCase();
       canaries.push(canary);
       const { fireId, secret } = await recordActiveRun(instanceId);
-      const res = await postJson(`/dispatch/${fireId}`, {
+      const res = await postJson(`/dispatch?fire_id=${fireId}`, {
         prompt: `Reply with only: ${canary}`,
-      }, { Authorization: `Bearer ${secret}` });
+      });
       expect(res.status, `dispatch ${i} response: ${res.raw}`).toBe(200);
       console.log(`dispatch #${i} accepted; waiting for canary ${canary}...`);
       await waitForSubstring(instanceId, canary, 90);
@@ -190,8 +189,7 @@ test('bug A: /help slash command does not show "Invalid argument"', async () => 
     // "Invalid argument" error that would result from the [SYSTEM:...]
     // marker being appended.
     const { fireId, secret } = await recordActiveRun(instanceId);
-    const res = await postJson(`/dispatch/${fireId}`, { prompt: '/help' },
-      { Authorization: `Bearer ${secret}` });
+    const res = await postJson(`/dispatch?fire_id=${fireId}`, { prompt: '/help' });
     expect(res.status, `/dispatch /help: ${res.raw}`).toBe(200);
 
     // Wait for either help text or invalid-argument error to appear.
@@ -232,9 +230,9 @@ test('bug B: ctrl+c during dispatch leaves conductor usable for next dispatch', 
 
     // Send a long-running prompt, then 3s later send Ctrl+C via WS.
     const { fireId: longFireId, secret: longSecret } = await recordActiveRun(instanceId);
-    await postJson(`/dispatch/${longFireId}`, {
+    await postJson(`/dispatch?fire_id=${longFireId}`, {
       prompt: 'Count slowly from 1 to 50, one number per line, with a sentence describing each.',
-    }, { Authorization: `Bearer ${longSecret}` });
+    });
 
     // Open WS, wait, send Ctrl+C
     await new Promise((r) => setTimeout(r, 3000));
@@ -258,9 +256,9 @@ test('bug B: ctrl+c during dispatch leaves conductor usable for next dispatch', 
     // Now a fresh dispatch must work.
     const followCanary = 'CR_AFTER_ABORT_' + Math.random().toString(36).slice(2, 6).toUpperCase();
     const { fireId, secret } = await recordActiveRun(instanceId);
-    const res = await postJson(`/dispatch/${fireId}`, {
+    const res = await postJson(`/dispatch?fire_id=${fireId}`, {
       prompt: `Reply with only: ${followCanary}`,
-    }, { Authorization: `Bearer ${secret}` });
+    });
     expect(res.status).toBe(200);
     await waitForSubstring(instanceId, followCanary, 90);
     console.log(`✅ post-abort dispatch succeeded`);

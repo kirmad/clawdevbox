@@ -4,10 +4,9 @@ async function readStdin(): Promise<string> {
   return Buffer.concat(chunks).toString('utf8');
 }
 const env = JSON.parse(await readStdin());
-const secret = process.env.CLAWDEVBOX_FIRE_SECRET ?? '';
 const res = await fetch(env.spawn_url, {
   method: 'POST',
-  headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${secret}` },
+  headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({ prompt: 'mode-b heartbeat', context: { run_id: env.run_id } }),
 });
 if (!res.ok) { process.stderr.write(`callback ${res.status}\n`); process.exit(1); }

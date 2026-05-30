@@ -1,11 +1,10 @@
-import json, os, sys, urllib.request
+import json, sys, urllib.request
 
 env = json.loads(sys.stdin.read())
-secret = os.environ.get("CLAWDEVBOX_FIRE_SECRET", "")
 req = urllib.request.Request(
     env["spawn_url"],
     data=json.dumps({"prompt": "python tick", "context": {"run_id": env["run_id"]}}).encode(),
-    headers={"Content-Type": "application/json", "Authorization": f"Bearer {secret}"},
+    headers={"Content-Type": "application/json"},
     method="POST",
 )
 with urllib.request.urlopen(req) as r:

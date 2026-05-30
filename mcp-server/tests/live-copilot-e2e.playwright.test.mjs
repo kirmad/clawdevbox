@@ -46,7 +46,7 @@ const PROVIDER = process.env.CLAWDEVBOX_PROVIDER ?? 'copilot';
 const PROJECT_DIR = process.env.CLAWDEVBOX_PROJECT_DIR ?? 'C:\\git\\clawdevbox\\mcp-server';
 const SHOT_DIR = resolve(__dirname, '..', 'verify-screenshots');
 
-const baseAuth = TOKEN ? { Authorization: `Bearer ${TOKEN}` } : {};
+const baseAuth = TOKEN ? {} : {};
 
 mkdirSync(SHOT_DIR, { recursive: true });
 
@@ -143,8 +143,7 @@ test.afterAll(async () => {
   // Best-effort cleanup: if a real copilot session is still alive,
   // try to /exit it via dispatch.
   if (dispatchFireId && dispatchSecret) {
-    await postJson(`/dispatch/${dispatchFireId}`, { prompt: '/exit' },
-      { Authorization: `Bearer ${dispatchSecret}` }).catch(() => {});
+    await postJson(`/dispatch?fire_id=${dispatchFireId}`, { prompt: '/exit' }).catch(() => {});
   }
   try { await context?.close(); } catch { /* ignore */ }
   try { await browser?.close(); } catch { /* ignore */ }
@@ -182,9 +181,9 @@ test('live: POST /spawn creates a real copilot pty visible in the UI', async () 
 
   initialCanary = 'COPILOT_HELLO_' + Math.random().toString(36).slice(2, 8).toUpperCase();
   console.log(`📤 POST /spawn provider=${PROVIDER} canary=${initialCanary}`);
-  const spawnRes = await postJson(`/spawn/${spawnFireId}`, {
+  const spawnRes = await postJson(`/spawn?fire_id=${spawnFireId}`, {
     prompt: `Reply with only: ${initialCanary}`,
-  }, { Authorization: `Bearer ${spawnSecret}` });
+  });
   expect(spawnRes.status, `/spawn body: ${spawnRes.raw}`).toBe(200);
   expect(spawnRes.body.ok).toBe(true);
   expect(spawnRes.body.instance_id).toBeTruthy();
@@ -262,9 +261,9 @@ test('live: POST /dispatch delivers a follow-up prompt to the SAME copilot pty',
 
   const canary2 = 'COPILOT_DISPATCH_' + Math.random().toString(36).slice(2, 8).toUpperCase();
   console.log(`📤 POST /dispatch canary=${canary2}`);
-  const dispRes = await postJson(`/dispatch/${dispatchFireId}`, {
+  const dispRes = await postJson(`/dispatch?fire_id=${dispatchFireId}`, {
     prompt: `Reply with only: ${canary2}`,
-  }, { Authorization: `Bearer ${dispatchSecret}` });
+  });
   expect(dispRes.status, `/dispatch body: ${dispRes.raw}`).toBe(200);
   expect(dispRes.body.ok).toBe(true);
   console.log(`✅ /dispatch accepted — conductor state=${dispRes.body.state}`);
@@ -292,8 +291,7 @@ test('live: POST /dispatch delivers a follow-up prompt to the SAME copilot pty',
 test('live: /exit dispatch closes the copilot session cleanly', async () => {
   test.setTimeout(30_000);
 
-  await postJson(`/dispatch/${dispatchFireId}`, { prompt: '/exit' },
-    { Authorization: `Bearer ${dispatchSecret}` });
+  await postJson(`/dispatch?fire_id=${dispatchFireId}`, { prompt: '/exit' });
 
   // Poll for the pty to exit (move from live → archived in /api/sessions).
   let exited = false;

@@ -5,6 +5,5 @@ URL=$(printf '%s' "$BODY" | python -c "import sys,json; print(json.load(sys.stdi
 RUN=$(printf '%s' "$BODY" | python -c "import sys,json; print(json.load(sys.stdin)['run_id'])")
 curl -fsS -X POST "$URL" \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer ${CLAWDEVBOX_FIRE_SECRET}" \
   -d "{\"prompt\":\"bash tick\",\"context\":{\"run_id\":\"${RUN}\"}}" >/dev/null
 echo '{"state":{"bash":true}}'

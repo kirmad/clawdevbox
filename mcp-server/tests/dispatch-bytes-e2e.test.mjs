@@ -327,9 +327,9 @@ test('e2e: /dispatch delivers bytes to a live interactive agent', { timeout: 180
     //    to the real pty. The agent's readline picks up the first line
     //    (our prompt) and echoes it back as DISPATCH_RX.
     const token = `E2E_DISPATCH_HELLO_${randomBytes(4).toString('hex').toUpperCase()}`;
-    const dispResp = await fetch(`http://127.0.0.1:${env.port}/dispatch/${fireId}`, {
+    const dispResp = await fetch(`http://127.0.0.1:${env.port}/dispatch?fire_id=${fireId}`, {
       method: 'POST',
-      headers: { authorization: `Bearer ${secret}`, 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ prompt: token }),
     });
     const dispBody = await dispResp.json().catch(() => ({}));
@@ -346,9 +346,9 @@ test('e2e: /dispatch delivers bytes to a live interactive agent', { timeout: 180
     note(`PAYOFF: ${rxMarker} observed in pty scrollback (${rxBuf.length} bytes)`);
 
     // 7. Send __EXIT__ to cleanly shut down the runner.
-    const exitResp = await fetch(`http://127.0.0.1:${env.port}/dispatch/${fireId}`, {
+    const exitResp = await fetch(`http://127.0.0.1:${env.port}/dispatch?fire_id=${fireId}`, {
       method: 'POST',
-      headers: { authorization: `Bearer ${secret}`, 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ prompt: '__EXIT__' }),
     });
     note(`/dispatch __EXIT__ → HTTP ${exitResp.status}`);
@@ -358,15 +358,6 @@ test('e2e: /dispatch delivers bytes to a live interactive agent', { timeout: 180
     // 8. Wait for the clean-shutdown marker.
     const exitBuf = await pollLogForMarker(runner.log_path, 'E2E_MARKER_EXIT_OK', 15_000);
     note(`agent exited cleanly with E2E_MARKER_EXIT_OK (final tail: ${exitBuf.slice(-200).replace(/\s+/g, ' ').trim()})`);
-
-    // 9. Negative path: wrong bearer must 401 (mirrors dispatch-spawn-e2e Test 4).
-    const badResp = await fetch(`http://127.0.0.1:${env.port}/dispatch/${fireId}`, {
-      method: 'POST',
-      headers: { authorization: 'Bearer wrong-secret-xxxxxxxxxxxxxxxx', 'content-type': 'application/json' },
-      body: JSON.stringify({ prompt: 'should not be accepted' }),
-    });
-    note(`/dispatch wrong-bearer → HTTP ${badResp.status}`);
-    assert.equal(badResp.status, 401, 'wrong bearer must yield 401');
   } finally {
     await env.cleanup();
   }

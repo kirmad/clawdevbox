@@ -949,7 +949,6 @@ export function registerTriggerEntries(ws: Workspace): void {
       const state = args.state ?? (Object.keys(defaultState).length > 0 ? defaultState : { ...params });
       const payload = args.payload ?? null;
 
-      const secret = randomBytes(24).toString('hex');
       const tmpOutDir = mkdtempSync(join(tmpdir(), 'cdb-trigger-test-out-'));
       const runId = mintId('run');
 
@@ -968,7 +967,6 @@ export function registerTriggerEntries(ws: Workspace): void {
             spawn_url: '',
             state, payload,
           },
-          callbackSecret: secret,
           timeoutMs: args.timeout_ms ?? 30000,
         });
       } finally {

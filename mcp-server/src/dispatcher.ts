@@ -22,7 +22,6 @@
  */
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { randomBytes } from 'node:crypto';
 import type { Database } from 'better-sqlite3';
 import { emitChange, onChange } from './event-bus.ts';
 import { logger } from './logger.ts';
@@ -40,13 +39,6 @@ import { runTriggerScript } from './trigger-runner.ts';
 import type { TriggerRuntime } from './validators.ts';
 import { type RegisteredTriggerType, type Workspace } from './workspace.ts';
 import type { runRecipe as RunRecipeFn } from './recipe-runner.ts';
-
-function constantTimeEquals(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
-  let r = 0;
-  for (let i = 0; i < a.length; i++) r |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  return r === 0;
-}
 
 interface TriggerRow {
   id: string;
@@ -90,7 +82,6 @@ export interface DispatcherOptions {
 }
 
 export interface ActiveRunEntry {
-  secret: string;
   outDir: string;
   triggerId: string;
   dispatchTargetInstanceId?: string;
@@ -246,30 +237,38 @@ export class Dispatcher {
    */
   async dispatchToConductor(
     fire_id: string,
-    presentedSecret: string,
     prompt: string,
   ): Promise<
     | { status: 'not_found_fire' }
-    | { status: 'unauthorized' }
     | { status: 'no_dispatch_target' }
     | { status: 'target_unavailable' }
     | { status: 'ok'; state: 'idle' | 'busy' | 'starting' | 'exited' }
   > {
     const entry = this.activeRuns.get(fire_id);
     if (!entry) return { status: 'not_found_fire' };
-    if (!constantTimeEquals(entry.secret, presentedSecret)) return { status: 'unauthorized' };
     if (!entry.dispatchTargetInstanceId) return { status: 'no_dispatch_target' };
+    return this.dispatchToInstance(entry.dispatchTargetInstanceId, prompt);
+  }
+
+  /**
+   * Dispatch a prompt directly to a SessionConductor by instance_id —
+   * no fire required. Used by ad-hoc callers that already know the
+   * target pty.
+   */
+  async dispatchToInstance(
+    instanceId: string,
+    prompt: string,
+  ): Promise<
+    | { status: 'target_unavailable' }
+    | { status: 'ok'; state: 'idle' | 'busy' | 'starting' | 'exited' }
+  > {
     const { getConductor } = await import('./pty-registry.ts');
-    const conductor = getConductor(entry.dispatchTargetInstanceId);
+    const conductor = getConductor(instanceId);
     if (!conductor) return { status: 'target_unavailable' };
-    // Fire-and-forget — we don't await the dispatch's completion (the
-    // queued prompt executes asynchronously in the agent). dispatch()'s
-    // promise resolves on the dispatched prompt's done signal, which may
-    // be many seconds; the HTTP caller only needs the queue ack.
     conductor.dispatch(prompt, { strategy: 'auto' }).catch((err) => {
       logger.warn(
-        { fire_id, err: err instanceof Error ? err.message : String(err) },
-        'dispatcher: dispatchToConductor — conductor.dispatch rejected',
+        { instanceId, err: err instanceof Error ? err.message : String(err) },
+        'dispatcher: dispatchToInstance — conductor.dispatch rejected',
       );
     });
     return { status: 'ok', state: conductor.state };
@@ -281,35 +280,66 @@ export class Dispatcher {
    * configured defaults. Returns the new instance_id + sessionId on
    * success.
    */
+  /**
+   * Spawn a fresh interactive agent session via recipe-runner with the
+   * supplied prompt. When `fire_id` resolves to an active fire entry,
+   * defaults come from that entry's `spawnDefaults`. When no fire_id
+   * (or fire not found), the caller must provide `provider`, `workspace_*`
+   * etc. directly.
+   */
   async spawnFromCallback(
-    fire_id: string,
-    presentedSecret: string,
+    fire_id: string | null,
     prompt: string,
-    agentOverride?: string,
-    workspaceIdOverride?: string,
+    overrides: {
+      agent?: string;
+      workspaceId?: string;
+      provider?: string;
+      workspacePath?: string;
+    } = {},
   ): Promise<
     | { status: 'not_found_fire' }
-    | { status: 'unauthorized' }
     | { status: 'spawn_failed'; message: string }
     | { status: 'ok'; instanceId: string; sessionId: string }
   > {
-    const entry = this.activeRuns.get(fire_id);
-    if (!entry) return { status: 'not_found_fire' };
-    if (!constantTimeEquals(entry.secret, presentedSecret)) return { status: 'unauthorized' };
+    let entry: ActiveRunEntry | undefined;
+    if (fire_id) {
+      entry = this.activeRuns.get(fire_id);
+      if (!entry && !(overrides.provider && overrides.workspacePath)) {
+        return { status: 'not_found_fire' };
+      }
+    }
 
     const { runRecipe } = this.runRecipeFn
       ? { runRecipe: this.runRecipeFn }
       : await import('./recipe-runner.ts');
     const { resolveConfig } = await import('./config.ts');
     const { resolveWorkspacesRoot } = await import('./workspaces-store.ts');
+    const { ensureWorkspace } = await import('./db/workspaces-store.ts');
 
     const cfg = resolveConfig({ projectDir: this.ws.projectDir, globalDir: this.ws.globalDir });
     const workspacesRoot = resolveWorkspacesRoot();
-    const agent = agentOverride ?? entry.spawnDefaults.agent;
-    const workspaceInfo =
-      workspaceIdOverride
-        ? this.resolveWorkspaceById(workspaceIdOverride) ?? { id: entry.spawnDefaults.workspaceId, path: entry.spawnDefaults.workspacePath }
-        : { id: entry.spawnDefaults.workspaceId, path: entry.spawnDefaults.workspacePath };
+    const agent = overrides.agent ?? entry?.spawnDefaults.agent;
+
+    // Resolve workspace: explicit id > explicit path > entry defaults
+    let workspaceInfo: { id: string; path: string } | null = null;
+    if (overrides.workspaceId) {
+      workspaceInfo = this.resolveWorkspaceById(overrides.workspaceId);
+    }
+    if (!workspaceInfo && overrides.workspacePath) {
+      const wsRow = ensureWorkspace(this.db, { path: overrides.workspacePath });
+      workspaceInfo = { id: wsRow.id, path: wsRow.path };
+    }
+    if (!workspaceInfo && entry) {
+      workspaceInfo = { id: entry.spawnDefaults.workspaceId, path: entry.spawnDefaults.workspacePath };
+    }
+    if (!workspaceInfo) {
+      return { status: 'spawn_failed', message: 'workspace_path or fire_id with valid spawn defaults required' };
+    }
+
+    const providerId = overrides.provider ?? entry?.spawnDefaults.providerId;
+    if (!providerId) {
+      return { status: 'spawn_failed', message: 'provider required (no fire defaults available)' };
+    }
 
     try {
       const result = await runRecipe({
@@ -319,13 +349,13 @@ export class Dispatcher {
         prompt,
         spawnMode: 'interactive',
         workspaceInfo,
-        agentCli: entry.spawnDefaults.providerId,
+        agentCli: providerId,
         agent,
         workspacesRoot,
         ws: this.ws,
         cfg,
-        triggerId: entry.triggerId,
-        fireId: fire_id,
+        triggerId: entry?.triggerId,
+        fireId: fire_id ?? undefined,
       });
       if (result.spawn_error) {
         return { status: 'spawn_failed', message: `${result.spawn_error.code}: ${result.spawn_error.message}` };
@@ -478,10 +508,9 @@ export class Dispatcher {
   ): Promise<{ exit_code: number }> {
     if (!typeManifest) throw new Error(`trigger type not found: ${trigger.type}`);
     const runtime = ((typeManifest as unknown as { runtime?: TriggerRuntime }).runtime ?? 'tsx') as TriggerRuntime;
-    const callbackSecret = randomBytes(16).toString('hex');
     const baseUrl = this.callbackUrlBase;
-    const dispatchUrl = `${baseUrl}/dispatch/${fire.fire_id}`;
-    const spawnUrl = `${baseUrl}/spawn/${fire.fire_id}`;
+    const dispatchUrl = `${baseUrl}/dispatch?fire_id=${encodeURIComponent(fire.fire_id)}`;
+    const spawnUrl = `${baseUrl}/spawn?fire_id=${encodeURIComponent(fire.fire_id)}`;
 
     const wsRow = this.db
       .prepare(`SELECT id, path FROM workspaces WHERE id = ?`)
@@ -512,7 +541,6 @@ export class Dispatcher {
     };
 
     this.recordActiveRun(fire.fire_id, {
-      secret: callbackSecret,
       outDir,
       triggerId: trigger.id,
       dispatchTargetInstanceId,
@@ -534,7 +562,6 @@ export class Dispatcher {
         state,
         payload,
       },
-      callbackSecret,
       timeoutMs: this.scriptTimeoutMs,
     });
 

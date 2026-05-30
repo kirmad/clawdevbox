@@ -347,28 +347,25 @@ export async function handleTestHook(
 
   // ── POST /api/test/record-active-run ──────────────────────────────────
   // Test-only: directly inject an activeRuns entry into the dispatcher so
-  // /spawn/<fire_id> and /dispatch/<fire_id> accept the per-fire bearer
+  // /spawn?fire_id=<id> and /dispatch?fire_id=<id> can resolve defaults
   // without needing a real trigger script to fire. Used by the
-  // terminals-panel-e2e playwright test. Also inserts a fires row +
-  // ensures the workspace is registered, so spawnFromCallback's
-  // workspace lookup succeeds.
+  // terminals-panel-e2e + dispatch-storm tests.
   //
-  // Body: { fire_id, secret, workspace_id?, workspace_path,
+  // Body: { fire_id, workspace_id?, workspace_path,
   //         provider_id?, dispatch_target_instance_id? }
-  // Returns 200 { ok: true, fire_id, secret } on success.
+  // Returns 200 { ok: true, fire_id, workspace_id } on success.
   if (path === '/api/test/record-active-run' && req.method === 'POST') {
     const body = (await readJsonBody<{
       fire_id?: string;
-      secret?: string;
       workspace_id?: string;
       workspace_path?: string;
       provider_id?: string;
       dispatch_target_instance_id?: string | null;
     }>(req, res)) ?? null;
     if (body == null) return true;
-    if (!body.fire_id || !body.secret || !body.workspace_path) {
+    if (!body.fire_id || !body.workspace_path) {
       sendJson(res, 400, {
-        error: { code: 'INVALID_REQUEST', message: 'fire_id, secret, workspace_path are required' },
+        error: { code: 'INVALID_REQUEST', message: 'fire_id, workspace_path are required' },
       });
       return true;
     }
@@ -431,7 +428,6 @@ export async function handleTestHook(
     }
 
     dispatcher.recordActiveRun(body.fire_id, {
-      secret: body.secret,
       outDir: body.workspace_path,
       triggerId: 'test-trigger',
       dispatchTargetInstanceId: body.dispatch_target_instance_id ?? undefined,
@@ -442,7 +438,7 @@ export async function handleTestHook(
       },
     });
 
-    sendJson(res, 200, { ok: true, fire_id: body.fire_id, secret: body.secret, workspace_id: workspaceId });
+    sendJson(res, 200, { ok: true, fire_id: body.fire_id, workspace_id: workspaceId });
     return true;
   }
 

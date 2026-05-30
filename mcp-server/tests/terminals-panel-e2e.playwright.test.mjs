@@ -51,7 +51,7 @@ let context;
 let workspaceId;
 let workspacePath;
 
-const baseAuth = () => ({ Authorization: `Bearer ${token}` });
+const baseAuth = () => ({});
 
 async function waitForHealth(timeoutMs = 45_000) {
   const deadline = Date.now() + timeoutMs;
@@ -244,11 +244,10 @@ test('Terminals panel: /spawn creates a new tab in Active section', async () => 
   });
 
   // 2. POST /spawn/<fire_id> with the per-fire bearer
-  const spawnRes = await fetch(`http://127.0.0.1:${port}/spawn/${fireId}`, {
+  const spawnRes = await fetch(`http://127.0.0.1:${port}/spawn?fire_id=${fireId}`, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
-      Authorization: `Bearer ${secret}`,
     },
     body: JSON.stringify({ prompt: 'Reply with only: E2E_INITIAL_OK' }),
   });
@@ -300,11 +299,10 @@ test('Terminals panel: /dispatch delivers a follow-up prompt to the same pty', a
     workspacePath,
   });
 
-  const spawnRes = await fetch(`http://127.0.0.1:${port}/spawn/${spawnFireId}`, {
+  const spawnRes = await fetch(`http://127.0.0.1:${port}/spawn?fire_id=${spawnFireId}`, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
-      Authorization: `Bearer ${spawnSecret}`,
     },
     body: JSON.stringify({ prompt: 'Reply with only: E2E_DISPATCH_TARGET_READY' }),
   });
@@ -342,11 +340,10 @@ test('Terminals panel: /dispatch delivers a follow-up prompt to the same pty', a
 
   // 3. POST /dispatch/<fire_id> with the dispatch prompt
   const canary = 'E2E_DISPATCH_HELLO_' + Math.random().toString(36).slice(2, 8).toUpperCase();
-  const dispatchRes = await fetch(`http://127.0.0.1:${port}/dispatch/${dispatchFireId}`, {
+  const dispatchRes = await fetch(`http://127.0.0.1:${port}/dispatch?fire_id=${dispatchFireId}`, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
-      Authorization: `Bearer ${dispatchSecret}`,
     },
     body: JSON.stringify({ prompt: canary }),
   });
@@ -402,11 +399,10 @@ test('Terminals panel: /dispatch delivers a follow-up prompt to the same pty', a
   expect(foundMarker, `expected to find "DISPATCH_RX: ${canary}" in xterm scrollback`).toBe(true);
 
   // Cleanup: signal __EXIT__ to the agent
-  await fetch(`http://127.0.0.1:${port}/dispatch/${dispatchFireId}`, {
+  await fetch(`http://127.0.0.1:${port}/dispatch?fire_id=${dispatchFireId}`, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
-      Authorization: `Bearer ${dispatchSecret}`,
     },
     body: JSON.stringify({ prompt: '__EXIT__' }),
   });

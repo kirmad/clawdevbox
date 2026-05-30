@@ -175,58 +175,82 @@ export async function handleCronApi(
   const path = url.pathname;
   const method = req.method ?? 'GET';
 
-  // ----- /dispatch/<fire_id> ------------------------------------------------
-  // Per-fire bearer (CLAWDEVBOX_FIRE_SECRET); routes a prompt into the
-  // SessionConductor for the trigger's subscriber pty.
-  {
-    const m = path.match(/^\/dispatch\/([^/]+)\/?$/);
-    if (m) {
-      if (method !== 'POST') { sendJson(res, 405, { error: 'method not allowed' }); return true; }
-      const fireId = decodeURIComponent(m[1]!);
-      const presented = bearer(req);
-      if (!presented) { reject401(res, 'missing bearer token'); return true; }
-      const body = (await readJson<{ prompt?: unknown }>(req)) ?? {};
-      if (typeof body.prompt !== 'string' || body.prompt.length === 0) {
-        sendJson(res, 400, { error: 'prompt required (non-empty string)' });
-        return true;
-      }
-      const result = await ctx.dispatcher.dispatchToConductor(fireId, presented, body.prompt);
-      if (result.status === 'not_found_fire')        { sendJson(res, 404, { error: 'fire not found or not in flight', fire_id: fireId }); return true; }
-      if (result.status === 'unauthorized')          { reject401(res, 'invalid bearer token'); return true; }
-      if (result.status === 'no_dispatch_target')    { sendJson(res, 404, { error: 'no dispatch target for this fire' }); return true; }
-      if (result.status === 'target_unavailable')    { sendJson(res, 404, { error: 'dispatch target pty has exited' }); return true; }
-      sendJson(res, 200, { ok: true, queued_at: Date.now(), state: result.state });
+  // ----- POST /dispatch -----------------------------------------------------
+  // Loopback-only, NO auth. Routes a prompt to either:
+  //   • the SessionConductor of the fire's subscriber pty (when ?fire_id=<id>),
+  //   • a specific instance_id (when ?instance_id=<id> or body.instance_id),
+  //   • or the fire's target (when body.fire_id is set instead of query).
+  //
+  // Body: { prompt: string, instance_id?: string, fire_id?: string }
+  // Query: ?fire_id=<id> or ?instance_id=<id>
+  if (path === '/dispatch') {
+    if (method !== 'POST') { sendJson(res, 405, { error: 'method not allowed' }); return true; }
+    const body = (await readJson<{ prompt?: unknown; instance_id?: unknown; fire_id?: unknown }>(req)) ?? {};
+    if (typeof body.prompt !== 'string' || body.prompt.length === 0) {
+      sendJson(res, 400, { error: 'prompt required (non-empty string)' });
       return true;
     }
+    const fireId = url.searchParams.get('fire_id')
+      ?? (typeof body.fire_id === 'string' ? body.fire_id : null);
+    const instanceId = url.searchParams.get('instance_id')
+      ?? (typeof body.instance_id === 'string' ? body.instance_id : null);
+
+    let result;
+    if (instanceId) {
+      result = await ctx.dispatcher.dispatchToInstance(instanceId, body.prompt);
+    } else if (fireId) {
+      result = await ctx.dispatcher.dispatchToConductor(fireId, body.prompt);
+    } else {
+      sendJson(res, 400, { error: 'instance_id or fire_id required (query string or body)' });
+      return true;
+    }
+
+    if (result.status === 'not_found_fire')    { sendJson(res, 404, { error: 'fire not found or not in flight', fire_id: fireId }); return true; }
+    if (result.status === 'no_dispatch_target'){ sendJson(res, 404, { error: 'no dispatch target for this fire' }); return true; }
+    if (result.status === 'target_unavailable'){ sendJson(res, 404, { error: 'dispatch target pty has exited' }); return true; }
+    sendJson(res, 200, { ok: true, queued_at: Date.now(), state: result.state });
+    return true;
   }
 
-  // ----- /spawn/<fire_id> --------------------------------------------------
-  // Per-fire bearer; spawns a fresh interactive agent session via recipe-runner.
-  {
-    const m = path.match(/^\/spawn\/([^/]+)\/?$/);
-    if (m) {
-      if (method !== 'POST') { sendJson(res, 405, { error: 'method not allowed' }); return true; }
-      const fireId = decodeURIComponent(m[1]!);
-      const presented = bearer(req);
-      if (!presented) { reject401(res, 'missing bearer token'); return true; }
-      const body = (await readJson<{ prompt?: unknown; agent?: unknown; workspace_id?: unknown }>(req)) ?? {};
-      if (typeof body.prompt !== 'string' || body.prompt.length === 0) {
-        sendJson(res, 400, { error: 'prompt required (non-empty string)' });
-        return true;
-      }
-      const result = await ctx.dispatcher.spawnFromCallback(
-        fireId,
-        presented,
-        body.prompt,
-        typeof body.agent === 'string' ? body.agent : undefined,
-        typeof body.workspace_id === 'string' ? body.workspace_id : undefined,
-      );
-      if (result.status === 'not_found_fire') { sendJson(res, 404, { error: 'fire not found or not in flight', fire_id: fireId }); return true; }
-      if (result.status === 'unauthorized')   { reject401(res, 'invalid bearer token'); return true; }
-      if (result.status === 'spawn_failed')   { sendJson(res, 500, { error: `spawn failed: ${result.message}` }); return true; }
-      sendJson(res, 200, { ok: true, instance_id: result.instanceId, session_id: result.sessionId });
+  // ----- POST /spawn --------------------------------------------------------
+  // Loopback-only, NO auth. Spawns a fresh interactive agent session via
+  // recipe-runner. When ?fire_id=<id> is given, defaults come from the
+  // dispatcher's activeRuns entry for that fire. Otherwise the body must
+  // provide enough to spawn a session standalone.
+  //
+  // Body: { prompt, provider?, workspace_path?, workspace_id?, agent?, fire_id? }
+  // Query: ?fire_id=<id>
+  if (path === '/spawn') {
+    if (method !== 'POST') { sendJson(res, 405, { error: 'method not allowed' }); return true; }
+    const body = (await readJson<{
+      prompt?: unknown;
+      agent?: unknown;
+      workspace_id?: unknown;
+      workspace_path?: unknown;
+      provider?: unknown;
+      fire_id?: unknown;
+    }>(req)) ?? {};
+    if (typeof body.prompt !== 'string' || body.prompt.length === 0) {
+      sendJson(res, 400, { error: 'prompt required (non-empty string)' });
       return true;
     }
+    const fireId = url.searchParams.get('fire_id')
+      ?? (typeof body.fire_id === 'string' ? body.fire_id : null);
+
+    const result = await ctx.dispatcher.spawnFromCallback(
+      fireId,
+      body.prompt,
+      {
+        agent: typeof body.agent === 'string' ? body.agent : undefined,
+        workspaceId: typeof body.workspace_id === 'string' ? body.workspace_id : undefined,
+        workspacePath: typeof body.workspace_path === 'string' ? body.workspace_path : undefined,
+        provider: typeof body.provider === 'string' ? body.provider : undefined,
+      },
+    );
+    if (result.status === 'not_found_fire') { sendJson(res, 404, { error: 'fire not found or not in flight', fire_id: fireId }); return true; }
+    if (result.status === 'spawn_failed')   { sendJson(res, 500, { error: `spawn failed: ${result.message}` }); return true; }
+    sendJson(res, 200, { ok: true, instance_id: result.instanceId, session_id: result.sessionId });
+    return true;
   }
 
   // -- /api/sessions* routes are loopback-only (no bearer required) ---------

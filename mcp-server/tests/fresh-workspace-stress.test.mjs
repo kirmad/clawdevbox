@@ -111,9 +111,8 @@ test(`fresh-workspace stress: ${N} cold-start workspaces all register + spawn`, 
 
       // Spawn against the fresh workspace
       const spawnRes = await postJson(
-        `/spawn/${fireId}`,
+        `/spawn?fire_id=${fireId}`,
         { prompt: `echo from iteration ${i + 1}` },
-        { Authorization: `Bearer ${secret}` },
       );
       assert.equal(spawnRes.status, 200, `/spawn failed: ${spawnRes.raw}`);
       const instanceId = spawnRes.body.instance_id;
@@ -148,8 +147,7 @@ test(`fresh-workspace stress: ${N} cold-start workspaces all register + spawn`, 
       try {
         const cleanupCtx = await recordActiveRun(tempDirs[0], 'e2e-test-runner').catch(() => null);
         if (cleanupCtx) {
-          await postJson(`/dispatch/${cleanupCtx.fireId}`, { prompt: '__EXIT__' },
-            { Authorization: `Bearer ${cleanupCtx.secret}` }).catch(() => {});
+          await postJson(`/dispatch?fire_id=${cleanupCtx.fireId}`, { prompt: '__EXIT__' }).catch(() => {});
         }
       } catch {}
     }

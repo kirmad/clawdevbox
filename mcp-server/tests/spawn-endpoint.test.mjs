@@ -84,7 +84,6 @@ function makeCtx(db, dispatcher, ws) {
 
 function seedActiveRun(dispatcher, fireId, overrides = {}) {
   dispatcher.recordActiveRun(fireId, {
-    secret: 'fire-secret-xyz',
     outDir: 'C:/tmp/out',
     triggerId: 't1',
     dispatchTargetInstanceId: undefined,
@@ -129,7 +128,7 @@ function makeRunRecipeStub(result) {
   return { fn, calls };
 }
 
-test('POST /spawn/<fire_id> — happy path returns 200 with instance_id + session_id', async () => {
+test('POST /spawn?fire_id — happy path returns 200 with instance_id + session_id', async () => {
   const db = openDb();
   const ws = makeWs(freshDirs('happy'));
   const stub = makeRunRecipeStub();
@@ -137,9 +136,9 @@ test('POST /spawn/<fire_id> — happy path returns 200 with instance_id + sessio
   const { server, port } = await startServer(makeCtx(db, dispatcher, ws));
   seedActiveRun(dispatcher, 'fire-spawn-happy');
   try {
-    const r = await fetch(`http://127.0.0.1:${port}/spawn/fire-spawn-happy`, {
+    const r = await fetch(`http://127.0.0.1:${port}/spawn?fire_id=fire-spawn-happy`, {
       method: 'POST',
-      headers: { authorization: 'Bearer fire-secret-xyz', 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ prompt: 'start fresh' }),
     });
     assert.equal(r.status, 200);
@@ -149,7 +148,6 @@ test('POST /spawn/<fire_id> — happy path returns 200 with instance_id + sessio
     assert.equal(body.session_id, 'sess_test');
     assert.equal(stub.calls.length, 1);
     assert.equal(stub.calls[0].prompt, 'start fresh');
-    // Defaults flow through.
     assert.equal(stub.calls[0].workspaceInfo.id, 'ws-default');
     assert.equal(stub.calls[0].agent, 'dev-buddy:dev-buddy');
   } finally {
@@ -158,7 +156,7 @@ test('POST /spawn/<fire_id> — happy path returns 200 with instance_id + sessio
   }
 });
 
-test('POST /spawn/<fire_id> — body.agent overrides default agent', async () => {
+test('POST /spawn?fire_id — body.agent overrides default agent', async () => {
   const db = openDb();
   const ws = makeWs(freshDirs('agent'));
   const stub = makeRunRecipeStub();
@@ -166,9 +164,9 @@ test('POST /spawn/<fire_id> — body.agent overrides default agent', async () =>
   const { server, port } = await startServer(makeCtx(db, dispatcher, ws));
   seedActiveRun(dispatcher, 'fire-spawn-agent');
   try {
-    const r = await fetch(`http://127.0.0.1:${port}/spawn/fire-spawn-agent`, {
+    const r = await fetch(`http://127.0.0.1:${port}/spawn?fire_id=fire-spawn-agent`, {
       method: 'POST',
-      headers: { authorization: 'Bearer fire-secret-xyz', 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ prompt: 'go', agent: 'x' }),
     });
     assert.equal(r.status, 200);
@@ -180,7 +178,7 @@ test('POST /spawn/<fire_id> — body.agent overrides default agent', async () =>
   }
 });
 
-test('POST /spawn/<fire_id> — body.workspace_id resolves to that workspace path', async () => {
+test('POST /spawn?fire_id — body.workspace_id resolves to that workspace path', async () => {
   const db = openDb();
   const ws = makeWs(freshDirs('ws'));
   insertWorkspace(db, 'ws-override', 'C:/workspaces/override');
@@ -189,9 +187,9 @@ test('POST /spawn/<fire_id> — body.workspace_id resolves to that workspace pat
   const { server, port } = await startServer(makeCtx(db, dispatcher, ws));
   seedActiveRun(dispatcher, 'fire-spawn-ws');
   try {
-    const r = await fetch(`http://127.0.0.1:${port}/spawn/fire-spawn-ws`, {
+    const r = await fetch(`http://127.0.0.1:${port}/spawn?fire_id=fire-spawn-ws`, {
       method: 'POST',
-      headers: { authorization: 'Bearer fire-secret-xyz', 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ prompt: 'go', workspace_id: 'ws-override' }),
     });
     assert.equal(r.status, 200);
@@ -204,28 +202,35 @@ test('POST /spawn/<fire_id> — body.workspace_id resolves to that workspace pat
   }
 });
 
-test('POST /spawn/<fire_id> — wrong bearer returns 401', async () => {
+test('POST /spawn — no fire_id, body provides provider+workspace_path (ad-hoc mode)', async () => {
   const db = openDb();
-  const ws = makeWs(freshDirs('401'));
+  const ws = makeWs(freshDirs('adhoc'));
   const stub = makeRunRecipeStub();
   const dispatcher = new Dispatcher(db, ws, { maxConcurrent: 1, runRecipeFn: stub.fn });
   const { server, port } = await startServer(makeCtx(db, dispatcher, ws));
-  seedActiveRun(dispatcher, 'fire-spawn-401');
   try {
-    const r = await fetch(`http://127.0.0.1:${port}/spawn/fire-spawn-401`, {
+    const r = await fetch(`http://127.0.0.1:${port}/spawn`, {
       method: 'POST',
-      headers: { authorization: 'Bearer wrong-secret', 'content-type': 'application/json' },
-      body: JSON.stringify({ prompt: 'go' }),
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        prompt: 'adhoc go',
+        provider: 'copilot',
+        workspace_path: 'C:/ad-hoc-workspace',
+      }),
     });
-    assert.equal(r.status, 401);
-    assert.equal(stub.calls.length, 0);
+    assert.equal(r.status, 200);
+    assert.equal(stub.calls.length, 1);
+    assert.equal(stub.calls[0].agentCli, 'copilot');
+    // ensureWorkspace canonicalizes path separators to platform-native (backslash on Windows)
+    const expected = 'C:/ad-hoc-workspace'.replace(/\//g, process.platform === 'win32' ? '\\' : '/');
+    assert.equal(stub.calls[0].workspaceInfo.path, expected);
   } finally {
     await stopServer(server);
     db.close();
   }
 });
 
-test('POST /spawn/<fire_id> — missing prompt returns 400', async () => {
+test('POST /spawn — missing prompt returns 400', async () => {
   const db = openDb();
   const ws = makeWs(freshDirs('400'));
   const stub = makeRunRecipeStub();
@@ -233,9 +238,9 @@ test('POST /spawn/<fire_id> — missing prompt returns 400', async () => {
   const { server, port } = await startServer(makeCtx(db, dispatcher, ws));
   seedActiveRun(dispatcher, 'fire-spawn-400');
   try {
-    const r = await fetch(`http://127.0.0.1:${port}/spawn/fire-spawn-400`, {
+    const r = await fetch(`http://127.0.0.1:${port}/spawn?fire_id=fire-spawn-400`, {
       method: 'POST',
-      headers: { authorization: 'Bearer fire-secret-xyz', 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json' },
       body: JSON.stringify({}),
     });
     assert.equal(r.status, 400);
@@ -247,7 +252,7 @@ test('POST /spawn/<fire_id> — missing prompt returns 400', async () => {
   }
 });
 
-test('POST /spawn/<fire_id> — runRecipe throws → 500 surfaces the error message', async () => {
+test('POST /spawn — runRecipe throws → 500 surfaces the error message', async () => {
   const db = openDb();
   const ws = makeWs(freshDirs('500'));
   const stub = makeRunRecipeStub(new Error('boom: pty.spawn failed'));
@@ -255,9 +260,9 @@ test('POST /spawn/<fire_id> — runRecipe throws → 500 surfaces the error mess
   const { server, port } = await startServer(makeCtx(db, dispatcher, ws));
   seedActiveRun(dispatcher, 'fire-spawn-500');
   try {
-    const r = await fetch(`http://127.0.0.1:${port}/spawn/fire-spawn-500`, {
+    const r = await fetch(`http://127.0.0.1:${port}/spawn?fire_id=fire-spawn-500`, {
       method: 'POST',
-      headers: { authorization: 'Bearer fire-secret-xyz', 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ prompt: 'go' }),
     });
     assert.equal(r.status, 500);
@@ -269,16 +274,16 @@ test('POST /spawn/<fire_id> — runRecipe throws → 500 surfaces the error mess
   }
 });
 
-test('POST /spawn/<fire_id> — unknown fire returns 404', async () => {
+test('POST /spawn?fire_id — unknown fire AND no body fallback returns 404', async () => {
   const db = openDb();
   const ws = makeWs(freshDirs('404'));
   const stub = makeRunRecipeStub();
   const dispatcher = new Dispatcher(db, ws, { maxConcurrent: 1, runRecipeFn: stub.fn });
   const { server, port } = await startServer(makeCtx(db, dispatcher, ws));
   try {
-    const r = await fetch(`http://127.0.0.1:${port}/spawn/no-such-fire`, {
+    const r = await fetch(`http://127.0.0.1:${port}/spawn?fire_id=no-such-fire`, {
       method: 'POST',
-      headers: { authorization: 'Bearer anything', 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ prompt: 'go' }),
     });
     assert.equal(r.status, 404);
@@ -291,4 +296,3 @@ test('POST /spawn/<fire_id> — unknown fire returns 404', async () => {
 test('cleanup tmp', () => {
   try { rmSync(TMP_ROOT, { recursive: true, force: true }); } catch { /* ignore */ }
 });
-
