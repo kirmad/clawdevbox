@@ -974,18 +974,19 @@ export async function runStart(flags: Flags): Promise<void> {
     logger.info({ signal }, 'shutting down');
     // Kill all live pty trees FIRST so child agent processes (agency.exe,
     // copilot.exe, claude.exe, plus their grandchildren) don't outlive us
-    // as orphans. Without this, the next clawdevbox spawn hits the
-    // "Session in use" modal because the prior session-file lock is still
-    // held by an orphan agency.exe process.
-    try {
-      const killed = killAllSessions();
-      if (killed > 0) logger.info({ killed }, 'shutdown: killed pty trees');
-    } catch (err) {
-      logger.warn(
-        { err: err instanceof Error ? err.message : String(err) },
-        'shutdown: killAllSessions threw',
-      );
-    }
+    // as orphans. The two-phase implementation tries graceful exit via
+    // \x03\x03 (double Ctrl+C) first so copilot can clean up its session
+    // lock files, then force-kills the survivors.
+    killAllSessions(2000)
+      .then((killed) => {
+        if (killed > 0) logger.info({ killed }, 'shutdown: killed pty trees');
+      })
+      .catch((err) => {
+        logger.warn(
+          { err: err instanceof Error ? err.message : String(err) },
+          'shutdown: killAllSessions threw',
+        );
+      });
     // Order: stop scheduler (no new wakes) → drain dispatcher → stop tunnel
     // → close DB → close HTTP. We give the dispatcher its configured drain
     // window before the hard 5s exit timeout below kicks in.

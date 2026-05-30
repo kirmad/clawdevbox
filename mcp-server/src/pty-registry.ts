@@ -334,11 +334,48 @@ function killPtyTree(s: PtySession): void {
  * Walk all live sessions and kill their pty trees. Returns the number of
  * sessions that were killed. Called from the shutdown handler in start.ts
  * to prevent orphan agent processes from outliving clawdevbox.
+ *
+ * Two-phase shutdown:
+ *   1. GRACEFUL: write `\x03\x03` (double Ctrl+C, copilot's clean-exit
+ *      sequence) to each pty, then wait up to `gracefulMs` for the pty
+ *      to actually exit. Clean exits let copilot remove its
+ *      `~/.copilot/session-state/<uuid>/inuse.<pid>.lock` files, which
+ *      prevents the "Session in use" modal on the next spawn into the
+ *      same session.
+ *   2. FORCE: for any pty that didn't exit gracefully, force-kill the
+ *      whole descendant process tree (taskkill /T /F on Windows,
+ *      ipty.kill() / SIGHUP on POSIX). This will leave stale locks
+ *      behind, but at least we don't orphan the processes.
  */
-export function killAllSessions(): number {
-  let killed = 0;
+export async function killAllSessions(gracefulMs = 2000): Promise<number> {
+  const live: PtySession[] = [];
   for (const s of sessions.values()) {
-    if (s.exited) continue;
+    if (!s.exited) live.push(s);
+  }
+  if (live.length === 0) return 0;
+
+  // Phase 1: ask each pty to exit cleanly. Copilot's "clean exit" is two
+  // consecutive Ctrl+C bytes ("ctrl+c again to exit"). claude.exe also
+  // honors this; e2e-test-runner ignores it (we'll force-kill it below).
+  for (const s of live) {
+    try { s.ipty.write('\x03\x03'); } catch { /* pipe may already be torn */ }
+  }
+
+  // Wait up to gracefulMs for sessions to mark themselves exited via the
+  // onExit handler. Poll in small intervals so we wake up promptly.
+  const deadline = Date.now() + gracefulMs;
+  while (Date.now() < deadline) {
+    if (live.every((s) => s.exited)) break;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+
+  // Phase 2: force-kill anyone still alive.
+  let killed = 0;
+  for (const s of live) {
+    if (s.exited) {
+      killed++;
+      continue;
+    }
     killPtyTree(s);
     killed++;
   }
