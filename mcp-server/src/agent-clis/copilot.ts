@@ -59,11 +59,15 @@ export const copilotProvider: AgentCliProvider = {
     writeMcpJson(ctx, opts.workspaceInfo.path, opts.mcp);
     const mcpPath = join(opts.workspaceInfo.path, '.mcp.json');
 
-    const sessionFlag = opts.init.kind === 'new'
-      ? `--name=${opts.init.session_id}`
-      : `--resume=${opts.init.session_id}`;
-
-    const argv: string[] = [sessionFlag, '--additional-mcp-config', `@${mcpPath}`];
+    // Use `--session-id <uuid>` for BOTH new and resume. Per `copilot --help`:
+    //   --session-id <id>    Resume an existing session or task by ID, or set
+    //                        the UUID for a new session
+    // The CLI treats it as resume when the UUID exists on disk, otherwise
+    // it creates a new session with that UUID. This mirrors how you'd run
+    // `copilot` interactively in a fresh terminal — no special "create-mode"
+    // flag needed. The opts.init.session_id is already a randomUUID() from
+    // the kernel so it's always a valid UUID for both new and resume paths.
+    const argv: string[] = [`--session-id=${opts.init.session_id}`, '--additional-mcp-config', `@${mcpPath}`];
     if (opts.agent) {
       argv.push('--agent', opts.agent);
     }

@@ -28,6 +28,7 @@ import { handleTestHook } from '../api-test-hooks.ts';
 import { onChange } from '../event-bus.ts';
 import { renderHomePage, resolveSpaAsset } from '../home-page.ts';
 import { logger } from '../logger.ts';
+import { cleanCopilotStaleLocks } from '../stale-locks.ts';
 import { startMainAgent, getMainAgentStatus } from '../main-agent.ts';
 import { buildProviderCtx } from '../agent-clis/shared.ts';
 import type { Workspace } from '../workspace.ts';
@@ -890,6 +891,24 @@ export async function runStart(flags: Flags): Promise<void> {
     },
     'trigger kernel started',
   );
+
+  // Sweep stale `inuse.<pid>.lock` files left under
+  // `~/.copilot/session-state/<uuid>/` by prior copilot processes that
+  // were force-killed (clawdevbox crash, OS reboot, SIGKILL). If we don't
+  // remove these BEFORE the main agent (or any other spawn) starts, the
+  // next copilot --session-id=<uuid> hits the "Session in use" modal which
+  // swallows our initial prompt.
+  try {
+    const { scanned, removed } = cleanCopilotStaleLocks();
+    if (scanned > 0) {
+      logger.info({ scanned, removed }, 'startup: swept stale copilot inuse locks');
+    }
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'startup: stale-lock sweep threw',
+    );
+  }
 
   // Spawn the dev-buddy main agent. Failures are non-fatal — the home page
   // still loads; the agent tab just shows a disconnected terminal.
