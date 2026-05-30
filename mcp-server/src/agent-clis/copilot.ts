@@ -67,14 +67,29 @@ export const copilotProvider: AgentCliProvider = {
     // `copilot` interactively in a fresh terminal — no special "create-mode"
     // flag needed. The opts.init.session_id is already a randomUUID() from
     // the kernel so it's always a valid UUID for both new and resume paths.
-    const argv: string[] = [`--session-id=${opts.init.session_id}`, '--additional-mcp-config', `@${mcpPath}`];
+    //
+    // `--yolo` enables all permissions (--allow-all-tools, --allow-all-paths,
+    // --allow-all-urls). Without it, every tool invocation (shell, file
+    // writes, network) prompts:
+    //   "Do you want to run this command? 1. Yes  2. Yes, don't ask again
+    //    3. No, tell Copilot what to do differently"
+    // That prompt blocks dispatched LLM prompts (no human at the terminal
+    // to type 1). Trigger-fired agents need to run autonomously, so we opt
+    // in to yolo for ALL clawdevbox-spawned sessions. Headless invocations
+    // (-p) already used --allow-all-tools; --yolo is the superset for
+    // interactive too. Verified against copilot 1.0.57-3.
+    const argv: string[] = [
+      `--session-id=${opts.init.session_id}`,
+      '--yolo',
+      '--additional-mcp-config', `@${mcpPath}`,
+    ];
     if (opts.agent) {
       argv.push('--agent', opts.agent);
     }
     argv.push(...buildVaultPluginDirArgs(opts.pluginDirs));
     if (opts.mode === 'headless') {
       if (!opts.prompt) throw new Error('copilot: headless mode requires opts.prompt');
-      argv.push('--allow-all-tools', '-p', opts.prompt);
+      argv.push('-p', opts.prompt);
     }
 
     const env = { ...process.env, ...opts.ambientEnv } as Record<string, string>;
