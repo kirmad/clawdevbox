@@ -438,6 +438,24 @@ export async function handleCronApi(
   }
 
   // ----- GET /api/cron/status -----------------------------------------------
+  // Bearer-gated routes below (/api/cron/*, /api/fires/*) — these are
+  // maintenance/introspection surfaces, NOT SPA-consumed. /api/sessions*
+  // sits OUTSIDE this gate (handled above) because the SPA consumes it
+  // without a bearer like every other /api/* surface.
+  if (path.startsWith('/api/cron/') || path.startsWith('/api/fires')) {
+    if (ctx.expectedToken) {
+      const token = bearer(req);
+      if (!token) {
+        reject401(res, 'missing bearer token');
+        return true;
+      }
+      if (!constantTimeEquals(token, ctx.expectedToken)) {
+        reject401(res, 'invalid bearer token');
+        return true;
+      }
+    }
+  }
+
   if (path === '/api/cron/status' && method === 'GET') {
     sendJson(res, 200, {
       service: ctx.service,
