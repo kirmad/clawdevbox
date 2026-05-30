@@ -21,6 +21,8 @@ const termHost = ref<HTMLDivElement | null>(null);
 let term: Terminal | null = null;
 let fit: FitAddon | null = null;
 let ws: WebSocket | null = null;
+let resizeObs: ResizeObserver | null = null;
+let onWindowResize: (() => void) | null = null;
 
 const selectedId = computed(() => store.terminals.selectedInstanceId);
 const activeSessions = computed(() => store.terminals.items.filter((s) => s.live));
@@ -51,7 +53,28 @@ function stateClass(state: Session['state']): string {
   return `state-dot state-${state}`;
 }
 
+/**
+ * Refit the xterm to its container and inform the server-side pty of
+ * the new cols/rows. Wrapped in requestAnimationFrame so layout has a
+ * chance to settle before measurement (FitAddon reads computed CSS
+ * dimensions; reading too early returns stale 0×0). No-ops if any
+ * piece isn't ready yet.
+ */
+function refit(): void {
+  if (!term || !fit) return;
+  requestAnimationFrame(() => {
+    try {
+      fit!.fit();
+      if (ws && ws.readyState === WebSocket.OPEN && term) {
+        ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+      }
+    } catch { /* host not measurable yet — next observer tick will retry */ }
+  });
+}
+
 async function teardown(): Promise<void> {
+  if (resizeObs) { try { resizeObs.disconnect(); } catch {} resizeObs = null; }
+  if (onWindowResize) { window.removeEventListener('resize', onWindowResize); onWindowResize = null; }
   if (ws) { try { ws.close(); } catch {} ws = null; }
   if (term) { try { term.dispose(); } catch {} term = null; }
   fit = null;
@@ -73,11 +96,17 @@ async function attach(): Promise<void> {
   term.loadAddon(fit);
   term.open(termHost.value);
   await nextTick();
-  try { fit.fit(); } catch {}
+  refit();
 
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const id = encodeURIComponent(selectedId.value);
   ws = new WebSocket(`${proto}//${location.host}/terminal/${id}/ws`);
+  ws.onopen = () => {
+    // The snapshot arrives next — re-fit once we know the host element
+    // is fully sized, and inform the server of the actual viewport size
+    // so the pty's tty matches what xterm is rendering.
+    refit();
+  };
   ws.onmessage = (ev) => {
     let msg: { type?: string; content?: string; chunk?: string };
     try { msg = JSON.parse(ev.data); } catch { return; }
@@ -89,6 +118,16 @@ async function attach(): Promise<void> {
       if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'input', data: d }));
     });
   }
+
+  // Auto-refit on container size changes (window resize, sidebar drawer
+  // toggle, tab switches) AND on window resize as a fallback for any
+  // change the ResizeObserver misses.
+  if (termHost.value && typeof ResizeObserver !== 'undefined') {
+    resizeObs = new ResizeObserver(() => refit());
+    resizeObs.observe(termHost.value);
+  }
+  onWindowResize = () => refit();
+  window.addEventListener('resize', onWindowResize);
 }
 
 function select(s: Session): void {
@@ -189,7 +228,7 @@ watch(selectedId, () => { attach(); });
 </template>
 
 <style scoped>
-.terminals-panel { display: flex; height: 100%; width: 100%; }
+.terminals-panel { display: flex; height: 100%; width: 100%; min-height: 0; min-width: 0; }
 .tab-list { width: 280px; min-width: 280px; max-width: 280px; overflow-y: auto; border-right: 1px solid #23262d; padding: 8px 4px; }
 .group-header { font-size: 11px; color: #7c8290; text-transform: uppercase; padding: 8px 10px 4px; cursor: pointer; }
 .group { margin-top: 8px; }
@@ -210,5 +249,15 @@ watch(selectedId, () => { attach(); });
 .resume-btn { position: absolute; right: 8px; top: 10px; padding: 2px 8px; font-size: 11px; background: #23262d; color: #d8dee9; border: 1px solid #3a3f4a; border-radius: 3px; cursor: pointer; display: none; }
 .archived:hover .resume-btn { display: inline-block; }
 .load-more { display: block; margin: 6px auto; padding: 4px 10px; font-size: 11px; background: transparent; color: #7c8290; border: 1px solid #3a3f4a; border-radius: 3px; cursor: pointer; }
-.xterm-host { flex: 1; background: #15171d; min-height: 0; }
+
+/* xterm-host fills the remaining width and full panel height. The two
+ * min-* zeros are required for flex children that contain content
+ * larger than the parent (xterm's canvas) — without them the host
+ * grows to the canvas's natural size and the flex 1 doesn't take effect.
+ * `position: relative` is needed because xterm.js positions its
+ * scrollbar absolutely inside the host. */
+.xterm-host { flex: 1 1 auto; min-width: 0; min-height: 0; background: #15171d; position: relative; padding: 4px; box-sizing: border-box; overflow: hidden; }
+.xterm-host :deep(.xterm) { width: 100%; height: 100%; }
+.xterm-host :deep(.xterm-viewport) { width: 100% !important; }
+.xterm-host :deep(.xterm-screen) { width: 100% !important; }
 </style>
