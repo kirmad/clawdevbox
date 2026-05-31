@@ -465,6 +465,17 @@ export async function runStart(flags: Flags): Promise<void> {
       return;
     }
 
+    // Standalone test UI — single self-contained HTML page with embedded
+    // CSS + JS for hand-driving the /spawn + /dispatch + /api/sessions
+    // endpoints. Loaded from CDN: xterm.js + addon-fit. No build step.
+    // Accessible at http://127.0.0.1:5201/test-ui — loopback only.
+    if (url.pathname === '/test-ui' || url.pathname === '/test-ui/' || url.pathname === '/test-ui/index.html') {
+      const { renderTestUI } = await import('../test-ui.ts');
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+      res.end(renderTestUI());
+      return;
+    }
+
     // Vite-built SPA assets — /assets/<name>-<hash>.{js,css,svg,…}.
     // Long-cached because the filename is hashed; index.html itself is
     // re-fetched per visit so deploys land immediately.
