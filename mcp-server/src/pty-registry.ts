@@ -216,6 +216,17 @@ export function hasSession(instanceId: string): boolean {
 }
 
 /**
+ * Returns true only if the session is in the registry AND not exited.
+ * Use this for "is the pty still usable" checks (smart routing's
+ * live-or-spawn decision); use hasSession for "is the row still present
+ * for late-attach viewers" checks.
+ */
+export function isSessionLive(instanceId: string): boolean {
+  const s = sessions.get(instanceId);
+  return !!s && !s.exited;
+}
+
+/**
  * Return the metadata captured at register time for `instanceId`, or null
  * if the pty has fully exited and been garbage-collected. Used by the
  * terminal viewer to populate the header with cwd / command / session.

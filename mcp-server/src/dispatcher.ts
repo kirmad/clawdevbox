@@ -293,9 +293,9 @@ export class Dispatcher {
       )
       .all(cliSessionId) as Row[];
     if (rows.length === 0) return null;
-    const { hasSession } = await import('./pty-registry.ts');
+    const { isSessionLive } = await import('./pty-registry.ts');
     for (const r of rows) {
-      if (hasSession(r.recipe_instance_id)) return r.recipe_instance_id;
+      if (isSessionLive(r.recipe_instance_id)) return r.recipe_instance_id;
     }
     return null;
   }
