@@ -19,6 +19,9 @@ verify-screenshots/
 .clawdevbox/
 clawdevbox-workspaces/
 
+# Git worktrees (isolated feature workspaces)
+.worktrees/
+
 # Logs
 *.log
 npm-debug.log*
