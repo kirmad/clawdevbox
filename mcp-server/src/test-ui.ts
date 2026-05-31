@@ -618,7 +618,14 @@ const HTML = `<!DOCTYPE html>
     const r = await api('POST', path, body);
     renderResp('sp-response', r);
     if (r.ok && r.body?.instance_id) {
-      setTimeout(() => { refreshSessions(); selectSession(r.body.instance_id); }, 500);
+      // Refresh the sidebar immediately so the new session is visible.
+      // Defer the auto-attach: opening the xterm WebSocket sends a resize
+      // to the pty, which races with copilot's initial-prompt delivery
+      // (the user-reported "prompt is added but not submitted" bug). Wait
+      // a few seconds — by then copilot's load+input handler has settled.
+      // User can still click the session in the sidebar to attach sooner.
+      setTimeout(() => { refreshSessions(); }, 500);
+      setTimeout(() => { selectSession(r.body.instance_id); }, 5000);
     }
   }
   window.doSpawn = doSpawn;

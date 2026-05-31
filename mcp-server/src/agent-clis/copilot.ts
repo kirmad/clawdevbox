@@ -124,10 +124,17 @@ export const copilotProvider: AgentCliProvider = {
     // writePrompt path. Fire-and-forget — the caller already has the
     // handle; delivery errors are surfaced via the logger.
     if (opts.mode === 'interactive' && opts.prompt) {
-      deliverInitialPromptWhenReady(pty, {
+      const initialPromptDelivery = deliverInitialPromptWhenReady(pty, {
         text: opts.prompt,
         promptReadyRegex: copilotCapabilities.promptReadyRegex,
+        fullyRenderedRegex: /context\s*\(\d+%\)/,
+        stableMs: 2500,
+        timeoutMs: 90_000,
         writePrompt: (o) => copilotProvider.writePrompt!(handle, o),
+      });
+      (handle as AgentHandle & { initialPromptDelivery?: Promise<unknown> }).initialPromptDelivery = initialPromptDelivery;
+      initialPromptDelivery.then(() => {
+        ctx.logger?.info?.({ sessionId: handle.sessionId }, 'copilot: initial prompt delivered');
       }).catch((err) => {
         ctx.logger?.warn?.({ err: err?.message ?? String(err), sessionId: handle.sessionId }, 'copilot: initial prompt delivery failed');
       });

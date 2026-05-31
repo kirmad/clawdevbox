@@ -40,6 +40,14 @@ const BUFFER_LIMIT_BYTES = 256 * 1024;
 /** Hold exited sessions this long so a reconnecting viewer still sees the tail. */
 const EXIT_RETAIN_MS = 10_000;
 
+/**
+ * Keep viewer-side terminal events away from Copilot's initial prompt submit.
+ * On Windows ConPTY, early xterm attach side effects (resizes plus terminal
+ * query/focus replies) can leave the prompt text in the input box while
+ * swallowing the submit.
+ */
+const INITIAL_PROMPT_VIEWER_GATE_GRACE_MS = 10_000;
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -98,6 +106,10 @@ export interface PtyRegisterOptions {
   agentHandle?: AgentHandle;
 }
 
+type AgentHandleWithInitialPrompt = AgentHandle & {
+  initialPromptDelivery?: Promise<unknown>;
+};
+
 interface PtySession {
   instanceId: string;
   workspaceId: string;
@@ -111,6 +123,8 @@ interface PtySession {
   exitCode: number | null;
   meta: PtySessionMeta;
   conductor: SessionConductor | null;
+  initialPromptGateActive: boolean;
+  pendingResize: { cols: number; rows: number } | null;
 }
 
 // ============================================================================
@@ -127,6 +141,29 @@ function appendToBuffer(s: PtySession, chunk: string): void {
     const head = s.buffer.shift();
     if (head !== undefined) s.bufferBytes -= head.length;
   }
+}
+
+function applyResize(s: PtySession, cols: number, rows: number): boolean {
+  s.cols = cols;
+  s.rows = rows;
+  try {
+    s.ipty.resize(cols, rows);
+  } catch {
+    return false;
+  }
+  return true;
+}
+
+function initialPromptDeliveryOf(handle?: AgentHandle): Promise<unknown> | null {
+  const delivery = (handle as AgentHandleWithInitialPrompt | undefined)?.initialPromptDelivery;
+  return delivery && typeof delivery.then === 'function' ? delivery : null;
+}
+
+function flushPendingResize(s: PtySession): boolean {
+  const pending = s.pendingResize;
+  s.pendingResize = null;
+  if (!pending || s.exited) return true;
+  return applyResize(s, pending.cols, pending.rows);
 }
 
 export function registerPty(opts: PtyRegisterOptions): void {
@@ -146,6 +183,8 @@ export function registerPty(opts: PtyRegisterOptions): void {
     exitCode: null,
     meta: { ...(opts.meta ?? {}), startedAt: Date.now() },
     conductor: null,
+    initialPromptGateActive: false,
+    pendingResize: null,
   };
 
   let conductor: SessionConductor | null = null;
@@ -179,6 +218,21 @@ export function registerPty(opts: PtyRegisterOptions): void {
     }
   }
   session.conductor = conductor;
+
+  const initialPromptDelivery = initialPromptDeliveryOf(opts.agentHandle);
+  if (initialPromptDelivery) {
+    session.initialPromptGateActive = true;
+    const releaseInitialPromptGate = () => {
+      const timer = setTimeout(() => {
+        const cur = sessions.get(opts.instanceId);
+        if (cur !== session) return;
+        cur.initialPromptGateActive = false;
+        flushPendingResize(cur);
+      }, INITIAL_PROMPT_VIEWER_GATE_GRACE_MS);
+      timer.unref?.();
+    };
+    initialPromptDelivery.then(releaseInitialPromptGate, releaseInitialPromptGate);
+  }
 
   sessions.set(opts.instanceId, session);
   emitChange('sessions');
@@ -280,6 +334,7 @@ export function subscribe(
 export function writeToPty(instanceId: string, data: string): boolean {
   const s = sessions.get(instanceId);
   if (!s || s.exited) return false;
+  if (s.initialPromptGateActive) return true;
   s.ipty.write(data);
   return true;
 }
@@ -287,14 +342,13 @@ export function writeToPty(instanceId: string, data: string): boolean {
 export function resizePty(instanceId: string, cols: number, rows: number): boolean {
   const s = sessions.get(instanceId);
   if (!s || s.exited) return false;
-  s.cols = cols;
-  s.rows = rows;
-  try {
-    s.ipty.resize(cols, rows);
-  } catch {
-    return false;
+  if (s.initialPromptGateActive) {
+    s.cols = cols;
+    s.rows = rows;
+    s.pendingResize = { cols, rows };
+    return true;
   }
-  return true;
+  return applyResize(s, cols, rows);
 }
 
 export function killPty(instanceId: string, signal?: string): boolean {

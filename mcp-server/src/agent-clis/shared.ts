@@ -216,13 +216,29 @@ export interface DeliverInitialPromptOpts {
   writePrompt: (opts: { text: string; strategy: 'submit' | 'queue' }) => Promise<void>;
   timeoutMs?: number;
   stableMs?: number;
+  /**
+   * Optional positive regex. When set, the buffer must match BOTH this AND
+   * `promptReadyRegex` before the stable timer starts.
+   *
+   * Why: copilot draws its `❯` prompt char early during initialization,
+   * BEFORE the rest of its UI scaffolding (model line, hint bar, MCP
+   * server status). Writing keystrokes during this intermediate state
+   * puts text into the input box but the `\r` submit is silently absorbed
+   * — copilot's input handler hasn't fully wired up yet. Empirically the
+   * model line (`context (\d+%)`) is the last thing to render, so waiting
+   * for it ensures the input handler is closer to ready.
+   *
+   * Pair with a longer `stableMs` (e.g. 2500ms) to also wait past any
+   * loading spinner that keeps emitting frames after the model line draws.
+   */
+  fullyRenderedRegex?: RegExp;
 }
 
 export function deliverInitialPromptWhenReady(
   pty: { onData: (cb: (chunk: string) => void) => { dispose(): void } },
   opts: DeliverInitialPromptOpts,
 ): Promise<'delivered'> {
-  const { text, promptReadyRegex, writePrompt } = opts;
+  const { text, promptReadyRegex, fullyRenderedRegex, writePrompt } = opts;
   const timeoutMs = opts.timeoutMs ?? 60_000;
   const stableMs = opts.stableMs ?? 250;
   return new Promise<'delivered'>((resolve, reject) => {
@@ -232,7 +248,8 @@ export function deliverInitialPromptWhenReady(
     const sub = pty.onData((chunk) => {
       if (done) return;
       buf = (buf + stripTuiNoise(chunk)).slice(-4096);
-      if (!promptReadyRegex.test(buf)) {
+      const ready = promptReadyRegex.test(buf) && (!fullyRenderedRegex || fullyRenderedRegex.test(buf));
+      if (!ready) {
         if (stableTimer) { clearTimeout(stableTimer); stableTimer = null; }
         return;
       }
