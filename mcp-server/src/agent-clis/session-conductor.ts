@@ -298,16 +298,19 @@ export class SessionConductor extends EventEmitter {
     // session — which is only possible if there's already an active
     // dispatch in flight. That branch is handled inline in dispatch()'s
     // resolved-strategy logic; the local FIFO drain here always submits.
-    const head = this.queue[0]!;
+    // Drain ONE at a time, not the whole queue. Coalescing prompts with
+    // `\n\n---\n\n` separators puts copilot into deep multi-line input
+    // mode where `\r` no longer submits — observed via the
+    // test-ui-dispatch-reliability harness (5 rapid dispatches → 2
+    // succeed, 3 stuck after 2 minutes with text in input bar).
+    //
+    // Each pending dispatch now gets its OWN writePrompt cycle and its
+    // own done-marker. They drain serially because the next call to
+    // maybeStartNext (from completeActive) only happens after the
+    // current dispatch finishes — preserving FIFO order and giving each
+    // caller a deterministic resolve on the matching marker.
+    const head = this.queue.shift()!;
     const drainBatch: PendingDispatch[] = [head];
-    this.queue.shift();
-    while (this.queue.length > 0) {
-      // Coalesce all queued items into one delivery on idle drain. Each
-      // pending caller still gets its own DispatchResult resolved when
-      // the combined marker fires — but they all share the same
-      // deliveredAt/doneAt timestamps and the same markerId.
-      drainBatch.push(this.queue.shift()!);
-    }
 
     this.beginDispatchBatch(drainBatch).catch((err) => {
       // beginDispatchBatch rejects all pending callers on its own.

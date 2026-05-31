@@ -166,7 +166,11 @@ test('queue strategy while busy uses provider native queue (Ctrl+Q)', async () =
   assert.equal(r2.doneSignal, 'marker');
 });
 
-test('claude-like provider buffers locally when busy and drains coalesced', async () => {
+test('claude-like provider buffers locally when busy and drains serially', async () => {
+  // Drains ONE-AT-A-TIME (no coalescing). Coalescing was removed because
+  // copilot's TUI enters multi-line input mode when fed text containing
+  // `\n\n---\n\n` separators, and `\r` no longer submits in that mode.
+  // Each queued dispatch now gets its own writePrompt + own marker.
   const { conductor, mock } = makeConductor({ provider: claudeProvider() });
   mock.emit('\n❯ \n');
   await sleep(80);
@@ -180,21 +184,37 @@ test('claude-like provider buffers locally when busy and drains coalesced', asyn
   const allWrites1 = mock.writes.map((w) => w.data).join('');
   // Claude bulk-cr → text+CR in one write. Should NOT contain DC1.
   assert.equal(allWrites1.includes('\x11'), false);
+  // Only the first prompt has been written so far.
+  assert.ok(allWrites1.includes('first'));
+  assert.equal(allWrites1.includes('second'), false, 'second not yet written');
+  assert.equal(allWrites1.includes('third'), false, 'third not yet written');
   const firstMarker = extractMarkerId(allWrites1);
   mock.emit(`first done\n###${firstMarker}###\n`);
   await first;
 
+  // After first completes, the next pending (second) drains alone.
   await sleep(40);
   const allWrites2 = mock.writes.map((w) => w.data).join('');
-  // The drained batch combined second+third with separator.
-  assert.ok(allWrites2.includes('second\n\n---\n\nthird'), `expected coalesced batch, got: ${allWrites2}`);
-  const drainMarker = extractMarkerId(allWrites2.slice(allWrites2.indexOf(firstMarker) + firstMarker.length + 3));
-  assert.ok(drainMarker);
-  mock.emit(`drained\n###${drainMarker}###\n`);
+  const tail2 = allWrites2.slice(allWrites2.indexOf(firstMarker) + firstMarker.length + 3);
+  assert.ok(tail2.includes('second'), 'second drained after first done');
+  assert.equal(tail2.includes('third'), false, 'third still buffered');
+  assert.equal(tail2.includes('---'), false, 'no coalesce separator');
+  const secondMarker = extractMarkerId(tail2);
+  assert.ok(secondMarker && secondMarker !== firstMarker);
+  mock.emit(`second done\n###${secondMarker}###\n`);
   const r2 = await second;
+  assert.equal(r2.markerId, secondMarker);
+  assert.equal(r2.doneSignal, 'marker');
+
+  // Then third drains on its own.
+  await sleep(40);
+  const allWrites3 = mock.writes.map((w) => w.data).join('');
+  const tail3 = allWrites3.slice(allWrites3.indexOf(secondMarker) + secondMarker.length + 3);
+  assert.ok(tail3.includes('third'));
+  const thirdMarker = extractMarkerId(tail3);
+  mock.emit(`third done\n###${thirdMarker}###\n`);
   const r3 = await third;
-  assert.equal(r2.markerId, drainMarker);
-  assert.equal(r3.markerId, drainMarker);
+  assert.equal(r3.markerId, thirdMarker);
 });
 
 // ---------------------------------------------------------------------------
@@ -320,7 +340,11 @@ test('dispatch rejects after per-dispatch timeout', async () => {
 // 10. Coalesce drain content check
 // ---------------------------------------------------------------------------
 
-test('coalesced drain wraps batch in a single marker block', async () => {
+test('queued dispatches drain serially with separate marker blocks', async () => {
+  // Replaces the old "coalesced drain wraps batch in a single marker block"
+  // test. Coalescing was removed to fix copilot's stuck-input bug under
+  // rapid-fire dispatch. Now each queued prompt gets its own write +
+  // own marker and they drain FIFO, one at a time.
   const { conductor, mock } = makeConductor({ provider: claudeProvider() });
   mock.emit('\n❯ \n');
   await sleep(80);
@@ -333,21 +357,43 @@ test('coalesced drain wraps batch in a single marker block', async () => {
   await sleep(20);
 
   const all = mock.writes.map((w) => w.data).join('');
+  // Only `one` written so far.
+  assert.ok(all.includes('one'));
+  assert.equal(all.includes('two'), false);
+  assert.equal(all.includes('---'), false, 'no coalesce separator anywhere');
   const firstMarker = extractMarkerId(all);
   mock.emit(`done\n###${firstMarker}###\n`);
   await first;
 
+  // Drain second.
   await sleep(40);
-  const all2 = mock.writes.map((w) => w.data).join('');
-  const tail = all2.slice(all2.indexOf(firstMarker) + firstMarker.length + 3);
-  const markerCount = (tail.match(/###CDB_DONE_/g) ?? []).length;
-  assert.equal(markerCount, 1, 'coalesced drain emits exactly one marker block');
-  assert.ok(tail.includes('two\n\n---\n\nthree\n\n---\n\nfour'));
+  const after1 = mock.writes.map((w) => w.data).join('').slice(
+    mock.writes.map((w) => w.data).join('').indexOf(firstMarker) + firstMarker.length + 3,
+  );
+  assert.ok(after1.includes('two'));
+  assert.equal(after1.includes('three'), false, 'third not yet written');
+  const secondMarker = extractMarkerId(after1);
+  mock.emit(`done2\n###${secondMarker}###\n`);
+  await second;
 
-  const drainMarker = extractMarkerId(tail);
-  assert.ok(drainMarker);
-  mock.emit(`drained\n###${drainMarker}###\n`);
-  await Promise.all([second, third, fourth]);
+  // Drain third.
+  await sleep(40);
+  const allWrites3 = mock.writes.map((w) => w.data).join('');
+  const after2 = allWrites3.slice(allWrites3.indexOf(secondMarker) + secondMarker.length + 3);
+  assert.ok(after2.includes('three'));
+  const thirdMarker = extractMarkerId(after2);
+  mock.emit(`done3\n###${thirdMarker}###\n`);
+  await third;
+
+  // Drain fourth.
+  await sleep(40);
+  const allWrites4 = mock.writes.map((w) => w.data).join('');
+  const after3 = allWrites4.slice(allWrites4.indexOf(thirdMarker) + thirdMarker.length + 3);
+  assert.ok(after3.includes('four'));
+  const fourthMarker = extractMarkerId(after3);
+  mock.emit(`done4\n###${fourthMarker}###\n`);
+  await fourth;
+
   conductor.dispose();
 });
 
