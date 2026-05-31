@@ -21,18 +21,23 @@ const HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#1a2028">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <title>clawdevbox · test UI</title>
 <link rel="stylesheet" href="https://unpkg.com/@xterm/xterm@5.5.0/css/xterm.css">
 <style>
   * { box-sizing: border-box; }
-  body {
+  html, body {
     margin: 0;
     font: 13px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     background: #0f1419;
     color: #d8dde2;
-    height: 100vh;
+    height: 100%;
     overflow: hidden;
+    -webkit-text-size-adjust: 100%;
   }
   header {
     background: #1a2028;
@@ -40,15 +45,21 @@ const HTML = `<!DOCTYPE html>
     border-bottom: 1px solid #2c3540;
     display: flex;
     align-items: center;
-    gap: 16px;
+    gap: 12px;
     height: 44px;
+    position: sticky;
+    top: 0;
+    z-index: 10;
   }
-  header h1 { font-size: 13px; font-weight: 600; margin: 0; color: #f0c674; }
-  header .status { font-size: 11px; color: #7c858f; }
+  header h1 { font-size: 13px; font-weight: 600; margin: 0; color: #f0c674; white-space: nowrap; }
+  header .status { font-size: 11px; color: #7c858f; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
   header .status.ok::before { content: '● '; color: #a8c97f; }
   header .status.err::before { content: '● '; color: #cc6666; }
   header .spacer { flex: 1; }
   header .clock { font-size: 11px; color: #7c858f; font-variant-numeric: tabular-nums; }
+  header button { min-height: 32px; touch-action: manipulation; }
+
+  /* ── DESKTOP (≥1200px): 3-col × 2-row grid ─────────────────────── */
   .layout {
     display: grid;
     grid-template-columns: 280px 1fr 480px;
@@ -61,7 +72,7 @@ const HTML = `<!DOCTYPE html>
   .panel { background: #0f1419; overflow: auto; }
   .side { grid-area: side; padding: 8px; }
   .main { grid-area: main; padding: 12px; overflow-y: auto; }
-  .term { grid-area: term; padding: 8px; display: flex; flex-direction: column; }
+  .term { grid-area: term; padding: 8px; display: flex; flex-direction: column; min-height: 0; }
   .term-host { flex: 1; min-height: 0; }
   .log { grid-area: log; padding: 8px; font-family: 'Cascadia Code', Consolas, monospace; font-size: 11px; }
   .log-entry { padding: 2px 0; border-bottom: 1px solid #1a2028; white-space: pre-wrap; word-break: break-all; }
@@ -71,69 +82,80 @@ const HTML = `<!DOCTYPE html>
   .log-entry.res { color: #a8c97f; }
   .log-entry.err { color: #e06c75; }
   .session {
-    padding: 8px;
+    padding: 10px;
     border: 1px solid #2c3540;
     border-radius: 4px;
     margin-bottom: 6px;
     cursor: pointer;
     transition: border-color 0.15s;
+    touch-action: manipulation;
   }
   .session:hover { border-color: #5c6370; }
   .session.selected { border-color: #f0c674; background: #1a2028; }
-  .session .id { font-family: 'Cascadia Code', Consolas, monospace; font-size: 11px; color: #61afef; }
+  .session .id { font-family: 'Cascadia Code', Consolas, monospace; font-size: 11px; color: #61afef; word-break: break-all; }
   .session .meta { font-size: 11px; color: #7c858f; margin-top: 2px; }
   .session .state { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 10px; font-weight: 600; }
   .session .state.idle { background: #1a2e1a; color: #a8c97f; }
   .session .state.busy { background: #2e2a1a; color: #f0c674; }
   .session .state.starting { background: #1a242e; color: #61afef; }
-  .session .actions { display: flex; gap: 4px; margin-top: 6px; }
+  .session .actions { display: flex; gap: 6px; margin-top: 8px; }
   .session .actions button {
     background: #2c3540; border: none; color: #d8dde2;
-    padding: 3px 8px; font-size: 10px; border-radius: 3px; cursor: pointer;
+    padding: 6px 10px; font-size: 11px; border-radius: 3px; cursor: pointer;
+    min-height: 32px; touch-action: manipulation;
   }
   .session .actions button:hover { background: #3c4651; }
   .session .actions button.danger { background: #3c2828; color: #e06c75; }
   .session .actions button.danger:hover { background: #5c3838; }
-  .tabs { display: flex; gap: 0; margin-bottom: 12px; border-bottom: 1px solid #2c3540; }
+  .tabs { display: flex; gap: 0; margin-bottom: 12px; border-bottom: 1px solid #2c3540; overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
+  .tabs::-webkit-scrollbar { display: none; }
   .tab {
-    padding: 8px 16px;
+    padding: 10px 16px;
     cursor: pointer;
     border-bottom: 2px solid transparent;
     color: #7c858f;
     font-weight: 500;
     user-select: none;
+    white-space: nowrap;
+    min-height: 40px;
+    touch-action: manipulation;
   }
   .tab.active { color: #f0c674; border-bottom-color: #f0c674; }
   .tab:hover:not(.active) { color: #d8dde2; }
   .tab-content { display: none; }
   .tab-content.active { display: block; }
   .form-grid { display: grid; grid-template-columns: 140px 1fr; gap: 8px 12px; max-width: 700px; }
-  .form-grid label { color: #7c858f; padding-top: 6px; font-size: 12px; }
+  .form-grid label { color: #7c858f; padding-top: 8px; font-size: 12px; }
   .form-grid input, .form-grid select, .form-grid textarea {
     background: #1a2028;
     border: 1px solid #2c3540;
     color: #d8dde2;
-    padding: 6px 8px;
+    padding: 8px 10px;
     border-radius: 3px;
     font-family: inherit;
-    font-size: 12px;
+    font-size: 13px;
+    min-height: 36px;
+    width: 100%;
   }
-  .form-grid textarea { font-family: 'Cascadia Code', Consolas, monospace; resize: vertical; min-height: 60px; }
+  .form-grid textarea { font-family: 'Cascadia Code', Consolas, monospace; resize: vertical; min-height: 70px; }
   .form-grid input:focus, .form-grid select:focus, .form-grid textarea:focus {
     outline: none; border-color: #61afef;
   }
   .form-grid .hint { color: #5c6370; font-size: 11px; padding-top: 6px; }
-  .form-actions { margin-top: 14px; display: flex; gap: 8px; }
+  .form-actions { margin-top: 14px; display: flex; gap: 8px; flex-wrap: wrap; }
   button.primary {
     background: #61afef; color: #0f1419; border: none;
-    padding: 8px 16px; border-radius: 3px; cursor: pointer;
-    font-weight: 600; font-size: 12px;
+    padding: 10px 18px; border-radius: 3px; cursor: pointer;
+    font-weight: 600; font-size: 13px;
+    min-height: 40px; touch-action: manipulation;
   }
   button.primary:hover { background: #7ec2f5; }
   button.primary:disabled { opacity: 0.5; cursor: not-allowed; }
+  button.primary:active { transform: translateY(1px); }
   button.secondary {
     background: transparent; border: 1px solid #2c3540; color: #d8dde2;
-    padding: 7px 16px; border-radius: 3px; cursor: pointer; font-size: 12px;
+    padding: 9px 16px; border-radius: 3px; cursor: pointer; font-size: 13px;
+    min-height: 40px; touch-action: manipulation;
   }
   button.secondary:hover { border-color: #5c6370; }
   .scenario-card {
@@ -155,12 +177,86 @@ const HTML = `<!DOCTYPE html>
     font-family: 'Cascadia Code', Consolas, monospace; font-size: 11px;
     border-left: 3px solid #61afef;
     white-space: pre-wrap; word-break: break-all;
+    max-height: 60vh;
+    overflow-y: auto;
   }
   .response.err { border-left-color: #e06c75; color: #e06c75; }
   .response.ok { border-left-color: #a8c97f; }
   .badge { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 10px; margin-left: 4px; font-weight: 600; }
   .badge.spawn { background: #1a2e1a; color: #a8c97f; }
   .badge.dispatch { background: #1a242e; color: #61afef; }
+
+  /* ── MOBILE NAV (only shown < 768px) ──────────────────────────── */
+  .mobile-nav {
+    display: none;
+    background: #1a2028;
+    border-top: 1px solid #2c3540;
+    padding-bottom: env(safe-area-inset-bottom, 0);
+  }
+  .mobile-nav-tab {
+    flex: 1;
+    padding: 10px 4px 12px;
+    text-align: center;
+    cursor: pointer;
+    user-select: none;
+    color: #7c858f;
+    font-size: 10px;
+    line-height: 1.3;
+    border-right: 1px solid #2c3540;
+    touch-action: manipulation;
+  }
+  .mobile-nav-tab:last-child { border-right: none; }
+  .mobile-nav-tab.active { color: #f0c674; background: #0f1419; }
+  .mobile-nav-tab .icon { display: block; font-size: 18px; margin-bottom: 2px; }
+
+  /* ── TABLET (≤1199px): 2 columns, term + log stack below ─────── */
+  @media (max-width: 1199px) {
+    .layout {
+      grid-template-columns: 260px 1fr;
+      grid-template-rows: 1fr 280px 160px;
+      grid-template-areas: "side main" "side term" "side log";
+    }
+  }
+
+  /* ── PHONE (≤767px): single panel + bottom mobile-nav ─────────── */
+  @media (max-width: 767px) {
+    header { padding: 8px 12px; gap: 8px; }
+    header h1 { font-size: 13px; }
+    header .status { font-size: 10px; }
+    header .clock { display: none; }
+    body { height: 100dvh; }
+    .layout {
+      grid-template-columns: 1fr;
+      grid-template-rows: 1fr 56px;
+      grid-template-areas: "active" "mnav";
+      height: calc(100dvh - 44px);
+    }
+    .panel { grid-area: active; display: none; }
+    .panel.mobile-active { display: block; }
+    .term { padding: 4px 6px; }
+    .term.mobile-active { display: flex; }
+    .mobile-nav { display: flex; grid-area: mnav; }
+    /* form fields stack labels on top */
+    .form-grid {
+      grid-template-columns: 1fr;
+      gap: 4px;
+    }
+    .form-grid label {
+      padding-top: 12px;
+      font-weight: 600;
+      color: #a8c97f;
+    }
+    /* 16px input prevents iOS auto-zoom */
+    .form-grid input, .form-grid select, .form-grid textarea {
+      font-size: 16px;
+      padding: 10px;
+    }
+    .form-actions button { flex: 1; min-width: 0; }
+    .tab { padding: 12px 14px; font-size: 13px; }
+    .main { padding: 10px; }
+    .side { padding: 6px; }
+    .log { font-size: 10px; }
+  }
 </style>
 </head>
 <body>
@@ -170,7 +266,7 @@ const HTML = `<!DOCTYPE html>
   <span class="status" id="server-status">connecting…</span>
   <span class="spacer"></span>
   <span class="clock" id="clock"></span>
-  <button class="secondary" onclick="refreshSessions()" style="padding: 4px 10px; font-size: 11px;">↻ refresh</button>
+  <button class="secondary" onclick="refreshSessions()" style="padding: 6px 12px; font-size: 11px; min-height: 32px;">↻</button>
 </header>
 
 <div class="layout">
@@ -300,6 +396,13 @@ const HTML = `<!DOCTYPE html>
     <div id="event-log"></div>
   </div>
 
+  <nav class="mobile-nav" id="mobile-nav">
+    <div class="mobile-nav-tab active" data-panel="main" onclick="setMobilePanel('main')"><span class="icon">▤</span>Forms</div>
+    <div class="mobile-nav-tab" data-panel="side" onclick="setMobilePanel('side')"><span class="icon">≡</span>Sessions</div>
+    <div class="mobile-nav-tab" data-panel="term" onclick="setMobilePanel('term')"><span class="icon">▭</span>Terminal</div>
+    <div class="mobile-nav-tab" data-panel="log" onclick="setMobilePanel('log')"><span class="icon">⌖</span>Log</div>
+  </nav>
+
 </div>
 
 <script src="https://unpkg.com/@xterm/xterm@5.5.0/lib/xterm.js"></script>
@@ -391,8 +494,28 @@ const HTML = `<!DOCTYPE html>
     document.getElementById('dp-instance').value = id;
     refreshSessions();
     attachTerm(id);
+    // On mobile, auto-switch to the Terminal panel
+    if (isMobile()) setMobilePanel('term');
   }
   window.selectSession = selectSession;
+
+  // ── mobile panel switching ──
+  function isMobile() { return window.matchMedia('(max-width: 767px)').matches; }
+  function setMobilePanel(name) {
+    document.querySelectorAll('.panel').forEach((el) => el.classList.remove('mobile-active'));
+    const target = document.querySelector('.' + name);
+    if (target) target.classList.add('mobile-active');
+    document.querySelectorAll('.mobile-nav-tab').forEach((el) => {
+      el.classList.toggle('active', el.dataset.panel === name);
+    });
+    // Re-fit xterm when switching to the terminal panel
+    if (name === 'term' && fitAddon && xterm) {
+      setTimeout(() => {
+        try { fitAddon.fit(); termWs?.send(JSON.stringify({ type: 'resize', cols: xterm.cols, rows: xterm.rows })); } catch {}
+      }, 50);
+    }
+  }
+  window.setMobilePanel = setMobilePanel;
 
   function attachTerm(id) {
     document.getElementById('term-id').textContent = id;
@@ -401,7 +524,7 @@ const HTML = `<!DOCTYPE html>
     fitAddon = new FitAddon.FitAddon();
     xterm = new Terminal({
       fontFamily: 'Cascadia Code, Consolas, monospace',
-      fontSize: 12,
+      fontSize: isMobile() ? 10 : 12,
       theme: { background: '#0f1419', foreground: '#d8dde2', cursor: '#f0c674' },
       cursorBlink: true,
       convertEol: true,
@@ -679,6 +802,15 @@ const HTML = `<!DOCTYPE html>
   loadProviders();
   refreshSessions();
   document.getElementById('sp-ws').value = window.location.search.includes('ws=') ? new URLSearchParams(window.location.search).get('ws') : '';
+  // Initialize mobile panel state: default to "Forms" (the main tab area).
+  // On desktop, this is a no-op because the .panel display: none rule only
+  // applies via the @media (max-width: 767px) query.
+  setMobilePanel('main');
+  // If the viewport crosses the 768px boundary (orientation flip, devtools
+  // open/close, real resize), re-fit the xterm so it adapts.
+  window.matchMedia('(max-width: 767px)').addEventListener('change', () => {
+    setTimeout(() => { try { fitAddon?.fit(); } catch {} }, 100);
+  });
 })();
 </script>
 </body>
