@@ -239,4 +239,22 @@ export const migrations: Migration[] = [
       `);
     },
   },
+  {
+    version: 4,
+    up: (db) => {
+      // Trigger API smart routing: lets callers use friendly session aliases
+      // (e.g. "my-feature", "pr-review-4547615") instead of having to mint
+      // and remember UUIDs. The alias maps to a stable GUID that's used as
+      // the underlying cli_session_id (which copilot --session-id requires
+      // to be a UUID).
+      db.exec(`
+        CREATE TABLE session_aliases (
+          alias TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL,
+          created_at INTEGER NOT NULL
+        );
+        CREATE INDEX idx_session_aliases_session ON session_aliases(session_id);
+      `);
+    },
+  },
 ];

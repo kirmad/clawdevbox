@@ -275,6 +275,32 @@ export class Dispatcher {
   }
 
   /**
+   * Find the live pty instance_id for a given cli_session_id (GUID),
+   * if any. Joins the `agent_sessions` DB row to the in-memory
+   * pty-registry: a session is "live" iff it's marked status='running'
+   * AND the pty is still in the registry (not exited, even briefly
+   * retained for late attaches).
+   *
+   * Returns the newest matching live instance_id, or null.
+   */
+  async findLiveInstanceForSession(cliSessionId: string): Promise<string | null> {
+    type Row = { recipe_instance_id: string };
+    const rows = this.db
+      .prepare(
+        `SELECT recipe_instance_id FROM agent_sessions
+         WHERE cli_session_id = ? AND status = 'running' AND interactive = 1
+         ORDER BY started_at DESC LIMIT 10`,
+      )
+      .all(cliSessionId) as Row[];
+    if (rows.length === 0) return null;
+    const { hasSession } = await import('./pty-registry.ts');
+    for (const r of rows) {
+      if (hasSession(r.recipe_instance_id)) return r.recipe_instance_id;
+    }
+    return null;
+  }
+
+  /**
    * Spawn a fresh interactive agent session via recipe-runner with the
    * supplied prompt. Optional body fields can override the trigger's
    * configured defaults. Returns the new instance_id + sessionId on
@@ -295,6 +321,10 @@ export class Dispatcher {
       workspaceId?: string;
       provider?: string;
       workspacePath?: string;
+      /** Explicit cli_session_id (GUID) to bind to. If omitted, runRecipe mints a fresh UUID. */
+      sessionId?: string;
+      /** When true and a session_id is provided, this is a resume (we've already verified the prior session existed). */
+      resume?: boolean;
     } = {},
   ): Promise<
     | { status: 'not_found_fire' }
@@ -320,10 +350,21 @@ export class Dispatcher {
     const workspacesRoot = resolveWorkspacesRoot();
     const agent = overrides.agent ?? entry?.spawnDefaults.agent;
 
-    // Resolve workspace: explicit id > explicit path > entry defaults
+    // Resolve workspace: explicit id > explicit path > entry defaults.
+    // If workspace_id is given AND no row exists, we still need workspace_path
+    // to create it (the id is honored — useful for stable references across
+    // restarts).
     let workspaceInfo: { id: string; path: string } | null = null;
     if (overrides.workspaceId) {
       workspaceInfo = this.resolveWorkspaceById(overrides.workspaceId);
+      if (!workspaceInfo && overrides.workspacePath) {
+        // Caller-supplied id + path — honor the id when creating.
+        const wsRow = ensureWorkspace(this.db, {
+          id: overrides.workspaceId,
+          path: overrides.workspacePath,
+        });
+        workspaceInfo = { id: wsRow.id, path: wsRow.path };
+      }
     }
     if (!workspaceInfo && overrides.workspacePath) {
       const wsRow = ensureWorkspace(this.db, { path: overrides.workspacePath });
@@ -356,6 +397,8 @@ export class Dispatcher {
         cfg,
         triggerId: entry?.triggerId,
         fireId: fire_id ?? undefined,
+        sessionId: overrides.sessionId,
+        resumeOf: overrides.resume ? overrides.sessionId : undefined,
       });
       if (result.spawn_error) {
         return { status: 'spawn_failed', message: `${result.spawn_error.code}: ${result.spawn_error.message}` };

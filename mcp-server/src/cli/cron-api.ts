@@ -213,18 +213,30 @@ export async function handleCronApi(
   }
 
   // ----- POST /spawn --------------------------------------------------------
-  // Loopback-only, NO auth. Spawns a fresh interactive agent session via
-  // recipe-runner. When ?fire_id=<id> is given, defaults come from the
-  // dispatcher's activeRuns entry for that fire. Otherwise the body must
-  // provide enough to spawn a session standalone.
+  // Loopback-only, NO auth. Smart routing:
   //
-  // Body: { prompt, provider?, workspace_path?, workspace_id?, agent?, fire_id? }
+  //   1. Resolve session_id → canonical GUID (mints + saves alias mapping
+  //      if input is not already a GUID; lets callers use friendly names
+  //      like "my-feature" or "pr-4547615").
+  //   2. Resolve workspace from workspace_id or workspace_path (auto-creates
+  //      the row if it doesn't exist yet).
+  //   3. Check if a live pty exists for that GUID:
+  //        live → DISPATCH the prompt as a follow-up (no second pty spawned)
+  //        not live → SPAWN with the GUID (copilot's --session-id resumes
+  //                   from the on-disk jsonl if one exists, else creates new)
+  //
+  // Body: { prompt, session_id?, provider?, workspace_path?, workspace_id?,
+  //         agent?, fire_id? }
   // Query: ?fire_id=<id>
+  //
+  // Response: { ok, mode: 'spawn' | 'dispatch', instance_id, session_id,
+  //             session_alias?, workspace_id }
   if (path === '/spawn') {
     if (method !== 'POST') { sendJson(res, 405, { error: 'method not allowed' }); return true; }
     const body = (await readJson<{
       prompt?: unknown;
       agent?: unknown;
+      session_id?: unknown;
       workspace_id?: unknown;
       workspace_path?: unknown;
       provider?: unknown;
@@ -236,7 +248,37 @@ export async function handleCronApi(
     }
     const fireId = url.searchParams.get('fire_id')
       ?? (typeof body.fire_id === 'string' ? body.fire_id : null);
+    const sessionInput = typeof body.session_id === 'string' ? body.session_id : null;
 
+    // Resolve session_id → canonical GUID. Imported lazily to keep the
+    // module loadable in test contexts that don't run migrations.
+    const { resolveSessionId } = await import('../db/session-aliases-store.ts');
+    const { guid: sessionGuid, alias: sessionAlias } = resolveSessionId(ctx.db, sessionInput);
+
+    // Check live state BEFORE spawning. If a pty already exists for this
+    // GUID, route the prompt as a follow-up to that pty's conductor.
+    const liveInstance = await ctx.dispatcher.findLiveInstanceForSession(sessionGuid);
+    if (liveInstance) {
+      const dr = await ctx.dispatcher.dispatchToInstance(liveInstance, body.prompt);
+      if (dr.status === 'target_unavailable') {
+        // Live in DB but conductor missing — fall through to spawn path so
+        // copilot can resume the session from its on-disk state.
+      } else {
+        sendJson(res, 200, {
+          ok: true,
+          mode: 'dispatch',
+          instance_id: liveInstance,
+          session_id: sessionGuid,
+          session_alias: sessionAlias,
+          state: dr.state,
+        });
+        return true;
+      }
+    }
+
+    // Not live → spawn (copilot --session-id resumes from disk if jsonl
+    // exists, else creates). We always pass the resolved GUID so subsequent
+    // /spawn calls with the same alias hit the same session.
     const result = await ctx.dispatcher.spawnFromCallback(
       fireId,
       body.prompt,
@@ -245,11 +287,18 @@ export async function handleCronApi(
         workspaceId: typeof body.workspace_id === 'string' ? body.workspace_id : undefined,
         workspacePath: typeof body.workspace_path === 'string' ? body.workspace_path : undefined,
         provider: typeof body.provider === 'string' ? body.provider : undefined,
+        sessionId: sessionGuid,
       },
     );
     if (result.status === 'not_found_fire') { sendJson(res, 404, { error: 'fire not found or not in flight', fire_id: fireId }); return true; }
     if (result.status === 'spawn_failed')   { sendJson(res, 500, { error: `spawn failed: ${result.message}` }); return true; }
-    sendJson(res, 200, { ok: true, instance_id: result.instanceId, session_id: result.sessionId });
+    sendJson(res, 200, {
+      ok: true,
+      mode: 'spawn',
+      instance_id: result.instanceId,
+      session_id: result.sessionId,
+      session_alias: sessionAlias,
+    });
     return true;
   }
 

@@ -76,9 +76,16 @@ async function postJson(path, body, extraHeaders = {}) {
 async function shoot(name) {
   if (!page) return;
   const file = resolve(SHOT_DIR, `live-copilot-${name}.png`);
-  await page.screenshot({ path: file, fullPage: true });
-  const size = existsSync(file) ? statSync(file).size : 0;
-  console.log(`📸 ${name}: ${size} bytes → ${file}`);
+  try {
+    // Bumped timeout to 20s — default 5s fails when system fonts are
+    // re-rasterizing under heavy server load. Screenshots are
+    // non-essential for test correctness, so we swallow errors.
+    await page.screenshot({ path: file, fullPage: true, timeout: 20_000 });
+    const size = existsSync(file) ? statSync(file).size : 0;
+    console.log(`📸 ${name}: ${size} bytes → ${file}`);
+  } catch (err) {
+    console.warn(`📸 ${name}: screenshot failed (${err.message}) — continuing`);
+  }
 }
 
 async function readXtermScreen() {
@@ -92,9 +99,7 @@ async function readXtermScreen() {
 // --- Top-level state shared across the test steps ---------------------------
 let spawnInstanceId = null;
 let spawnFireId = null;
-let spawnSecret = null;
 let dispatchFireId = null;
-let dispatchSecret = null;
 let initialCanary = null;
 
 // ---------------------------------------------------------------------------
@@ -142,7 +147,7 @@ test.beforeAll(async () => {
 test.afterAll(async () => {
   // Best-effort cleanup: if a real copilot session is still alive,
   // try to /exit it via dispatch.
-  if (dispatchFireId && dispatchSecret) {
+  if (dispatchFireId) {
     await postJson(`/dispatch?fire_id=${dispatchFireId}`, { prompt: '/exit' }).catch(() => {});
   }
   try { await context?.close(); } catch { /* ignore */ }
@@ -171,13 +176,11 @@ test('live: POST /spawn creates a real copilot pty visible in the UI', async () 
   // Inject activeRuns entry so /spawn accepts the per-fire bearer.
   const rec = await postJson('/api/test/record-active-run', {
     fire_id: `fire_live_copilot_${Date.now().toString(36)}`,
-    secret: 'sec_live_' + Math.random().toString(36).slice(2, 10).padEnd(32, 'x'),
     workspace_path: PROJECT_DIR,
     provider_id: PROVIDER,
   });
   expect(rec.status).toBe(200);
   spawnFireId = rec.body.fire_id;
-  spawnSecret = rec.body.secret;
 
   initialCanary = 'COPILOT_HELLO_' + Math.random().toString(36).slice(2, 8).toUpperCase();
   console.log(`📤 POST /spawn provider=${PROVIDER} canary=${initialCanary}`);
@@ -250,14 +253,12 @@ test('live: POST /dispatch delivers a follow-up prompt to the SAME copilot pty',
   // Inject a new activeRuns entry targeting the existing spawned pty.
   const rec = await postJson('/api/test/record-active-run', {
     fire_id: `fire_live_dispatch_${Date.now().toString(36)}`,
-    secret: 'sec_live_d_' + Math.random().toString(36).slice(2, 10).padEnd(32, 'x'),
     workspace_path: PROJECT_DIR,
     provider_id: PROVIDER,
     dispatch_target_instance_id: spawnInstanceId,
   });
   expect(rec.status).toBe(200);
   dispatchFireId = rec.body.fire_id;
-  dispatchSecret = rec.body.secret;
 
   const canary2 = 'COPILOT_DISPATCH_' + Math.random().toString(36).slice(2, 8).toUpperCase();
   console.log(`📤 POST /dispatch canary=${canary2}`);
