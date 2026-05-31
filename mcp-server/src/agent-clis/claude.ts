@@ -70,6 +70,9 @@ export const claudeProvider: AgentCliProvider = {
     if (opts.agent) {
       argv.push('--agent', opts.agent);
     }
+    if (opts.model) {
+      argv.push('--model', opts.model);
+    }
     argv.push(...buildVaultPluginDirArgs(opts.pluginDirs));
     if (opts.mode === 'headless') {
       if (!opts.prompt) throw new Error('claude: headless mode requires opts.prompt');

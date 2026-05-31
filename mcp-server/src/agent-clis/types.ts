@@ -88,6 +88,14 @@ export interface SpawnSessionOpts {
    * support a named-agent flag (e.g. `echo-stub`) ignore this field.
    */
   agent?: string;
+  /**
+   * Optional model name. Maps to the CLI's `--model <name>` flag.
+   * Supported by copilot (e.g. `gpt-5.2`, `claude-opus-4.7-1m-internal`),
+   * claude (e.g. `sonnet`, `opus`, `claude-sonnet-4-6`), and agency
+   * (which forwards to copilot). Providers that don't expose a
+   * `--model` flag (`e2e-test-runner`, `echo-stub`) ignore this field.
+   */
+  model?: string;
   workspaceInfo: { id: string; path: string };
   /** Env vars the kernel wants the child process to see (ambient context). */
   ambientEnv: Record<string, string>;

@@ -182,6 +182,33 @@ test('POST /spawn?fire_id — body.agent overrides default agent', async () => {
   }
 });
 
+test('POST /spawn — body.model flows through to runRecipe', async () => {
+  const db = openDb();
+  const ws = makeWs(freshDirs('model'));
+  const stub = makeRunRecipeStub();
+  const dispatcher = new Dispatcher(db, ws, { maxConcurrent: 1, runRecipeFn: stub.fn });
+  const { server, port } = await startServer(makeCtx(db, dispatcher, ws));
+  try {
+    const r = await fetch(`http://127.0.0.1:${port}/spawn`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        prompt: 'go',
+        provider: 'copilot',
+        workspace_path: 'C:/ws/model',
+        model: 'claude-opus-4.7-1m-internal',
+      }),
+    });
+    assert.equal(r.status, 200);
+    assert.equal(stub.calls.length, 1);
+    assert.equal(stub.calls[0].model, 'claude-opus-4.7-1m-internal',
+      'model must flow from /spawn body → spawnFromCallback → runRecipe');
+  } finally {
+    await stopServer(server);
+    db.close();
+  }
+});
+
 test('POST /spawn?fire_id — body.workspace_id resolves to that workspace path', async () => {
   const db = openDb();
   const ws = makeWs(freshDirs('ws'));

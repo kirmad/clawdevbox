@@ -236,6 +236,7 @@ export async function handleCronApi(
     const body = (await readJson<{
       prompt?: unknown;
       agent?: unknown;
+      model?: unknown;
       session_id?: unknown;
       workspace_id?: unknown;
       workspace_path?: unknown;
@@ -284,6 +285,7 @@ export async function handleCronApi(
       body.prompt,
       {
         agent: typeof body.agent === 'string' ? body.agent : undefined,
+        model: typeof body.model === 'string' ? body.model : undefined,
         workspaceId: typeof body.workspace_id === 'string' ? body.workspace_id : undefined,
         workspacePath: typeof body.workspace_path === 'string' ? body.workspace_path : undefined,
         provider: typeof body.provider === 'string' ? body.provider : undefined,

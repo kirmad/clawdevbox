@@ -74,6 +74,11 @@ export interface RunRecipeOptions {
    * `agent:` field; can be overridden by the caller of `recipe.run`.
    */
   agent?: string;
+  /**
+   * Optional model override (passed as `--model <name>` to the agent CLI).
+   * Supported by copilot/claude/agency providers; stub providers ignore.
+   */
+  model?: string;
   /** Explicit CLI session id. Auto-minted from the instance id when absent. */
   sessionId?: string;
   /** Resume a prior recipe instance (CLI session id of the predecessor). */
@@ -312,6 +317,7 @@ export async function runRecipe(opts: RunRecipeOptions): Promise<RunRecipeResult
       role: 'recipe-instance',
       prompt: opts.prompt,
       agent: opts.agent,
+      model: opts.model,
       workspaceInfo: opts.workspaceInfo,
       ambientEnv: spawnEnv,
       mcp: {

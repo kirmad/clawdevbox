@@ -318,6 +318,8 @@ export class Dispatcher {
     prompt: string,
     overrides: {
       agent?: string;
+      /** Optional --model override for copilot/claude/agency. */
+      model?: string;
       workspaceId?: string;
       provider?: string;
       workspacePath?: string;
@@ -392,6 +394,7 @@ export class Dispatcher {
         workspaceInfo,
         agentCli: providerId,
         agent,
+        model: overrides.model,
         workspacesRoot,
         ws: this.ws,
         cfg,

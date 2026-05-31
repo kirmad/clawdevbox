@@ -347,6 +347,11 @@ export function registerRecipeEntries(ws: Workspace): void {
           .min(1)
           .optional()
           .describe('Optional agent persona name. Maps to the CLI\'s `--agent <name>` flag (supported by copilot, claude, and agency). When omitted, falls back to the recipe YAML\'s `agent:` field if it has one, else no `--agent` flag is passed.'),
+        model: z
+          .string()
+          .min(1)
+          .optional()
+          .describe('Optional AI model name. Maps to the CLI\'s `--model <name>` flag. Examples: `gpt-5.2` (copilot), `opus`/`sonnet`/`claude-sonnet-4-6` (claude), `claude-opus-4.7-1m-internal` (copilot/agency). When omitted, the CLI uses its configured default.'),
         session_id: z
           .string()
           .min(1)
@@ -507,6 +512,7 @@ export function registerRecipeEntries(ws: Workspace): void {
         attachToInboxItemId: args.attach_to_inbox_item_id,
         agentCli,
         agent,
+        model: args.model,
         sessionId: args.session_id,
         resumeOf: args.resume_of,
         spawnMode: args.spawn_mode,

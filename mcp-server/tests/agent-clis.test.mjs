@@ -216,6 +216,29 @@ test('copilot argv: --agent is omitted when opts.agent is unset', async () => {
   assert.ok(!c.args.includes('--agent'), `copilot must not pass --agent by default; argv: ${c.args.join(' ')}`);
 });
 
+test('copilot argv: --model <name> appended when opts.model is set', async () => {
+  const ws = await makeWs();
+  const ctx = captureSpawnCtx(buildProviderCtx(ws, {}));
+  const opts = baseOpts({ ws, mode: 'interactive', kind: 'new', sessionId: 's', prompt: undefined });
+  opts.model = 'claude-opus-4.7-1m-internal';
+  await (await copilotProvider.spawnSession(ctx, opts)).exited;
+  const c = ctx._captured();
+  const i = c.args.indexOf('--model');
+  assert.ok(i >= 0, `copilot must pass --model when opts.model is set; argv: ${c.args.join(' ')}`);
+  assert.equal(c.args[i + 1], 'claude-opus-4.7-1m-internal');
+});
+
+test('copilot argv: --model is omitted when opts.model is unset', async () => {
+  const ws = await makeWs();
+  const ctx = captureSpawnCtx(buildProviderCtx(ws, {}));
+  await (await copilotProvider.spawnSession(
+    ctx,
+    baseOpts({ ws, mode: 'interactive', kind: 'new', sessionId: 's', prompt: undefined }),
+  )).exited;
+  const c = ctx._captured();
+  assert.ok(!c.args.includes('--model'), `copilot must not pass --model by default; argv: ${c.args.join(' ')}`);
+});
+
 test('claude argv: --agent <name> appended when opts.agent is set', async () => {
   const ws = await makeWs();
   const ctx = captureSpawnCtx(buildProviderCtx(ws, {}));
@@ -246,6 +269,24 @@ test('claude argv: --agent is omitted when opts.agent is unset', async () => {
     )).exited;
     const c = ctx._captured();
     assert.ok(!c.args.includes('--agent'), `claude must not pass --agent by default; argv: ${c.args.join(' ')}`);
+  } finally {
+    if (prevClaude !== undefined) process.env.CLAWDEVBOX_CLAUDE_PATH = prevClaude;
+  }
+});
+
+test('claude argv: --model <name> appended when opts.model is set', async () => {
+  const ws = await makeWs();
+  const ctx = captureSpawnCtx(buildProviderCtx(ws, {}));
+  const prevClaude = process.env.CLAWDEVBOX_CLAUDE_PATH;
+  delete process.env.CLAWDEVBOX_CLAUDE_PATH;
+  try {
+    const opts = baseOpts({ ws, mode: 'interactive', kind: 'new', sessionId: 's', prompt: undefined });
+    opts.model = 'opus';
+    await (await claudeProvider.spawnSession(ctx, opts)).exited;
+    const c = ctx._captured();
+    const i = c.args.indexOf('--model');
+    assert.ok(i >= 0, `claude must pass --model when opts.model is set; argv: ${c.args.join(' ')}`);
+    assert.equal(c.args[i + 1], 'opus');
   } finally {
     if (prevClaude !== undefined) process.env.CLAWDEVBOX_CLAUDE_PATH = prevClaude;
   }
