@@ -510,6 +510,20 @@ export async function handleCronApi(
       });
       return true;
     }
+    // DELETE /api/sessions/<instance_id> — kill the pty tree. Use when a
+    // graceful /exit isn't an option (copilot doesn't have a built-in
+    // /exit command). Idempotent: 200 whether or not the session existed.
+    if (m && method === 'DELETE') {
+      const { hasSession, killPty } = await import('../pty-registry.ts');
+      const instanceId = decodeURIComponent(m[1]!);
+      if (!hasSession(instanceId)) {
+        sendJson(res, 200, { ok: true, killed: false, reason: 'not_live' });
+        return true;
+      }
+      const ok = killPty(instanceId);
+      sendJson(res, 200, { ok: true, killed: ok });
+      return true;
+    }
   }
 
   // ----- GET /api/cron/status -----------------------------------------------

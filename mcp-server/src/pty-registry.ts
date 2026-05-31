@@ -289,6 +289,14 @@ export function resizePty(instanceId: string, cols: number, rows: number): boole
 export function killPty(instanceId: string, signal?: string): boolean {
   const s = sessions.get(instanceId);
   if (!s || s.exited) return false;
+  // On Windows, ipty.kill() alone leaves child copilot.exe / agency.exe
+  // processes alive (ConPTY tears down the pipe but not the descendants).
+  // Use the same tree-kill helper that shutdown uses so the pty is fully
+  // gone after this call returns.
+  if (process.platform === 'win32') {
+    killPtyTree(s);
+    return true;
+  }
   try {
     s.ipty.kill(signal);
   } catch {
