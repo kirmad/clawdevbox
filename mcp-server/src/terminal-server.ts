@@ -52,11 +52,36 @@ import {
 } from './pty-registry.ts';
 import { tmuxSessionRegistry } from './cli-sessions/tmux-session-runtime.ts';
 import { spawn as ptySpawn } from 'node-pty';
+import { spawnSync } from 'node:child_process';
 import { resolveConfig } from './config.ts';
 import { resolveRendererFile } from './renderer-registry.ts';
 import type { Workspace } from './workspace.ts';
 import { listWorkspaces, resolveWorkspacesRoot } from './workspaces-store.ts';
 import { readRecipeInstance } from './recipe-instances-store.ts';
+
+/**
+ * Resolve the absolute path to `tmux.exe` (Windows) / `tmux` (Unix). node-pty
+ * doesn't search PATH the way child_process.spawn does on Windows, so we need
+ * an absolute path. Result is cached for the process lifetime.
+ */
+let _tmuxBinPath: string | null = null;
+function resolveTmuxBin(): string {
+  if (_tmuxBinPath) return _tmuxBinPath;
+  const isWin = process.platform === 'win32';
+  const which = spawnSync(isWin ? 'where.exe' : 'which', ['tmux'], { encoding: 'utf8' });
+  if (which.status === 0) {
+    // `where` returns one path per line; take the first.
+    const first = which.stdout.split(/\r?\n/).map((l) => l.trim()).find((l) => l.length > 0);
+    if (first) {
+      _tmuxBinPath = first;
+      return first;
+    }
+  }
+  // Fallback: well-known location (matches the smoke probe / cdb.tmux.conf
+  // bundling) — emits the original name and lets node-pty surface ENOENT.
+  _tmuxBinPath = isWin ? 'tmux.exe' : 'tmux';
+  return _tmuxBinPath;
+}
 
 // ============================================================================
 // Server boot
@@ -820,7 +845,7 @@ function attachWebsocketViaTmux(
 
   let ipty: ReturnType<typeof ptySpawn>;
   try {
-    ipty = ptySpawn('tmux', args, {
+    ipty = ptySpawn(resolveTmuxBin(), args, {
       name: 'xterm-256color',
       cols: 120,
       rows: 30,
