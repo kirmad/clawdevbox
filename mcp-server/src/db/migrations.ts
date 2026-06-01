@@ -257,4 +257,18 @@ export const migrations: Migration[] = [
       `);
     },
   },
+  {
+    version: 5,
+    up: (db) => {
+      // Tmux-migration: agents now report status via the update_status MCP
+      // tool instead of sentinel markers in stdout. These columns persist
+      // the latest report so the UI can render status badges + "needs you"
+      // banners without re-querying the agent.
+      db.exec(`
+        ALTER TABLE agent_sessions ADD COLUMN status_text TEXT;
+        ALTER TABLE agent_sessions ADD COLUMN needs_user_input INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE agent_sessions ADD COLUMN last_status_at INTEGER;
+      `);
+    },
+  },
 ];
