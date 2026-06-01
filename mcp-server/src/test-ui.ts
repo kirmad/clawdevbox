@@ -117,12 +117,19 @@ const HTML = `<!DOCTYPE html>
   }
   .session:hover { border-color: #5c6370; }
   .session.selected { border-color: #f0c674; background: #1a2028; }
+  /* Foreign tmux sessions (not spawned by clawdevbox) are dimmed so they
+   * stand visually apart from clawdevbox-owned sessions. */
+  .session.foreign { opacity: 0.65; border-style: dashed; }
+  .session.foreign .id { color: #7c858f; }
   .session .id { font-family: 'Cascadia Code', Consolas, monospace; font-size: 11px; color: #61afef; word-break: break-all; }
   .session .meta { font-size: 11px; color: #7c858f; margin-top: 2px; }
   .session .state { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 10px; font-weight: 600; }
   .session .state.idle { background: #1a2e1a; color: #a8c97f; }
   .session .state.busy { background: #2e2a1a; color: #f0c674; }
   .session .state.starting { background: #1a242e; color: #61afef; }
+  .session .state.running { background: #1a2e1a; color: #a8c97f; }
+  .session .state.needs_user_input { background: #2e1a1a; color: #e06c75; }
+  .session .state.foreign { background: #2a2a2a; color: #888; }
   .session .actions { display: flex; gap: 6px; margin-top: 8px; }
   .session .actions button {
     background: #2c3540; border: none; color: #d8dde2;
@@ -491,18 +498,23 @@ const HTML = `<!DOCTYPE html>
     }
     list.innerHTML = items.map((s) => {
       const sel = s.instance_id === selectedInstance ? ' selected' : '';
-      const state = s.state || 'unknown';
+      const isForeign = s.kind === 'foreign';
+      const foreignClass = isForeign ? ' foreign' : '';
+      const state = (s.state || 'unknown').toString().replace(/\s+/g, '_');
+      const providerLabel = isForeign
+        ? '(foreign tmux)'
+        : esc(s.provider_id || '(main)') + ' · queue ' + (s.queue_depth ?? 0);
       return \`
-        <div class="session\${sel}" onclick="selectSession('\${s.instance_id}')">
+        <div class="session\${sel}\${foreignClass}" onclick="selectSession('\${s.instance_id}')">
           <div class="id">\${esc(s.instance_id)}</div>
           <div class="meta">
             <span class="state \${state}">\${state}</span>
-            \${esc(s.provider_id || '(main)')} · queue \${s.queue_depth ?? 0}
+            \${providerLabel}
           </div>
           <div class="meta">\${esc(s.label || '')}</div>
           <div class="actions">
             <button onclick="event.stopPropagation(); attachTerm('\${s.instance_id}')">attach</button>
-            \${s.instance_id !== 'main' ? \`<button class="danger" onclick="event.stopPropagation(); killSession('\${s.instance_id}')">kill</button>\` : ''}
+            \${(s.instance_id !== 'main' && !isForeign) ? \`<button class="danger" onclick="event.stopPropagation(); killSession('\${s.instance_id}')">kill</button>\` : ''}
           </div>
         </div>\`;
     }).join('');

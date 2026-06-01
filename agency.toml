@@ -2,4 +2,4 @@
 auth = "None"
 type = "remote"
 url = "http://127.0.0.1:5201/mcp"
-header = ["X-Clawdevbox-Project-Dir: C:\\git\\clawdevbox"]
+header = ["X-Clawdevbox-Project-Dir: C:\\git\\clawdevbox\\.worktrees\\tmux-migration"]

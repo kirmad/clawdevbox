@@ -4,7 +4,7 @@
       "type": "http",
       "url": "http://127.0.0.1:5201/mcp",
       "headers": {
-        "X-Clawdevbox-Project-Dir": "C:\\git\\clawdevbox"
+        "X-Clawdevbox-Project-Dir": "C:\\git\\clawdevbox\\.worktrees\\tmux-migration"
       },
       "tools": [
         "*"

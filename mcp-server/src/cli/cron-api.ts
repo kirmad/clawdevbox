@@ -317,7 +317,7 @@ export async function handleCronApi(
     const since = Number(url.searchParams.get('since') ?? 0) || 0;
     const limit = Math.min(Math.max(Number(url.searchParams.get('limit') ?? 50) || 50, 1), 200);
     const { listSessions, getSessionMeta } = await import('../pty-registry.ts');
-    const { tmuxSessionRegistry } = await import('../cli-sessions/tmux-session-runtime.ts');
+    const { tmuxSessionRegistry, tmuxSessionRuntime } = await import('../cli-sessions/tmux-session-runtime.ts');
     const { listAllSessions } = await import('../db/agent-sessions-store.ts');
     const db = ctx.db;
 
@@ -398,6 +398,38 @@ export async function handleCronApi(
       }
     }
 
+    // 3) Foreign tmux sessions — anything live in tmux that we didn't spawn
+    // (e.g., user's own `tmux new -s test1` session). Surfaces them in the
+    // UI with kind='foreign' so the user can attach for visibility, but
+    // distinguished visually from clawdevbox-owned sessions.
+    const foreignList: Array<typeof live[number] & { foreign: true }> = [];
+    try {
+      const allTmux = await tmuxSessionRuntime().list();
+      for (const s of allTmux) {
+        // Skip if already accounted for under its cdb_ instance id mapping.
+        // cdb_<id> sessions correspond to instance id `<id>` (no prefix).
+        const asInstance = s.name.startsWith('cdb_') ? s.name.slice(4) : s.name;
+        if (liveIds.has(asInstance)) continue;
+        foreignList.push({
+          instance_id: s.name,
+          live: true as const,
+          state: 'foreign',
+          queue_depth: 0,
+          provider_id: null,
+          recipe_id: null,
+          cli_session_id: null,
+          workspace_id: '',
+          started_at: 0,
+          ended_at: null,
+          foreign: true,
+        });
+        liveIds.add(s.name);
+      }
+    } catch {
+      // tmux runtime not initialized or tmux not on PATH — skip foreign list.
+    }
+    live.push(...foreignList);
+
     // Archived rows from agent_sessions; filter out anything already in
     // `live` so the dedupe key (instance_id) only carries the
     // authoritative live entry.
@@ -429,15 +461,16 @@ export async function handleCronApi(
     }
 
     const enrich = (item: typeof live[number] | typeof archived[number]) => {
+      const isForeign = (item as { foreign?: boolean }).foreign === true;
       const recipeId = item.recipe_id ?? recipeMap[item.instance_id] ?? null;
-      const kind: 'main' | 'recipe' | 'adhoc' =
-        item.instance_id === 'main'
-          ? 'main'
-          : (recipeId && recipeId.startsWith('__adhoc_'))
-            ? 'adhoc'
-            : 'recipe';
+      const kind: 'main' | 'recipe' | 'adhoc' | 'foreign' =
+        isForeign ? 'foreign'
+          : item.instance_id === 'main' ? 'main'
+          : (recipeId && recipeId.startsWith('__adhoc_')) ? 'adhoc'
+          : 'recipe';
       const label =
-        kind === 'main' ? 'Main Agent'
+        kind === 'foreign' ? `tmux: ${item.instance_id}`
+          : kind === 'main' ? 'Main Agent'
           : kind === 'adhoc' ? `Spawn ${item.instance_id.slice(-8)}`
           : recipeId ?? item.instance_id;
       return { ...item, recipe_id: recipeId, kind, label };

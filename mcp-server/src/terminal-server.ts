@@ -767,6 +767,14 @@ function attachWebsocket(ws: WebSocket, instanceId: string): void {
     return;
   }
 
+  // Foreign tmux session — the user is viewing one of their own non-clawdevbox
+  // tmux sessions (surfaced by /api/sessions as kind='foreign'). The
+  // instance_id IS the tmux session name in this case. Try attaching by name.
+  if (!instanceId.startsWith('cdb_') && !hasSession(instanceId)) {
+    attachWebsocketViaTmux(ws, instanceId, instanceId);
+    return;
+  }
+
   if (!hasSession(instanceId)) {
     // Pty has exited and been garbage-collected from the registry.
     // Fall back to the on-disk log so the viewer at least shows what

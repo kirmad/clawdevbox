@@ -27,7 +27,10 @@ export function createTmuxSessionRuntime(client: TmuxClientOpts): CliSessionRunt
       for (const line of r.stdout.split('\n')) {
         const n = line.trim();
         const sessionName = n.split(/[:(\s]/)[0];
-        if (sessionName.startsWith('cdb_')) out.push({ name: sessionName, alive: true });
+        // Return ALL sessions (cdb_* + foreign). Callers filter as needed:
+        // reconcile adopts only cdb_* below; /api/sessions surfaces foreign
+        // sessions in the UI with a dimmer style.
+        if (sessionName) out.push({ name: sessionName, alive: true });
       }
       return out;
     },
@@ -121,27 +124,32 @@ export async function reconcileOnStartup(
 ): Promise<{ adopted: number; orphaned: number }> {
   const runtime = tmuxSessionRuntime();
   const live = await runtime.list();
-  const liveShortNames = new Set<string>();
+  // tmux session names are `cdb_<recipe_instance_id>` — strip prefix to get
+  // the recipe_instance_id (which is what tmuxSessionRegistry keys on and
+  // dispatcher.dispatchToInstance looks up).
+  const liveInstanceIds = new Set<string>();
   for (const item of live) {
-    // tmux session names are `cdb_<recipe_instance_id>` — strip prefix.
-    liveShortNames.add(item.name.replace(/^cdb_/, ''));
+    if (item.name.startsWith('cdb_')) {
+      liveInstanceIds.add(item.name.replace(/^cdb_/, ''));
+    }
   }
 
-  type Row = { id: string };
-  const rows = db.prepare(`SELECT id FROM agent_sessions WHERE status = 'running'`).all() as Row[];
+  type Row = { id: string; recipe_instance_id: string | null };
+  const rows = db.prepare(
+    `SELECT id, recipe_instance_id FROM agent_sessions WHERE status = 'running'`,
+  ).all() as Row[];
 
   let adopted = 0;
   let orphaned = 0;
   const now = Date.now();
   for (const row of rows) {
-    if (liveShortNames.has(row.id)) {
-      const session = await runtime.attach(row.id);
+    const instanceId = row.recipe_instance_id;
+    if (instanceId && liveInstanceIds.has(instanceId)) {
+      const session = await runtime.attach(instanceId);
       if (session) {
-        tmuxSessionRegistry.register(row.id, session);
+        tmuxSessionRegistry.register(instanceId, session);
         adopted++;
       } else {
-        // Listed but couldn't attach (race) — treat as orphan.
-        // agent_sessions.status CHECK allows: running/success/failure/cancelled/suspended
         db.prepare(`UPDATE agent_sessions SET status = 'failure', ended_at = ? WHERE id = ?`).run(now, row.id);
         orphaned++;
       }
