@@ -90,6 +90,12 @@ import { Scheduler } from '../scheduler.ts';
 import { handleCronApi, type CronApiContext } from './cron-api.ts';
 import { handleAgentCliApi } from './agent-clis-api.ts';
 import type { Flags } from './index.ts';
+import {
+  initTmuxSessionRuntime,
+  reconcileOnStartup,
+  bundledTmuxConfPath,
+} from '../cli-sessions/tmux-session-runtime.ts';
+import { tmuxRunAsync } from '../cli-sessions/tmux-client.ts';
 
 function str(flags: Flags, key: string): string | undefined {
   const v = flags[key];
@@ -375,6 +381,32 @@ export async function runStart(flags: Flags): Promise<void> {
     'db opened',
   );
   scanLegacyFiles(cfg, opened.db);
+
+  // Initialize tmux session runtime: required for tmux-migrated providers
+  // (copilot, claude, agency, echo-stub). Probes the tmux binary first;
+  // fatal-exit if missing.
+  {
+    const tmuxSocket = cfg.tmux?.socket ?? 'clawdevbox';
+    const tmuxConfPath = bundledTmuxConfPath();
+    const tmuxClient = { socket: tmuxSocket, configPath: tmuxConfPath };
+
+    const probe = await tmuxRunAsync({ socket: null, configPath: null }, ['-V']);
+    if (probe.exitCode !== 0) {
+      process.stderr.write(
+        `FATAL: tmux binary not found on PATH. Install tmux (https://github.com/tmux/tmux or psmux on Windows).\n`,
+      );
+      process.exit(2);
+    }
+    initTmuxSessionRuntime(tmuxClient);
+
+    const recon = await reconcileOnStartup(opened.db);
+    if (recon.adopted > 0 || recon.orphaned > 0) {
+      logger.info(
+        { adopted: recon.adopted, orphaned: recon.orphaned },
+        'tmux: reconciled sessions on startup',
+      );
+    }
+  }
 
   // Bidirectional plugin sync (spec §6). Eager when cfg.clientSync.mode='auto'
   // or 'discover-only'; otherwise a no-op. Failures degrade to WARN.

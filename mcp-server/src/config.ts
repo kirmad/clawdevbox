@@ -177,6 +177,8 @@ export interface ResolvedConfig {
   };
   /** Registered vaults. Empty array when none configured. */
   vaults: VaultEntry[];
+  /** tmux client config (optional). socket=null shares default socket. */
+  tmux?: { socket: string | null };
 }
 
 export class ConfigError extends Error {
