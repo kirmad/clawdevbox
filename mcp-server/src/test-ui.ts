@@ -62,19 +62,44 @@ const HTML = `<!DOCTYPE html>
   /* ── DESKTOP (≥1200px): 3-col × 2-row grid ─────────────────────── */
   .layout {
     display: grid;
-    grid-template-columns: 280px 1fr 480px;
+    grid-template-columns: 280px 1fr var(--term-w, 480px);
     grid-template-rows: 1fr 200px;
     grid-template-areas: "side main term" "side log term";
     height: calc(100vh - 44px);
     gap: 1px;
     background: #2c3540;
+    position: relative;
   }
   .panel { background: #0f1419; overflow: auto; }
   .side { grid-area: side; padding: 8px; }
   .main { grid-area: main; padding: 12px; overflow-y: auto; }
-  .term { grid-area: term; padding: 8px; display: flex; flex-direction: column; min-height: 0; }
+  .term { grid-area: term; padding: 8px; display: flex; flex-direction: column; min-height: 0; position: relative; }
   .term-host { flex: 1; min-height: 0; }
   .log { grid-area: log; padding: 8px; font-family: 'Cascadia Code', Consolas, monospace; font-size: 11px; }
+  /* Resizable splitter on the LEFT edge of the terminal panel. Drag to
+   * adjust the --term-w CSS variable; persists to localStorage. */
+  .splitter-x {
+    position: absolute;
+    left: -4px; top: 0; bottom: 0;
+    width: 8px;
+    cursor: col-resize;
+    background: transparent;
+    z-index: 10;
+    transition: background 0.15s;
+  }
+  .splitter-x:hover, .splitter-x.dragging { background: #61afef; }
+  /* Tablet: a horizontal splitter for the terminal row height. */
+  .splitter-y {
+    display: none;
+    position: absolute;
+    left: 0; right: 0;
+    height: 8px;
+    cursor: row-resize;
+    background: transparent;
+    z-index: 10;
+    transition: background 0.15s;
+  }
+  .splitter-y:hover, .splitter-y.dragging { background: #61afef; }
   .log-entry { padding: 2px 0; border-bottom: 1px solid #1a2028; white-space: pre-wrap; word-break: break-all; }
   .log-entry .ts { color: #5c6370; }
   .log-entry .method { color: #61afef; font-weight: 600; }
@@ -213,9 +238,13 @@ const HTML = `<!DOCTYPE html>
   @media (max-width: 1199px) {
     .layout {
       grid-template-columns: 260px 1fr;
-      grid-template-rows: 1fr 280px 160px;
+      grid-template-rows: 1fr var(--term-h, 280px) 160px;
       grid-template-areas: "side main" "side term" "side log";
     }
+    /* Hide the column splitter; show the row splitter (positioned at top
+     * edge of .term to drag the row height). */
+    .splitter-x { display: none; }
+    .splitter-y { display: block; top: -4px; }
   }
 
   /* ── PHONE (≤767px): single panel + bottom mobile-nav ─────────── */
@@ -256,6 +285,7 @@ const HTML = `<!DOCTYPE html>
     .main { padding: 10px; }
     .side { padding: 6px; }
     .log { font-size: 10px; }
+    .splitter-x, .splitter-y { display: none; }
   }
 </style>
 </head>
@@ -385,6 +415,8 @@ const HTML = `<!DOCTYPE html>
   </div>
 
   <div class="panel term">
+    <div class="splitter-x" id="splitter-x" title="Drag to resize terminal width"></div>
+    <div class="splitter-y" id="splitter-y" title="Drag to resize terminal height"></div>
     <div class="panel-h">
       terminal · <span id="term-id" style="font-family: 'Cascadia Code', monospace; color: #61afef;">(none)</span>
     </div>
@@ -786,6 +818,79 @@ const HTML = `<!DOCTYPE html>
     }
   }
   window.runScenario = runScenario;
+
+  // ── resizable splitters ──
+  // Desktop: drag .splitter-x left/right to adjust the terminal column width
+  // (var --term-w). Tablet: drag .splitter-y up/down to adjust the terminal
+  // row height (var --term-h). Persists to localStorage; debounced fit-xterm
+  // on each move so the live terminal reflows in real time.
+  function setupResizer(handleId, axis, cssVar, storageKey, minPx, maxFn) {
+    const handle = document.getElementById(handleId);
+    if (!handle) return;
+    // Restore prior value
+    const saved = localStorage.getItem(storageKey);
+    if (saved) document.documentElement.style.setProperty(cssVar, saved);
+    let dragging = false;
+    let lastFit = 0;
+    const refit = () => {
+      const now = Date.now();
+      if (now - lastFit < 50) return;
+      lastFit = now;
+      try {
+        fitAddon?.fit();
+        if (termWs && termWs.readyState === 1 && typeof xterm !== 'undefined') {
+          termWs.send(JSON.stringify({ type: 'resize', cols: xterm.cols, rows: xterm.rows }));
+        }
+      } catch {}
+    };
+    handle.addEventListener('pointerdown', (e) => {
+      dragging = true;
+      handle.classList.add('dragging');
+      handle.setPointerCapture(e.pointerId);
+      document.body.style.userSelect = 'none';
+      document.body.style.cursor = axis === 'x' ? 'col-resize' : 'row-resize';
+      e.preventDefault();
+    });
+    handle.addEventListener('pointermove', (e) => {
+      if (!dragging) return;
+      const maxPx = maxFn();
+      let value;
+      if (axis === 'x') {
+        // .term is anchored to the RIGHT edge — width = window.innerWidth - clientX
+        value = Math.max(minPx, Math.min(maxPx, window.innerWidth - e.clientX));
+      } else {
+        // .term is in the MIDDLE row — height = bottom-anchor (window.innerHeight - bottom-row - clientY)
+        // simpler: compute from .term's top edge directly
+        const termRect = document.querySelector('.term').getBoundingClientRect();
+        // new height = current height + (current top - new top); but we drag the top edge
+        // so: new top = e.clientY; new height = (termRect.bottom - e.clientY)
+        value = Math.max(minPx, Math.min(maxPx, termRect.bottom - e.clientY));
+      }
+      const px = value + 'px';
+      document.documentElement.style.setProperty(cssVar, px);
+      localStorage.setItem(storageKey, px);
+      refit();
+    });
+    handle.addEventListener('pointerup', (e) => {
+      if (!dragging) return;
+      dragging = false;
+      handle.classList.remove('dragging');
+      try { handle.releasePointerCapture(e.pointerId); } catch {}
+      document.body.style.userSelect = '';
+      document.body.style.cursor = '';
+      refit();
+    });
+    handle.addEventListener('pointercancel', () => {
+      dragging = false;
+      handle.classList.remove('dragging');
+      document.body.style.userSelect = '';
+      document.body.style.cursor = '';
+    });
+  }
+  setupResizer('splitter-x', 'x', '--term-w', 'cdb-term-w',
+    240, () => Math.max(320, window.innerWidth - 600));
+  setupResizer('splitter-y', 'y', '--term-h', 'cdb-term-h',
+    150, () => Math.max(200, window.innerHeight - 400));
 
   // ── health check + clock ──
   async function healthCheck() {
