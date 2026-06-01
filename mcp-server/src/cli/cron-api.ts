@@ -607,13 +607,43 @@ export async function handleCronApi(
     // /exit command). Idempotent: 200 whether or not the session existed.
     if (m && method === 'DELETE') {
       const { hasSession, killPty } = await import('../pty-registry.ts');
+      const { tmuxSessionRegistry } = await import('../cli-sessions/tmux-session-runtime.ts');
       const instanceId = decodeURIComponent(m[1]!);
-      if (!hasSession(instanceId)) {
-        sendJson(res, 200, { ok: true, killed: false, reason: 'not_live' });
+
+      // 1) Owned tmux session (in registry) — kill via session.kill() so the
+      // auto-unregister hook fires.
+      const owned = tmuxSessionRegistry.get(instanceId);
+      if (owned) {
+        try { await owned.kill(); } catch { /* best effort */ }
+        sendJson(res, 200, { ok: true, killed: true, kind: 'tmux' });
         return true;
       }
-      const ok = killPty(instanceId);
-      sendJson(res, 200, { ok: true, killed: ok });
+
+      // 2) Legacy IPty path.
+      if (hasSession(instanceId)) {
+        const ok = killPty(instanceId);
+        sendJson(res, 200, { ok: true, killed: ok, kind: 'pty' });
+        return true;
+      }
+
+      // 3) Foreign / leftover tmux session — `tmux kill-session -t <name>`.
+      // Probe first (cheap) so we can distinguish "killed" from "not_live".
+      const { spawnSync } = await import('node:child_process');
+      const tmuxBin = process.platform === 'win32' ? 'tmux.exe' : 'tmux';
+      const probe = spawnSync(tmuxBin, ['has-session', '-t', instanceId], {
+        encoding: 'utf8',
+        timeout: 1500,
+      });
+      if (probe.status === 0) {
+        const killed = spawnSync(tmuxBin, ['kill-session', '-t', instanceId], {
+          encoding: 'utf8',
+          timeout: 3000,
+        });
+        sendJson(res, 200, { ok: true, killed: killed.status === 0, kind: 'foreign-tmux' });
+        return true;
+      }
+
+      sendJson(res, 200, { ok: true, killed: false, reason: 'not_live' });
       return true;
     }
   }

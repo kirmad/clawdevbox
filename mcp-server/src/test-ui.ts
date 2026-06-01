@@ -491,6 +491,7 @@ const HTML = `<!DOCTYPE html>
   async function refreshSessions() {
     const r = await api('GET', '/api/sessions?status=active&limit=200');
     const items = r.body?.items ?? [];
+    window.__lastSessions = items;
     const list = document.getElementById('session-list');
     if (items.length === 0) {
       list.innerHTML = '<div class="empty">(no active sessions)</div>';
@@ -514,7 +515,7 @@ const HTML = `<!DOCTYPE html>
           <div class="meta">\${esc(s.label || '')}</div>
           <div class="actions">
             <button onclick="event.stopPropagation(); attachTerm('\${s.instance_id}')">attach</button>
-            \${(s.instance_id !== 'main' && !isForeign) ? \`<button class="danger" onclick="event.stopPropagation(); killSession('\${s.instance_id}')">kill</button>\` : ''}
+            \${s.instance_id !== 'main' ? \`<button class="danger" onclick="event.stopPropagation(); killSession('\${s.instance_id}')">kill</button>\` : ''}
           </div>
         </div>\`;
     }).join('');
@@ -607,6 +608,13 @@ const HTML = `<!DOCTYPE html>
   window.attachTerm = attachTerm;
 
   async function killSession(id) {
+    // Foreign tmux sessions (e.g. user's interactive 'test1') are easy to
+    // accidentally kill -- confirm first. Owned/recipe sessions skip confirm.
+    const item = (window.__lastSessions ?? []).find((s) => s.instance_id === id);
+    if (item && item.kind === 'foreign') {
+      const ok = window.confirm('Kill foreign tmux session "' + id + '"? This is one of your own tmux sessions, not a clawdevbox spawn.');
+      if (!ok) return;
+    }
     const r = await api('DELETE', '/api/sessions/' + encodeURIComponent(id));
     if (r.ok) logEntry('res', 'killed ' + id);
     refreshSessions();
