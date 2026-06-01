@@ -1374,7 +1374,7 @@ async function handleRecipeResume(
       ptyCols: 120,
       ptyRows: 30,
     });
-    const ptyProc = handle.pty;
+    const ptyProc = handle.pty!;
     pid = handle.pid ?? undefined;
     registerPty({
       instanceId: newInstanceId,

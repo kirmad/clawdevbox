@@ -335,7 +335,7 @@ export async function runRecipe(opts: RunRecipeOptions): Promise<RunRecipeResult
       ptyCols,
       ptyRows,
     });
-    const ptyProc = handle.pty;
+    const ptyProc = handle.pty!;
     pid = handle.pid ?? undefined;
     const lastSpawn = lastSpawnRef.value;
     const commandLine = lastSpawn

@@ -262,7 +262,7 @@ export const e2eTestRunnerProvider: AgentCliProvider = {
     }
     // bulk-cr: single write with trailing CR. The agent's stdin-read
     // loop splits on \n (LF), and node-pty translates CR to LF on Windows.
-    handle.pty.write(text + '\r');
+    handle.pty!.write(text + '\r');
   },
 
   async detect(_ctx: ProviderCtx) {

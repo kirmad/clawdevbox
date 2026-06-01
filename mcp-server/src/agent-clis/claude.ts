@@ -117,9 +117,9 @@ export const claudeProvider: AgentCliProvider = {
     // keystroke (otherwise terminals interpret `ESC <byte>` as `Alt+<byte>`).
     // ESC both dismisses any overlay/modal from a prior slash-command AND
     // clears the input box, so it replaces the prior `\x15` (Ctrl+U).
-    handle.pty.write('\x1b');
+    handle.pty!.write('\x1b');
     await new Promise((r) => setTimeout(r, 200));
-    handle.pty.write(text + '\r');
+    handle.pty!.write(text + '\r');
   },
 
   async syncPluginInventory(ctx: ProviderCtx, opts: SyncPluginInventoryOpts): Promise<SyncReport> {

@@ -20,6 +20,7 @@ import { resolveRecipeInstanceId } from '../context-resolver.ts';
 import { getPending, resolvePending } from '../pending-dispatch-registry.ts';
 import { updateStatus } from '../db/agent-sessions-store.ts';
 import { emitChange } from '../event-bus.ts';
+import { getDatabase } from '../db/index.ts';
 import type { Workspace } from '../workspace.ts';
 
 const STATUS_TEXT_CAP = 4096;
@@ -106,7 +107,7 @@ Call this:
     handler: async (args, extra) => {
       const instanceId = resolveRecipeInstanceId(extra);
       const result = await handleUpdateStatus(
-        { db: ws.db, instanceId },
+        { db: getDatabase(), instanceId },
         args as UpdateStatusArgs,
       );
       return {

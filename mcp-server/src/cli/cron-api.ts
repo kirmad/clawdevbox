@@ -324,13 +324,17 @@ export async function handleCronApi(
     const liveRaw = listSessions();
     const liveIds = new Set(liveRaw.map((s) => s.instanceId));
     const live = liveRaw.map((s) => {
-      const cond = getConductor(s.instanceId);
+      // getConductor is a null-returning compat stub since the tmux migration;
+      // state/queue_depth come from agent_sessions.status_text and pending-
+      // dispatch-registry once T19 rewires this surface. For now we report
+      // `'unknown'` (or `'exited'` when the pty has exited) and queue_depth 0.
+      void getConductor(s.instanceId);
       const meta = getSessionMeta(s.instanceId);
       return {
         instance_id: s.instanceId,
         live: true as const,
-        state: (cond?.state ?? (s.exited ? 'exited' : 'unknown')) as string,
-        queue_depth: cond?.pendingCount() ?? 0,
+        state: (s.exited ? 'exited' : 'unknown') as string,
+        queue_depth: 0,
         provider_id: meta?.agentCli ?? null,
         recipe_id: meta?.recipeId ?? null,
         cli_session_id: meta?.sessionId ?? null,
@@ -496,15 +500,16 @@ export async function handleCronApi(
   {
     const m = path.match(/^\/api\/sessions\/([^/]+)\/?$/);
     if (m && method === 'GET') {
-      const { getConductor, hasSession, getSessionMeta } = await import('../pty-registry.ts');
+      const { hasSession, getSessionMeta } = await import('../pty-registry.ts');
       const instanceId = decodeURIComponent(m[1]!);
       if (!hasSession(instanceId)) { sendJson(res, 404, { error: 'session not found' }); return true; }
-      const cond = getConductor(instanceId);
       const meta = getSessionMeta(instanceId);
       sendJson(res, 200, {
         instance_id: instanceId,
-        state: cond?.state ?? 'unknown',
-        queue_depth: cond?.pendingCount() ?? 0,
+        // state + queue_depth: see comment in /api/sessions handler above.
+        // These will read from agent_sessions/pending-dispatch in T19.
+        state: 'unknown' as const,
+        queue_depth: 0,
         provider_id: meta?.agentCli ?? null,
         agent_session_id: meta?.sessionId ?? null,
       });

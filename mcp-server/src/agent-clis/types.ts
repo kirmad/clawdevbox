@@ -2,6 +2,7 @@ import type { IPty } from 'node-pty';
 import type { PluginEntry, Workspace } from '../workspace.ts';
 import type { ResolvedConfig } from '../config.ts';
 import type { logger as Logger } from '../logger.ts';
+import type { CliSession, CliSessionSpawnOpts } from '../cli-sessions/types.ts';
 
 export type SessionMode = 'interactive' | 'headless';
 
@@ -130,7 +131,17 @@ export interface SpawnSessionOpts {
 export interface AgentHandle {
   pid: number | null;
   sessionId: string;
-  pty: IPty;
+  /**
+   * Legacy node-pty handle. Populated by providers that haven't migrated to
+   * tmux yet. Will be removed once all providers populate `session` (T19+).
+   * Consumers should prefer `session` and treat `pty` as fallback only.
+   */
+  pty?: IPty;
+  /**
+   * Tmux-backed CliSession. Populated by tmux-migrated providers. New code
+   * should read from this (sendText/sendKey/snapshot/resize/kill).
+   */
+  session?: CliSession;
   exited: Promise<{ exitCode: number; signal?: string }>;
 }
 
@@ -158,6 +169,13 @@ export interface ProviderCtx {
   cfg: ResolvedConfig;
   logger: typeof Logger;
   spawnPty(file: string, args: string[], opts: PtySpawnOpts): IPty;
+  /**
+   * Spawn an agent inside a tmux session. Populated when the tmux session
+   * runtime has been booted (T13+). tmux-migrated providers prefer this
+   * over `spawnPty` and populate `AgentHandle.session`. Optional during
+   * the staged migration; assert presence in provider code before calling.
+   */
+  spawnTmuxSession?(opts: CliSessionSpawnOpts): Promise<CliSession>;
   writeWorkspaceFile(relativePath: string, contents: string): void;
 }
 

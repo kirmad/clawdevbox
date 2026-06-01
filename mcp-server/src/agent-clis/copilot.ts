@@ -169,12 +169,12 @@ export const copilotProvider: AgentCliProvider = {
   // Copilot's native queue and a fresh box opens; no clear is needed.
   async writePrompt(handle: AgentHandle, { text, strategy }: WritePromptOpts): Promise<void> {
     if (strategy === 'submit') {
-      handle.pty.write('\x1b');
+      handle.pty!.write('\x1b');
       await sleep(200);
     }
-    handle.pty.write(text);
+    handle.pty!.write(text);
     await sleep(SLEEP_BEFORE_COMMIT_MS);
-    handle.pty.write(strategy === 'queue' ? '\x11' : '\r');
+    handle.pty!.write(strategy === 'queue' ? '\x11' : '\r');
   },
 
   async syncPluginInventory(ctx: ProviderCtx, opts: SyncPluginInventoryOpts): Promise<SyncReport> {
