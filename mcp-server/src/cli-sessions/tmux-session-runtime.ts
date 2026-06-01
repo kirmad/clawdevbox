@@ -3,6 +3,7 @@ import { tmuxRunAsync, type TmuxClientOpts } from './tmux-client.ts';
 import { createTmuxSession, adoptTmuxSession } from './tmux-session.ts';
 import type { CliSession, CliSessionRuntime, CliSessionSpawnOpts } from './types.ts';
 
+
 export function createTmuxSessionRuntime(client: TmuxClientOpts): CliSessionRuntime {
   return {
     async spawn(opts: CliSessionSpawnOpts): Promise<CliSession> {
@@ -26,3 +27,33 @@ export function createTmuxSessionRuntime(client: TmuxClientOpts): CliSessionRunt
     },
   };
 }
+
+/**
+ * Singleton tmux session lookup for dispatcher consumption.
+ *
+ * In T13 this is populated by `initTmuxSessionRuntime()` at boot and
+ * `provider.spawnSession` populates entries. For T10 (this commit) we
+ * ship a stub-only `get()` so the dispatcher compiles + can be wired
+ * incrementally; production callers will see `null` until T13 lands.
+ *
+ * Test code that needs to inject a session uses `__register`.
+ */
+const liveSessions = new Map<string, CliSession>();
+
+export const tmuxSessionRegistry = {
+  get(instanceId: string): CliSession | null {
+    return liveSessions.get(instanceId) ?? null;
+  },
+  /** TEST/runtime hatch: register a live tmux session for an instance id. */
+  __register(instanceId: string, session: CliSession): void {
+    liveSessions.set(instanceId, session);
+  },
+  /** TEST/runtime hatch: remove a session from the registry. */
+  __unregister(instanceId: string): void {
+    liveSessions.delete(instanceId);
+  },
+  /** TEST hatch: reset the registry between tests. */
+  __resetForTests(): void {
+    liveSessions.clear();
+  },
+};

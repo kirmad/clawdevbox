@@ -22,6 +22,9 @@
  */
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { setTimeout as sleepP } from 'node:timers/promises';
+import { registerPending, resolvePendingTimeout } from './pending-dispatch-registry.ts';
+import { tmuxSessionRegistry } from './cli-sessions/tmux-session-runtime.ts';
 import type { Database } from 'better-sqlite3';
 import { emitChange, onChange } from './event-bus.ts';
 import { logger } from './logger.ts';
@@ -231,7 +234,7 @@ export class Dispatcher {
   }
 
   /**
-   * Dispatch a prompt to the SessionConductor attached to the fire's
+   * Dispatch a prompt to the tmux session attached to the fire's
    * subscriber pty. Returns a discriminated union signaling the routing
    * outcome; the HTTP handler maps each variant to an appropriate response.
    */
@@ -242,7 +245,7 @@ export class Dispatcher {
     | { status: 'not_found_fire' }
     | { status: 'no_dispatch_target' }
     | { status: 'target_unavailable' }
-    | { status: 'ok'; state: 'idle' | 'busy' | 'starting' | 'exited' }
+    | { status: 'ok'; state: 'dispatched'; dispatchId: string }
   > {
     const entry = this.activeRuns.get(fire_id);
     if (!entry) return { status: 'not_found_fire' };
@@ -251,27 +254,70 @@ export class Dispatcher {
   }
 
   /**
-   * Dispatch a prompt directly to a SessionConductor by instance_id —
-   * no fire required. Used by ad-hoc callers that already know the
-   * target pty.
+   * Dispatch a prompt directly to a tmux session by instance_id — no fire
+   * required. Used by ad-hoc callers (the /dispatch endpoint, /spawn smart
+   * routing) that already know the target session.
+   *
+   * Behavior:
+   *   1. Look up the tmux session via `tmuxSessionRegistry`. Returns
+   *      `target_unavailable` if not found (caller can fall through to a
+   *      spawn path or surface a 404).
+   *   2. Register a pending-dispatch entry. Subsequent dispatches to the
+   *      same instance are FIFO-queued; only one is "active" at a time.
+   *   3. Send the bytes: Escape (clears any overlay) → gap → text → gap →
+   *      Enter. The two gaps match copilot's documented split-cr-250ms
+   *      timing — too-fast Enter is absorbed by the TUI.
+   *   4. Race the agent's `update_status` response against an overall
+   *      timeout in the BACKGROUND. The method itself returns as soon as
+   *      the bytes are written so the HTTP caller doesn't block.
+   *
+   * The returned `state` is always `'dispatched'` under the tmux model —
+   * the legacy SessionConductor state machine ('idle'|'busy'|'starting'|
+   * 'exited') no longer exists. The caller treats the field opaquely.
    */
   async dispatchToInstance(
     instanceId: string,
     prompt: string,
   ): Promise<
     | { status: 'target_unavailable' }
-    | { status: 'ok'; state: 'idle' | 'busy' | 'starting' | 'exited' }
+    | { status: 'ok'; state: 'dispatched'; dispatchId: string }
   > {
-    const { getConductor } = await import('./pty-registry.ts');
-    const conductor = getConductor(instanceId);
-    if (!conductor) return { status: 'target_unavailable' };
-    conductor.dispatch(prompt, { strategy: 'auto' }).catch((err) => {
+    const session = tmuxSessionRegistry.get(instanceId);
+    if (!session) return { status: 'target_unavailable' };
+
+    const { dispatchId, promise } = registerPending(instanceId, prompt);
+
+    // Bytes-on-the-wire ordering. Each gap is empirically required: Copilot's
+    // TUI absorbs Enter that arrives too close to a preceding ESC or the
+    // input bytes.
+    try {
+      await session.sendKey('Escape');
+      await sleepP(200);
+      await session.sendText(prompt);
+      await sleepP(250);
+      await session.sendKey('Enter');
+    } catch (err) {
       logger.warn(
         { instanceId, err: err instanceof Error ? err.message : String(err) },
-        'dispatcher: dispatchToInstance — conductor.dispatch rejected',
+        'dispatcher: dispatchToInstance — sendText/sendKey failed',
       );
-    });
-    return { status: 'ok', state: conductor.state };
+      // Treat send-failure as immediate target_unavailable; tear down the
+      // pending entry so a retry can re-register.
+      resolvePendingTimeout(instanceId);
+      return { status: 'target_unavailable' };
+    }
+
+    // Background timeout race — does NOT block the HTTP response.
+    const TIMEOUT_MS = 5 * 60 * 1000;
+    const timeoutPromise = new Promise<'timeout'>((res) => setTimeout(() => res('timeout'), TIMEOUT_MS));
+    Promise.race([promise, timeoutPromise]).then((winner) => {
+      if (winner === 'timeout') {
+        resolvePendingTimeout(instanceId);
+        logger.warn({ instanceId, dispatchId }, 'dispatcher: dispatch timed out waiting for update_status');
+      }
+    }).catch(() => { /* swallow — registry already resolved */ });
+
+    return { status: 'ok', state: 'dispatched', dispatchId };
   }
 
   /**
