@@ -121,6 +121,16 @@ export async function createTmuxSession(
 
   await spawnSession(opts.cols, opts.rows);
 
+  return buildCliSession(client, sessionName, usingPsmux);
+}
+
+// Build a CliSession bound to an existing tmux session (no new-session call).
+// Used by adoptTmuxSession for adopt-on-startup scenarios after restart.
+function buildCliSession(
+  client: TmuxClientOpts,
+  sessionName: string,
+  usingPsmux: boolean,
+): CliSession {
   // Exit-poller: poll #{pane_dead}|#{pane_dead_status} until pane_dead == 1,
   // then resolve `exited`. If the session is killed externally (display-
   // message fails), resolve with exitCode null.
@@ -289,4 +299,20 @@ export async function createTmuxSession(
   };
 
   return session;
+}
+
+// Build a CliSession bound to an EXISTING tmux session (no new-session call).
+// Used by runtime.attach() for adopt-on-startup after a clawdevbox restart.
+export async function adoptTmuxSession(
+  client: TmuxClientOpts,
+  shortName: string,
+): Promise<CliSession | null> {
+  const sessionName = `cdb_${shortName}`;
+  const probe = await tmuxRunAsync(client, ['has-session', '-t', sessionName]);
+  if (probe.exitCode !== 0) return null;
+
+  // Determine if we're using psmux for pane_dead polling logic.
+  const usingPsmux = isPsmux(client);
+
+  return buildCliSession(client, sessionName, usingPsmux);
 }
