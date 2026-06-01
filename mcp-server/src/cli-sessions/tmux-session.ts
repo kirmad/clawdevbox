@@ -1,5 +1,8 @@
 // mcp-server/src/cli-sessions/tmux-session.ts
 import { spawnSync } from 'node:child_process';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { tmuxRun, tmuxRunAsync, type TmuxClientOpts } from './tmux-client.ts';
 import { specialKeyToTmux } from './special-keys.ts';
@@ -63,7 +66,24 @@ function buildPsmuxShellScript(opts: CliSessionSpawnOpts): string | null {
   }
 
   const command = [opts.command, ...opts.args].map(shQuote).join(' ');
-  return `${exports.join('; ')}; exec ${command}`;
+  return `#!/bin/sh\n${exports.join('\n')}\nexec ${command}\n`;
+}
+
+/**
+ * Write the shell script to a temp file under the OS temp dir. Returns the
+ * file path. This avoids the ~8KB argv truncation and quote-mangling that
+ * happens when passing long shell scripts as a single `-c` argument
+ * through tmux → psmux → /usr/bin/sh on Windows.
+ */
+function writePsmuxScriptFile(opts: CliSessionSpawnOpts, script: string): string {
+  const dir = join(tmpdir(), 'clawdevbox-tmux-scripts');
+  mkdirSync(dir, { recursive: true });
+  // Use the tmux session name as the filename so we can correlate scripts
+  // with sessions when debugging. .sh extension so editors syntax-highlight.
+  const fname = `cdb_${opts.name.replace(/[^A-Za-z0-9_-]/g, '_')}.sh`;
+  const path = join(dir, fname);
+  writeFileSync(path, script, { encoding: 'utf8' });
+  return path;
 }
 
 async function waitForPane(client: TmuxClientOpts, sessionName: string, extraDelayMs: number): Promise<void> {
@@ -105,9 +125,14 @@ export async function createTmuxSession(
     let args: string[];
     if (usingPsmux) {
       const script = buildPsmuxShellScript(opts);
-      args = script
-        ? [...baseArgs, '--', findPortableShell(isPortableShell(opts.command) ? opts.command : undefined)!, '-c', script]
-        : [...baseArgs, '--', opts.command, ...opts.args];
+      if (script) {
+        const scriptPath = writePsmuxScriptFile(opts, script);
+        const shell = findPortableShell(isPortableShell(opts.command) ? opts.command : undefined)!;
+        // sh <file>  — no -c, no argv-quoting headaches. Tested against psmux 3.3.2.
+        args = [...baseArgs, '--', shell, scriptPath];
+      } else {
+        args = [...baseArgs, '--', opts.command, ...opts.args];
+      }
     } else {
       args = [...baseArgs, ...envArgs, opts.command, ...opts.args];
     }
