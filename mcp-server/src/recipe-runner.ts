@@ -33,6 +33,8 @@ import {
 import { getDatabase } from './db/index.ts';
 import { buildProviderCtx } from './agent-clis/shared.ts';
 import { parseRecipeSource } from './validators.ts';
+import { logger } from './logger.ts';
+import type { CliSession } from './cli-sessions/types.ts';
 import type { Workspace } from './workspace.ts';
 import type { ResolvedConfig } from './config.ts';
 
@@ -335,47 +337,75 @@ export async function runRecipe(opts: RunRecipeOptions): Promise<RunRecipeResult
       ptyCols,
       ptyRows,
     });
-    const ptyProc = handle.pty!;
     pid = handle.pid ?? undefined;
     const lastSpawn = lastSpawnRef.value;
     const commandLine = lastSpawn
       ? formatCommandLine(lastSpawn.file, lastSpawn.args)
       : undefined;
-    registerPty({
-      instanceId,
-      workspaceId: opts.workspaceInfo.id,
-      cols: ptyCols,
-      rows: ptyRows,
-      ipty: ptyProc,
-      meta: {
-        cwd: lastSpawn?.cwd ?? opts.workspaceInfo.path,
-        commandLine,
-        agentCli,
-        sessionId,
-        recipeId: recipeIdResolved,
-      },
-      provider: spawnMode === 'interactive' ? provider : undefined,
-      agentHandle: spawnMode === 'interactive' ? handle : undefined,
-    });
-    ptyProc.onData((data) => {
-      logStream.write(data);
-    });
-    ptyProc.onExit(({ exitCode, signal }) => {
-      logStream.end();
-      const current = readRecipeInstance(opts.workspaceInfo.path, instanceId);
-      if (current && current.status === 'running') {
-        const ok = (signal === undefined || signal === 0) && exitCode === 0;
-        writeRecipeInstance(opts.workspaceInfo.path, {
-          ...current,
-          status: ok ? 'success' : 'failure',
-          completed_at: Date.now(),
-          message:
-            signal !== undefined && signal !== 0
-              ? `agent exited via signal ${signal}`
-              : `agent exited with code ${exitCode}${ok ? ' (no recipe.done call; treating as success)' : ''}`,
-        });
-      }
-    });
+
+    // Tmux-migrated providers return a CliSession (no .pty fd). Legacy providers
+    // return a node-pty IPty. Branch on which one the provider populated.
+    const ptyProc = handle.pty;
+    if (ptyProc) {
+      // Legacy IPty path (pre-tmux-migration providers + e2e-test-runner).
+      registerPty({
+        instanceId,
+        workspaceId: opts.workspaceInfo.id,
+        cols: ptyCols,
+        rows: ptyRows,
+        ipty: ptyProc,
+        meta: {
+          cwd: lastSpawn?.cwd ?? opts.workspaceInfo.path,
+          commandLine,
+          agentCli,
+          sessionId,
+          recipeId: recipeIdResolved,
+        },
+        provider: spawnMode === 'interactive' ? provider : undefined,
+        agentHandle: spawnMode === 'interactive' ? handle : undefined,
+      });
+      ptyProc.onData((data) => {
+        logStream.write(data);
+      });
+      ptyProc.onExit(({ exitCode, signal }) => {
+        logStream.end();
+        const current = readRecipeInstance(opts.workspaceInfo.path, instanceId);
+        if (current && current.status === 'running') {
+          const ok = (signal === undefined || signal === 0) && exitCode === 0;
+          writeRecipeInstance(opts.workspaceInfo.path, {
+            ...current,
+            status: ok ? 'success' : 'failure',
+            completed_at: Date.now(),
+            message:
+              signal !== undefined && signal !== 0
+                ? `agent exited via signal ${signal}`
+                : `agent exited with code ${exitCode}${ok ? ' (no recipe.done call; treating as success)' : ''}`,
+          });
+        }
+      });
+    } else if (handle.session) {
+      // Tmux-backed path. Agent lives inside `tmux new-session -s cdb_<id>`.
+      // We don't register a pty (T19 will pivot pty-registry to viewer-only
+      // IPtys spawned by terminal-server). The agent is already in
+      // tmuxSessionRegistry — registered by the provider. The exited promise
+      // drives the status writeback.
+      try { logStream.end(); } catch { /* ignore */ }
+      handle.exited.then(({ exitCode, signal }) => {
+        const current = readRecipeInstance(opts.workspaceInfo.path, instanceId);
+        if (current && current.status === 'running') {
+          const ok = (signal === undefined || signal === '0') && exitCode === 0;
+          writeRecipeInstance(opts.workspaceInfo.path, {
+            ...current,
+            status: ok ? 'success' : 'failure',
+            completed_at: Date.now(),
+            message:
+              signal && signal !== '0'
+                ? `agent exited via signal ${signal}`
+                : `agent exited with code ${exitCode}${ok ? ' (no recipe.done call; treating as success)' : ''}`,
+          });
+        }
+      });
+    }
   } catch (err) {
     spawnError = err;
     try {
@@ -424,6 +454,28 @@ export async function runRecipe(opts: RunRecipeOptions): Promise<RunRecipeResult
     }
   }
 
+  // 6. Initial prompt delivery for tmux-migrated interactive providers.
+  //    The provider no longer auto-delivers the seed prompt (the
+  //    deliverInitialPromptWhenReady byte-stream helper was removed in T15-T17).
+  //    Instead, we fire-and-forget a snapshot-poll readiness wait + dispatch
+  //    via the dispatcher's standard pending-dispatch path. This lets the
+  //    initial prompt benefit from update_status done-detection just like any
+  //    follow-up dispatch.
+  //
+  //    Skipped when:
+  //      - no opts.prompt (interactive shell without a seed)
+  //      - spawnMode !== 'interactive' (headless already passed -p to the CLI)
+  //      - the provider hasn't been tmux-migrated (handle.session missing —
+  //        legacy IPty providers ignore opts.prompt now, but no caller relies
+  //        on initial prompt for headless e2e-test-runner)
+  if (spawnMode === 'interactive' && opts.prompt) {
+    const { tmuxSessionRegistry } = await import('./cli-sessions/tmux-session-runtime.ts');
+    const session = tmuxSessionRegistry.get(instanceId);
+    if (session) {
+      void deliverInitialPromptAfterReady(instanceId, session, opts.prompt);
+    }
+  }
+
   return {
     recipe_instance_id: instanceId,
     recipe_id: recipeIdResolved,
@@ -439,4 +491,51 @@ export async function runRecipe(opts: RunRecipeOptions): Promise<RunRecipeResult
     log_path: logPath,
     view_url: getTerminalServer()?.url(instanceId) ?? null,
   };
+}
+
+/**
+ * Fire-and-forget: wait for the agent's TUI to draw the prompt-ready glyph
+ * (and the model-line indicator for copilot), then dispatch the initial
+ * prompt via the standard dispatcher path. Errors are logged but never
+ * raised — the caller has already returned to its caller.
+ */
+async function deliverInitialPromptAfterReady(
+  instanceId: string,
+  session: CliSession,
+  prompt: string,
+): Promise<void> {
+  try {
+    const { waitForReady } = await import('./cli-sessions/wait-for-ready.ts');
+    await waitForReady(session, {
+      // Copilot/Agency: `❯` glyph, status bar `context (N%)`. Claude: `❯`
+      // followed by NBSP or space; no context line. We test for both and
+      // accept either fully-rendered indicator.
+      promptReadyRegex: /❯/,
+      fullyRenderedRegex: /context\s*\(\d+%\)|Model:|Conversation/i,
+      pollIntervalMs: 500,
+      stableMs: 2500,
+      timeoutMs: 90_000,
+    });
+  } catch (err) {
+    logger.warn(
+      { instanceId, err: err instanceof Error ? err.message : String(err) },
+      'recipe-runner: waitForReady failed; dispatching initial prompt anyway',
+    );
+  }
+  try {
+    // Send Escape + text + Enter via the session API. We don't go through
+    // dispatcher.dispatchToInstance here to avoid a circular dep — and the
+    // initial prompt doesn't need pending-dispatch queueing (it's the FIRST
+    // bytes the agent sees).
+    await session.sendKey('Escape');
+    await new Promise((r) => setTimeout(r, 200));
+    await session.sendText(prompt);
+    await new Promise((r) => setTimeout(r, 250));
+    await session.sendKey('Enter');
+  } catch (err) {
+    logger.warn(
+      { instanceId, err: err instanceof Error ? err.message : String(err) },
+      'recipe-runner: initial prompt dispatch failed',
+    );
+  }
 }
