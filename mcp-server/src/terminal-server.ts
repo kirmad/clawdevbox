@@ -50,6 +50,9 @@ import {
   getSessionMeta,
   type PtySessionMeta,
 } from './pty-registry.ts';
+import { tmuxSessionRegistry } from './cli-sessions/tmux-session-runtime.ts';
+import { spawn as ptySpawn } from 'node-pty';
+import { resolveConfig } from './config.ts';
 import { resolveRendererFile } from './renderer-registry.ts';
 import type { Workspace } from './workspace.ts';
 import { listWorkspaces, resolveWorkspacesRoot } from './workspaces-store.ts';
@@ -729,6 +732,16 @@ function renderTerminalHtml(instanceId: string, meta: TerminalHeaderMeta): strin
 // ============================================================================
 
 function attachWebsocket(ws: WebSocket, instanceId: string): void {
+  // T19: tmux-attach path. If the instance is a tmux-backed agent, spawn a
+  // per-viewer `tmux attach` IPty. xterm.js capability replies go INTO tmux
+  // (a TUI client) and never reach the agent — this is the structural fix
+  // for the viewer-input race that motivated the gate in pty-registry.
+  const tmuxSession = tmuxSessionRegistry.get(instanceId);
+  if (tmuxSession) {
+    attachWebsocketViaTmux(ws, instanceId, tmuxSession.name);
+    return;
+  }
+
   if (!hasSession(instanceId)) {
     // Pty has exited and been garbage-collected from the registry.
     // Fall back to the on-disk log so the viewer at least shows what
@@ -782,6 +795,92 @@ function attachWebsocket(ws: WebSocket, instanceId: string): void {
 
   ws.on('close', () => unsubscribe());
   ws.on('error', () => unsubscribe());
+}
+
+/**
+ * T19: spawn a per-viewer `tmux attach -t cdb_<instanceId>` IPty and wire it
+ * to the WebSocket. Each viewer gets its own attach process; closing the WS
+ * kills only that viewer's attach without affecting other viewers OR the
+ * agent (which keeps running in tmux).
+ */
+function attachWebsocketViaTmux(
+  ws: WebSocket,
+  instanceId: string,
+  tmuxSessionName: string,
+): void {
+  const cfg = resolveConfig({
+    projectDir: process.env.CLAWDEVBOX_PROJECT_DIR ?? process.cwd(),
+    globalDir: process.env.CLAWDEVBOX_GLOBAL_DIR ?? '',
+  });
+  const tmuxSocket = (cfg as { tmux?: { socket: string | null } }).tmux?.socket ?? 'clawdevbox';
+
+  const args: string[] = [];
+  if (tmuxSocket) args.push('-L', tmuxSocket);
+  args.push('attach-session', '-t', tmuxSessionName);
+
+  let ipty: ReturnType<typeof ptySpawn>;
+  try {
+    ipty = ptySpawn('tmux', args, {
+      name: 'xterm-256color',
+      cols: 120,
+      rows: 30,
+      cwd: process.cwd(),
+      env: process.env as Record<string, string>,
+    });
+  } catch (err) {
+    try {
+      ws.send(JSON.stringify({
+        type: 'snapshot',
+        content: `[clawdevbox] failed to attach tmux viewer: ${(err as Error).message}\r\n`,
+        cols: 120, rows: 30, exited: true, exitCode: 1,
+      }));
+      ws.send(JSON.stringify({ type: 'exit', exitCode: 1 }));
+      ws.close(1011, 'tmux attach failed');
+    } catch { /* ignore */ }
+    return;
+  }
+
+  let closed = false;
+  ipty.onData((chunk) => {
+    if (closed || ws.readyState !== ws.OPEN) return;
+    try { ws.send(JSON.stringify({ type: 'data', chunk })); } catch { /* viewer drop */ }
+  });
+  ipty.onExit(({ exitCode }) => {
+    if (closed) return;
+    try { ws.send(JSON.stringify({ type: 'exit', exitCode: exitCode ?? 0 })); } catch {}
+    try { ws.close(1000, 'tmux attach exited'); } catch {}
+  });
+
+  ws.on('message', (raw) => {
+    if (closed) return;
+    let msg: unknown;
+    try { msg = JSON.parse(raw.toString('utf8')); } catch { return; }
+    if (!msg || typeof msg !== 'object') return;
+    const m = msg as Record<string, unknown>;
+    if (m.type === 'input' && typeof m.data === 'string') {
+      try { ipty.write(m.data); } catch { /* attach dead */ }
+    } else if (
+      m.type === 'resize' &&
+      typeof m.cols === 'number' &&
+      typeof m.rows === 'number'
+    ) {
+      try { ipty.resize(m.cols, m.rows); } catch { /* attach dead */ }
+    }
+    // 'kill' on a tmux-attach viewer just detaches (kill the attach IPty),
+    // not the agent. Use DELETE /api/sessions/<id> for full agent kill.
+    if (m.type === 'kill') {
+      try { ipty.kill(); } catch { /* ignore */ }
+      closed = true;
+    }
+  });
+
+  const cleanup = (): void => {
+    if (closed) return;
+    closed = true;
+    try { ipty.kill(); } catch { /* ignore */ }
+  };
+  ws.on('close', cleanup);
+  ws.on('error', cleanup);
 }
 
 /**

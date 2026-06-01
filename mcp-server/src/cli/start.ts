@@ -399,13 +399,20 @@ export async function runStart(flags: Flags): Promise<void> {
     }
     initTmuxSessionRuntime(tmuxClient);
 
-    const recon = await reconcileOnStartup(opened.db);
-    if (recon.adopted > 0 || recon.orphaned > 0) {
-      logger.info(
-        { adopted: recon.adopted, orphaned: recon.orphaned },
-        'tmux: reconciled sessions on startup',
-      );
-    }
+    // Fire-and-forget: reconcile orphan sessions in background so a slow
+    // attach loop (464 stale rows on dev machines) doesn't block boot. The
+    // reconcile only matters for adopting truly-still-alive tmux sessions
+    // from a prior kernel run; HTTP server starts immediately.
+    void reconcileOnStartup(opened.db).then((recon) => {
+      if (recon.adopted > 0 || recon.orphaned > 0) {
+        logger.info(
+          { adopted: recon.adopted, orphaned: recon.orphaned },
+          'tmux: reconciled sessions on startup',
+        );
+      }
+    }).catch((err) => {
+      logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'tmux reconcile failed');
+    });
   }
 
   // Bidirectional plugin sync (spec §6). Eager when cfg.clientSync.mode='auto'

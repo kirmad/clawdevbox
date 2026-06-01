@@ -141,11 +141,12 @@ export async function reconcileOnStartup(
         adopted++;
       } else {
         // Listed but couldn't attach (race) — treat as orphan.
-        db.prepare(`UPDATE agent_sessions SET status = 'crashed', ended_at = ? WHERE id = ?`).run(now, row.id);
+        // agent_sessions.status CHECK allows: running/success/failure/cancelled/suspended
+        db.prepare(`UPDATE agent_sessions SET status = 'failure', ended_at = ? WHERE id = ?`).run(now, row.id);
         orphaned++;
       }
     } else {
-      db.prepare(`UPDATE agent_sessions SET status = 'crashed', ended_at = ? WHERE id = ?`).run(now, row.id);
+      db.prepare(`UPDATE agent_sessions SET status = 'failure', ended_at = ? WHERE id = ?`).run(now, row.id);
       orphaned++;
     }
   }
