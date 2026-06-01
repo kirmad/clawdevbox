@@ -90,6 +90,12 @@ import { Scheduler } from '../scheduler.ts';
 import { handleCronApi, type CronApiContext } from './cron-api.ts';
 import { handleAgentCliApi } from './agent-clis-api.ts';
 import type { Flags } from './index.ts';
+import {
+  initTmuxSessionRuntime,
+  reconcileOnStartup,
+  bundledTmuxConfPath,
+} from '../cli-sessions/tmux-session-runtime.ts';
+import { tmuxRunAsync } from '../cli-sessions/tmux-client.ts';
 
 function str(flags: Flags, key: string): string | undefined {
   const v = flags[key];
@@ -375,6 +381,46 @@ export async function runStart(flags: Flags): Promise<void> {
     'db opened',
   );
   scanLegacyFiles(cfg, opened.db);
+
+  // Initialize tmux session runtime: required for tmux-migrated providers
+  // (copilot, claude, agency, echo-stub). Probes the tmux binary first;
+  // fatal-exit if missing.
+  {
+    // Default to the shared tmux server (no -L). psmux on Windows creates a
+    // SEPARATE server per `new-session -L <name>` invocation rather than
+    // multiplexing one server per socket name (real-tmux behavior), which
+    // breaks `tmux attach` from secondary clients. Using the default socket
+    // forces psmux to multiplex on one process, which works correctly. Set
+    // `cfg.tmux.socket` to a non-null string only if you NEED isolation
+    // (e.g., multiple clawdevbox instances on the same machine).
+    const tmuxSocket = cfg.tmux?.socket ?? null;
+    const tmuxConfPath = bundledTmuxConfPath();
+    const tmuxClient = { socket: tmuxSocket, configPath: tmuxConfPath };
+
+    const probe = await tmuxRunAsync({ socket: null, configPath: null }, ['-V']);
+    if (probe.exitCode !== 0) {
+      process.stderr.write(
+        `FATAL: tmux binary not found on PATH. Install tmux (https://github.com/tmux/tmux or psmux on Windows).\n`,
+      );
+      process.exit(2);
+    }
+    initTmuxSessionRuntime(tmuxClient);
+
+    // Fire-and-forget: reconcile orphan sessions in background so a slow
+    // attach loop (464 stale rows on dev machines) doesn't block boot. The
+    // reconcile only matters for adopting truly-still-alive tmux sessions
+    // from a prior kernel run; HTTP server starts immediately.
+    void reconcileOnStartup(opened.db).then((recon) => {
+      if (recon.adopted > 0 || recon.orphaned > 0) {
+        logger.info(
+          { adopted: recon.adopted, orphaned: recon.orphaned },
+          'tmux: reconciled sessions on startup',
+        );
+      }
+    }).catch((err) => {
+      logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'tmux reconcile failed');
+    });
+  }
 
   // Bidirectional plugin sync (spec §6). Eager when cfg.clientSync.mode='auto'
   // or 'discover-only'; otherwise a no-op. Failures degrade to WARN.
@@ -1374,7 +1420,7 @@ async function handleRecipeResume(
       ptyCols: 120,
       ptyRows: 30,
     });
-    const ptyProc = handle.pty;
+    const ptyProc = handle.pty!;
     pid = handle.pid ?? undefined;
     registerPty({
       instanceId: newInstanceId,

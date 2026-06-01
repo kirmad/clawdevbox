@@ -50,10 +50,55 @@ import {
   getSessionMeta,
   type PtySessionMeta,
 } from './pty-registry.ts';
+import { tmuxSessionRegistry } from './cli-sessions/tmux-session-runtime.ts';
+import { spawn as ptySpawn } from 'node-pty';
+import { spawnSync } from 'node:child_process';
+import { resolveConfig } from './config.ts';
 import { resolveRendererFile } from './renderer-registry.ts';
 import type { Workspace } from './workspace.ts';
 import { listWorkspaces, resolveWorkspacesRoot } from './workspaces-store.ts';
 import { readRecipeInstance } from './recipe-instances-store.ts';
+
+/**
+ * Resolve the absolute path to `tmux.exe` (Windows) / `tmux` (Unix). node-pty
+ * doesn't search PATH the way child_process.spawn does on Windows, so we need
+ * an absolute path. Result is cached for the process lifetime.
+ */
+let _tmuxBinPath: string | null = null;
+function resolveTmuxBin(): string {
+  if (_tmuxBinPath) return _tmuxBinPath;
+  const isWin = process.platform === 'win32';
+  const which = spawnSync(isWin ? 'where.exe' : 'which', ['tmux'], { encoding: 'utf8' });
+  if (which.status === 0) {
+    // `where` returns one path per line; take the first.
+    const first = which.stdout.split(/\r?\n/).map((l) => l.trim()).find((l) => l.length > 0);
+    if (first) {
+      _tmuxBinPath = first;
+      return first;
+    }
+  }
+  // Fallback: well-known location (matches the smoke probe / cdb.tmux.conf
+  // bundling) — emits the original name and lets node-pty surface ENOENT.
+  _tmuxBinPath = isWin ? 'tmux.exe' : 'tmux';
+  return _tmuxBinPath;
+}
+
+/**
+ * Probe whether a tmux session with the given name exists on the default
+ * socket. Cheap: synchronous `tmux has-session -t <name>` exits 0 if it does,
+ * non-zero otherwise. Returns false on any error (no tmux binary, etc.).
+ */
+function tmuxSessionExists(name: string): boolean {
+  try {
+    const r = spawnSync(resolveTmuxBin(), ['has-session', '-t', name], {
+      encoding: 'utf8',
+      timeout: 1500,
+    });
+    return r.status === 0;
+  } catch {
+    return false;
+  }
+}
 
 // ============================================================================
 // Server boot
@@ -729,6 +774,26 @@ function renderTerminalHtml(instanceId: string, meta: TerminalHeaderMeta): strin
 // ============================================================================
 
 function attachWebsocket(ws: WebSocket, instanceId: string): void {
+  // T19: tmux-attach path. If the instance is a tmux-backed agent in our
+  // registry, spawn a per-viewer `tmux attach` IPty. xterm.js capability
+  // replies go INTO tmux (a TUI client) and never reach the agent — this is
+  // the structural fix for the viewer-input race.
+  const tmuxSession = tmuxSessionRegistry.get(instanceId);
+  if (tmuxSession) {
+    attachWebsocketViaTmux(ws, instanceId, tmuxSession.name);
+    return;
+  }
+
+  // Not in tmuxSessionRegistry — could be a foreign tmux session OR a leftover
+  // clawdevbox-spawned tmux session that survived a kernel restart (cdb_<id>
+  // name still alive in tmux). In either case, if a tmux session with the
+  // exact instance_id name exists, attach to it. Probe with `tmux has-session`
+  // (cheap; psmux returns exit 0 if found, non-zero otherwise).
+  if (!hasSession(instanceId) && tmuxSessionExists(instanceId)) {
+    attachWebsocketViaTmux(ws, instanceId, instanceId);
+    return;
+  }
+
   if (!hasSession(instanceId)) {
     // Pty has exited and been garbage-collected from the registry.
     // Fall back to the on-disk log so the viewer at least shows what
@@ -782,6 +847,100 @@ function attachWebsocket(ws: WebSocket, instanceId: string): void {
 
   ws.on('close', () => unsubscribe());
   ws.on('error', () => unsubscribe());
+}
+
+/**
+ * T19: spawn a per-viewer `tmux attach -t cdb_<instanceId>` IPty and wire it
+ * to the WebSocket. Each viewer gets its own attach process; closing the WS
+ * kills only that viewer's attach without affecting other viewers OR the
+ * agent (which keeps running in tmux).
+ */
+function attachWebsocketViaTmux(
+  ws: WebSocket,
+  instanceId: string,
+  tmuxSessionName: string,
+): void {
+  const tmuxBin = resolveTmuxBin();
+  const cfg = resolveConfig({
+    projectDir: process.env.CLAWDEVBOX_PROJECT_DIR ?? process.cwd(),
+    globalDir: process.env.CLAWDEVBOX_GLOBAL_DIR ?? '',
+  });
+  // See start.ts: default to the shared tmux server (no -L) because psmux on
+  // Windows doesn't multiplex sessions per named socket — every new-session
+  // creates a separate server process, which prevents `tmux attach` from
+  // finding the right server.
+  const tmuxSocket = (cfg as { tmux?: { socket: string | null } }).tmux?.socket ?? null;
+
+  const args: string[] = [];
+  if (tmuxSocket) args.push('-L', tmuxSocket);
+  args.push('attach-session', '-t', tmuxSessionName);
+
+  // eslint-disable-next-line no-console
+  console.log('[tmux-attach]', JSON.stringify({ bin: tmuxBin, args, cwd: process.cwd() }));
+
+  let ipty: ReturnType<typeof ptySpawn>;
+  try {
+    ipty = ptySpawn(tmuxBin, args, {
+      name: 'xterm-256color',
+      cols: 120,
+      rows: 30,
+      cwd: process.cwd(),
+      env: process.env as Record<string, string>,
+    });
+  } catch (err) {
+    try {
+      ws.send(JSON.stringify({
+        type: 'snapshot',
+        content: `[clawdevbox] failed to attach tmux viewer: ${(err as Error).message}\r\n`,
+        cols: 120, rows: 30, exited: true, exitCode: 1,
+      }));
+      ws.send(JSON.stringify({ type: 'exit', exitCode: 1 }));
+      ws.close(1011, 'tmux attach failed');
+    } catch { /* ignore */ }
+    return;
+  }
+
+  let closed = false;
+  ipty.onData((chunk) => {
+    if (closed || ws.readyState !== ws.OPEN) return;
+    try { ws.send(JSON.stringify({ type: 'data', chunk })); } catch { /* viewer drop */ }
+  });
+  ipty.onExit(({ exitCode }) => {
+    if (closed) return;
+    try { ws.send(JSON.stringify({ type: 'exit', exitCode: exitCode ?? 0 })); } catch {}
+    try { ws.close(1000, 'tmux attach exited'); } catch {}
+  });
+
+  ws.on('message', (raw) => {
+    if (closed) return;
+    let msg: unknown;
+    try { msg = JSON.parse(raw.toString('utf8')); } catch { return; }
+    if (!msg || typeof msg !== 'object') return;
+    const m = msg as Record<string, unknown>;
+    if (m.type === 'input' && typeof m.data === 'string') {
+      try { ipty.write(m.data); } catch { /* attach dead */ }
+    } else if (
+      m.type === 'resize' &&
+      typeof m.cols === 'number' &&
+      typeof m.rows === 'number'
+    ) {
+      try { ipty.resize(m.cols, m.rows); } catch { /* attach dead */ }
+    }
+    // 'kill' on a tmux-attach viewer just detaches (kill the attach IPty),
+    // not the agent. Use DELETE /api/sessions/<id> for full agent kill.
+    if (m.type === 'kill') {
+      try { ipty.kill(); } catch { /* ignore */ }
+      closed = true;
+    }
+  });
+
+  const cleanup = (): void => {
+    if (closed) return;
+    closed = true;
+    try { ipty.kill(); } catch { /* ignore */ }
+  };
+  ws.on('close', cleanup);
+  ws.on('error', cleanup);
 }
 
 /**

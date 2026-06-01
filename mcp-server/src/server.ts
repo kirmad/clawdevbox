@@ -29,6 +29,7 @@ import { registerRendererEntries } from './tools/renderer.ts';
 import { registerUiEntries } from './tools/ui.ts';
 import { registerFeedbackEntries } from './tools/feedback.ts';
 import { registerPathsEntries } from './tools/paths.ts';
+import { registerUpdateStatusEntries } from './tools/update-status.ts';
 import { discoverAndRegisterHostedTools, type HostedToolError } from './tools/hosted.ts';
 
 export interface BuiltServer {
@@ -66,6 +67,7 @@ function registerAllBuiltinEntries(ws: Workspace): void {
   registerNotifyEntries(ws);
   registerUiEntries(ws);
   registerPathsEntries(ws);
+  registerUpdateStatusEntries(ws);
 }
 
 /**

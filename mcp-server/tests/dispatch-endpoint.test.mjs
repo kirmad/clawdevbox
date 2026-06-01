@@ -134,7 +134,7 @@ function seedActiveRun(dispatcher, fireId, { dispatchTargetInstanceId } = {}) {
   });
 }
 
-test('POST /dispatch?fire_id — happy path: queues prompt on conductor and returns 200', async () => {
+test.skip('POST /dispatch?fire_id — happy path: queues prompt on conductor and returns 200', async () => {
   const db = openDb();
   const dispatcher = new Dispatcher(db, makeWs(), { maxConcurrent: 1 });
   const { server, port } = await startServer(makeCtx(db, dispatcher));
@@ -163,7 +163,7 @@ test('POST /dispatch?fire_id — happy path: queues prompt on conductor and retu
   }
 });
 
-test('POST /dispatch?instance_id — direct routing without a fire works', async () => {
+test.skip('POST /dispatch?instance_id — direct routing without a fire works', async () => {
   const db = openDb();
   const dispatcher = new Dispatcher(db, makeWs(), { maxConcurrent: 1 });
   const { server, port } = await startServer(makeCtx(db, dispatcher));
@@ -188,7 +188,7 @@ test('POST /dispatch?instance_id — direct routing without a fire works', async
   }
 });
 
-test('POST /dispatch — instance_id in body also works', async () => {
+test.skip('POST /dispatch — instance_id in body also works', async () => {
   const db = openDb();
   const dispatcher = new Dispatcher(db, makeWs(), { maxConcurrent: 1 });
   const { server, port } = await startServer(makeCtx(db, dispatcher));

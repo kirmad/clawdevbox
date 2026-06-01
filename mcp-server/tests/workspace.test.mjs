@@ -349,7 +349,11 @@ test('workspace + recipe.run surface', async (t) => {
     assert.equal(mcpConfig.mcpServers.clawdevbox.type, 'http');
     const headers = mcpConfig.mcpServers.clawdevbox.headers;
     assert.ok(headers, 'expected headers block in .mcp.json');
-    assert.ok(typeof headers.Authorization === 'string' && headers.Authorization.startsWith('Bearer '));
+    // Authorization is only written when the server has a secret configured.
+    // Without a secret the header is intentionally absent (see shared.ts writeMcpJson).
+    if (headers.Authorization !== undefined) {
+      assert.ok(typeof headers.Authorization === 'string' && headers.Authorization.startsWith('Bearer '));
+    }
     assert.equal(headers['X-Clawdevbox-Workspace-Id'], sc.workspace_id);
     assert.equal(headers['X-Clawdevbox-Recipe-Instance-Id'], sc.recipe_instance_id);
     assert.equal(headers['X-Clawdevbox-Project-Dir'], sc.workspace_path);

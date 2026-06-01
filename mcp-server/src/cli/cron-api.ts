@@ -316,29 +316,119 @@ export async function handleCronApi(
     const status = (url.searchParams.get('status') ?? 'all') as 'active' | 'archived' | 'all';
     const since = Number(url.searchParams.get('since') ?? 0) || 0;
     const limit = Math.min(Math.max(Number(url.searchParams.get('limit') ?? 50) || 50, 1), 200);
-    const { listSessions, getConductor, getSessionMeta } = await import('../pty-registry.ts');
+    const { listSessions, getSessionMeta } = await import('../pty-registry.ts');
+    const { tmuxSessionRegistry, tmuxSessionRuntime } = await import('../cli-sessions/tmux-session-runtime.ts');
     const { listAllSessions } = await import('../db/agent-sessions-store.ts');
     const db = ctx.db;
 
-    // Live rows from pty-registry — these win for state/queue_depth.
-    const liveRaw = listSessions();
-    const liveIds = new Set(liveRaw.map((s) => s.instanceId));
-    const live = liveRaw.map((s) => {
-      const cond = getConductor(s.instanceId);
+    // 1) Legacy pty-registry live entries (e2e-test-runner + anything not yet
+    // tmux-migrated).
+    const ptyLive = listSessions();
+    const liveIds = new Set(ptyLive.map((s) => s.instanceId));
+    const live: Array<{
+      instance_id: string;
+      live: true;
+      state: string;
+      queue_depth: number;
+      provider_id: string | null;
+      recipe_id: string | null;
+      cli_session_id: string | null;
+      workspace_id: string;
+      started_at: number;
+      ended_at: number | null;
+    }> = ptyLive.map((s) => {
       const meta = getSessionMeta(s.instanceId);
       return {
         instance_id: s.instanceId,
         live: true as const,
-        state: (cond?.state ?? (s.exited ? 'exited' : 'unknown')) as string,
-        queue_depth: cond?.pendingCount() ?? 0,
+        state: (s.exited ? 'exited' : 'unknown'),
+        queue_depth: 0,
         provider_id: meta?.agentCli ?? null,
         recipe_id: meta?.recipeId ?? null,
         cli_session_id: meta?.sessionId ?? null,
         workspace_id: s.workspaceId,
         started_at: meta?.startedAt ?? 0,
-        ended_at: null as number | null,
+        ended_at: null,
       };
     });
+
+    // 2) Tmux-backed live entries (T19+): copilot, claude, agency, echo-stub
+    // all spawn into tmuxSessionRegistry. Look up workspace + agent_cli from
+    // agent_sessions rows so the UI gets useful labels.
+    const tmuxEntries = tmuxSessionRegistry.list();
+    if (tmuxEntries.length > 0) {
+      const ids = tmuxEntries.map((e) => e.instanceId).filter((id) => !liveIds.has(id));
+      if (ids.length > 0) {
+        const placeholders = ids.map(() => '?').join(',');
+        const rows = db
+          .prepare(
+            `SELECT id, cli_session_id, recipe_instance_id, workspace_id, agent_cli,
+                    started_at, status_text, needs_user_input
+             FROM agent_sessions
+             WHERE recipe_instance_id IN (${placeholders})`,
+          )
+          .all(...ids) as Array<{
+          id: string;
+          cli_session_id: string | null;
+          recipe_instance_id: string;
+          workspace_id: string;
+          agent_cli: string;
+          started_at: number;
+          status_text: string | null;
+          needs_user_input: number;
+        }>;
+        const rowByInstance = new Map(rows.map((r) => [r.recipe_instance_id, r]));
+        for (const e of tmuxEntries) {
+          if (liveIds.has(e.instanceId)) continue;
+          const row = rowByInstance.get(e.instanceId);
+          live.push({
+            instance_id: e.instanceId,
+            live: true as const,
+            state: row?.needs_user_input ? 'needs_user_input' : (row?.status_text || 'running'),
+            queue_depth: 0,
+            provider_id: row?.agent_cli ?? null,
+            recipe_id: null,
+            cli_session_id: row?.cli_session_id ?? null,
+            workspace_id: row?.workspace_id ?? '',
+            started_at: row?.started_at ?? 0,
+            ended_at: null,
+          });
+          liveIds.add(e.instanceId);
+        }
+      }
+    }
+
+    // 3) Foreign tmux sessions — anything live in tmux that we didn't spawn
+    // (e.g., user's own `tmux new -s test1` session). Surfaces them in the
+    // UI with kind='foreign' so the user can attach for visibility, but
+    // distinguished visually from clawdevbox-owned sessions.
+    const foreignList: Array<typeof live[number] & { foreign: true }> = [];
+    try {
+      const allTmux = await tmuxSessionRuntime().list();
+      for (const s of allTmux) {
+        // Skip if already accounted for under its cdb_ instance id mapping.
+        // cdb_<id> sessions correspond to instance id `<id>` (no prefix).
+        const asInstance = s.name.startsWith('cdb_') ? s.name.slice(4) : s.name;
+        if (liveIds.has(asInstance)) continue;
+        foreignList.push({
+          instance_id: s.name,
+          live: true as const,
+          state: 'foreign',
+          queue_depth: 0,
+          provider_id: null,
+          recipe_id: null,
+          cli_session_id: null,
+          workspace_id: '',
+          started_at: 0,
+          ended_at: null,
+          foreign: true,
+        });
+        liveIds.add(s.name);
+      }
+    } catch {
+      // tmux runtime not initialized or tmux not on PATH — skip foreign list.
+    }
+    live.push(...foreignList);
 
     // Archived rows from agent_sessions; filter out anything already in
     // `live` so the dedupe key (instance_id) only carries the
@@ -371,15 +461,16 @@ export async function handleCronApi(
     }
 
     const enrich = (item: typeof live[number] | typeof archived[number]) => {
+      const isForeign = (item as { foreign?: boolean }).foreign === true;
       const recipeId = item.recipe_id ?? recipeMap[item.instance_id] ?? null;
-      const kind: 'main' | 'recipe' | 'adhoc' =
-        item.instance_id === 'main'
-          ? 'main'
-          : (recipeId && recipeId.startsWith('__adhoc_'))
-            ? 'adhoc'
-            : 'recipe';
+      const kind: 'main' | 'recipe' | 'adhoc' | 'foreign' =
+        isForeign ? 'foreign'
+          : item.instance_id === 'main' ? 'main'
+          : (recipeId && recipeId.startsWith('__adhoc_')) ? 'adhoc'
+          : 'recipe';
       const label =
-        kind === 'main' ? 'Main Agent'
+        kind === 'foreign' ? `tmux: ${item.instance_id}`
+          : kind === 'main' ? 'Main Agent'
           : kind === 'adhoc' ? `Spawn ${item.instance_id.slice(-8)}`
           : recipeId ?? item.instance_id;
       return { ...item, recipe_id: recipeId, kind, label };
@@ -496,15 +587,16 @@ export async function handleCronApi(
   {
     const m = path.match(/^\/api\/sessions\/([^/]+)\/?$/);
     if (m && method === 'GET') {
-      const { getConductor, hasSession, getSessionMeta } = await import('../pty-registry.ts');
+      const { hasSession, getSessionMeta } = await import('../pty-registry.ts');
       const instanceId = decodeURIComponent(m[1]!);
       if (!hasSession(instanceId)) { sendJson(res, 404, { error: 'session not found' }); return true; }
-      const cond = getConductor(instanceId);
       const meta = getSessionMeta(instanceId);
       sendJson(res, 200, {
         instance_id: instanceId,
-        state: cond?.state ?? 'unknown',
-        queue_depth: cond?.pendingCount() ?? 0,
+        // state + queue_depth: see comment in /api/sessions handler above.
+        // These will read from agent_sessions/pending-dispatch in T19.
+        state: 'unknown' as const,
+        queue_depth: 0,
         provider_id: meta?.agentCli ?? null,
         agent_session_id: meta?.sessionId ?? null,
       });
@@ -515,13 +607,43 @@ export async function handleCronApi(
     // /exit command). Idempotent: 200 whether or not the session existed.
     if (m && method === 'DELETE') {
       const { hasSession, killPty } = await import('../pty-registry.ts');
+      const { tmuxSessionRegistry } = await import('../cli-sessions/tmux-session-runtime.ts');
       const instanceId = decodeURIComponent(m[1]!);
-      if (!hasSession(instanceId)) {
-        sendJson(res, 200, { ok: true, killed: false, reason: 'not_live' });
+
+      // 1) Owned tmux session (in registry) — kill via session.kill() so the
+      // auto-unregister hook fires.
+      const owned = tmuxSessionRegistry.get(instanceId);
+      if (owned) {
+        try { await owned.kill(); } catch { /* best effort */ }
+        sendJson(res, 200, { ok: true, killed: true, kind: 'tmux' });
         return true;
       }
-      const ok = killPty(instanceId);
-      sendJson(res, 200, { ok: true, killed: ok });
+
+      // 2) Legacy IPty path.
+      if (hasSession(instanceId)) {
+        const ok = killPty(instanceId);
+        sendJson(res, 200, { ok: true, killed: ok, kind: 'pty' });
+        return true;
+      }
+
+      // 3) Foreign / leftover tmux session — `tmux kill-session -t <name>`.
+      // Probe first (cheap) so we can distinguish "killed" from "not_live".
+      const { spawnSync } = await import('node:child_process');
+      const tmuxBin = process.platform === 'win32' ? 'tmux.exe' : 'tmux';
+      const probe = spawnSync(tmuxBin, ['has-session', '-t', instanceId], {
+        encoding: 'utf8',
+        timeout: 1500,
+      });
+      if (probe.status === 0) {
+        const killed = spawnSync(tmuxBin, ['kill-session', '-t', instanceId], {
+          encoding: 'utf8',
+          timeout: 3000,
+        });
+        sendJson(res, 200, { ok: true, killed: killed.status === 0, kind: 'foreign-tmux' });
+        return true;
+      }
+
+      sendJson(res, 200, { ok: true, killed: false, reason: 'not_live' });
       return true;
     }
   }
@@ -684,6 +806,7 @@ export async function handleCronApi(
     return true;
   }
 
-  sendJson(res, 404, { error: 'not found', path });
-  return true;
+  // Not a cron-api route. Return false so the caller can try the next
+  // dispatcher (e.g. dispatchTerminalRequest for /terminal/<id>).
+  return false;
 }

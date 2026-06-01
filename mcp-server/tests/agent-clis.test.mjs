@@ -43,6 +43,7 @@ async function makeWs() {
 
 function captureSpawnCtx(realCtx) {
   let captured;
+  let capturedTmux;
   return {
     ...realCtx,
     spawnPty(file, args, opts) {
@@ -53,7 +54,26 @@ function captureSpawnCtx(realCtx) {
         onData() {}, write() {}, kill() {}, resize() {},
       };
     },
+    // Mirrors spawnPty for tmux-migrated providers. Returns a fake CliSession
+    // whose `exited` resolves on next microtask so test `await handle.exited`
+    // completes immediately.
+    async spawnTmuxSession(opts) {
+      capturedTmux = opts;
+      captured = { file: opts.command, args: opts.args, opts: { cwd: opts.cwd, env: opts.env, cols: opts.cols, rows: opts.rows } };
+      const exited = Promise.resolve({ exitCode: 0 });
+      return {
+        name: `cdb_${opts.name}`,
+        pid: async () => 12345,
+        exited,
+        sendText: async () => {},
+        sendKey: async () => {},
+        resize: async () => {},
+        snapshot: async () => '',
+        kill: async () => {},
+      };
+    },
     _captured() { return captured; },
+    _capturedTmux() { return capturedTmux; },
   };
 }
 

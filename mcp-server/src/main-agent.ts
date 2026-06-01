@@ -196,7 +196,7 @@ export async function startMainAgent(opts: MainAgentOptions): Promise<MainAgentS
       workspaceId: 'project',
       cols: 120,
       rows: 30,
-      ipty: handle.pty,
+      ipty: handle.pty!,
       provider,
       agentHandle: handle,
     });

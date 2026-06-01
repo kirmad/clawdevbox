@@ -363,7 +363,7 @@ export function registerRecipeEntries(ws: Workspace): void {
           .optional()
           .describe('Recipe-instance id to resume. When set, the agent CLI is spawned with --resume <session_id_of_resume_of> and the new instance is recorded as a continuation.'),
         spawn_mode: z.enum(['interactive', 'headless']).optional().describe(
-          "Spawn mode. 'headless' (default) exits when the prompt is complete. 'interactive' keeps the pty alive, exposing a SessionConductor so external callers can dispatch follow-up prompts.",
+          "Spawn mode. 'headless' (default) exits when the prompt is complete. 'interactive' keeps the tmux session alive so external callers can dispatch follow-up prompts via the /dispatch endpoint.",
         ),
       }),
     handler: async (args) => {

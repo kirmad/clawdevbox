@@ -42,18 +42,14 @@ export { writeMcpJson, cliPluginSync, cliPluginDiscover, parsePluginListOutput, 
 export type { DeliverInitialPromptOpts } from './shared.ts';
 export { trustCopilotWorkspace } from '../trust-workspace.ts';
 
+// Tmux session runtime — exposed for external plugin providers (e.g.
+// agency-cli) so they can spawn agents inside tmux sessions and register
+// them for dispatch routing. The runtime singleton is initialized at boot
+// in cli/start.ts via initTmuxSessionRuntime().
 export {
-  SessionConductor,
-  createSessionConductor,
-  SessionDisposedError,
-  SessionExitedError,
-  SessionTimeoutError,
-  UnsupportedProviderError,
-} from './session-conductor.ts';
-export type {
-  ConductorOpts,
-  ConductorState,
-  DispatchOpts,
-  DispatchResult,
-  DoneSignal,
-} from './session-conductor.ts';
+  tmuxSessionRuntime,
+  tmuxSessionRegistry,
+} from '../cli-sessions/tmux-session-runtime.ts';
+export type { CliSession, CliSessionSpawnOpts, CliSessionRuntime, SpecialKey } from '../cli-sessions/types.ts';
+
+

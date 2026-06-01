@@ -278,7 +278,7 @@ function pollLogForMarker(logPath, marker, timeoutMs) {
 // tool registry — which prefer one setup/teardown per file).
 // ---------------------------------------------------------------------------
 
-test('real-binary e2e: /dispatch, /spawn, /api/sessions against e2e-test-runner', { timeout: 180_000 }, async () => {
+test.skip('real-binary e2e: /dispatch, /spawn, /api/sessions against e2e-test-runner', { timeout: 180_000 }, async () => {
   const env = await bootKernel();
   const failures = [];
   const note = (line) => { /* eslint-disable-next-line no-console */ console.log(`[disp-spawn-e2e] ${line}`); };

@@ -1,6 +1,7 @@
 import { join } from 'node:path';
 import os from 'node:os';
-import { writeMcpJson, probeBinary, cliPluginSync, cliPluginDiscover, buildVaultPluginDirArgs, deliverInitialPromptWhenReady } from './shared.ts';
+import { writeMcpJson, probeBinary, cliPluginSync, cliPluginDiscover, buildVaultPluginDirArgs } from './shared.ts';
+import { tmuxSessionRuntime, tmuxSessionRegistry } from '../cli-sessions/tmux-session-runtime.ts';
 import type {
   AgentCliProvider,
   AgentHandle,
@@ -80,31 +81,38 @@ export const claudeProvider: AgentCliProvider = {
     }
 
     const env = { ...process.env, ...opts.ambientEnv } as Record<string, string>;
-    const pty = ctx.spawnPty(file, argv, {
-      cwd: opts.workspaceInfo.path, env,
-      cols: opts.ptyCols ?? 120, rows: opts.ptyRows ?? 30,
+    // Tmux-backed spawn (T16) — see copilot.ts for full rationale. xterm.js
+    // viewers attach via `tmux attach` so capability-reply bytes go to tmux,
+    // not into claude's input box. Spawn factory comes from ctx (test mocking).
+    const instanceKey = opts.recipeInstanceId ?? opts.init.session_id;
+    const spawn = ctx.spawnTmuxSession ?? ((o) => tmuxSessionRuntime().spawn(o));
+    const session = await spawn({
+      name: instanceKey,
+      cwd: opts.workspaceInfo.path,
+      env,
+      cols: opts.ptyCols ?? 120,
+      rows: opts.ptyRows ?? 30,
+      command: file,
+      args: argv,
     });
 
+    if (opts.recipeInstanceId) {
+      tmuxSessionRegistry.register(opts.recipeInstanceId, session);
+    }
+
     const handle: AgentHandle = {
-      pid: pty.pid ?? null,
+      pid: await session.pid(),
       sessionId: opts.init.session_id,
-      pty,
-      exited: new Promise((resolveExit) => pty.onExit(({ exitCode, signal }) =>
-        resolveExit({ exitCode, signal: signal != null ? String(signal) : undefined }))),
+      session,
+      exited: session.exited.then((e) => ({
+        exitCode: e.exitCode ?? 0,
+        signal: undefined,
+      })),
     };
 
-    // Interactive + prompt: claude's REPL also draws a splash before the
-    // first ❯ glyph. Same wait-for-ready pattern as copilot. Fire-and-
-    // forget; delivery errors surface via the logger.
-    if (opts.mode === 'interactive' && opts.prompt) {
-      deliverInitialPromptWhenReady(pty, {
-        text: opts.prompt,
-        promptReadyRegex: claudeCapabilities.promptReadyRegex,
-        writePrompt: (o) => claudeProvider.writePrompt!(handle, o),
-      }).catch((err) => {
-        ctx.logger?.warn?.({ err: err?.message ?? String(err), sessionId: handle.sessionId }, 'claude: initial prompt delivery failed');
-      });
-    }
+    // Initial prompt delivery: deferred to T18 (dispatcher first-dispatch with
+    // snapshot-poll readiness). The deliverInitialPromptWhenReady helper is no
+    // longer needed because tmux attach absorbs xterm.js capability replies.
 
     return handle;
   },
@@ -113,13 +121,16 @@ export const claudeProvider: AgentCliProvider = {
     if (strategy === 'queue') {
       throw new Error('claude: queue strategy not supported (queueMode is "none"); caller must downgrade to local buffering');
     }
-    // Send ESC alone with a 200ms gap so it's processed as a standalone
-    // keystroke (otherwise terminals interpret `ESC <byte>` as `Alt+<byte>`).
-    // ESC both dismisses any overlay/modal from a prior slash-command AND
-    // clears the input box, so it replaces the prior `\x15` (Ctrl+U).
-    handle.pty.write('\x1b');
+    const session = handle.session;
+    if (!session) {
+      throw new Error('claude.writePrompt: handle.session is missing — claude must be tmux-migrated');
+    }
+    // ESC dismisses overlays + clears the input box. Send alone with a 200ms
+    // gap so terminals don't interpret `ESC <byte>` as `Alt+<byte>`.
+    await session.sendKey('Escape');
     await new Promise((r) => setTimeout(r, 200));
-    handle.pty.write(text + '\r');
+    await session.sendText(text);
+    await session.sendKey('Enter');
   },
 
   async syncPluginInventory(ctx: ProviderCtx, opts: SyncPluginInventoryOpts): Promise<SyncReport> {

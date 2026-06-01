@@ -2,6 +2,7 @@ import { join } from 'node:path';
 import { mkdirSync } from 'node:fs';
 import { writeFileAtomic } from '../fs-util.ts';
 import { writeMcpJson } from './shared.ts';
+import { tmuxSessionRuntime, tmuxSessionRegistry } from '../cli-sessions/tmux-session-runtime.ts';
 import type { AgentCliProvider, AgentHandle, ProviderCtx, SpawnSessionOpts } from './types.ts';
 
 function renderScriptBody(opts: SpawnSessionOpts): string {
@@ -77,16 +78,42 @@ export const echoStubProvider: AgentCliProvider = {
     writeMcpJson(ctx, opts.workspaceInfo.path, opts.mcp);
 
     const env = { ...process.env, ...opts.ambientEnv } as Record<string, string>;
-    const pty = ctx.spawnPty(process.execPath, [scriptPath], {
-      cwd: opts.workspaceInfo.path, env,
-      cols: opts.ptyCols ?? 80, rows: opts.ptyRows ?? 24,
+    // Tmux-backed spawn. The agent process runs inside `tmux new-session -d -s
+    // cdb_<recipeInstanceId>`; sendText/sendKey route through `tmux send-keys`
+    // instead of writing to a raw pty fd.
+    //
+    // We prefer recipeInstanceId for the tmux session name (so /dispatch can
+    // find this session by instance id) but fall back to session_id for
+    // standalone spawns that aren't part of a recipe instance.
+    //
+    // The spawn factory is taken from ctx (allows test mocking) and falls back
+    // to the tmuxSessionRuntime() singleton in production.
+    const instanceKey = opts.recipeInstanceId ?? opts.init.session_id;
+    const spawn = ctx.spawnTmuxSession ?? ((o) => tmuxSessionRuntime().spawn(o));
+    const session = await spawn({
+      name: instanceKey,
+      cwd: opts.workspaceInfo.path,
+      env,
+      cols: opts.ptyCols ?? 80,
+      rows: opts.ptyRows ?? 24,
+      command: process.execPath,
+      args: [scriptPath],
     });
+
+    // Only register under recipeInstanceId so /dispatch routes match. Standalone
+    // spawns without a recipe-instance id are not dispatch-addressable.
+    if (opts.recipeInstanceId) {
+      tmuxSessionRegistry.register(opts.recipeInstanceId, session);
+    }
+
     return {
-      pid: pty.pid ?? null,
+      pid: await session.pid(),
       sessionId: opts.init.session_id,
-      pty,
-      exited: new Promise((resolveExit) => pty.onExit(({ exitCode, signal }) =>
-        resolveExit({ exitCode, signal: signal != null ? String(signal) : undefined }))),
+      session,
+      exited: session.exited.then((e) => ({
+        exitCode: e.exitCode ?? 0,
+        signal: undefined,
+      })),
     };
   },
 };

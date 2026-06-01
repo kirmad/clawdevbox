@@ -210,71 +210,40 @@ export function stripTuiNoise(s: string): string {
  * - `timeoutMs`: defaults to 60s. The promise rejects on timeout so callers
  *   can log the failure; the pty handle itself remains usable.
  */
+/**
+ * @deprecated DELETED in the tmux migration. Use
+ * `cli-sessions/wait-for-ready.ts` (snapshot-poll) instead — the byte-stream
+ * approach this used is meaningless under tmux because xterm.js viewers
+ * route their input bytes to `tmux attach`, not to the agent fd.
+ *
+ * Kept as a type-only re-export for transitional source compatibility with
+ * any external plugin that still imports it. Will be deleted entirely once
+ * agency-provider's feat/tmux-migration branch is published.
+ */
 export interface DeliverInitialPromptOpts {
   text: string;
   promptReadyRegex: RegExp;
   writePrompt: (opts: { text: string; strategy: 'submit' | 'queue' }) => Promise<void>;
   timeoutMs?: number;
   stableMs?: number;
-  /**
-   * Optional positive regex. When set, the buffer must match BOTH this AND
-   * `promptReadyRegex` before the stable timer starts.
-   *
-   * Why: copilot draws its `❯` prompt char early during initialization,
-   * BEFORE the rest of its UI scaffolding (model line, hint bar, MCP
-   * server status). Writing keystrokes during this intermediate state
-   * puts text into the input box but the `\r` submit is silently absorbed
-   * — copilot's input handler hasn't fully wired up yet. Empirically the
-   * model line (`context (\d+%)`) is the last thing to render, so waiting
-   * for it ensures the input handler is closer to ready.
-   *
-   * Pair with a longer `stableMs` (e.g. 2500ms) to also wait past any
-   * loading spinner that keeps emitting frames after the model line draws.
-   */
   fullyRenderedRegex?: RegExp;
 }
 
+/**
+ * @deprecated See DeliverInitialPromptOpts. Throws if called — the helper
+ * has no role in the tmux model; callers should use `waitForReady` then
+ * dispatch the initial prompt via the standard dispatcher.dispatchToInstance
+ * path.
+ */
 export function deliverInitialPromptWhenReady(
-  pty: { onData: (cb: (chunk: string) => void) => { dispose(): void } },
-  opts: DeliverInitialPromptOpts,
+  _pty: unknown,
+  _opts: DeliverInitialPromptOpts,
 ): Promise<'delivered'> {
-  const { text, promptReadyRegex, fullyRenderedRegex, writePrompt } = opts;
-  const timeoutMs = opts.timeoutMs ?? 60_000;
-  const stableMs = opts.stableMs ?? 250;
-  return new Promise<'delivered'>((resolve, reject) => {
-    let buf = '';
-    let stableTimer: NodeJS.Timeout | null = null;
-    let done = false;
-    const sub = pty.onData((chunk) => {
-      if (done) return;
-      buf = (buf + stripTuiNoise(chunk)).slice(-4096);
-      const ready = promptReadyRegex.test(buf) && (!fullyRenderedRegex || fullyRenderedRegex.test(buf));
-      if (!ready) {
-        if (stableTimer) { clearTimeout(stableTimer); stableTimer = null; }
-        return;
-      }
-      if (stableTimer) clearTimeout(stableTimer);
-      stableTimer = setTimeout(async () => {
-        if (done) return;
-        done = true;
-        try { sub.dispose(); } catch { /* ignore */ }
-        clearTimeout(safetyTimer);
-        try {
-          await writePrompt({ text, strategy: 'submit' });
-          resolve('delivered');
-        } catch (err) {
-          reject(err instanceof Error ? err : new Error(String(err)));
-        }
-      }, stableMs);
-    });
-    const safetyTimer = setTimeout(() => {
-      if (done) return;
-      done = true;
-      if (stableTimer) clearTimeout(stableTimer);
-      try { sub.dispose(); } catch { /* ignore */ }
-      reject(new Error(`initial prompt: timed out after ${timeoutMs}ms waiting for prompt-ready`));
-    }, timeoutMs);
-  });
+  return Promise.reject(
+    new Error(
+      'deliverInitialPromptWhenReady was removed in the tmux migration. Use cli-sessions/wait-for-ready.ts and dispatch initial prompts via the dispatcher.',
+    ),
+  );
 }
 
 export function parsePluginListOutput(

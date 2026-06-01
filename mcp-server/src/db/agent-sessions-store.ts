@@ -35,6 +35,9 @@ export interface AgentSessionRow {
   error: string | null;
   resume_of_agent_session_id: string | null;
   interactive: number;
+  status_text: string | null;
+  needs_user_input: number;
+  last_status_at: number | null;
 }
 
 export function mintSessionId(): string {
@@ -202,4 +205,16 @@ export function markResumedInto(
      WHERE recipe_instance_id = ?`,
   ).run(newInstanceId, oldInstanceId);
   emitChange('sessions');
+}
+
+export function updateStatus(
+  db: Database,
+  id: string,
+  payload: { text: string | null; needs_user_input: boolean; ts: number },
+): void {
+  db.prepare(
+    `UPDATE agent_sessions
+      SET status_text = ?, needs_user_input = ?, last_status_at = ?
+     WHERE id = ?`,
+  ).run(payload.text, payload.needs_user_input ? 1 : 0, payload.ts, id);
 }
