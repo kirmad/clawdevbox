@@ -83,6 +83,23 @@ function resolveTmuxBin(): string {
   return _tmuxBinPath;
 }
 
+/**
+ * Probe whether a tmux session with the given name exists on the default
+ * socket. Cheap: synchronous `tmux has-session -t <name>` exits 0 if it does,
+ * non-zero otherwise. Returns false on any error (no tmux binary, etc.).
+ */
+function tmuxSessionExists(name: string): boolean {
+  try {
+    const r = spawnSync(resolveTmuxBin(), ['has-session', '-t', name], {
+      encoding: 'utf8',
+      timeout: 1500,
+    });
+    return r.status === 0;
+  } catch {
+    return false;
+  }
+}
+
 // ============================================================================
 // Server boot
 // ============================================================================
@@ -757,20 +774,22 @@ function renderTerminalHtml(instanceId: string, meta: TerminalHeaderMeta): strin
 // ============================================================================
 
 function attachWebsocket(ws: WebSocket, instanceId: string): void {
-  // T19: tmux-attach path. If the instance is a tmux-backed agent, spawn a
-  // per-viewer `tmux attach` IPty. xterm.js capability replies go INTO tmux
-  // (a TUI client) and never reach the agent — this is the structural fix
-  // for the viewer-input race that motivated the gate in pty-registry.
+  // T19: tmux-attach path. If the instance is a tmux-backed agent in our
+  // registry, spawn a per-viewer `tmux attach` IPty. xterm.js capability
+  // replies go INTO tmux (a TUI client) and never reach the agent — this is
+  // the structural fix for the viewer-input race.
   const tmuxSession = tmuxSessionRegistry.get(instanceId);
   if (tmuxSession) {
     attachWebsocketViaTmux(ws, instanceId, tmuxSession.name);
     return;
   }
 
-  // Foreign tmux session — the user is viewing one of their own non-clawdevbox
-  // tmux sessions (surfaced by /api/sessions as kind='foreign'). The
-  // instance_id IS the tmux session name in this case. Try attaching by name.
-  if (!instanceId.startsWith('cdb_') && !hasSession(instanceId)) {
+  // Not in tmuxSessionRegistry — could be a foreign tmux session OR a leftover
+  // clawdevbox-spawned tmux session that survived a kernel restart (cdb_<id>
+  // name still alive in tmux). In either case, if a tmux session with the
+  // exact instance_id name exists, attach to it. Probe with `tmux has-session`
+  // (cheap; psmux returns exit 0 if found, non-zero otherwise).
+  if (!hasSession(instanceId) && tmuxSessionExists(instanceId)) {
     attachWebsocketViaTmux(ws, instanceId, instanceId);
     return;
   }
