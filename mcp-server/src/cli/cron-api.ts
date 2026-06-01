@@ -316,33 +316,87 @@ export async function handleCronApi(
     const status = (url.searchParams.get('status') ?? 'all') as 'active' | 'archived' | 'all';
     const since = Number(url.searchParams.get('since') ?? 0) || 0;
     const limit = Math.min(Math.max(Number(url.searchParams.get('limit') ?? 50) || 50, 1), 200);
-    const { listSessions, getConductor, getSessionMeta } = await import('../pty-registry.ts');
+    const { listSessions, getSessionMeta } = await import('../pty-registry.ts');
+    const { tmuxSessionRegistry } = await import('../cli-sessions/tmux-session-runtime.ts');
     const { listAllSessions } = await import('../db/agent-sessions-store.ts');
     const db = ctx.db;
 
-    // Live rows from pty-registry — these win for state/queue_depth.
-    const liveRaw = listSessions();
-    const liveIds = new Set(liveRaw.map((s) => s.instanceId));
-    const live = liveRaw.map((s) => {
-      // getConductor is a null-returning compat stub since the tmux migration;
-      // state/queue_depth come from agent_sessions.status_text and pending-
-      // dispatch-registry once T19 rewires this surface. For now we report
-      // `'unknown'` (or `'exited'` when the pty has exited) and queue_depth 0.
-      void getConductor(s.instanceId);
+    // 1) Legacy pty-registry live entries (e2e-test-runner + anything not yet
+    // tmux-migrated).
+    const ptyLive = listSessions();
+    const liveIds = new Set(ptyLive.map((s) => s.instanceId));
+    const live: Array<{
+      instance_id: string;
+      live: true;
+      state: string;
+      queue_depth: number;
+      provider_id: string | null;
+      recipe_id: string | null;
+      cli_session_id: string | null;
+      workspace_id: string;
+      started_at: number;
+      ended_at: number | null;
+    }> = ptyLive.map((s) => {
       const meta = getSessionMeta(s.instanceId);
       return {
         instance_id: s.instanceId,
         live: true as const,
-        state: (s.exited ? 'exited' : 'unknown') as string,
+        state: (s.exited ? 'exited' : 'unknown'),
         queue_depth: 0,
         provider_id: meta?.agentCli ?? null,
         recipe_id: meta?.recipeId ?? null,
         cli_session_id: meta?.sessionId ?? null,
         workspace_id: s.workspaceId,
         started_at: meta?.startedAt ?? 0,
-        ended_at: null as number | null,
+        ended_at: null,
       };
     });
+
+    // 2) Tmux-backed live entries (T19+): copilot, claude, agency, echo-stub
+    // all spawn into tmuxSessionRegistry. Look up workspace + agent_cli from
+    // agent_sessions rows so the UI gets useful labels.
+    const tmuxEntries = tmuxSessionRegistry.list();
+    if (tmuxEntries.length > 0) {
+      const ids = tmuxEntries.map((e) => e.instanceId).filter((id) => !liveIds.has(id));
+      if (ids.length > 0) {
+        const placeholders = ids.map(() => '?').join(',');
+        const rows = db
+          .prepare(
+            `SELECT id, cli_session_id, recipe_instance_id, workspace_id, agent_cli,
+                    started_at, status_text, needs_user_input
+             FROM agent_sessions
+             WHERE recipe_instance_id IN (${placeholders})`,
+          )
+          .all(...ids) as Array<{
+          id: string;
+          cli_session_id: string | null;
+          recipe_instance_id: string;
+          workspace_id: string;
+          agent_cli: string;
+          started_at: number;
+          status_text: string | null;
+          needs_user_input: number;
+        }>;
+        const rowByInstance = new Map(rows.map((r) => [r.recipe_instance_id, r]));
+        for (const e of tmuxEntries) {
+          if (liveIds.has(e.instanceId)) continue;
+          const row = rowByInstance.get(e.instanceId);
+          live.push({
+            instance_id: e.instanceId,
+            live: true as const,
+            state: row?.needs_user_input ? 'needs_user_input' : (row?.status_text || 'running'),
+            queue_depth: 0,
+            provider_id: row?.agent_cli ?? null,
+            recipe_id: null,
+            cli_session_id: row?.cli_session_id ?? null,
+            workspace_id: row?.workspace_id ?? '',
+            started_at: row?.started_at ?? 0,
+            ended_at: null,
+          });
+          liveIds.add(e.instanceId);
+        }
+      }
+    }
 
     // Archived rows from agent_sessions; filter out anything already in
     // `live` so the dedupe key (instance_id) only carries the
