@@ -689,6 +689,7 @@ export async function handleCronApi(
     return true;
   }
 
-  sendJson(res, 404, { error: 'not found', path });
-  return true;
+  // Not a cron-api route. Return false so the caller can try the next
+  // dispatcher (e.g. dispatchTerminalRequest for /terminal/<id>).
+  return false;
 }

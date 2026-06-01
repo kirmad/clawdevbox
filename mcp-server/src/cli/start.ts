@@ -386,7 +386,14 @@ export async function runStart(flags: Flags): Promise<void> {
   // (copilot, claude, agency, echo-stub). Probes the tmux binary first;
   // fatal-exit if missing.
   {
-    const tmuxSocket = cfg.tmux?.socket ?? 'clawdevbox';
+    // Default to the shared tmux server (no -L). psmux on Windows creates a
+    // SEPARATE server per `new-session -L <name>` invocation rather than
+    // multiplexing one server per socket name (real-tmux behavior), which
+    // breaks `tmux attach` from secondary clients. Using the default socket
+    // forces psmux to multiplex on one process, which works correctly. Set
+    // `cfg.tmux.socket` to a non-null string only if you NEED isolation
+    // (e.g., multiple clawdevbox instances on the same machine).
+    const tmuxSocket = cfg.tmux?.socket ?? null;
     const tmuxConfPath = bundledTmuxConfPath();
     const tmuxClient = { socket: tmuxSocket, configPath: tmuxConfPath };
 

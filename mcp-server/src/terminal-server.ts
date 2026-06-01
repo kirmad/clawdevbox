@@ -833,19 +833,27 @@ function attachWebsocketViaTmux(
   instanceId: string,
   tmuxSessionName: string,
 ): void {
+  const tmuxBin = resolveTmuxBin();
   const cfg = resolveConfig({
     projectDir: process.env.CLAWDEVBOX_PROJECT_DIR ?? process.cwd(),
     globalDir: process.env.CLAWDEVBOX_GLOBAL_DIR ?? '',
   });
-  const tmuxSocket = (cfg as { tmux?: { socket: string | null } }).tmux?.socket ?? 'clawdevbox';
+  // See start.ts: default to the shared tmux server (no -L) because psmux on
+  // Windows doesn't multiplex sessions per named socket — every new-session
+  // creates a separate server process, which prevents `tmux attach` from
+  // finding the right server.
+  const tmuxSocket = (cfg as { tmux?: { socket: string | null } }).tmux?.socket ?? null;
 
   const args: string[] = [];
   if (tmuxSocket) args.push('-L', tmuxSocket);
   args.push('attach-session', '-t', tmuxSessionName);
 
+  // eslint-disable-next-line no-console
+  console.log('[tmux-attach]', JSON.stringify({ bin: tmuxBin, args, cwd: process.cwd() }));
+
   let ipty: ReturnType<typeof ptySpawn>;
   try {
-    ipty = ptySpawn(resolveTmuxBin(), args, {
+    ipty = ptySpawn(tmuxBin, args, {
       name: 'xterm-256color',
       cols: 120,
       rows: 30,
