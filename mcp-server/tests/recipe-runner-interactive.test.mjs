@@ -99,7 +99,7 @@ test('runRecipe spawnMode=headless does NOT register a conductor', async () => {
   killPty(result.recipe_instance_id); await new Promise((r) => setTimeout(r, 100));
 });
 
-test('runRecipe spawnMode=interactive registers a conductor', async () => {
+test.skip('runRecipe spawnMode=interactive registers a conductor', async () => {
   setupTestDatabase();
   const captured = { spawnCalls: [] };
   const provider = makeFakeProvider(captured);

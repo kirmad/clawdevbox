@@ -26,7 +26,11 @@
 import type { IPty } from 'node-pty';
 import { spawnSync } from 'node:child_process';
 import type { AgentCliProvider, AgentHandle } from './agent-clis/types.ts';
-import { createSessionConductor, UnsupportedProviderError, type SessionConductor } from './agent-clis/session-conductor.ts';
+// SessionConductor was removed in the tmux migration. The legacy `conductor`
+// field on PtyEntry is retained as null-only for source-level compat with
+// call sites that read it; pending-dispatch-registry now owns dispatch
+// queueing, and update_status MCP tool owns done-detection.
+type SessionConductor = never;
 import { emitChange } from './event-bus.ts';
 import { logger } from './logger.ts';
 
@@ -187,36 +191,8 @@ export function registerPty(opts: PtyRegisterOptions): void {
     pendingResize: null,
   };
 
-  let conductor: SessionConductor | null = null;
-  if (opts.provider && opts.agentHandle) {
-    try {
-      conductor = createSessionConductor({
-        handle: opts.agentHandle,
-        provider: opts.provider,
-        role: opts.instanceId,
-      });
-    } catch (err) {
-      // UnsupportedProviderError is expected: provider lacks capabilities
-      // or writePrompt (e.g. echo-stub). The session remains valid for
-      // raw terminal viewing — the caller just can't dispatch through
-      // the conductor API. Anything else is unexpected and worth a log:
-      // the handle could be malformed (closed pty, missing exited
-      // thenable, etc.) and silently returning null hides that.
-      if (err instanceof UnsupportedProviderError) {
-        conductor = null;
-      } else {
-        logger.warn(
-          {
-            instance_id: opts.instanceId,
-            provider_id: opts.provider.id,
-            err: err instanceof Error ? err.message : String(err),
-          },
-          'pty-registry: unexpected error creating SessionConductor; session will have no conductor',
-        );
-        conductor = null;
-      }
-    }
-  }
+  // Conductor creation removed in tmux migration; see src/pending-dispatch-registry.ts
+  const conductor: SessionConductor | null = null;
   session.conductor = conductor;
 
   const initialPromptDelivery = initialPromptDeliveryOf(opts.agentHandle);
@@ -247,9 +223,6 @@ export function registerPty(opts: PtyRegisterOptions): void {
   opts.ipty.onExit(({ exitCode, signal }) => {
     session.exited = true;
     session.exitCode = exitCode ?? 0;
-    if (session.conductor) {
-      try { session.conductor.dispose(); } catch { /* idempotent */ }
-    }
     for (const sub of session.subscribers) {
       try { sub({ type: 'exit', exitCode: exitCode ?? 0, signal }); } catch { /* viewer drop */ }
     }
@@ -291,14 +264,12 @@ export function getSessionMeta(instanceId: string): PtySessionMeta | null {
 }
 
 /**
- * Return the SessionConductor for `instanceId`, or null if:
- *  - the session is unknown,
- *  - the session was registered without a provider+agentHandle pair, or
- *  - the provider didn't declare capabilities/writePrompt (conductor creation threw).
+ * Compatibility stub. SessionConductor was removed in the tmux migration;
+ * callers should subscribe to `pending-dispatch-registry` for dispatch state
+ * and `agent_sessions.status_text/needs_user_input` for live status.
  */
-export function getConductor(instanceId: string): SessionConductor | null {
-  const s = sessions.get(instanceId);
-  return s ? s.conductor : null;
+export function getConductor(_instanceId: string): SessionConductor | null {
+  return null;
 }
 
 export function subscribe(

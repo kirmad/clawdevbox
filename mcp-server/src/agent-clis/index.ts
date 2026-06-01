@@ -42,18 +42,4 @@ export { writeMcpJson, cliPluginSync, cliPluginDiscover, parsePluginListOutput, 
 export type { DeliverInitialPromptOpts } from './shared.ts';
 export { trustCopilotWorkspace } from '../trust-workspace.ts';
 
-export {
-  SessionConductor,
-  createSessionConductor,
-  SessionDisposedError,
-  SessionExitedError,
-  SessionTimeoutError,
-  UnsupportedProviderError,
-} from './session-conductor.ts';
-export type {
-  ConductorOpts,
-  ConductorState,
-  DispatchOpts,
-  DispatchResult,
-  DoneSignal,
-} from './session-conductor.ts';
+

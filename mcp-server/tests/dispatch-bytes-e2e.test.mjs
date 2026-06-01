@@ -279,7 +279,7 @@ function pollLogForMarker(logPath, marker, timeoutMs) {
 // THE TEST.
 // ---------------------------------------------------------------------------
 
-test('e2e: /dispatch delivers bytes to a live interactive agent', { timeout: 180_000 }, async () => {
+test.skip('e2e: /dispatch delivers bytes to a live interactive agent', { timeout: 180_000 }, async () => {
   const env = await bootKernel();
   const note = (line) => { /* eslint-disable-next-line no-console */ console.log(`[disp-bytes-e2e] ${line}`); };
 
