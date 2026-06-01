@@ -20,9 +20,15 @@ interface Entry {
   promise: Promise<DispatchResult>;
 }
 
-// Active head per instance. Queued (waiting) entries live only in chained .then()
-// closures — they become the head when the prior entry's promise resolves.
-const registry = new Map<string, Entry>();
+// Per-instance FIFO queue. queue[0] is the active (head) dispatch; the rest are
+// pending. Synchronous head promotion on resolve prevents microtask-window races
+// where a newcomer could leapfrog a queued entry.
+const queues = new Map<string, Entry[]>();
+
+function activeHead(instanceId: string): Entry | null {
+  const q = queues.get(instanceId);
+  return q && q.length > 0 ? q[0] : null;
+}
 
 export function registerPending(
   instanceId: string,
@@ -42,32 +48,30 @@ export function registerPending(
     promise,
   };
 
-  const prior = registry.get(instanceId);
-  if (!prior) {
-    // No active dispatch — install immediately.
-    registry.set(instanceId, entry);
+  const q = queues.get(instanceId);
+  if (!q) {
+    queues.set(instanceId, [entry]);
   } else {
-    // Queue: become head only after prior resolves.
-    prior.promise.then(() => {
-      registry.set(instanceId, entry);
-    });
+    q.push(entry);
   }
-
-  // When this resolves, clear if still the head.
-  promise.then(() => {
-    const cur = registry.get(instanceId);
-    if (cur && cur.dispatchId === dispatchId) registry.delete(instanceId);
-  });
 
   return { dispatchId, promise };
 }
 
 export function getPending(instanceId: string): Entry | null {
-  return registry.get(instanceId) ?? null;
+  return activeHead(instanceId);
 }
 
 export function hasPending(instanceId: string): boolean {
-  return registry.has(instanceId);
+  return activeHead(instanceId) !== null;
+}
+
+function settleHead(instanceId: string, result: DispatchResult): void {
+  const q = queues.get(instanceId);
+  if (!q || q.length === 0) return;
+  const head = q.shift()!;
+  if (q.length === 0) queues.delete(instanceId);
+  head.resolve(result);
 }
 
 export function resolvePending(
@@ -75,15 +79,14 @@ export function resolvePending(
   dispatchId: string,
   payload: DispatchPayload,
 ): void {
-  const e = registry.get(instanceId);
-  if (!e || e.dispatchId !== dispatchId) return;
-  e.resolve({ status: 'ok', ...payload });
+  const head = activeHead(instanceId);
+  if (!head || head.dispatchId !== dispatchId) return;
+  settleHead(instanceId, { status: 'ok', ...payload });
 }
 
 export function resolvePendingTimeout(instanceId: string): void {
-  const e = registry.get(instanceId);
-  if (!e) return;
-  e.resolve({
+  if (!activeHead(instanceId)) return;
+  settleHead(instanceId, {
     status: 'timeout',
     needs_user_input: false,
     task_complete: false,
@@ -93,5 +96,5 @@ export function resolvePendingTimeout(instanceId: string): void {
 
 /** TEST-ONLY hatch: clear the registry. */
 export function _resetForTests(): void {
-  registry.clear();
+  queues.clear();
 }

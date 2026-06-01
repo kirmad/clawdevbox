@@ -74,3 +74,22 @@ test('needs_user_input alone is a valid resolution (not just task_complete)', as
   assert.equal(r.task_complete, false);
   assert.equal(r.status, 'ok');
 });
+
+test('three concurrent dispatches resolve in FIFO order (no queue-jump race)', async () => {
+  _resetForTests();
+  // Register A, B, C synchronously. Each must complete in order with no
+  // entry getting lost — even though A may resolve before C is registered.
+  const a = registerPending('inst-G', 'first');
+  const b = registerPending('inst-G', 'second');
+  resolvePending('inst-G', a.dispatchId, { task_complete: true, needs_user_input: false, doneAt: 1 });
+  // A just resolved. B is now head. Synchronously register C — under the old
+  // microtask-chained implementation, C could overwrite B and B would be orphaned.
+  const c = registerPending('inst-G', 'third');
+  await a.promise;
+  // B must still be head, not C.
+  resolvePending('inst-G', b.dispatchId, { task_complete: true, needs_user_input: false, doneAt: 2 });
+  await b.promise;
+  resolvePending('inst-G', c.dispatchId, { task_complete: true, needs_user_input: false, doneAt: 3 });
+  await c.promise;
+  assert.equal(hasPending('inst-G'), false);
+});
