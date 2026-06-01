@@ -1,6 +1,7 @@
 import { join } from 'node:path';
 import os from 'node:os';
-import { writeMcpJson, probeBinary, cliPluginSync, cliPluginDiscover, buildVaultPluginDirArgs, deliverInitialPromptWhenReady } from './shared.ts';
+import { writeMcpJson, probeBinary, cliPluginSync, cliPluginDiscover, buildVaultPluginDirArgs } from './shared.ts';
+import { tmuxSessionRuntime, tmuxSessionRegistry } from '../cli-sessions/tmux-session-runtime.ts';
 import { trustCopilotWorkspace } from '../trust-workspace.ts';
 import type {
   AgentCliProvider,
@@ -104,41 +105,43 @@ export const copilotProvider: AgentCliProvider = {
     }
 
     const env = { ...process.env, ...opts.ambientEnv } as Record<string, string>;
-    const pty = ctx.spawnPty(bin, argv, {
-      cwd: opts.workspaceInfo.path, env,
-      cols: opts.ptyCols ?? 120, rows: opts.ptyRows ?? 30,
+    // Tmux-backed spawn (T15): the copilot.exe agent runs inside `tmux
+    // new-session -d -s cdb_<recipeInstanceId>`. xterm.js viewers attach via
+    // `tmux attach`, which STRUCTURALLY eliminates the viewer-input race
+    // class — DA1/cursor capability replies go to tmux (a TUI consumer)
+    // instead of into copilot's input box. The spawn factory is taken from
+    // ctx (test mocking) with the tmuxSessionRuntime() singleton as default.
+    const instanceKey = opts.recipeInstanceId ?? opts.init.session_id;
+    const spawn = ctx.spawnTmuxSession ?? ((o) => tmuxSessionRuntime().spawn(o));
+    const session = await spawn({
+      name: instanceKey,
+      cwd: opts.workspaceInfo.path,
+      env,
+      cols: opts.ptyCols ?? 120,
+      rows: opts.ptyRows ?? 30,
+      command: bin,
+      args: argv,
     });
 
+    if (opts.recipeInstanceId) {
+      tmuxSessionRegistry.register(opts.recipeInstanceId, session);
+    }
+
     const handle: AgentHandle = {
-      pid: pty.pid ?? null,
+      pid: await session.pid(),
       sessionId: opts.init.session_id,
-      pty,
-      exited: new Promise((resolveExit) => pty.onExit(({ exitCode, signal }) =>
-        resolveExit({ exitCode, signal: signal != null ? String(signal) : undefined }))),
+      session,
+      exited: session.exited.then((e) => ({
+        exitCode: e.exitCode ?? 0,
+        signal: undefined,
+      })),
     };
 
-    // Interactive + prompt: copilot's TUI takes a moment to draw its first
-    // ❯ glyph (splash screen, plugin probe, agent slot). Writing bytes
-    // before that point dumps them into a non-existent input box. Wait for
-    // a stable prompt-ready tail, then submit via the byte-correct
-    // writePrompt path. Fire-and-forget — the caller already has the
-    // handle; delivery errors are surfaced via the logger.
-    if (opts.mode === 'interactive' && opts.prompt) {
-      const initialPromptDelivery = deliverInitialPromptWhenReady(pty, {
-        text: opts.prompt,
-        promptReadyRegex: copilotCapabilities.promptReadyRegex,
-        fullyRenderedRegex: /context\s*\(\d+%\)/,
-        stableMs: 2500,
-        timeoutMs: 90_000,
-        writePrompt: (o) => copilotProvider.writePrompt!(handle, o),
-      });
-      (handle as AgentHandle & { initialPromptDelivery?: Promise<unknown> }).initialPromptDelivery = initialPromptDelivery;
-      initialPromptDelivery.then(() => {
-        ctx.logger?.info?.({ sessionId: handle.sessionId }, 'copilot: initial prompt delivered');
-      }).catch((err) => {
-        ctx.logger?.warn?.({ err: err?.message ?? String(err), sessionId: handle.sessionId }, 'copilot: initial prompt delivery failed');
-      });
-    }
+    // Initial prompt delivery: deferred to T18 (dispatcher-side first-dispatch
+    // pattern with snapshot-poll readiness gate). The deliverInitialPromptWhenReady
+    // helper previously called here is no longer needed because tmux attach
+    // routes xterm.js bytes to tmux (not the agent), eliminating the race that
+    // motivated the gate in the first place.
 
     return handle;
   },
@@ -168,13 +171,17 @@ export const copilotProvider: AgentCliProvider = {
   // For `strategy: 'queue'` (Ctrl+Q) the input box is committed to
   // Copilot's native queue and a fresh box opens; no clear is needed.
   async writePrompt(handle: AgentHandle, { text, strategy }: WritePromptOpts): Promise<void> {
+    const session = handle.session;
+    if (!session) {
+      throw new Error('copilot.writePrompt: handle.session is missing — copilot must be tmux-migrated');
+    }
     if (strategy === 'submit') {
-      handle.pty!.write('\x1b');
+      await session.sendKey('Escape');
       await sleep(200);
     }
-    handle.pty!.write(text);
+    await session.sendText(text);
     await sleep(SLEEP_BEFORE_COMMIT_MS);
-    handle.pty!.write(strategy === 'queue' ? '\x11' : '\r');
+    await session.sendKey(strategy === 'queue' ? 'C-q' : 'Enter');
   },
 
   async syncPluginInventory(ctx: ProviderCtx, opts: SyncPluginInventoryOpts): Promise<SyncReport> {

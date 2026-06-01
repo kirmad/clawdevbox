@@ -77,52 +77,56 @@ test('claude promptReadyRegex matches ❯ followed by NBSP + status bar (real cl
 // ---------------------------------------------------------------------------
 
 function fakeHandle() {
-  const writes = [];
+  const calls = [];
   return {
     handle: {
       pid: 1,
       sessionId: 'sess',
-      pty: {
-        write(data) { writes.push({ at: Date.now(), data }); },
-        onData() { return { dispose() {} }; },
-        onExit() { return { dispose() {} }; },
-        kill() {},
-        resize() {},
+      session: {
+        name: 'cdb_fake',
+        pid: async () => 1,
+        exited: new Promise(() => {}),
+        async sendText(t) { calls.push({ at: Date.now(), kind: 'text', data: t }); },
+        async sendKey(k) { calls.push({ at: Date.now(), kind: 'key', data: k }); },
+        async resize() {},
+        async snapshot() { return ''; },
+        async kill() {},
       },
       exited: new Promise(() => {}),
     },
-    writes,
+    calls,
   };
 }
 
-test('copilot writePrompt submit writes ESC (200ms gap) then text then CR with ~250ms gap', async () => {
-  const { handle, writes } = fakeHandle();
+test('copilot writePrompt submit sends Escape (200ms gap) then text then Enter with ~250ms gap', async () => {
+  const { handle, calls } = fakeHandle();
   await copilotProvider.writePrompt(handle, { text: 'hello world', strategy: 'submit' });
-  assert.equal(writes.length, 3);
-  assert.equal(writes[0].data, '\x1b');
-  assert.equal(writes[1].data, 'hello world');
-  assert.equal(writes[2].data, '\r');
-  const escGap = writes[1].at - writes[0].at;
+  assert.equal(calls.length, 3);
+  assert.deepEqual({ kind: calls[0].kind, data: calls[0].data }, { kind: 'key', data: 'Escape' });
+  assert.deepEqual({ kind: calls[1].kind, data: calls[1].data }, { kind: 'text', data: 'hello world' });
+  assert.deepEqual({ kind: calls[2].kind, data: calls[2].data }, { kind: 'key', data: 'Enter' });
+  const escGap = calls[1].at - calls[0].at;
   assert.ok(escGap >= 150, `expected ~200ms ESC gap, got ${escGap}ms`);
-  const submitGap = writes[2].at - writes[1].at;
+  const submitGap = calls[2].at - calls[1].at;
   assert.ok(submitGap >= 200, `expected ~250ms submit gap, got ${submitGap}ms`);
 });
 
-test('copilot writePrompt queue writes text then DC1 (Ctrl+Q) without ESC', async () => {
-  const { handle, writes } = fakeHandle();
+test('copilot writePrompt queue sends text then C-q (Ctrl+Q) without Escape', async () => {
+  const { handle, calls } = fakeHandle();
   await copilotProvider.writePrompt(handle, { text: 'follow up', strategy: 'queue' });
-  assert.equal(writes.length, 2);
-  assert.equal(writes[0].data, 'follow up');
-  assert.equal(writes[1].data, '\x11');
+  assert.equal(calls.length, 2);
+  assert.deepEqual({ kind: calls[0].kind, data: calls[0].data }, { kind: 'text', data: 'follow up' });
+  assert.deepEqual({ kind: calls[1].kind, data: calls[1].data }, { kind: 'key', data: 'C-q' });
 });
 
-test('claude writePrompt submit dismisses overlays with ESC (200ms gap) then writes text+CR', async () => {
-  const { handle, writes } = fakeHandle();
+test('claude writePrompt submit dismisses overlays with Escape (200ms gap) then sends text+Enter', async () => {
+  const { handle, calls } = fakeHandle();
   await claudeProvider.writePrompt(handle, { text: 'do thing', strategy: 'submit' });
-  assert.equal(writes.length, 2);
-  assert.equal(writes[0].data, '\x1b');
-  assert.equal(writes[1].data, 'do thing\r');
-  const escGap = writes[1].at - writes[0].at;
+  assert.equal(calls.length, 3);
+  assert.deepEqual({ kind: calls[0].kind, data: calls[0].data }, { kind: 'key', data: 'Escape' });
+  assert.deepEqual({ kind: calls[1].kind, data: calls[1].data }, { kind: 'text', data: 'do thing' });
+  assert.deepEqual({ kind: calls[2].kind, data: calls[2].data }, { kind: 'key', data: 'Enter' });
+  const escGap = calls[1].at - calls[0].at;
   assert.ok(escGap >= 150, `expected ~200ms ESC gap, got ${escGap}ms`);
 });
 
