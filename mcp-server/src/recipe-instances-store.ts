@@ -1,21 +1,20 @@
 /**
- * recipe-instances-store.ts (DB + JSON dual-write)
+ * recipe-instances-store.ts (DB-first; JSON file is a debounced legacy mirror)
  *
- * Storage for recipe-run instances (spec §6.1). Phase 4 — the SQLite
- * kernel DB is now the canonical store; the legacy on-disk
+ * Storage for recipe-run instances (spec §6.1). Phase 5 — the SQLite
+ * kernel DB is the canonical store. The legacy on-disk
  * `<workspace>/.clawdevbox/recipe-instances/<id>.json` files are
- * preserved as a write-through mirror so that:
+ * preserved as a debounced write-through mirror so that:
  *
- *   - the echo-stub child process (which mutates the JSON file directly
- *     to mark itself complete) keeps working
- *   - existing tests that introspect the JSON file shape keep passing
- *   - future phases (recipe-runner extraction) can flip the read path
- *     to the DB without churn here
+ *   - existing scripts / test fixtures that inspect the JSON file shape
+ *     keep working
+ *   - the on-disk files remain available for human inspection
  *
- * Reads prefer the JSON file (it's the live, sub-process-mutated copy);
- * if the file is missing, we fall back to the DB row. Writes go to
- * both: file first (atomic), then DB upsert + optional agent_sessions
- * row insert.
+ * Writes go to the DB synchronously (upsert via `upsertInstanceToDb`);
+ * the per-instance JSON file is scheduled 500ms after each write
+ * (mirrors the inbox pattern). Reads prefer the DB row; the JSON file
+ * is only used as a backward-compat fallback when the DB has no matching
+ * row (pre-V5 instances that were never re-saved).
  *
  * Schema mapping (RecipeInstance on disk → DB rows):
  *
@@ -33,8 +32,8 @@
  *     match by `step_id` and update status/message/timestamps.
  */
 
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import type { Database } from 'better-sqlite3';
 import { getDatabase } from './db/index.ts';
 import { ensureWorkspace } from './db/workspaces-store.ts';
@@ -478,38 +477,75 @@ function mirrorStepsToDb(
 }
 
 // ============================================================================
-// Read / write — file-primary, DB-mirror
+// Debounced JSON mirror (per-instance file, legacy inspection only)
+// ============================================================================
+
+const JSON_MIRROR_DEBOUNCE_MS = 500;
+/** Map of filePath → pending timer; one entry per in-flight debounce. */
+const pendingMirrorTimers = new Map<string, NodeJS.Timeout>();
+
+/**
+ * Schedule a debounced write of the DB-authoritative instance back to the
+ * legacy per-instance JSON file. Collapses rapid successive writes into one
+ * flush (500ms after the last call). Fires unref'd so it doesn't prevent
+ * process exit.
+ */
+function scheduleInstanceMirror(filePath: string, workspacePath: string, id: string): void {
+  if (pendingMirrorTimers.has(filePath)) return; // already pending
+  const timer = setTimeout(() => {
+    pendingMirrorTimers.delete(filePath);
+    const conn = safeDb();
+    if (!conn) return;
+    try {
+      const row = conn
+        .prepare('SELECT * FROM recipe_instances WHERE id = ?')
+        .get(id) as RecipeInstanceRow | undefined;
+      if (!row) return;
+      const instance = rowToInstance(conn, row, workspacePath);
+      mkdirSync(dirname(filePath), { recursive: true });
+      writeFileAtomic(filePath, JSON.stringify(instance, null, 2) + '\n');
+    } catch {
+      // best-effort mirror — DB is authoritative; mirror failure is non-fatal
+    }
+  }, JSON_MIRROR_DEBOUNCE_MS);
+  if (typeof timer.unref === 'function') timer.unref();
+  pendingMirrorTimers.set(filePath, timer);
+}
+
+// ============================================================================
+// Read / write — DB-primary, JSON-mirror
 // ============================================================================
 
 export function readRecipeInstance(
   workspacePath: string,
   id: string,
 ): RecipeInstance | null {
+  // DB-first (V5+). JSON file is fallback only for pre-V5 rows missing from DB.
+  const conn = safeDb();
+  if (conn) {
+    try {
+      const row = conn
+        .prepare('SELECT * FROM recipe_instances WHERE id = ? AND workspace_path = ?')
+        .get(id, workspacePath) as RecipeInstanceRow | undefined;
+      if (row) return rowToInstance(conn, row, workspacePath);
+    } catch {
+      // fall through to JSON fallback
+    }
+  }
+  // Legacy fallback: DB row missing but JSON file exists (pre-V5 backward compat).
   const p = recipeInstancePath(workspacePath, id);
   if (existsSync(p)) {
     try {
       return JSON.parse(readFileSync(p, 'utf8')) as RecipeInstance;
     } catch {
-      // fall through to DB read
+      // corrupt file — nothing to return
     }
   }
-  const conn = safeDb();
-  if (!conn) return null;
-  const row = conn
-    .prepare('SELECT * FROM recipe_instances WHERE id = ? AND workspace_path = ?')
-    .get(id, workspacePath) as RecipeInstanceRow | undefined;
-  if (!row) return null;
-  return rowToInstance(conn, row, workspacePath);
+  return null;
 }
 
 export function writeRecipeInstance(workspacePath: string, instance: RecipeInstance, opts?: { interactive?: boolean }): void {
-  // 1. Atomic file write (legacy primary).
-  writeFileAtomic(
-    recipeInstancePath(workspacePath, instance.id),
-    JSON.stringify(instance, null, 2) + '\n',
-  );
-
-  // 2. Snapshot sidecar — captures the YAML so the DB row can point at it.
+  // 1. Snapshot sidecar — synchronous (small text file, read-on-demand for display).
   if (instance.recipe_snapshot) {
     try {
       writeFileAtomic(
@@ -521,16 +557,22 @@ export function writeRecipeInstance(workspacePath: string, instance: RecipeInsta
     }
   }
 
-  // 3. DB mirror upsert.
+  // 2. DB upsert — authoritative and synchronous.
   const conn = safeDb();
   if (conn) {
     try {
       upsertInstanceToDb(conn, instance, opts);
     } catch {
-      // The file write is the source of truth in Phase 4; never let a
-      // DB hiccup mask a successful disk write to callers.
+      // Log-worthy but non-fatal: schedule a direct JSON write as emergency fallback.
     }
   }
+
+  // 3. Debounced JSON mirror (legacy, for human inspection / backward compat).
+  scheduleInstanceMirror(
+    recipeInstancePath(workspacePath, instance.id),
+    workspacePath,
+    instance.id,
+  );
 
   emitChange('recipes');
 }
@@ -671,56 +713,22 @@ export function listAllRecipeInstancesFromDb(): RecipeInstance[] {
 }
 
 /**
- * List every recipe instance under a workspace path. Returns an empty list
- * if the workspace has no `.clawdevbox/recipe-instances/` directory yet.
- * Corrupt or unreadable files are silently skipped so a single bad row
- * doesn't break the listing.
+ * List every recipe instance for a workspace. DB-only query — no directory
+ * scan. Returns an empty list when the DB is unavailable.
  */
 export function listRecipeInstancesInWorkspace(workspacePath: string): RecipeInstance[] {
-  const dir = recipeInstancesDir(workspacePath);
-  const out: RecipeInstance[] = [];
-  const seen = new Set<string>();
-
-  if (existsSync(dir)) {
-    let entries: string[];
-    try {
-      entries = readdirSync(dir);
-    } catch {
-      entries = [];
-    }
-    for (const name of entries) {
-      if (!name.endsWith('.json')) continue;
-      try {
-        const parsed = JSON.parse(readFileSync(join(dir, name), 'utf8')) as RecipeInstance;
-        if (parsed && typeof parsed.id === 'string') {
-          out.push(parsed);
-          seen.add(parsed.id);
-        }
-      } catch {
-        /* corrupt entry — skip */
-      }
-    }
-  }
-
-  // Pick up DB rows that don't have a corresponding JSON file yet.
   const conn = safeDb();
-  if (conn) {
-    try {
-      const ws = ensureWorkspace(conn, { path: workspacePath });
-      const rows = conn
-        .prepare(
-          `SELECT * FROM recipe_instances WHERE workspace_id = ?
-           ORDER BY started_at DESC`,
-        )
-        .all(ws.id) as RecipeInstanceRow[];
-      for (const row of rows) {
-        if (seen.has(row.id)) continue;
-        out.push(rowToInstance(conn, row, workspacePath));
-        seen.add(row.id);
-      }
-    } catch {
-      // ignore — DB might not be available in some test contexts
-    }
+  if (!conn) return [];
+  try {
+    const ws = ensureWorkspace(conn, { path: workspacePath });
+    const rows = conn
+      .prepare(
+        `SELECT * FROM recipe_instances WHERE workspace_id = ?
+         ORDER BY started_at DESC`,
+      )
+      .all(ws.id) as RecipeInstanceRow[];
+    return rows.map((row) => rowToInstance(conn, row, workspacePath));
+  } catch {
+    return [];
   }
-  return out;
 }
