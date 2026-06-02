@@ -11,6 +11,20 @@ import type { CliSession, CliSessionRuntime, CliSessionSpawnOpts } from './types
 // Runtime factory (unchanged from T6)
 // ============================================================================
 
+// Per-runtime cached `list()` result. Spawning `tmux list-sessions` costs
+// ~100ms on Windows psmux (subprocess fork is slow), and the SPA polls
+// /api/sessions every 2s, so without a cache every poll forks a child.
+// 1 second TTL keeps the response fresh enough for UI updates while
+// coalescing back-to-back probes from the SPA + terminal-server +
+// dispatcher into a single subprocess.
+const LIST_CACHE_TTL_MS = 1000;
+interface ListCacheEntry {
+  ts: number;
+  value: Array<{ name: string; alive: boolean }>;
+  inflight: Promise<Array<{ name: string; alive: boolean }>> | null;
+}
+const listCaches = new WeakMap<TmuxClientOpts, ListCacheEntry>();
+
 export function createTmuxSessionRuntime(client: TmuxClientOpts): CliSessionRuntime {
   return {
     async spawn(opts: CliSessionSpawnOpts): Promise<CliSession> {
@@ -20,19 +34,36 @@ export function createTmuxSessionRuntime(client: TmuxClientOpts): CliSessionRunt
       return adoptTmuxSession(client, name);
     },
     async list(): Promise<Array<{ name: string; alive: boolean }>> {
-      const r = await tmuxRunAsync(client, ['list-sessions', '-F', '#{session_name}']);
-      // psmux returns exitCode 0 with empty stdout if no server; real tmux returns 1
-      if (r.exitCode !== 0) return [];
-      const out: Array<{ name: string; alive: boolean }> = [];
-      for (const line of r.stdout.split('\n')) {
-        const n = line.trim();
-        const sessionName = n.split(/[:(\s]/)[0];
-        // Return ALL sessions (cdb_* + foreign). Callers filter as needed:
-        // reconcile adopts only cdb_* below; /api/sessions surfaces foreign
-        // sessions in the UI with a dimmer style.
-        if (sessionName) out.push({ name: sessionName, alive: true });
+      const now = Date.now();
+      let cache = listCaches.get(client);
+      if (cache) {
+        if (cache.inflight) return cache.inflight;
+        if (now - cache.ts < LIST_CACHE_TTL_MS) return cache.value;
+      } else {
+        cache = { ts: 0, value: [], inflight: null };
+        listCaches.set(client, cache);
       }
-      return out;
+      cache.inflight = (async () => {
+        try {
+          const r = await tmuxRunAsync(client, ['list-sessions', '-F', '#{session_name}']);
+          if (r.exitCode !== 0) return [];
+          const out: Array<{ name: string; alive: boolean }> = [];
+          for (const line of r.stdout.split('\n')) {
+            const n = line.trim();
+            const sessionName = n.split(/[:(\s]/)[0];
+            if (sessionName) out.push({ name: sessionName, alive: true });
+          }
+          return out;
+        } finally {
+          // Reset inflight before storing so concurrent callers see
+          // the new cache.value on the next call instead of a stale promise.
+          cache!.inflight = null;
+        }
+      })();
+      const value = await cache.inflight;
+      cache.value = value;
+      cache.ts = Date.now();
+      return value;
     },
   };
 }

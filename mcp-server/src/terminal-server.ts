@@ -85,16 +85,16 @@ function resolveTmuxBin(): string {
 
 /**
  * Probe whether a tmux session with the given name exists on the default
- * socket. Cheap: synchronous `tmux has-session -t <name>` exits 0 if it does,
- * non-zero otherwise. Returns false on any error (no tmux binary, etc.).
+ * socket. Uses the cached `tmuxSessionRuntime().list()` (1s TTL) instead of
+ * spawning a fresh `tmux has-session` subprocess — at SPA poll rates (every
+ * 2s on /api/sessions + per-WS-attach probe), forking a child on every
+ * check would block the Node event loop for 100ms+ on Windows psmux.
  */
-function tmuxSessionExists(name: string): boolean {
+async function tmuxSessionExists(name: string): Promise<boolean> {
   try {
-    const r = spawnSync(resolveTmuxBin(), ['has-session', '-t', name], {
-      encoding: 'utf8',
-      timeout: 1500,
-    });
-    return r.status === 0;
+    const { tmuxSessionRuntime } = await import('./cli-sessions/tmux-session-runtime.ts');
+    const list = await tmuxSessionRuntime().list();
+    return list.some((s) => s.name === name);
   } catch {
     return false;
   }
@@ -174,7 +174,7 @@ export async function startTerminalServer(opts: {
     }
     const instanceId = wsMatch[1];
     wsServer!.handleUpgrade(req, socket, head, (ws) => {
-      attachWebsocket(ws, instanceId);
+      void attachWebsocket(ws, instanceId);
     });
   });
 
@@ -773,7 +773,7 @@ function renderTerminalHtml(instanceId: string, meta: TerminalHeaderMeta): strin
 // WS handler
 // ============================================================================
 
-function attachWebsocket(ws: WebSocket, instanceId: string): void {
+async function attachWebsocket(ws: WebSocket, instanceId: string): Promise<void> {
   // T19: tmux-attach path. If the instance is a tmux-backed agent in our
   // registry, spawn a per-viewer `tmux attach` IPty. xterm.js capability
   // replies go INTO tmux (a TUI client) and never reach the agent — this is
@@ -787,9 +787,9 @@ function attachWebsocket(ws: WebSocket, instanceId: string): void {
   // Not in tmuxSessionRegistry — could be a foreign tmux session OR a leftover
   // clawdevbox-spawned tmux session that survived a kernel restart (cdb_<id>
   // name still alive in tmux). In either case, if a tmux session with the
-  // exact instance_id name exists, attach to it. Probe with `tmux has-session`
-  // (cheap; psmux returns exit 0 if found, non-zero otherwise).
-  if (!hasSession(instanceId) && tmuxSessionExists(instanceId)) {
+  // exact instance_id name exists, attach to it. Uses the cached tmux list
+  // (1s TTL) so back-to-back WS attaches don't fork a child each.
+  if (!hasSession(instanceId) && await tmuxSessionExists(instanceId)) {
     attachWebsocketViaTmux(ws, instanceId, instanceId);
     return;
   }
