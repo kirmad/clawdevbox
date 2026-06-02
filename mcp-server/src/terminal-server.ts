@@ -84,6 +84,47 @@ function resolveTmuxBin(): string {
 }
 
 /**
+ * Force a tmux pane + window to the given dimensions. Required on psmux
+ * (Windows) because `aggressive-resize` does not propagate SIGWINCH from an
+ * `attach-session` client back to the tmux server — so the pane stays at its
+ * creation size (120×30) even after the browser sends a resize message.
+ *
+ * We run both `resize-window` and `resize-pane` because psmux sometimes needs
+ * both: resize-window sets the window geometry; resize-pane adjusts the
+ * individual pane within it.  Both are fire-and-forget via spawnSync with a
+ * short timeout so they don't block the Node event loop.
+ */
+function tmuxResizePane(
+  tmuxBin: string,
+  tmuxSocket: string | null,
+  sessionName: string,
+  cols: number,
+  rows: number,
+): void {
+  const socketArgs = tmuxSocket ? ['-L', tmuxSocket] : [];
+  // eslint-disable-next-line no-console
+  console.log('[tmux-resize]', JSON.stringify({ session: sessionName, cols, rows }));
+  // psmux (Windows) reserves 1 row internally even with `status off`, so the
+  // visible pane height is window_height - 1.  The caller already compensated
+  // in ipty.resize (passing rows+1); here we pass the original rows so that
+  // resize-window + ipty together converge on the correct pane height.
+  // resize-pane with only -x keeps pane width in sync; omitting -y avoids the
+  // double-subtract that would give rows-2.
+  for (const subcmd of [
+    ['resize-window', '-t', sessionName, '-x', String(cols), '-y', String(rows)],
+    ['resize-pane', '-t', sessionName, '-x', String(cols)],
+    ['refresh-client', '-t', sessionName],
+  ]) {
+    try {
+      spawnSync(tmuxBin, [...socketArgs, ...subcmd], {
+        timeout: 2000,
+        stdio: 'ignore',
+      });
+    } catch { /* ignore — psmux may return non-zero for unsupported commands */ }
+  }
+}
+
+/**
  * Probe whether a tmux session with the given name exists on the default
  * socket. Uses the cached `tmuxSessionRuntime().list()` (1s TTL) instead of
  * spawning a fresh `tmux has-session` subprocess — at SPA poll rates (every
@@ -924,7 +965,16 @@ function attachWebsocketViaTmux(
       typeof m.cols === 'number' &&
       typeof m.rows === 'number'
     ) {
-      try { ipty.resize(m.cols, m.rows); } catch { /* attach dead */ }
+      const cols = m.cols as number;
+      const rows = m.rows as number;
+      // psmux on Windows: the SIGWINCH path through `ipty.resize` tells tmux
+      // attach that the viewport is cols×rows, but aggressive-resize subtracts
+      // 1 row from the reported size when it propagates to the pane.  Pass
+      // rows+1 to ipty so the pane ends up at the rows the browser expects.
+      try { ipty.resize(cols, rows + 1); } catch { /* attach dead */ }
+      // Explicit resize-window / resize-pane as belt-and-suspenders for psmux
+      // (aggressive-resize alone doesn't update the pane on Windows).
+      tmuxResizePane(tmuxBin, tmuxSocket, tmuxSessionName, cols, rows);
     }
     // 'kill' on a tmux-attach viewer just detaches (kill the attach IPty),
     // not the agent. Use DELETE /api/sessions/<id> for full agent kill.

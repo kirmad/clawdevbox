@@ -103,10 +103,12 @@ async function attach(): Promise<void> {
   const id = encodeURIComponent(selectedId.value);
   ws = new WebSocket(`${proto}//${location.host}/terminal/${id}/ws`);
   ws.onopen = () => {
-    // The snapshot arrives next — re-fit once we know the host element
-    // is fully sized, and inform the server of the actual viewport size
-    // so the pty's tty matches what xterm is rendering.
+    // Immediately fit with current layout, then again after 100 ms so that
+    // any async CSS reflows (flex layout settling, scrollbar appearing) have
+    // completed.  The second call also covers the common race where xterm
+    // opens before the host element has reached its final rendered width.
     refit();
+    setTimeout(() => refit(), 100);
   };
   ws.onmessage = (ev) => {
     let msg: { type?: string; content?: string; chunk?: string };
