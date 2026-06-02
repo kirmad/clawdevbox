@@ -536,6 +536,141 @@ export function writeRecipeInstance(workspacePath: string, instance: RecipeInsta
 }
 
 /**
+ * Fetch ALL recipe instances from the DB in 3 batched queries (instances +
+ * agent_sessions + recipe_steps) joined in memory.  Avoids the N+1 pattern
+ * in rowToInstance() and the per-workspace filesystem scan in
+ * listRecipeInstancesInWorkspace().  Returns an empty array when the DB is
+ * unavailable.
+ *
+ * NOTE: recipe_snapshot is intentionally omitted (set to '') — the list
+ * endpoint doesn't expose it to the SPA and it requires one extra file-read
+ * per row.
+ */
+export function listAllRecipeInstancesFromDb(): RecipeInstance[] {
+  const conn = safeDb();
+  if (!conn) return [];
+  try {
+    const rows = conn
+      .prepare('SELECT * FROM recipe_instances ORDER BY started_at DESC')
+      .all() as RecipeInstanceRow[];
+    if (rows.length === 0) return [];
+
+    const ids = rows.map((r) => r.id);
+    const placeholders = ids.map(() => '?').join(',');
+
+    // One query for all agent_sessions (latest per instance — DESC order).
+    interface SessionRow {
+      recipe_instance_id: string;
+      agent_cli: string;
+      pid: number | null;
+      cli_session_id: string | null;
+      resume_of_agent_session_id: string | null;
+    }
+    const sessions = conn
+      .prepare(
+        `SELECT s.recipe_instance_id, s.agent_cli, s.pid, s.cli_session_id,
+                s.resume_of_agent_session_id
+         FROM agent_sessions s
+         WHERE s.recipe_instance_id IN (${placeholders})
+         ORDER BY s.started_at DESC`,
+      )
+      .all(...ids) as SessionRow[];
+
+    const sessionByInstance = new Map<string, SessionRow>();
+    for (const s of sessions) {
+      if (!sessionByInstance.has(s.recipe_instance_id)) {
+        sessionByInstance.set(s.recipe_instance_id, s);
+      }
+    }
+
+    // One query to resolve resume_of pointers.
+    const resumeAgentIds = [
+      ...new Set(
+        sessions
+          .filter((s) => s.resume_of_agent_session_id)
+          .map((s) => s.resume_of_agent_session_id!),
+      ),
+    ];
+    const resumeCliSessionById = new Map<string, string | null>();
+    if (resumeAgentIds.length > 0) {
+      const rp = resumeAgentIds.map(() => '?').join(',');
+      (
+        conn
+          .prepare(`SELECT id, cli_session_id FROM agent_sessions WHERE id IN (${rp})`)
+          .all(...resumeAgentIds) as Array<{ id: string; cli_session_id: string | null }>
+      ).forEach((r) => resumeCliSessionById.set(r.id, r.cli_session_id));
+    }
+
+    // One query for all recipe_steps.
+    interface StepRowWithInstance extends StepRowLite {
+      recipe_instance_id: string;
+    }
+    const allSteps = conn
+      .prepare(
+        `SELECT step_id, name, goal, status, started_at, completed_at,
+                message, awaiting_user_message, state_json, recipe_instance_id
+         FROM recipe_steps
+         WHERE recipe_instance_id IN (${placeholders})
+         ORDER BY recipe_instance_id, step_index ASC`,
+      )
+      .all(...ids) as StepRowWithInstance[];
+
+    const stepsByInstance = new Map<string, StepRowLite[]>();
+    for (const { recipe_instance_id, ...s } of allSteps) {
+      const arr = stepsByInstance.get(recipe_instance_id) ?? [];
+      arr.push(s);
+      stepsByInstance.set(recipe_instance_id, arr);
+    }
+
+    return rows.map((row) => {
+      const session = sessionByInstance.get(row.id);
+      const resume_of = session?.resume_of_agent_session_id
+        ? (resumeCliSessionById.get(session.resume_of_agent_session_id) ?? null)
+        : null;
+
+      const steps = (stepsByInstance.get(row.id) ?? []).map((r): RecipeStep => {
+        const state = JSON.parse(r.state_json) as Record<string, unknown>;
+        const step: RecipeStep = { id: r.step_id, title: r.name ?? r.goal, status: r.status };
+        if (r.started_at != null) step.started_at = r.started_at;
+        if (r.completed_at != null) step.completed_at = r.completed_at;
+        if (r.message) step.message = r.message;
+        if (r.awaiting_user_message) step.awaiting_user_prompt = r.awaiting_user_message;
+        if (typeof state.child_recipe_instance_id === 'string') {
+          step.child_recipe_instance_id = state.child_recipe_instance_id;
+        }
+        if (typeof state.artifact_id === 'string') {
+          step.artifact_id = state.artifact_id;
+        }
+        return step;
+      });
+
+      return {
+        id: row.id,
+        recipe_id: row.recipe_id ?? '',
+        recipe_snapshot: '',   // omitted from list endpoint — saves file I/O
+        workspace_id: row.workspace_id,
+        workspace_path: row.workspace_path,
+        prompt: row.prompt ?? '',
+        params: JSON.parse(row.params_json) as Record<string, unknown>,
+        agent_cli: session?.agent_cli ?? 'unknown',
+        pid: session?.pid ?? null,
+        started_at: row.started_at,
+        status: row.status,
+        completed_at: row.completed_at,
+        result: row.result ? safeParse(row.result) : null,
+        message: row.message,
+        session_id: session?.cli_session_id ?? undefined,
+        resume_of,
+        steps: steps.length > 0 ? steps : undefined,
+        parent_recipe_instance_id: row.parent_recipe_instance_id,
+      };
+    });
+  } catch {
+    return [];
+  }
+}
+
+/**
  * List every recipe instance under a workspace path. Returns an empty list
  * if the workspace has no `.clawdevbox/recipe-instances/` directory yet.
  * Corrupt or unreadable files are silently skipped so a single bad row
