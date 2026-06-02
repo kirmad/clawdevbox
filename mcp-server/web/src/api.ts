@@ -387,3 +387,11 @@ export async function resumeSession(instanceId: string): Promise<ResumeSessionRe
   }
   return (await res.json()) as ResumeSessionResponse;
 }
+
+export async function deleteSession(instanceId: string): Promise<void> {
+  const res = await fetch(`/api/sessions/${encodeURIComponent(instanceId)}`, { method: 'DELETE' });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => '');
+    throw new Error(`delete session failed: ${res.status} ${txt.slice(0, 200)}`);
+  }
+}

@@ -13,6 +13,7 @@ import {
   fetchInbox,
   fetchSessions,
   resumeSession,
+  deleteSession,
   fetchInboxItem,
   fetchPushStatus,
   fetchPushVapid,
@@ -671,6 +672,16 @@ export const useUiStore = defineStore('ui', {
       const r = await resumeSession(instanceId);
       this.terminals.selectedInstanceId = r.new_instance_id;
       // Optimistic — the 'sessions' topic event will refresh authoritatively.
+      await this.refreshTerminals({ status: 'all' });
+    },
+
+    async killTerminal(instanceId: string): Promise<void> {
+      await deleteSession(instanceId);
+      if (this.terminals.selectedInstanceId === instanceId) {
+        this.terminals.selectedInstanceId = null;
+      }
+      this.terminals.items = this.terminals.items.filter((i) => i.instance_id !== instanceId);
+      // Authoritative refresh so state dot, archive sections all stay correct.
       await this.refreshTerminals({ status: 'all' });
     },
 

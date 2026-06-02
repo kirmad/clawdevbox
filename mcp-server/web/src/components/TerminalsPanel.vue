@@ -135,6 +135,21 @@ function select(s: Session): void {
   store.selectTerminal(s.instance_id);
 }
 
+async function kill(s: Session): Promise<void> {
+  if (s.kind === 'foreign') {
+    const ok = window.confirm(`Kill foreign tmux session "${s.instance_id}"?\nThis is one of your own tmux sessions, not a clawdevbox spawn.`);
+    if (!ok) return;
+  } else {
+    const ok = window.confirm(`Kill session "${s.label}" (${s.instance_id})?`);
+    if (!ok) return;
+  }
+  try {
+    await store.killTerminal(s.instance_id);
+  } catch (err) {
+    console.error('kill failed:', err);
+  }
+}
+
 async function resume(s: Session): Promise<void> {
   try {
     await store.resumeTerminal(s.instance_id);
@@ -164,7 +179,7 @@ watch(selectedId, () => { attach(); });
         v-for="s in activeSessions"
         :key="s.instance_id"
         class="tab-row"
-        :class="{ selected: s.instance_id === selectedId }"
+        :class="{ selected: s.instance_id === selectedId, foreign: s.kind === 'foreign' }"
         @click="select(s)"
       >
         <div class="row-1">
@@ -173,8 +188,15 @@ watch(selectedId, () => { attach(); });
         </div>
         <div class="row-2">
           <span :class="stateClass(s.state)" />
-          <span class="muted">{{ s.provider_id ?? '—' }} · {{ relTime(s.started_at) }}</span>
+          <span class="muted">{{ s.provider_id ?? (s.kind === 'foreign' ? '(foreign tmux)' : '—') }} · {{ relTime(s.started_at) }}</span>
         </div>
+        <button
+          v-if="s.instance_id !== 'main'"
+          class="kill-btn"
+          :class="{ 'kill-btn--foreign': s.kind === 'foreign' }"
+          title="Kill session"
+          @click.stop="kill(s)"
+        >✕</button>
       </button>
 
       <details class="group" :open="store.terminals.archiveExpanded || recentArchived.length > 0">
@@ -252,6 +274,10 @@ watch(selectedId, () => { attach(); });
 .state-foreign { background: #555b66; }
 .resume-btn { position: absolute; right: 8px; top: 10px; padding: 2px 8px; font-size: 11px; background: #23262d; color: #d8dee9; border: 1px solid #3a3f4a; border-radius: 3px; cursor: pointer; display: none; }
 .archived:hover .resume-btn { display: inline-block; }
+.kill-btn { position: absolute; right: 8px; top: 50%; transform: translateY(-50%); padding: 2px 7px; font-size: 11px; background: #2c1a1a; color: #e06c75; border: 1px solid #5a2222; border-radius: 3px; cursor: pointer; display: none; line-height: 1.4; }
+.kill-btn--foreign { background: #2a2020; color: #c06060; border-color: #4a1818; }
+.tab-row:hover .kill-btn { display: inline-block; }
+.tab-row.foreign { opacity: 0.75; border-left-style: dashed; }
 .load-more { display: block; margin: 6px auto; padding: 4px 10px; font-size: 11px; background: transparent; color: #7c8290; border: 1px solid #3a3f4a; border-radius: 3px; cursor: pointer; }
 
 /* xterm-host fills the remaining width and full panel height. The two
