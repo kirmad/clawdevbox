@@ -52,3 +52,9 @@ Thumbs.db
 # commit these.
 plugins/*/node_modules
 
+
+# Runtime artifacts (per-session outputs)
+/artifacts/
+# Playwright screenshots from ad-hoc validation
+/files/
+
