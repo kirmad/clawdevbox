@@ -461,14 +461,13 @@ export async function runStart(flags: Flags): Promise<void> {
   let cronApiCtx: CronApiContext | null = null;
   let testHookDispatcher: Dispatcher | null = null;
 
-  // ── Fast response caches for expensive list endpoints ────────────────────
-  // Both /api/inbox and /api/recipes scan hundreds or thousands of workspace
-  // directories on every call (N × filesystem ops + N×3 DB queries).
-  // We cache the pre-serialised JSON response string and invalidate it via
-  // the event bus whenever a mutation occurs.  A 10 s TTL provides a fallback
-  // in case an event is missed.  On a warm cache, response time drops from
-  // ~20 s → <1 ms.
-  const API_CACHE_TTL_MS = 10_000;
+  // ── Fast response caches for list endpoints ─────────────────────────────
+  // /api/inbox and /api/recipes are now fully SQL-backed (V6+) and read in
+  // <30ms cold. The cache is a thin rate-limiter that coalesces rapid SPA
+  // polls (~every 2s) into a single SQL query. Invalidated on the relevant
+  // event-bus topics; the 2 s TTL provides a fallback in case an event is
+  // missed.
+  const API_CACHE_TTL_MS = 2_000;
   const inboxCache: { json: string | null; ts: number } = { json: null, ts: 0 };
   const recipeCache: { json: string | null; ts: number } = { json: null, ts: 0 };
 

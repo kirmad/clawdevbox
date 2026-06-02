@@ -271,4 +271,22 @@ export const migrations: Migration[] = [
       `);
     },
   },
+  {
+    version: 6,
+    up: (db) => {
+      // Inbox-DB-first: previously inbox.json on disk was the source of truth
+      // and inbox_items was a partial mirror that lost `kind`, `state`,
+      // `description_format`, `description_size`. Now the DB is authoritative
+      // and the JSON file is a legacy mirror only. Add the missing columns +
+      // a `raw_json` blob for forward-compatibility (any new InboxItem field
+      // survives without a schema migration).
+      db.exec(`
+        ALTER TABLE inbox_items ADD COLUMN kind TEXT;
+        ALTER TABLE inbox_items ADD COLUMN state TEXT;
+        ALTER TABLE inbox_items ADD COLUMN description_format TEXT;
+        ALTER TABLE inbox_items ADD COLUMN description_size INTEGER;
+        ALTER TABLE inbox_items ADD COLUMN raw_json TEXT;
+      `);
+    },
+  },
 ];

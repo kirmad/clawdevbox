@@ -1,19 +1,20 @@
 /**
- * inbox-persistence.ts (DB + JSON dual-write)
+ * inbox-persistence.ts (DB-first; JSON file is a debounced legacy mirror)
  *
- * Disk layer for the inbox store. Phase 4 — the SQLite kernel DB is the
- * canonical metadata store; the legacy `<globalDir>/inbox.json` file is
- * preserved as a write-through mirror so existing tests that inspect the
- * file shape keep passing. Body sidecars under
- * `<globalDir>/inbox-bodies/<safe-id>.<ext>` are unchanged — bodies stay
- * on disk and the DB only knows the `body_path` pointing at them.
+ * The SQLite kernel DB is the canonical inbox store. Each row is full-fidelity:
+ * the `raw_json` column stores the original `InboxItem` shape so future field
+ * additions don't require schema migrations. The indexed columns (`status`,
+ * `state`, `kind`, `created_at`, etc.) exist for filtering / ordering.
  *
- *   <globalDir>/inbox.json                      ← legacy metadata mirror
- *   <globalDir>/inbox-bodies/<safe-id>.<ext>     ← full description bodies
+ * Body sidecars under `<globalDir>/inbox-bodies/<safe-id>.<ext>` remain
+ * on-disk and are referenced via `body_path` — the DB only tracks the path.
  *
- * Reads prefer the JSON file (it remains the live mirror); if the file
- * is missing we fall back to the `inbox_items` table. Writes go to the
- * file first (atomic) and then upsert into the DB.
+ *   <globalDir>/inbox.json                       ← legacy mirror (debounced)
+ *   <globalDir>/inbox-bodies/<safe-id>.<ext>      ← full description bodies
+ *
+ * Why the JSON file still exists: scripts + old test fixtures inspect it.
+ * The mirror is written ~500ms after the latest mutation via a single timer,
+ * NOT on every save, so list/upsert latency is dominated by the SQL queries.
  */
 
 import { existsSync, mkdirSync, readFileSync, unlinkSync } from 'node:fs';
@@ -91,22 +92,50 @@ interface InboxRow {
   agent_session_id: string | null;
   created_at: number;
   updated_at: number;
+  // V6 additions
+  kind: string | null;
+  state: string | null;
+  description_format: string | null;
+  description_size: number | null;
+  raw_json: string | null;
 }
 
 function rowToItem(row: InboxRow): InboxItem {
+  // V6+: raw_json is full-fidelity. Use it when present; fall back to a
+  // best-effort reconstruction from indexed columns (handles pre-V6 rows
+  // that haven't been re-saved since the migration).
+  if (row.raw_json) {
+    try {
+      const parsed = JSON.parse(row.raw_json) as InboxItem;
+      // Make sure the indexed fields win over any stale embedded copy.
+      return {
+        ...parsed,
+        id: row.id,
+        kind: row.kind ?? parsed.kind,
+        state: (row.state as InboxItem['state']) ?? parsed.state,
+        source: row.source ?? parsed.source ?? '',
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+      };
+    } catch {
+      // Corrupted blob — fall through to column-based reconstruction.
+    }
+  }
   return {
     id: row.id,
-    kind: row.status, // kind is not first-class in DB; preserved via the JSON mirror.
+    kind: row.kind ?? row.status,
     source: row.source ?? '',
     title: row.title || undefined,
     preview: row.preview ?? undefined,
+    description_format: (row.description_format as InboxBodyFormat | null) ?? undefined,
+    description_size: row.description_size ?? undefined,
     attachments: row.attachments_json ? JSON.parse(row.attachments_json) : undefined,
     labels: row.labels_json ? JSON.parse(row.labels_json) : undefined,
     recipe_instance: row.recipe_instance_id ? { id: row.recipe_instance_id } : undefined,
     trigger_id: row.trigger_id ?? undefined,
     recipe_step_id: row.recipe_step_id ?? undefined,
     agent_session_id: row.agent_session_id ?? undefined,
-    state: 'new',
+    state: (row.state as InboxItem['state']) ?? 'new',
     snoozed_until: row.snoozed_until ?? undefined,
     created_at: row.created_at,
     updated_at: row.updated_at,
@@ -118,8 +147,15 @@ function rowToItem(row: InboxRow): InboxItem {
 // ============================================================================
 
 export function loadInboxFromDisk(globalDir: string): InboxItem[] {
-  const path = inboxFilePath(globalDir);
-  if (existsSync(path)) {
+  void globalDir;
+  // DB is authoritative (V6+). The JSON file is a debounced one-way mirror
+  // for human inspection / backup — never read from in the hot path.
+  const conn = safeDb();
+  if (!conn) {
+    // DB not open yet — try the legacy JSON file ONCE for boot-time reads
+    // before migrations run. Production callers always have the DB open.
+    const path = inboxFilePath(globalDir);
+    if (!existsSync(path)) return [];
     try {
       const parsed = JSON.parse(readFileSync(path, 'utf8')) as Partial<InboxFile>;
       if (parsed && typeof parsed === 'object' && Array.isArray(parsed.items)) {
@@ -138,14 +174,11 @@ export function loadInboxFromDisk(globalDir: string): InboxItem[] {
     } catch (err) {
       logger.warn(
         { err: err instanceof Error ? err.message : String(err), path },
-        'inbox: file unreadable; falling back to DB',
+        'inbox: pre-DB boot read failed; returning empty list',
       );
     }
+    return [];
   }
-
-  // Fallback to DB when the JSON mirror is missing or unreadable.
-  const conn = safeDb();
-  if (!conn) return [];
   try {
     const rows = conn
       .prepare('SELECT * FROM inbox_items ORDER BY created_at DESC')
@@ -160,70 +193,280 @@ export function loadInboxFromDisk(globalDir: string): InboxItem[] {
 // Write
 // ============================================================================
 
-export function saveInboxToDisk(globalDir: string, items: InboxItem[]): void {
-  // 1. Legacy JSON mirror (atomic).
-  const path = inboxFilePath(globalDir);
-  mkdirSync(dirname(path), { recursive: true });
-  const file: InboxFile = { version: 1, items };
-  writeFileAtomic(path, JSON.stringify(file, null, 2) + '\n');
+/**
+ * Debounce timer for the legacy JSON mirror write. Collapses many rapid
+ * inbox mutations into a single file rewrite. Module-scoped because the
+ * mirror is global per-process (only one globalDir per kernel).
+ */
+const JSON_MIRROR_DEBOUNCE_MS = 500;
+let pendingMirrorTimer: NodeJS.Timeout | null = null;
+let pendingMirrorPath: string | null = null;
+let pendingMirrorItems: InboxItem[] | null = null;
 
-  // 2. DB mirror — replace all rows in a single transaction.
+function scheduleJsonMirror(path: string, items: InboxItem[]): void {
+  pendingMirrorPath = path;
+  pendingMirrorItems = items;
+  if (pendingMirrorTimer) return;
+  pendingMirrorTimer = setTimeout(() => {
+    pendingMirrorTimer = null;
+    const p = pendingMirrorPath;
+    const it = pendingMirrorItems;
+    pendingMirrorPath = null;
+    pendingMirrorItems = null;
+    if (!p || !it) return;
+    try {
+      mkdirSync(dirname(p), { recursive: true });
+      const file: InboxFile = { version: 1, items: it };
+      writeFileAtomic(p, JSON.stringify(file, null, 2) + '\n');
+    } catch (err) {
+      logger.warn(
+        { err: err instanceof Error ? err.message : String(err), path: p },
+        'inbox: legacy JSON mirror write failed (DB remains authoritative)',
+      );
+    }
+  }, JSON_MIRROR_DEBOUNCE_MS);
+  if (typeof pendingMirrorTimer.unref === 'function') pendingMirrorTimer.unref();
+}
+
+/**
+ * Single-row read by id. Returns null if not found.
+ * Fast path used by InboxStore.read() — avoids loading the whole table.
+ * Falls back to the JSON file when the DB is unavailable (tests, pre-boot).
+ */
+export function readInboxItemById(globalDir: string, id: string): InboxItem | null {
+  const conn = safeDb();
+  if (conn) {
+    try {
+      const row = conn.prepare('SELECT * FROM inbox_items WHERE id = ?').get(id) as InboxRow | undefined;
+      return row ? rowToItem(row) : null;
+    } catch {
+      // Fall through to JSON fallback.
+    }
+  }
+  // DB unavailable — read from the JSON mirror.
+  const all = loadInboxFromDisk(globalDir);
+  return all.find((it) => it.id === id) ?? null;
+}
+
+/**
+ * Single-row upsert. Called from InboxStore.upsert/setState/snooze instead
+ * of rewriting the whole table on every mutation. Same column set as the
+ * bulk save below; the V6 `raw_json` blob captures any future field.
+ */
+export function upsertInboxItem(globalDir: string, item: InboxItem): void {
   const conn = safeDb();
   if (!conn) {
+    // No DB — synchronous JSON fallback. Used by unit tests and pre-boot.
+    const all = loadInboxFromDisk(globalDir);
+    const idx = all.findIndex((it) => it.id === item.id);
+    if (idx >= 0) all[idx] = item;
+    else all.push(item);
+    const path = inboxFilePath(globalDir);
+    mkdirSync(dirname(path), { recursive: true });
+    const file: InboxFile = { version: 1, items: all };
+    writeFileAtomic(path, JSON.stringify(file, null, 2) + '\n');
     emitChange('inbox');
     return;
   }
   try {
-    const tx = conn.transaction((rows: InboxItem[]) => {
-      conn.prepare('DELETE FROM inbox_items').run();
-      const insertStmt = conn.prepare(
-        `INSERT INTO inbox_items (
-           id, workspace_id, title, preview, body_path,
-           attachments_json, labels_json, source, status, snoozed_until,
-           recipe_instance_id, recipe_step_id, trigger_id, fire_id,
-           agent_session_id, created_at, updated_at
-         ) VALUES (
-           @id, @workspace_id, @title, @preview, @body_path,
-           @attachments_json, @labels_json, @source, @status, @snoozed_until,
-           @recipe_instance_id, @recipe_step_id, @trigger_id, @fire_id,
-           @agent_session_id, @created_at, @updated_at
-         )`,
-      );
-      for (const it of rows) {
-        const bodyFmt = it.description_format as InboxBodyFormat | undefined;
-        const body_path = bodyFmt ? inboxBodyPath(globalDir, it.id, bodyFmt) : null;
-        const recipe_instance_id =
-          (it.recipe_instance && typeof it.recipe_instance === 'object'
-            ? (it.recipe_instance as { id?: string }).id
-            : null) ?? null;
-        insertStmt.run({
-          id: it.id,
-          workspace_id: null,
-          title: it.title ?? '',
-          preview: it.preview ?? null,
-          body_path,
-          attachments_json: it.attachments ? JSON.stringify(it.attachments) : null,
-          labels_json: it.labels ? JSON.stringify(it.labels) : null,
-          source: it.source ?? null,
-          status: it.state ?? 'new',
-          snoozed_until: it.snoozed_until ?? null,
-          recipe_instance_id,
-          recipe_step_id: (it.recipe_step_id as string | null) ?? null,
-          trigger_id: (it.trigger_id as string | null) ?? null,
-          fire_id: null,
-          agent_session_id: (it.agent_session_id as string | null) ?? null,
-          created_at: it.created_at,
-          updated_at: it.updated_at,
-        });
-      }
+    const bodyFmt = item.description_format as InboxBodyFormat | undefined;
+    const body_path = bodyFmt ? inboxBodyPath(globalDir, item.id, bodyFmt) : null;
+    const recipe_instance_id =
+      (item.recipe_instance && typeof item.recipe_instance === 'object'
+        ? (item.recipe_instance as { id?: string }).id
+        : null) ?? null;
+    conn.prepare(
+      `INSERT INTO inbox_items (
+         id, workspace_id, title, preview, body_path,
+         attachments_json, labels_json, source, status, snoozed_until,
+         recipe_instance_id, recipe_step_id, trigger_id, fire_id,
+         agent_session_id, created_at, updated_at,
+         kind, state, description_format, description_size, raw_json
+       ) VALUES (
+         @id, @workspace_id, @title, @preview, @body_path,
+         @attachments_json, @labels_json, @source, @status, @snoozed_until,
+         @recipe_instance_id, @recipe_step_id, @trigger_id, @fire_id,
+         @agent_session_id, @created_at, @updated_at,
+         @kind, @state, @description_format, @description_size, @raw_json
+       )
+       ON CONFLICT(id) DO UPDATE SET
+         workspace_id        = excluded.workspace_id,
+         title               = excluded.title,
+         preview             = excluded.preview,
+         body_path           = excluded.body_path,
+         attachments_json    = excluded.attachments_json,
+         labels_json         = excluded.labels_json,
+         source              = excluded.source,
+         status              = excluded.status,
+         snoozed_until       = excluded.snoozed_until,
+         recipe_instance_id  = excluded.recipe_instance_id,
+         recipe_step_id      = excluded.recipe_step_id,
+         trigger_id          = excluded.trigger_id,
+         fire_id             = excluded.fire_id,
+         agent_session_id    = excluded.agent_session_id,
+         updated_at          = excluded.updated_at,
+         kind                = excluded.kind,
+         state               = excluded.state,
+         description_format  = excluded.description_format,
+         description_size    = excluded.description_size,
+         raw_json            = excluded.raw_json`,
+    ).run({
+      id: item.id,
+      workspace_id: null,
+      title: item.title ?? '',
+      preview: item.preview ?? null,
+      body_path,
+      attachments_json: item.attachments ? JSON.stringify(item.attachments) : null,
+      labels_json: item.labels ? JSON.stringify(item.labels) : null,
+      source: item.source ?? null,
+      status: item.state ?? 'new',
+      snoozed_until: item.snoozed_until ?? null,
+      recipe_instance_id,
+      recipe_step_id: (item.recipe_step_id as string | null) ?? null,
+      trigger_id: (item.trigger_id as string | null) ?? null,
+      fire_id: null,
+      agent_session_id: (item.agent_session_id as string | null) ?? null,
+      created_at: item.created_at,
+      updated_at: item.updated_at,
+      kind: item.kind ?? null,
+      state: item.state ?? null,
+      description_format: bodyFmt ?? null,
+      description_size: item.description_size ?? null,
+      raw_json: JSON.stringify(item),
     });
-    tx(items);
   } catch (err) {
     logger.warn(
-      { err: err instanceof Error ? err.message : String(err) },
-      'inbox: DB mirror save failed; JSON mirror remains authoritative',
+      { err: err instanceof Error ? err.message : String(err), id: item.id },
+      'inbox: single-row upsert failed',
     );
   }
+
+  // Schedule a debounced JSON mirror refresh — re-reads from DB at flush
+  // time so the file always reflects the latest authoritative state.
+  const path = inboxFilePath(globalDir);
+  if (!pendingMirrorTimer) {
+    pendingMirrorPath = path;
+    pendingMirrorItems = null;
+    pendingMirrorTimer = setTimeout(() => {
+      pendingMirrorTimer = null;
+      const p = pendingMirrorPath;
+      pendingMirrorPath = null;
+      pendingMirrorItems = null;
+      if (!p) return;
+      try {
+        const all = loadInboxFromDisk(globalDir);
+        mkdirSync(dirname(p), { recursive: true });
+        const file: InboxFile = { version: 1, items: all };
+        writeFileAtomic(p, JSON.stringify(file, null, 2) + '\n');
+      } catch (err) {
+        logger.warn(
+          { err: err instanceof Error ? err.message : String(err), path: p },
+          'inbox: legacy JSON mirror refresh failed (DB remains authoritative)',
+        );
+      }
+    }, JSON_MIRROR_DEBOUNCE_MS);
+    if (typeof pendingMirrorTimer.unref === 'function') pendingMirrorTimer.unref();
+  }
+
+  emitChange('inbox');
+}
+
+/**
+ * Single-row delete by id. No-op if the row doesn't exist or DB unavailable.
+ */
+export function deleteInboxItem(globalDir: string, id: string): void {
+  const conn = safeDb();
+  if (conn) {
+    try {
+      conn.prepare('DELETE FROM inbox_items WHERE id = ?').run(id);
+    } catch (err) {
+      logger.warn(
+        { err: err instanceof Error ? err.message : String(err), id },
+        'inbox: single-row delete failed',
+      );
+    }
+    scheduleJsonMirror(inboxFilePath(globalDir), loadInboxFromDisk(globalDir));
+  } else {
+    // No DB — synchronous JSON fallback.
+    const all = loadInboxFromDisk(globalDir).filter((it) => it.id !== id);
+    const path = inboxFilePath(globalDir);
+    mkdirSync(dirname(path), { recursive: true });
+    const file: InboxFile = { version: 1, items: all };
+    writeFileAtomic(path, JSON.stringify(file, null, 2) + '\n');
+  }
+  emitChange('inbox');
+}
+
+export function saveInboxToDisk(globalDir: string, items: InboxItem[]): void {
+  // 1. DB write — synchronous + authoritative. This is what /api/inbox reads.
+  const conn = safeDb();
+  if (conn) {
+    try {
+      const tx = conn.transaction((rows: InboxItem[]) => {
+        conn.prepare('DELETE FROM inbox_items').run();
+        const insertStmt = conn.prepare(
+          `INSERT INTO inbox_items (
+             id, workspace_id, title, preview, body_path,
+             attachments_json, labels_json, source, status, snoozed_until,
+             recipe_instance_id, recipe_step_id, trigger_id, fire_id,
+             agent_session_id, created_at, updated_at,
+             kind, state, description_format, description_size, raw_json
+           ) VALUES (
+             @id, @workspace_id, @title, @preview, @body_path,
+             @attachments_json, @labels_json, @source, @status, @snoozed_until,
+             @recipe_instance_id, @recipe_step_id, @trigger_id, @fire_id,
+             @agent_session_id, @created_at, @updated_at,
+             @kind, @state, @description_format, @description_size, @raw_json
+           )`,
+        );
+        for (const it of rows) {
+          const bodyFmt = it.description_format as InboxBodyFormat | undefined;
+          const body_path = bodyFmt ? inboxBodyPath(globalDir, it.id, bodyFmt) : null;
+          const recipe_instance_id =
+            (it.recipe_instance && typeof it.recipe_instance === 'object'
+              ? (it.recipe_instance as { id?: string }).id
+              : null) ?? null;
+          insertStmt.run({
+            id: it.id,
+            workspace_id: null,
+            title: it.title ?? '',
+            preview: it.preview ?? null,
+            body_path,
+            attachments_json: it.attachments ? JSON.stringify(it.attachments) : null,
+            labels_json: it.labels ? JSON.stringify(it.labels) : null,
+            source: it.source ?? null,
+            status: it.state ?? 'new',
+            snoozed_until: it.snoozed_until ?? null,
+            recipe_instance_id,
+            recipe_step_id: (it.recipe_step_id as string | null) ?? null,
+            trigger_id: (it.trigger_id as string | null) ?? null,
+            fire_id: null,
+            agent_session_id: (it.agent_session_id as string | null) ?? null,
+            created_at: it.created_at,
+            updated_at: it.updated_at,
+            // V6 columns
+            kind: it.kind ?? null,
+            state: it.state ?? null,
+            description_format: bodyFmt ?? null,
+            description_size: it.description_size ?? null,
+            raw_json: JSON.stringify(it),
+          });
+        }
+      });
+      tx(items);
+    } catch (err) {
+      logger.warn(
+        { err: err instanceof Error ? err.message : String(err) },
+        'inbox: DB write failed; legacy JSON mirror will still be written',
+      );
+    }
+  }
+
+  // 2. Debounced legacy JSON mirror — humans / scripts inspecting the file
+  // get an eventually-consistent view without paying file-write latency on
+  // every mutation.
+  scheduleJsonMirror(inboxFilePath(globalDir), items);
+
   emitChange('inbox');
 }
 

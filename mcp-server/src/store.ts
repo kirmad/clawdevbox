@@ -27,7 +27,12 @@
  */
 
 import { emitChange } from './event-bus.ts';
-import { loadInboxFromDisk, saveInboxToDisk } from './inbox-persistence.ts';
+import {
+  loadInboxFromDisk,
+  saveInboxToDisk,
+  readInboxItemById,
+  upsertInboxItem,
+} from './inbox-persistence.ts';
 
 // ============================================================================
 // Id minting
@@ -159,9 +164,10 @@ export class InboxStore {
   }
 
   upsert(id: string, kind: string, source: string, patch: InboxPatch = {}): UpsertResult {
-    const items = this.load();
     const now = Date.now();
-    const existing = items.get(id);
+    const existing = this.globalDir
+      ? readInboxItemById(this.globalDir, id) ?? undefined
+      : this.memory.get(id);
     let item: InboxItem;
     let created: boolean;
     if (existing) {
@@ -179,14 +185,17 @@ export class InboxStore {
       };
       created = true;
     }
-    items.set(id, item);
-    this.save(items);
-    emitChange('inbox');
+    if (this.globalDir) {
+      upsertInboxItem(this.globalDir, item);
+    } else {
+      this.memory.set(id, item);
+    }
     return { item, created };
   }
 
   read(id: string): InboxItem | undefined {
-    return this.load().get(id);
+    if (this.globalDir) return readInboxItemById(this.globalDir, id) ?? undefined;
+    return this.memory.get(id);
   }
 
   list(filter: { kind?: string; state?: InboxState; label?: string; limit?: number; cursor?: string } = {}): InboxItem[] {
@@ -206,29 +215,35 @@ export class InboxStore {
   }
 
   setState(id: string, state: InboxState): InboxItem | undefined {
-    const items = this.load();
-    const item = items.get(id);
-    if (!item) return undefined;
-    const updated: InboxItem = { ...item, state, updated_at: Date.now() };
-    items.set(id, updated);
-    this.save(items);
-    emitChange('inbox');
+    const existing = this.globalDir
+      ? readInboxItemById(this.globalDir, id) ?? undefined
+      : this.memory.get(id);
+    if (!existing) return undefined;
+    const updated: InboxItem = { ...existing, state, updated_at: Date.now() };
+    if (this.globalDir) {
+      upsertInboxItem(this.globalDir, updated);
+    } else {
+      this.memory.set(id, updated);
+    }
     return updated;
   }
 
   snooze(id: string, until: number): InboxItem | undefined {
-    const items = this.load();
-    const item = items.get(id);
-    if (!item) return undefined;
+    const existing = this.globalDir
+      ? readInboxItemById(this.globalDir, id) ?? undefined
+      : this.memory.get(id);
+    if (!existing) return undefined;
     const updated: InboxItem = {
-      ...item,
+      ...existing,
       state: 'snoozed',
       snoozed_until: until,
       updated_at: Date.now(),
     };
-    items.set(id, updated);
-    this.save(items);
-    emitChange('inbox');
+    if (this.globalDir) {
+      upsertInboxItem(this.globalDir, updated);
+    } else {
+      this.memory.set(id, updated);
+    }
     return updated;
   }
 
