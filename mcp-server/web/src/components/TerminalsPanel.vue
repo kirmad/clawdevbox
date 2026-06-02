@@ -46,6 +46,7 @@ function relTime(ts: number): string {
 function iconFor(kind: Session['kind']): string {
   if (kind === 'main') return 'pi pi-microchip';
   if (kind === 'recipe') return 'pi pi-book';
+  if (kind === 'foreign') return 'pi pi-globe';
   return 'pi pi-bolt';
 }
 
@@ -242,10 +243,13 @@ watch(selectedId, () => { attach(); });
 .state-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
 .state-idle { background: #4caf50; }
 .state-busy { background: #4a8be8; }
+.state-running { background: #4caf50; }
 .state-starting { background: #a0a0a0; }
+.state-needs_user_input { background: #ff9800; }
 .state-exited { background: #d44; }
 .state-archived { background: transparent; border: 1px solid #7c8290; }
 .state-unknown { background: #7c8290; }
+.state-foreign { background: #555b66; }
 .resume-btn { position: absolute; right: 8px; top: 10px; padding: 2px 8px; font-size: 11px; background: #23262d; color: #d8dee9; border: 1px solid #3a3f4a; border-radius: 3px; cursor: pointer; display: none; }
 .archived:hover .resume-btn { display: inline-block; }
 .load-more { display: block; margin: 6px auto; padding: 4px 10px; font-size: 11px; background: transparent; color: #7c8290; border: 1px solid #3a3f4a; border-radius: 3px; cursor: pointer; }

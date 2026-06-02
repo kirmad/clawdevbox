@@ -342,8 +342,8 @@ export async function postPushTest(): Promise<{ ok: boolean; error?: string }> {
 
 export interface Session {
   instance_id: string;
-  kind: 'main' | 'recipe' | 'adhoc';
-  state: 'starting' | 'idle' | 'busy' | 'exited' | 'archived' | 'unknown';
+  kind: 'main' | 'recipe' | 'adhoc' | 'foreign';
+  state: 'starting' | 'idle' | 'busy' | 'exited' | 'archived' | 'unknown' | 'running' | 'needs_user_input' | 'foreign';
   provider_id: string | null;
   cli_session_id: string | null;
   recipe_id: string | null;
@@ -353,6 +353,7 @@ export interface Session {
   live: boolean;
   queue_depth: number;
   workspace_id: string;
+  foreign?: boolean;
 }
 
 export interface FetchSessionsResponse {
