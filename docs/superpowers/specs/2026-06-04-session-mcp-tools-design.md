@@ -68,15 +68,13 @@ MCP HTTP requests carry `X-Clawdevbox-Project-Dir` (and optionally `X-Clawdevbox
 
 ## Tool specs
 
-### 1. `session.send` — smart spawn-or-dispatch
+### 1. `session.send` — smart spawn-or-dispatch-or-resume
 
 ```ts
 parameters: {
   prompt: string,                  // required — user-style message
   session_id?: string,             // alias OR canonical GUID.
-                                   //   live pty exists → DISPATCH
-                                   //   no live pty    → SPAWN with this GUID
-                                   //   omitted        → fresh GUID, always SPAWN
+                                   //   See mode resolution below.
   provider?: string,               // 'copilot' | 'claude' | 'agency' | ...
                                    //   defaults to cfg.defaultAgentCli
                                    //   neither set → PROVIDER_REQUIRED error
@@ -88,17 +86,40 @@ parameters: {
 }
 returns: {
   ok: true,
-  mode: 'spawn' | 'dispatch',
-  instance_id: string,
-  session_id: string,              // canonical GUID
+  mode: 'spawn' | 'dispatch' | 'resume',
+  instance_id: string,             // for resume: NEW instance id (not the resumed one)
+  session_id: string,              // canonical GUID (preserved across resume)
   session_alias?: string,          // human-friendly alias if provided
   state?: 'dispatched',            // only on mode='dispatch'
+  resumed_from?: string,           // only on mode='resume' — the old instance_id
 }
 ```
 
-**Behavior**: thin wrapper around `spawnOrDispatch(ctx, args)` (extracted from `/spawn` handler). Smart-routing logic is unchanged from HTTP.
+**Mode resolution**:
+```
+session_id given?
+  no  → SPAWN with fresh GUID (mode='spawn')
+  yes → resolve to canonical GUID
+        ↓
+        live pty exists for GUID?
+          yes → DISPATCH the prompt (mode='dispatch')
+          no  → look up latest archived agent_sessions row for GUID
+                ↓
+                row found AND row.cli_session_id != null
+                  AND provider(row.agent_cli).supportsResume?
+                    yes → RESUME (runRecipe with resumeOf=cli_session_id)
+                          then dispatch prompt (mode='resume')
+                    no  → fresh SPAWN with this GUID (mode='spawn')
+                row not found → fresh SPAWN with this GUID (mode='spawn')
+```
 
-**Concurrency safety**: per-canonical-`sessionGuid` async mutex around `findLiveInstanceForSession → dispatch-or-spawn` block. Without this, two concurrent `session.send` calls with the same alias for a not-yet-live session both observe "no live instance" and both spawn duplicates. The mutex serializes the check-and-act atomically; subsequent calls inside the lock see the just-spawned instance and route to dispatch.
+**Resume path**: when triggered, internally calls `runRecipe({resumeOf: row.cli_session_id, isAdhoc: <inferred>, recipeId: <inferred from original row>, spawnMode: 'interactive', workspaceInfo: {id: row.workspace_id, path: <looked-up>}, agentCli: row.agent_cli, ...})`. This is the same call the existing `POST /api/sessions/<id>/resume` makes. After the new pty is alive, the resolved instance_id is FIFO-dispatched the prompt. The OLD archived row is marked via `markResumedInto(db, oldInstanceId, newInstanceId)` so the UI's "Resumed as <new-id>" badge renders.
+
+**Behavior**: wrapper around `spawnDispatchOrResume(ctx, args)` (extracted from `/spawn` handler + extended with the resume branch).
+
+**Concurrency safety**: per-canonical-`sessionGuid` async mutex around `findLiveInstanceForSession → lookup-archive → dispatch/resume/spawn` block. Without this, two concurrent `session.send` calls with the same alias for a not-yet-live session both observe "no live instance" and both spawn duplicates. The mutex serializes the check-and-act atomically; subsequent calls inside the lock see the just-spawned instance and route to dispatch.
+
+**Foreign tmux is read-only**: if `session_id` resolves to a foreign tmux session (live in tmux, not in our registry, no archived row in our DB), `session.send` rejects with `FOREIGN_NOT_WRITABLE`. Rationale: we don't know what's running inside a foreign tmux (could be the user's shell, a `vim` session, anything) — typing into it could break the user's work. `session.read` and `session.list` work fine on foreign sessions; only writes are blocked.
 
 **Async semantics — documented in description**:
 > "Returns immediately. For `mode='spawn'`, the initial prompt is delivered fire-and-forget after a readiness poll (the agent CLI's input box must render before bytes are typed). Don't assume the spawned agent has started work — poll `session.read` to observe progress. For `mode='dispatch'`, the prompt is FIFO-queued via the pending-dispatch-registry; bytes are typed when prior dispatches resolve."
@@ -148,10 +169,12 @@ This single guard covers restart, respawn, ring-GC, and tmux-restart with one me
 | `backend` | When | Source | `supports_incremental` |
 |---|---|---|---|
 | `pty` | legacy IPty in `pty-registry` (e.g., e2e-test-runner sessions) | ring buffer + cursor | `true` |
-| `tmux` | tmux-backed via `tmuxSessionRegistry` (Copilot/Claude/Agency — the dominant path) | `tmux capture-pane -p -t cdb_<id> -S -<lines>` | `false` (MVP) |
+| `tmux` | tmux-backed via `tmuxSessionRegistry` (Copilot/Claude/Agency — the dominant path) OR a foreign tmux session whose name resolves | `tmux capture-pane -p -t <name> -S -<lines>` | `false` (MVP) |
 | `archive` | reserved — not used in MVP. Future: when ring/tmux is gone, fall back to on-disk log. | — | — |
 
 For `tmux` backend in MVP, `cursor` is still returned and accepted, but every call re-issues `capture-pane` and returns the full snapshot. `supports_incremental: false` tells the caller polling is wasteful — they should rely on stable-tail detection.
+
+**Foreign tmux read**: when `instance_id` matches a tmux session that's live in the system but NOT in `tmuxSessionRegistry` (e.g., user spawned it with `tmux new -s my-shell`, or it's a leftover `cdb_*` from a prior clawdevbox the orphan sweep didn't catch), `session.read` still works — same `capture-pane` path. The tool resolves to the tmux session name via `tmux has-session -t <id>` and reads. `backend: 'tmux'`, `supports_incremental: false`. This is how agents can observe foreign sessions surfaced by `session.list`.
 
 **Stronger ANSI strip**: non-raw mode uses `stripTuiNoise` (not just `stripAnsi`) — strips SGR colors, cursor movement, erase-line, OSC sequences, control bytes. This is the same helper `agent-clis/shared.ts` uses for done-detection.
 
@@ -186,27 +209,31 @@ No `signal` parameter (semantics differ across backends — tmux kill is always 
 ```ts
 parameters: {
   status?: 'all' | 'active' | 'archived',  // default 'active'
+  include_foreign?: boolean,               // default true — include user-spawned tmux
+                                           //   sessions (kind='foreign'). Set false to
+                                           //   only see clawdevbox-owned sessions.
   since?: number,                          // epoch ms for archived pagination
   limit?: number,                          // default 50, max 200
 }
 returns: {
   items: Array<{
-    instance_id: string,
+    instance_id: string,                   // for foreign sessions: the tmux session name
     session_id?: string,
     session_alias?: string,
     live: boolean,
-    state: string,                         // 'idle' | 'busy' | 'starting' | etc.
+    state: string,                         // 'idle' | 'busy' | 'starting' | 'foreign' | etc.
     provider_id?: string,
     workspace_id: string,
     kind: 'main' | 'recipe' | 'adhoc' | 'foreign',
     label: string,
     started_at: number,
     ended_at?: number,
-  }>
+  }>,
+  next_since?: number,                     // pagination cursor for archived rows
 }
 ```
 
-Identical shape to `GET /api/sessions` JSON, served by the same extracted `listSessions(ctx, opts)` helper.
+Identical shape to `GET /api/sessions` JSON, served by the same extracted `listSessions(ctx, opts)` helper. Foreign sessions are tmux sessions live in the system that clawdevbox didn't spawn (e.g., user's own `tmux new -s test1`, or clawdevbox-spawned sessions from a prior process whose parent PID is now dead but somehow escaped the startup orphan sweep). They're surfaced so agents can discover them. **Writing** to foreign sessions via `session.send` is intentionally disallowed (see `session.send` below).
 
 ## Data flow
 
@@ -291,7 +318,9 @@ All errors returned via `structuredError(code, message)` (matches existing tool 
 | `SESSION_NOT_FOUND` | `session.read` or `session.kill` with `session_id` whose GUID has no live instance |
 | `INSTANCE_NOT_FOUND` | `session.read` or `session.kill` with `instance_id` not in pty-registry/tmux-registry, and (for read) no archive fallback |
 | `INVALID_CURSOR` | `session.read` cursor string fails to parse — different shape from `truncated_before` (which is "valid cursor but data is gone") |
-| `SPAWN_FAILED` | `dispatcher.spawnFromCallback` returned `spawn_failed` — surfaces the underlying message |
+| `SPAWN_FAILED` | `session.send` spawn-mode path failed (provider not registered, recipe-runner threw, etc.) — surfaces underlying message |
+| `RESUME_FAILED` | `session.send` resume-mode path failed (e.g., recipe-runner threw during resume). Distinct from `SPAWN_FAILED` so callers can tell which branch failed. |
+| `FOREIGN_NOT_WRITABLE` | `session.send` resolved to a foreign tmux session — writes are blocked for safety |
 
 ## Testing strategy
 
@@ -311,6 +340,11 @@ All errors returned via `structuredError(code, message)` (matches existing tool 
 12. **session.kill of live tmux** — `kind: 'tmux'`, `killed: true`, tmux session gone after.
 13. **session.list returns spawned session** — spawn 2 sessions, assert both in list with correct `live`/`kind`.
 14. **session.list status filter** — kill one, set `status: 'archived'`, assert killed one is present and live one isn't.
+15. **session.send auto-resume archived copilot session** — spawn a `copilot` session with alias `X`, kill it, send `session.send({prompt, session_id: 'X'})`, assert `mode: 'resume'`, response includes `resumed_from: <old_instance_id>`, the OLD row in agent_sessions has `resumed_into_instance_id` set.
+16. **session.send falls through to spawn when provider can't resume** — spawn an `echo-stub` session with alias `Y`, kill it, send `session.send({prompt, session_id: 'Y'})`, assert `mode: 'spawn'` (echo-stub has `supportsResume: false`), fresh instance_id different from old.
+17. **session.list include_foreign default true / false** — create a foreign tmux session via `tmux new-session -d -s test_foreign_X`, call `session.list()`, assert it appears with `kind: 'foreign'`; call `session.list({include_foreign: false})`, assert it's filtered out.
+18. **session.read of foreign tmux works** — read the same foreign session, assert `backend: 'tmux'`, `supports_incremental: false`, content was captured via capture-pane.
+19. **session.send to foreign tmux is rejected** — call `session.send({prompt, session_id: 'test_foreign_X'})`, assert `FOREIGN_NOT_WRITABLE` error.
 
 ## Open questions & follow-ups
 
@@ -321,7 +355,7 @@ All errors returned via `structuredError(code, message)` (matches existing tool 
 
 ## Acceptance criteria
 
-- All 14 tests pass.
+- All 19 tests pass.
 - `list_tools` filter `session` returns exactly the 4 new entries.
 - `learn_tool` returns valid Zod schemas + non-trivial descriptions for each.
 - An end-to-end run from the main agent in the Terminals tab successfully:
@@ -329,5 +363,6 @@ All errors returned via `structuredError(code, message)` (matches existing tool 
   - Polls `session.read({session_id: "e2e-test"})` 5×; eventually sees "HELLO_E2E" in content.
   - Calls `session.send({prompt: "say BYE_E2E", session_id: "e2e-test"})` → returns `mode: 'dispatch'`.
   - Calls `session.kill({session_id: "e2e-test"})` → returns `killed: true`.
+  - Calls `session.send({prompt: "say WELCOME_BACK", session_id: "e2e-test"})` → returns `mode: 'resume'` (copilot session was killed but resumable from its on-disk jsonl).
 - HTTP routes (`POST /spawn`, `POST /dispatch`, etc.) still pass their existing test suites after the refactor.
 - No regressions in `tests/cli-sessions/`, `tests/dispatch-*`, or `tests/api-sessions*`.
