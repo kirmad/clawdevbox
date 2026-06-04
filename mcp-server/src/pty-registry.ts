@@ -120,8 +120,8 @@ interface PtySession {
   ipty: IPty;
   cols: number;
   rows: number;
-  buffer: string[];        // ring of recent chunks
-  bufferBytes: number;     // approximate total bytes in buffer
+  buffer: string[];
+  bufferBytes: number;
   subscribers: Set<PtySubscriber>;
   exited: boolean;
   exitCode: number | null;
@@ -129,6 +129,19 @@ interface PtySession {
   conductor: SessionConductor | null;
   initialPromptGateActive: boolean;
   pendingResize: { cols: number; rows: number } | null;
+  /**
+   * Monotonic total UTF-16 code units appended to this session's output
+   * stream (NOT the current buffer length — counts content already dropped
+   * from the ring). Cursor offset basis for readScrollback.
+   */
+  totalCodeUnits: number;
+  /**
+   * Code-unit offset of the FIRST character currently in the ring.
+   * Advances when appendToBuffer drops head entries past BUFFER_LIMIT_BYTES.
+   */
+  headCodeUnits: number;
+  /** Epoch ms at register time. Encoded into cursor so respawn invalidates. */
+  spawnTs: number;
 }
 
 // ============================================================================
@@ -141,9 +154,13 @@ const sessions = new Map<string, PtySession>();
 function appendToBuffer(s: PtySession, chunk: string): void {
   s.buffer.push(chunk);
   s.bufferBytes += chunk.length;
+  s.totalCodeUnits += chunk.length;
   while (s.bufferBytes > BUFFER_LIMIT_BYTES && s.buffer.length > 1) {
     const head = s.buffer.shift();
-    if (head !== undefined) s.bufferBytes -= head.length;
+    if (head !== undefined) {
+      s.bufferBytes -= head.length;
+      s.headCodeUnits += head.length;
+    }
   }
 }
 
@@ -189,6 +206,9 @@ export function registerPty(opts: PtyRegisterOptions): void {
     conductor: null,
     initialPromptGateActive: false,
     pendingResize: null,
+    totalCodeUnits: 0,
+    headCodeUnits: 0,
+    spawnTs: Date.now(),
   };
 
   // Conductor creation removed in tmux migration; see src/pending-dispatch-registry.ts
@@ -432,4 +452,51 @@ export function listSessions(): { instanceId: string; workspaceId: string; exite
     workspaceId: s.workspaceId,
     exited: s.exited,
   }));
+}
+
+export interface ReadScrollbackOpts {
+  since: number;
+}
+
+export interface ReadScrollbackResult {
+  /** Content from Math.max(since, headCodeUnits) to totalCodeUnits. */
+  content: string;
+  /** Total code units written so far. New cursor offset. */
+  totalOffset: number;
+  /** First code unit still in the ring. */
+  headOffset: number;
+  /** Session spawn timestamp — encode into cursor so respawn invalidates. */
+  spawnTs: number;
+  exited: boolean;
+  exitCode?: number;
+}
+
+/**
+ * Return scrollback slice from `Math.max(since, headOffset)` to current
+ * total. Returns null when the session isn't in the registry. Caller
+ * compares `since` with `headOffset` to compute truncated_before.
+ */
+export function readScrollback(
+  instanceId: string,
+  opts: ReadScrollbackOpts,
+): ReadScrollbackResult | null {
+  const s = sessions.get(instanceId);
+  if (!s) return null;
+  const since = Math.max(opts.since, s.headCodeUnits);
+  const full = s.buffer.join('');
+  const startInFull = since - s.headCodeUnits;
+  const content = startInFull >= full.length ? '' : full.slice(startInFull);
+  return {
+    content,
+    totalOffset: s.totalCodeUnits,
+    headOffset: s.headCodeUnits,
+    spawnTs: s.spawnTs,
+    exited: s.exited,
+    exitCode: s.exitCode ?? undefined,
+  };
+}
+
+/** Test hatch — wipes the live registry. Production callers should not use. */
+export function _resetForTests(): void {
+  sessions.clear();
 }
