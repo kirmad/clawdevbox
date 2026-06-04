@@ -496,7 +496,22 @@ export function readScrollback(
   };
 }
 
-/** Test hatch — wipes the live registry. Production callers should not use. */
+/**
+ * Test hatch — wipes the live registry. Throws when called outside tests
+ * to prevent accidental imports from clearing live ptys in production.
+ * Detection: process.env.NODE_ENV === 'test' OR process.env.npm_lifecycle_event
+ * matches 'test*' (covers `npm test`, `npm run test:*`), OR Node's test
+ * worker context is present, OR `node --test` is the entry point (detected via
+ * process.execArgv).
+ */
 export function _resetForTests(): void {
+  const isTest =
+    process.env.NODE_ENV === 'test' ||
+    /^test/i.test(process.env.npm_lifecycle_event ?? '') ||
+    process.env.NODE_TEST_CONTEXT === 'child-v8' ||
+    process.execArgv.some((arg) => arg === '--test' || arg.startsWith('--test='));
+  if (!isTest) {
+    throw new Error('_resetForTests: refusing to clear pty-registry outside test context');
+  }
   sessions.clear();
 }
