@@ -16,7 +16,10 @@
 
 import { EventEmitter } from 'node:events';
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { mkdirSync, openSync, writeSync, closeSync, statSync, renameSync, existsSync } from 'node:fs';
+import {
+  mkdirSync, openSync, writeSync, closeSync, statSync, renameSync, existsSync,
+  fstatSync, readSync,
+} from 'node:fs';
 import { dirname, join } from 'node:path';
 import { setTimeout as sleepP } from 'node:timers/promises';
 import { logger } from './logger.ts';
@@ -245,7 +248,6 @@ export function daemonLogPath(workspacePath: string, daemonId: string, runId: st
 export function readDaemonLog(logPath: string, tailBytes = 32_768): string {
   try {
     if (!existsSync(logPath)) return '';
-    const { openSync, fstatSync, readSync, closeSync } = require('node:fs') as typeof import('node:fs');
     const fd = openSync(logPath, 'r');
     try {
       const size = fstatSync(fd).size;

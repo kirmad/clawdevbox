@@ -30,7 +30,7 @@
  * mirroring taskdock's watcher pattern.
  */
 
-import { createReadStream, existsSync, readFileSync, statSync } from 'node:fs';
+import { closeSync, createReadStream, existsSync, openSync, readFileSync, readSync, statSync } from 'node:fs';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { extname, join } from 'node:path';
 import { WebSocketServer, type WebSocket } from 'ws';
@@ -68,7 +68,10 @@ let _tmuxBinPath: string | null = null;
 function resolveTmuxBin(): string {
   if (_tmuxBinPath) return _tmuxBinPath;
   const isWin = process.platform === 'win32';
-  const which = spawnSync(isWin ? 'where.exe' : 'which', ['tmux'], { encoding: 'utf8' });
+  const which = spawnSync(isWin ? 'where.exe' : 'which', ['tmux'], {
+    encoding: 'utf8',
+    windowsHide: true,
+  });
   if (which.status === 0) {
     // `where` returns one path per line; take the first.
     const first = which.stdout.split(/\r?\n/).map((l) => l.trim()).find((l) => l.length > 0);
@@ -119,6 +122,9 @@ function tmuxResizePane(
       spawnSync(tmuxBin, [...socketArgs, ...subcmd], {
         timeout: 2000,
         stdio: 'ignore',
+        // tmuxResizePane fires 3× per browser resize message; without
+        // windowsHide each one pops a brief console window on Windows.
+        windowsHide: true,
       });
     } catch { /* ignore — psmux may return non-zero for unsupported commands */ }
   }
@@ -1018,13 +1024,29 @@ function readArchivedTerminalLog(instanceId: string): string | null {
   } catch {
     /* ignore */
   }
+  // Hard tail cap: a forgotten-but-noisy agent can produce multi-GB log files.
+  // Reading the whole file with readFileSync would allocate a giant string
+  // inside the kernel process — a single such request can OOM the service.
+  // 1 MB tail is enough for a meaningful "what was it doing" snapshot.
+  const TAIL_BYTES = 1024 * 1024;
   for (const p of candidates) {
-    if (existsSync(p)) {
-      try {
+    if (!existsSync(p)) continue;
+    try {
+      const { size } = statSync(p);
+      if (size <= TAIL_BYTES) {
         return readFileSync(p, 'utf8');
-      } catch {
-        /* ignore */
       }
+      // Tail: read the last TAIL_BYTES, prepend a truncation banner.
+      const fd = openSync(p, 'r');
+      try {
+        const buf = Buffer.alloc(TAIL_BYTES);
+        readSync(fd, buf, 0, TAIL_BYTES, size - TAIL_BYTES);
+        return `[clawdevbox] log truncated — showing last ${TAIL_BYTES} of ${size} bytes\r\n…\r\n` + buf.toString('utf8');
+      } finally {
+        closeSync(fd);
+      }
+    } catch {
+      /* ignore — try next candidate */
     }
   }
   return null;

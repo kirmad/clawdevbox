@@ -28,6 +28,7 @@ import { handleTestHook } from '../api-test-hooks.ts';
 import { onChange } from '../event-bus.ts';
 import { renderHomePage, resolveSpaAsset } from '../home-page.ts';
 import { logger } from '../logger.ts';
+import { startHeapMonitor, type HeapMonitorHandle } from '../heap-monitor.ts';
 import { cleanCopilotStaleLocks } from '../stale-locks.ts';
 import { startMainAgent, getMainAgentStatus } from '../main-agent.ts';
 import { buildProviderCtx } from '../agent-clis/shared.ts';
@@ -93,6 +94,7 @@ import {
   initTmuxSessionRuntime,
   reconcileOnStartup,
   bundledTmuxConfPath,
+  sweepStaleTmuxSessions,
 } from '../cli-sessions/tmux-session-runtime.ts';
 import { tmuxRunAsync } from '../cli-sessions/tmux-client.ts';
 
@@ -405,6 +407,29 @@ export async function runStart(flags: Flags): Promise<void> {
     }
     initTmuxSessionRuntime(tmuxClient);
 
+    // Sweep orphan `cdb_*` tmux sessions before anything else uses tmux.
+    // When clawdevbox dies hard (OOM, kill /F, power loss) the tmux servers
+    // it spawned become orphans and the agency/copilot processes inside
+    // keep running indefinitely, leaking ~5-10 processes per orphan. We
+    // tag each session at creation with CDB_CREATOR_PID; this sweep kills
+    // any cdb_* session whose creator PID is dead (or untagged, which
+    // implies pre-fix legacy). Concurrent clawdevbox instances are safe:
+    // their sessions stay because their PIDs are alive.
+    try {
+      const sweep = await sweepStaleTmuxSessions(tmuxClient);
+      if (sweep.killed > 0 || sweep.kept > 0) {
+        logger.info(
+          { killed: sweep.killed, kept: sweep.kept },
+          'tmux: swept orphan cdb_* sessions',
+        );
+      }
+    } catch (err) {
+      logger.warn(
+        { err: err instanceof Error ? err.message : String(err) },
+        'tmux orphan sweep failed (non-fatal)',
+      );
+    }
+
     // Fire-and-forget: reconcile orphan sessions in background so a slow
     // attach loop (464 stale rows on dev machines) doesn't block boot. The
     // reconcile only matters for adopting truly-still-alive tmux sessions
@@ -538,12 +563,78 @@ export async function runStart(flags: Flags): Promise<void> {
 
   const serviceStartedAt = Date.now();
   const ownVersion = readOwnVersion();
+
+  // Long-running memory observability. Logs a heap-usage line every 60 s
+  // and writes an automatic .heapsnapshot under <globalDir>/heap-snapshots/
+  // when heap crosses 80% of the configured --max-old-space-size. We've
+  // had OOM crashes after ~30 min uptime with no visible cause; this gives
+  // the next leak an actionable artifact rather than a stack trace from
+  // V8's mark-compact thrash. /api/heap-snapshot triggers one on demand
+  // (loopback-only, no bearer). Started here (before createServer) so the
+  // request-handler closure captures a fully-initialized handle even if
+  // the very first request races the server.listen() callback.
+  const heapMonitor: HeapMonitorHandle = startHeapMonitor({
+    snapshotDir: join(ws.globalDir, 'heap-snapshots'),
+  });
+
   const httpServer = createServer(async (req, res) => {
     const url = new URL(req.url ?? '/', `http://${cfg.http.host}`);
 
     if (url.pathname === '/healthz') {
       res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
       res.end('ok');
+      return;
+    }
+
+    // Loopback-only memory diagnostics. GET returns the latest heap sample
+    // (rss, heapUsed, heapTotal, configured max-old-space-size); POST writes
+    // a `.heapsnapshot` under <globalDir>/heap-snapshots/ and returns the
+    // path. Use to capture state on demand when investigating a memory leak
+    // without restarting the server.
+    if (url.pathname === '/api/heap-status' || url.pathname === '/api/heap-snapshot') {
+      const remote = req.socket.remoteAddress ?? '';
+      const isLoopback = remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1';
+      if (!isLoopback) {
+        res.writeHead(403, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: { code: 'LOOPBACK_ONLY' } }));
+        return;
+      }
+      if (url.pathname === '/api/heap-status' && req.method === 'GET') {
+        // Enrich the heap sample with per-subsystem counters so the next
+        // climb is diagnosable from /api/heap-status alone (no need to
+        // walk a heap snapshot for the obvious suspects).
+        const { listSessions: ptyListSessions } = await import('../pty-registry.ts');
+        const { pendingDispatchStats } = await import('../pending-dispatch-registry.ts');
+        const { tmuxSessionRegistry } = await import('../cli-sessions/tmux-session-runtime.ts');
+        const ptyLive = ptyListSessions();
+        const pendingStats = pendingDispatchStats();
+        const enriched = {
+          ...heapMonitor.lastSample(),
+          counters: {
+            mcpSessions: mcpTransports.size,
+            ptySessions: ptyLive.length,
+            ptyBufferBytesTotal: 0,  // pty buffers are bounded at 256 KB each
+            tmuxSessions: tmuxSessionRegistry.list().length,
+            pendingDispatch: pendingStats,
+            workspacesInDb: opened.db.prepare('SELECT COUNT(*) AS n FROM workspaces').get() as { n: number },
+            daemonRunsLive: opened.db.prepare(
+              "SELECT COUNT(*) AS n FROM daemon_runs WHERE status IN ('starting','running')"
+            ).get() as { n: number },
+          },
+        };
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(enriched));
+        return;
+      }
+      if (url.pathname === '/api/heap-snapshot' && req.method === 'POST') {
+        const file = heapMonitor.snapshotNow();
+        heapMonitor.armSnapshot();
+        res.writeHead(file ? 200 : 500, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(file ? { ok: true, file } : { ok: false, error: 'writeHeapSnapshot failed' }));
+        return;
+      }
+      res.writeHead(405, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { code: 'METHOD_NOT_ALLOWED' } }));
       return;
     }
 
@@ -1147,6 +1238,7 @@ export async function runStart(flags: Flags): Promise<void> {
     // → close DB → close HTTP. We give the dispatcher its configured drain
     // window before the hard 5s exit timeout below kicks in.
     scheduler.stop();
+    heapMonitor.stop();
     // Daemon supervisor: gracefully stop every supervised daemon. Best-
     // effort; bounded by the supervisor's drainMs.
     daemonSupervisor.stop().catch((err) => {

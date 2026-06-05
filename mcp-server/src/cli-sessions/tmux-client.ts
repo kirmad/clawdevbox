@@ -37,6 +37,11 @@ export function tmuxRun(
     input: opts.input,
     cwd: opts.cwd,
     env: opts.env ?? process.env,
+    // Suppress the brief console-window flash on Windows. tmuxRun is on the
+    // hot path (500ms pane-dead poller, send-keys dispatch, etc.) so without
+    // this every call pops a window for the SPA/dispatcher user. No effect
+    // on non-Windows platforms.
+    windowsHide: true,
   });
   return {
     exitCode: r.status ?? -1,
@@ -54,6 +59,9 @@ export function tmuxRunAsync(
     const child = spawn('tmux', buildArgs(client, args), {
       cwd: opts.cwd,
       env: opts.env ?? process.env,
+      // Same rationale as tmuxRun above — every cached-list miss
+      // (~once/second under SPA polling) would otherwise flash a window.
+      windowsHide: true,
     });
     let stdout = '';
     let stderr = '';

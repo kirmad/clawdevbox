@@ -108,8 +108,43 @@ export async function runTriggerScript(opts: RunOptions): Promise<RunResult> {
     windowsHide: true,
   });
 
-  child.stdout.on('data', (d: Buffer) => { stdout += d.toString('utf8'); });
-  child.stderr.on('data', (d: Buffer) => { stderr += d.toString('utf8'); });
+  // Cap each stream at 4 MB. A buggy trigger spamming stdout could otherwise
+  // grow these strings unboundedly inside the kernel process. Once the cap is
+  // hit we drop further bytes from THAT stream (timeout still bounds total
+  // duration; this just bounds total RAM per invocation).
+  const STREAM_CAP_BYTES = 4 * 1024 * 1024;
+  let stdoutTruncated = false;
+  let stderrTruncated = false;
+  child.stdout.on('data', (d: Buffer) => {
+    if (stdoutTruncated) return;
+    const remaining = STREAM_CAP_BYTES - Buffer.byteLength(stdout, 'utf8');
+    if (remaining <= 0) {
+      stdoutTruncated = true;
+      stdout += `\n[clawdevbox] stdout truncated at ${STREAM_CAP_BYTES} bytes\n`;
+      return;
+    }
+    const chunk = d.length <= remaining ? d.toString('utf8') : d.subarray(0, remaining).toString('utf8');
+    stdout += chunk;
+    if (d.length > remaining) {
+      stdoutTruncated = true;
+      stdout += `\n[clawdevbox] stdout truncated at ${STREAM_CAP_BYTES} bytes\n`;
+    }
+  });
+  child.stderr.on('data', (d: Buffer) => {
+    if (stderrTruncated) return;
+    const remaining = STREAM_CAP_BYTES - Buffer.byteLength(stderr, 'utf8');
+    if (remaining <= 0) {
+      stderrTruncated = true;
+      stderr += `\n[clawdevbox] stderr truncated at ${STREAM_CAP_BYTES} bytes\n`;
+      return;
+    }
+    const chunk = d.length <= remaining ? d.toString('utf8') : d.subarray(0, remaining).toString('utf8');
+    stderr += chunk;
+    if (d.length > remaining) {
+      stderrTruncated = true;
+      stderr += `\n[clawdevbox] stderr truncated at ${STREAM_CAP_BYTES} bytes\n`;
+    }
+  });
 
   child.stdin.end(JSON.stringify(opts.envelope));
 

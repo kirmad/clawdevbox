@@ -14,7 +14,13 @@ export interface DispatchResult extends Partial<DispatchPayload> {
 interface Entry {
   instanceId: string;
   dispatchId: string;
-  prompt: string;
+  /** Bytes of the prompt at registration time — kept only as a counter for
+   *  diagnostics. We do NOT retain the prompt text itself because dispatched
+   *  prompts can be large (multi-KB Teams-context prompts), and a backlog
+   *  of pending dispatches would retain those bytes for up to the dispatcher
+   *  timeout (~5 min). The dispatch consumer (`update-status`) only reads
+   *  `dispatchId`. */
+  promptBytes: number;
   startedAt: number;
   resolve: (r: DispatchResult) => void;
   promise: Promise<DispatchResult>;
@@ -42,7 +48,7 @@ export function registerPending(
   const entry: Entry = {
     instanceId,
     dispatchId,
-    prompt,
+    promptBytes: typeof prompt === 'string' ? Buffer.byteLength(prompt, 'utf8') : 0,
     startedAt: Date.now(),
     resolve: resolveFn,
     promise,
@@ -92,6 +98,34 @@ export function resolvePendingTimeout(instanceId: string): void {
     task_complete: false,
     doneAt: Date.now(),
   });
+}
+
+/**
+ * Diagnostics — total queued entries + total prompt bytes across all instances.
+ * Used by /api/heap-status to surface backlog pressure.
+ */
+export function pendingDispatchStats(): {
+  count: number;
+  instances: number;
+  totalPromptBytes: number;
+  oldestAgeMs: number;
+} {
+  let count = 0;
+  let totalPromptBytes = 0;
+  let oldest = Date.now();
+  for (const q of queues.values()) {
+    count += q.length;
+    for (const e of q) {
+      totalPromptBytes += e.promptBytes;
+      if (e.startedAt < oldest) oldest = e.startedAt;
+    }
+  }
+  return {
+    count,
+    instances: queues.size,
+    totalPromptBytes,
+    oldestAgeMs: count > 0 ? Date.now() - oldest : 0,
+  };
 }
 
 /** TEST-ONLY hatch: clear the registry. */

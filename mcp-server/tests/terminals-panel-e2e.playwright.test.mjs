@@ -236,6 +236,69 @@ test('Terminals panel: initial state shows Main Agent in Active section', async 
   await page.close();
 });
 
+test('Terminals panel: hidden mount on Inbox tab does NOT send a bad resize to the live pty', async () => {
+  // Regression: PrimeVue eagerly mounts every TabPanel, so <TerminalsPanel>
+  // mounts even while the default Inbox tab is active. Its attach() runs
+  // against a hidden 0×0 .xterm-host; before the fix, fit.fit() silently
+  // no-op'd but term.cols/rows still held xterm's 80×24 defaults, and
+  // ws.onopen sent `resize: {cols: 80, rows: 24}` — SHRINKING the live
+  // pty (e.g. the agency CLI's input box rendered in the middle of the
+  // viewport with empty rows below, exactly what the user-reported
+  // screenshot showed). Guard added in TerminalsPanel.vue::refit().
+  const page = await context.newPage();
+  page.on('pageerror', (err) => console.error('[pageerror]', err.message));
+
+  // Instrument WebSocket.send BEFORE app boot so the SPA's terminal WS
+  // is captured from the very first message.
+  await page.addInitScript(() => {
+    window.__resizeCalls = [];
+    const origSend = WebSocket.prototype.send;
+    WebSocket.prototype.send = function(data) {
+      try {
+        const m = JSON.parse(data);
+        if (m && m.type === 'resize' && /\/terminal\//.test(this.url)) {
+          window.__resizeCalls.push({ cols: m.cols, rows: m.rows, url: this.url, when: 'hidden' });
+        }
+      } catch {}
+      return origSend.call(this, data);
+    };
+  });
+
+  await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: 'domcontentloaded' });
+  await page.locator('.p-tabs').waitFor({ state: 'visible', timeout: 10_000 });
+  // Stay on the default Inbox tab. Give the SPA time to mount all
+  // TabPanels (including the hidden <TerminalsPanel>), open its WS,
+  // receive snapshot, and fire any refit() side effects.
+  await page.waitForTimeout(2000);
+
+  const hiddenResizes = await page.evaluate(() => window.__resizeCalls.slice());
+  console.log('[resize-bug] resizes sent while Inbox tab active:', JSON.stringify(hiddenResizes));
+
+  // Specifically forbid the xterm-default 80×24 from being sent — that's
+  // the smoking gun of the bug. Any tiny size leaked to the pty would
+  // shrink it.
+  const bad = hiddenResizes.filter((r) => r.cols === 80 && r.rows === 24);
+  expect(bad, 'no resize(80,24) — xterm defaults — should be sent while Terminals tab is hidden').toEqual([]);
+  // Belt-and-suspenders: any resize sent while hidden is suspect because
+  // the host hasn't been measured. After the fix, we expect zero.
+  expect(hiddenResizes.length, `no resize messages expected while Terminals tab is hidden; got ${JSON.stringify(hiddenResizes)}`).toBe(0);
+
+  // Sanity: switching to Terminals tab DOES send a real resize so the
+  // pty gets correctly sized for the viewer.
+  await page.evaluate(() => { window.__resizeCalls.length = 0; });
+  await page.locator('[role="tab"]:has-text("Terminals")').first().click();
+  await page.waitForTimeout(1500);
+  const visibleResizes = await page.evaluate(() => window.__resizeCalls.slice());
+  console.log('[resize-bug] resizes sent after Terminals tab visible:', JSON.stringify(visibleResizes));
+  expect(visibleResizes.length, 'at least one resize should fire when host becomes visible').toBeGreaterThan(0);
+  for (const r of visibleResizes) {
+    expect(r.cols, 'cols should reflect real host width, not xterm default').toBeGreaterThan(40);
+    expect(r.rows, 'rows should reflect real host height, not xterm default').toBeGreaterThan(10);
+  }
+
+  await page.close();
+});
+
 test('Terminals panel: /spawn creates a new tab in Active section', async () => {
   // 1. Record a fake fire + secret in dispatcher's activeRuns
   const { fireId, secret } = await recordActiveRun({

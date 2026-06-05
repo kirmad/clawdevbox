@@ -3,7 +3,7 @@ import { existsSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Database } from 'better-sqlite3';
-import { tmuxRunAsync, type TmuxClientOpts } from './tmux-client.ts';
+import { tmuxRun, tmuxRunAsync, type TmuxClientOpts } from './tmux-client.ts';
 import { createTmuxSession, adoptTmuxSession } from './tmux-session.ts';
 import type { CliSession, CliSessionRuntime, CliSessionSpawnOpts } from './types.ts';
 
@@ -190,6 +190,86 @@ export async function reconcileOnStartup(
     }
   }
   return { adopted, orphaned };
+}
+
+// ============================================================================
+// Orphan tmux sweep
+// ============================================================================
+
+/**
+ * On Windows, when clawdevbox crashes (OOM, hard kill, `taskkill /F`),
+ * its child tmux servers don't die — they become orphans, and the
+ * agency/copilot processes inside keep running forever, spawning new
+ * shell + MCP subprocesses on each agent turn. Across multiple crashes
+ * this accumulates into hundreds of leaked processes.
+ *
+ * `createTmuxSession` tags every `cdb_*` tmux session with
+ * `CDB_CREATOR_PID = <process.pid>` via `tmux set-environment`. This
+ * sweep, called at clawdevbox startup BEFORE the main agent spawns,
+ * walks the live tmux session list and kills any `cdb_*` session whose
+ * recorded creator PID is no longer alive (or whose env tag is missing,
+ * which only happens for pre-fix sessions — those are always orphans
+ * by the time a new clawdevbox starts).
+ *
+ * Sessions belonging to *another* running clawdevbox instance are
+ * preserved because their CDB_CREATOR_PID is still alive.
+ *
+ * Returns { killed, kept } counts so the caller can log a summary line.
+ */
+export interface SweepResult {
+  killed: number;
+  kept: number;
+  details: Array<{ name: string; creatorPid: number | null; alive: boolean; killed: boolean }>;
+}
+
+function isPidAlive(pid: number): boolean {
+  try {
+    // Signal 0 doesn't deliver — it just checks process existence and
+    // throws ESRCH/EPERM otherwise. Works on Windows + Unix.
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function sweepStaleTmuxSessions(client: TmuxClientOpts): Promise<SweepResult> {
+  const list = await tmuxRunAsync(client, ['list-sessions', '-F', '#{session_name}']);
+  const result: SweepResult = { killed: 0, kept: 0, details: [] };
+  if (list.exitCode !== 0) return result;
+
+  const sessionNames = list.stdout
+    .split('\n')
+    .map((l) => l.trim().split(/[:(\s]/)[0])
+    .filter((n) => n && n.startsWith('cdb_'));
+
+  for (const name of sessionNames) {
+    // Query the tag we set in createTmuxSession. show-environment writes
+    // `NAME=VALUE` on stdout when the var is set; "-NAME" when explicitly
+    // unset; non-zero exit when the session is gone (race).
+    const env = tmuxRun(client, ['show-environment', '-t', name, 'CDB_CREATOR_PID']);
+    let creatorPid: number | null = null;
+    if (env.exitCode === 0) {
+      const m = env.stdout.trim().match(/^CDB_CREATOR_PID=(\d+)/m);
+      if (m) creatorPid = Number(m[1]);
+    }
+
+    const alive = creatorPid != null && isPidAlive(creatorPid);
+    if (alive) {
+      // Owned by a live clawdevbox (this one or another concurrent run) — keep.
+      result.kept++;
+      result.details.push({ name, creatorPid, alive: true, killed: false });
+      continue;
+    }
+
+    // Either no creator tag (pre-fix session, always orphan since the original
+    // clawdevbox that made it is gone) or creator PID is dead. Kill it.
+    const kill = tmuxRun(client, ['kill-session', '-t', name]);
+    const killed = kill.exitCode === 0;
+    if (killed) result.killed++;
+    result.details.push({ name, creatorPid, alive: false, killed });
+  }
+  return result;
 }
 
 // ============================================================================

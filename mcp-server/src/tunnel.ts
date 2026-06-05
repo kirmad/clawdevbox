@@ -251,6 +251,7 @@ export async function stopTunnel(): Promise<void> {
       // taskkill /T kills the entire devtunnel process tree.
       spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], {
         stdio: 'ignore',
+        windowsHide: true,
       });
     } else {
       proc.kill();
