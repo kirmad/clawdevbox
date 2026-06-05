@@ -36,7 +36,10 @@ function isPortableShell(command: string): boolean {
 }
 
 function shellWorks(command: string): boolean {
-  const r = spawnSync(command, ['-c', 'echo OK'], { encoding: 'utf8' });
+  const r = spawnSync(command, ['-c', 'echo OK'], {
+    encoding: 'utf8',
+    windowsHide: true,
+  });
   return r.status === 0 && r.stdout.trim() === 'OK';
 }
 
@@ -146,6 +149,17 @@ export async function createTmuxSession(
 
   await spawnSession(opts.cols, opts.rows);
 
+  // Tag the session with the creator clawdevbox PID via tmux's session
+  // environment. The startup sweep (sweepStaleTmuxSessions) queries this
+  // to identify orphan `cdb_*` sessions whose owning clawdevbox crashed
+  // (OOM, hard kill) — those sessions and their agent/copilot subtrees
+  // would otherwise stay alive forever and accumulate every restart.
+  // Best-effort: silent if tmux's set-environment errors (older psmux
+  // builds might reject it).
+  try {
+    tmuxRun(client, ['set-environment', '-t', sessionName, 'CDB_CREATOR_PID', String(process.pid)]);
+  } catch { /* non-fatal — sweep skips sessions with no env var */ }
+
   return buildCliSession(client, sessionName, usingPsmux);
 }
 
@@ -215,34 +229,19 @@ function buildCliSession(
 
     async sendText(text: string): Promise<void> {
       if (text.length === 0) return;
-      if (usingPsmux && text.includes('\n')) {
-        const lines = text.split('\n');
-        for (let i = 0; i < lines.length; i += 1) {
-          const line = lines[i] ?? '';
-          if (line.length > 4096) {
-            // Single line larger than send-keys command-line limit — use
-            // load-buffer + paste-buffer to inject just this line.
-            const buf = `cdb_${sessionName}_line${i}`;
-            const load = await tmuxRunAsync(client, ['load-buffer', '-b', buf, '-'], { input: line });
-            if (load.exitCode !== 0) throw new Error(`load-buffer failed: ${load.stderr}`);
-            try {
-              const paste = await tmuxRunAsync(client, ['paste-buffer', '-t', sessionName, '-b', buf, '-d', '-p']);
-              if (paste.exitCode !== 0) throw new Error(`paste-buffer failed: ${paste.stderr}`);
-            } finally {
-              await tmuxRunAsync(client, ['delete-buffer', '-b', buf]);
-            }
-          } else {
-            await sendLiteral(line);
-          }
-          if (i < lines.length - 1) await sendTmuxKey('Enter');
-        }
-        return;
-      }
       if (text.includes('\n') || text.length > 4096) {
-        // Multi-line / large text: use load-buffer + paste-buffer so
-        // newlines aren't interpreted as key boundaries by send-keys.
+        // Multi-line / large text: load-buffer + paste-buffer with `-p`
+        // (bracketed paste). This is the ONLY safe path for TUI inputs
+        // like copilot/claude/agency that treat raw Enter as "submit
+        // message" — line-by-line + sendKey('Enter') turns a 10-line
+        // prompt into 10 separate submitted prompts.
+        //
         // paste-buffer goes through the pane (real terminal), unlike
-        // show-buffer which escapes newlines on Windows MSYS tmux.
+        // show-buffer which escapes newlines on Windows MSYS tmux. The
+        // `-p` flag wraps the content in ESC[200~ / ESC[201~ so the TUI
+        // recognizes it as a paste (newlines inserted, no Enter fired).
+        //
+        // Works on both real tmux (Linux/macOS) and psmux (Windows).
         const buf = `cdb_${sessionName}`;
         const load = await tmuxRunAsync(client, ['load-buffer', '-b', buf, '-'], { input: text });
         if (load.exitCode !== 0) throw new Error(`load-buffer failed: ${load.stderr}`);
