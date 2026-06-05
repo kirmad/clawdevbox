@@ -117,7 +117,12 @@ export async function spawnDispatchOrResume(
             message: `session_id '${args.session_id}' is a foreign tmux session — writes are not allowed for safety. Use session.read to observe it.`,
           };
         }
-      } catch { /* tmux not available — fall through, spawn will surface real error */ }
+      } catch (err) {
+        logger.warn(
+          { err: err instanceof Error ? err.message : String(err) },
+          'session.send: tmux probe failed during foreign-tmux check; falling through to spawn',
+        );
+      }
     }
 
     // 3. ARCHIVED + RESUMABLE? → resume
@@ -245,6 +250,7 @@ async function runResume(
     isAdhoc,
     prompt,
     spawnMode: 'interactive',
+    sessionId: row.cli_session_id,
     resumeOf: row.cli_session_id,
     workspaceInfo: { id: wsRow.id, path: wsRow.path },
     agentCli: row.agent_cli,
@@ -615,7 +621,8 @@ export async function readScrollbackHelper(
   });
   if (ptyResult) {
     const truncatedBefore =
-      (parsedCursor && parsedCursor.instanceId === instanceId
+      (parsedCursor && parsedCursor.instanceId !== instanceId)
+      || (parsedCursor && parsedCursor.instanceId === instanceId
         && parsedCursor.spawnTs !== ptyResult.spawnTs)
       || (parsedCursor && parsedCursor.offset < ptyResult.headOffset)
       || false;
