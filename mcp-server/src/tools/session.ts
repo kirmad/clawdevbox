@@ -16,7 +16,6 @@ import { z } from 'zod';
 import { defineTool } from './registry.ts';
 import { structuredError } from '../scope.ts';
 import type { Workspace } from '../workspace.ts';
-import { HEADER_PROJECT_DIR } from '../context-resolver.ts';
 import {
   spawnDispatchOrResume,
   readScrollbackHelper,
@@ -24,23 +23,6 @@ import {
   listSessions,
   type SessionHelperCtx,
 } from '../session-helpers.ts';
-
-function readHeader(headers: unknown, name: string): string | null {
-  if (!headers || typeof headers !== 'object') return null;
-  const lower = name.toLowerCase();
-  for (const [k, v] of Object.entries(headers as Record<string, unknown>)) {
-    if (k.toLowerCase() === lower) {
-      if (typeof v === 'string') return v;
-      if (Array.isArray(v) && v.length > 0 && typeof v[0] === 'string') return v[0];
-    }
-  }
-  return null;
-}
-
-function projectDirFromExtra(extra: any): string | null {
-  const fromHeader = readHeader(extra?.requestInfo?.headers, HEADER_PROJECT_DIR);
-  return fromHeader ?? process.env.CLAWDEVBOX_PROJECT_DIR ?? null;
-}
 
 export function registerSessionEntries(ws: Workspace): void {
   // Build ctx lazily — the dispatcher and cfg are owned by start.ts.
@@ -74,10 +56,10 @@ export function registerSessionEntries(ws: Workspace): void {
       model: z.string().min(1).optional().describe('LLM model override passed as --model.'),
       workspace_id: z.string().min(1).optional().describe('Existing workspace id to run in.'),
       workspace_path: z.string().min(1).optional().describe(
-        "Absolute path. If the workspace doesn't exist yet, it's created. Defaults to the calling agent's project dir (X-Clawdevbox-Project-Dir header).",
+        "Absolute path. If the workspace doesn't exist yet, it's created. When omitted, an auto-managed workspace under `cfg.workspacesRoot/ws_<id>/` is created on first spawn and reused for any subsequent send/resume to the same `session_id`.",
       ),
     }),
-    handler: async (args, extra) => {
+    handler: async (args) => {
       const ctx = buildCtx();
       const result = await spawnDispatchOrResume(ctx, {
         prompt: args.prompt,
@@ -87,13 +69,14 @@ export function registerSessionEntries(ws: Workspace): void {
         model: args.model ?? null,
         workspace_id: args.workspace_id ?? null,
         workspace_path: args.workspace_path ?? null,
-        default_workspace_path: projectDirFromExtra(extra),
       });
       if (!result.ok) return structuredError(result.code, result.message, result.details ?? {});
+      const verb = result.mode === 'spawn' ? 'Spawned' : result.mode === 'resume' ? 'Resumed' : 'Dispatched to';
+      const wsBit = result.workspace_path ? ` in ${result.workspace_path}` : '';
       return {
         content: [{
           type: 'text',
-          text: `${result.mode === 'spawn' ? 'Spawned' : result.mode === 'resume' ? 'Resumed' : 'Dispatched to'} ${result.instance_id} (session ${result.session_id}${result.session_alias ? `, alias ${result.session_alias}` : ''})`,
+          text: `${verb} ${result.instance_id} (session ${result.session_id}${result.session_alias ? `, alias ${result.session_alias}` : ''})${wsBit}`,
         }],
         structuredContent: result,
       };

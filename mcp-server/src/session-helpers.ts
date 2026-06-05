@@ -20,6 +20,7 @@ import type { Database } from 'better-sqlite3';
 import type { Dispatcher } from './dispatcher.ts';
 import type { Workspace } from './workspace.ts';
 import type { ResolvedConfig } from './config.ts';
+import { join } from 'node:path';
 import { withKeyedLock } from './async-mutex.ts';
 import { stripTuiNoise } from './agent-clis/shared.ts';
 import { logger } from './logger.ts';
@@ -49,7 +50,8 @@ export interface SendArgs {
 
 export type SendResult =
   | { ok: true; mode: SendMode; instance_id: string; session_id: string;
-      session_alias?: string | null; state?: 'dispatched'; resumed_from?: string }
+      session_alias?: string | null; state?: 'dispatched'; resumed_from?: string;
+      workspace_id?: string; workspace_path?: string }
   | { ok: false; code: SendErrorCode; message: string; details?: Record<string, unknown> };
 
 export type SendErrorCode =
@@ -132,12 +134,15 @@ export async function spawnDispatchOrResume(
       if (provider?.supportsResume) {
         try {
           const result = await runResume(ctx, resumeRow, args.prompt, sessionGuid);
+          const wsRow = ctx.db.prepare('SELECT id, path FROM workspaces WHERE id = ?')
+            .get(resumeRow.workspace_id) as { id: string; path: string } | undefined;
           return {
             ok: true, mode: 'resume',
             instance_id: result.newInstanceId,
             session_id: sessionGuid,
             session_alias: sessionAlias,
             resumed_from: resumeRow.recipe_instance_id ?? resumeRow.id,
+            ...(wsRow ? { workspace_id: wsRow.id, workspace_path: wsRow.path } : {}),
           };
         } catch (err) {
           return {
@@ -160,9 +165,20 @@ export async function spawnDispatchOrResume(
       };
     }
 
-    const workspacePath = args.workspace_path
-      ?? args.default_workspace_path
-      ?? null;
+    // Workspace resolution precedence:
+    //   1. Explicit workspace_id / workspace_path → use as-is.
+    //   2. fire_id present → defer to spawnFromCallback's entry.spawnDefaults
+    //      so trigger-callback semantics keep their existing workspace.
+    //   3. default_workspace_path (legacy callers) → honored.
+    //   4. Auto-managed workspace pinned to this session GUID (reused
+    //      across resume / re-spawn, fresh on first spawn).
+    let workspaceId = args.workspace_id ?? null;
+    let workspacePath = args.workspace_path ?? args.default_workspace_path ?? null;
+    if (!workspaceId && !workspacePath && !args.fire_id) {
+      const ws = await getOrCreateSessionWorkspace(ctx, sessionGuid, sessionAlias);
+      workspaceId = ws.id;
+      workspacePath = ws.path;
+    }
 
     const result = await ctx.dispatcher.spawnFromCallback(
       args.fire_id ?? null,
@@ -170,7 +186,7 @@ export async function spawnDispatchOrResume(
       {
         agent: args.agent ?? undefined,
         model: args.model ?? undefined,
-        workspaceId: args.workspace_id ?? undefined,
+        workspaceId: workspaceId ?? undefined,
         workspacePath: workspacePath ?? undefined,
         provider,
         sessionId: sessionGuid,
@@ -188,8 +204,52 @@ export async function spawnDispatchOrResume(
       instance_id: result.instanceId,
       session_id: result.sessionId,
       session_alias: sessionAlias,
+      workspace_id: result.workspaceId,
+      workspace_path: result.workspacePath,
     };
   });
+}
+
+/**
+ * Find or create the workspace pinned to this session GUID.
+ *
+ * Rule: a session GUID gets ONE workspace for life. The most-recent
+ * interactive `agent_sessions` row's `workspace_id` is the binding. When
+ * no prior row exists (first spawn), we mint a fresh workspace under
+ * `cfg.workspacesRoot` and scaffold the `.clawdevbox/` tree via
+ * `ensureWorkspace` (which writes both the DB row and the on-disk index).
+ *
+ * Concurrency: callers must hold the per-sessionGuid mutex (`session.send:<guid>`).
+ * `spawnDispatchOrResume` already does this, so two concurrent first-spawns
+ * with the same session_id serialize and only one workspace is minted.
+ */
+async function getOrCreateSessionWorkspace(
+  ctx: SessionHelperCtx,
+  sessionGuid: string,
+  sessionAlias: string | null,
+): Promise<{ id: string; path: string }> {
+  const existing = ctx.db.prepare(
+    `SELECT w.id AS id, w.path AS path
+     FROM agent_sessions s
+     JOIN workspaces w ON w.id = s.workspace_id
+     WHERE s.cli_session_id = ?
+       AND s.interactive = 1
+     ORDER BY s.started_at DESC
+     LIMIT 1`,
+  ).get(sessionGuid) as { id: string; path: string } | undefined;
+  if (existing) return existing;
+
+  const { ensureWorkspace, mintWorkspaceId } = await import('./db/workspaces-store.ts');
+  const { resolveWorkspacesRoot } = await import('./workspaces-store.ts');
+  const root = ctx.cfg.workspacesRoot ?? resolveWorkspacesRoot();
+  const id = mintWorkspaceId();
+  const path = join(root, id);
+  const row = ensureWorkspace(ctx.db, {
+    id,
+    path,
+    name: sessionAlias ?? `session-${sessionGuid.slice(0, 8)}`,
+  });
+  return { id: row.id, path: row.path };
 }
 
 interface ArchivedResumeRow {

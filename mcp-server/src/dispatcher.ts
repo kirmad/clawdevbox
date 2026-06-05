@@ -377,7 +377,7 @@ export class Dispatcher {
   ): Promise<
     | { status: 'not_found_fire' }
     | { status: 'spawn_failed'; message: string }
-    | { status: 'ok'; instanceId: string; sessionId: string }
+    | { status: 'ok'; instanceId: string; sessionId: string; workspaceId: string; workspacePath: string }
   > {
     let entry: ActiveRunEntry | undefined;
     if (fire_id) {
@@ -452,7 +452,8 @@ export class Dispatcher {
       if (result.spawn_error) {
         return { status: 'spawn_failed', message: `${result.spawn_error.code}: ${result.spawn_error.message}` };
       }
-      return { status: 'ok', instanceId: result.recipe_instance_id, sessionId: result.session_id };
+      return { status: 'ok', instanceId: result.recipe_instance_id, sessionId: result.session_id,
+               workspaceId: workspaceInfo.id, workspacePath: workspaceInfo.path };
     } catch (err) {
       return { status: 'spawn_failed', message: err instanceof Error ? err.message : String(err) };
     }

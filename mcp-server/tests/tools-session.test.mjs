@@ -39,9 +39,10 @@ function freshDirs(name) {
   return { root, projectDir, globalDir };
 }
 
-function makeCfg(projectDir, globalDir, defaultAgentCli = 'echo-stub') {
+function makeCfg(projectDir, globalDir, defaultAgentCli = 'echo-stub', workspacesRoot = null) {
   return {
     projectDir, globalDir,
+    workspacesRoot: workspacesRoot ?? join(globalDir, 'workspaces'),
     defaultAgentCli,
     http: { host: '127.0.0.1', port: 0, token: null },
     tunnel: { kind: 'none', auto_start: false },
@@ -188,7 +189,15 @@ async function setupHarness(options = {}) {
   setDatabaseForTesting(db);
 
   const ws = makeWs(dirs.projectDir, dirs.globalDir);
-  const cfg = makeCfg(dirs.projectDir, dirs.globalDir, options.defaultAgentCli ?? 'echo-stub');
+  const workspacesRoot = join(dirs.root, 'workspaces');
+  // The ensureWorkspace helper in db/workspaces-store.ts mirrors to the
+  // on-disk index using resolveWorkspacesRoot(), which reads the env var.
+  // Point both at the same temp path so auto-managed workspaces don't leak
+  // to ~/.clawdevbox/workspaces.
+  const prevEnv = process.env.CLAWDEVBOX_WORKSPACES_ROOT;
+  process.env.CLAWDEVBOX_WORKSPACES_ROOT = workspacesRoot;
+  const cfg = makeCfg(dirs.projectDir, dirs.globalDir,
+    options.defaultAgentCli ?? 'echo-stub', workspacesRoot);
   const stub = makeRunRecipeStub(db);
   const dispatcher = new Dispatcher(db, ws, {
     defaultAgentCli: options.defaultAgentCli ?? 'echo-stub',
@@ -207,6 +216,7 @@ async function setupHarness(options = {}) {
   const ctx = { db, dispatcher, ws, cfg };
   return {
     ctx,
+    workspacesRoot,
     spawnCalls: stub.calls,
     dispatches,
     cleanup() {
@@ -218,6 +228,8 @@ async function setupHarness(options = {}) {
       try { setDatabaseForTesting(null); } catch {}
       try { db.close(); } catch {}
       try { rmSync(dirs.root, { recursive: true, force: true }); } catch {}
+      if (prevEnv === undefined) delete process.env.CLAWDEVBOX_WORKSPACES_ROOT;
+      else process.env.CLAWDEVBOX_WORKSPACES_ROOT = prevEnv;
     },
   };
 }
@@ -314,6 +326,74 @@ test('5. session.send: default_workspace_path used when neither id nor path give
     const row = h.ctx.db.prepare('SELECT path FROM workspaces WHERE path = ?')
       .get(h.ctx.ws.projectDir);
     assert.ok(row, 'workspace should have been created');
+  } finally { h.cleanup(); }
+});
+
+test('5a. session.send: no workspace at all → auto-creates under cfg.workspacesRoot', async () => {
+  const h = await setupHarness();
+  try {
+    const r = await spawnDispatchOrResume(h.ctx, {
+      prompt: 'hi', session_id: 'auto-ws-A',
+    });
+    assert.equal(r.ok, true);
+    assert.equal(r.mode, 'spawn');
+    assert.ok(r.workspace_id, 'workspace_id should be returned');
+    assert.ok(r.workspace_path, 'workspace_path should be returned');
+    assert.ok(r.workspace_id.startsWith('ws_'), `expected ws_ prefix, got ${r.workspace_id}`);
+    assert.ok(
+      r.workspace_path.startsWith(h.workspacesRoot),
+      `workspace_path ${r.workspace_path} should be under ${h.workspacesRoot}`,
+    );
+    // The DB row exists and is named after the alias.
+    const row = h.ctx.db.prepare('SELECT name FROM workspaces WHERE id = ?')
+      .get(r.workspace_id);
+    assert.equal(row.name, 'auto-ws-A');
+  } finally { h.cleanup(); }
+});
+
+test('5b. session.send: second spawn with same session_id reuses the workspace', async () => {
+  const h = await setupHarness();
+  try {
+    const r1 = await spawnDispatchOrResume(h.ctx, {
+      prompt: 'first', session_id: 'reuse-ws-A',
+    });
+    assert.equal(r1.mode, 'spawn');
+    assert.ok(r1.workspace_id);
+
+    // Simulate the prior session ending: archive its agent_sessions row
+    // and clear the live pty so the next send falls through to SPAWN/RESUME.
+    h.ctx.db.prepare(
+      `UPDATE agent_sessions SET status='success', ended_at=? WHERE cli_session_id=?`,
+    ).run(Date.now(), r1.session_id);
+    resetPtyRegistry();
+
+    const r2 = await spawnDispatchOrResume(h.ctx, {
+      prompt: 'second', session_id: 'reuse-ws-A',
+    });
+    assert.equal(r2.ok, true);
+    // echo-stub doesn't support --resume → falls through to spawn, but with
+    // the SAME workspace_id pinned to this session GUID.
+    assert.equal(r2.mode, 'spawn');
+    assert.equal(r2.workspace_id, r1.workspace_id,
+      'second spawn with same session_id must reuse the workspace');
+    assert.equal(r2.workspace_path, r1.workspace_path);
+  } finally { h.cleanup(); }
+});
+
+test('5c. session.send: explicit workspace_path wins over auto-create', async () => {
+  const h = await setupHarness();
+  try {
+    const r = await spawnDispatchOrResume(h.ctx, {
+      prompt: 'x', session_id: 'explicit-ws-A',
+      workspace_path: h.ctx.ws.projectDir,
+    });
+    assert.equal(r.ok, true);
+    assert.equal(r.mode, 'spawn');
+    assert.equal(r.workspace_path, h.ctx.ws.projectDir);
+    // No ws_-prefixed auto-workspace was minted for this session.
+    assert.ok(!r.workspace_id.match(/^ws_[a-z0-9]+_[0-9a-f]+$/) ||
+      r.workspace_path === h.ctx.ws.projectDir,
+      `expected explicit workspace, got ${r.workspace_path}`);
   } finally { h.cleanup(); }
 });
 
