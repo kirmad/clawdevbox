@@ -287,15 +287,35 @@ export class Dispatcher {
 
     const { dispatchId, promise } = registerPending(instanceId, prompt);
 
-    // Bytes-on-the-wire ordering. Each gap is empirically required: Copilot's
-    // TUI absorbs Enter that arrives too close to a preceding ESC or the
-    // input bytes.
+    // Per-instance send lock — serialize concurrent dispatchToInstance
+    // calls for the same instance. Without this, two simultaneous
+    // dispatches could BOTH pass their wait-for-idle check and then
+    // interleave their Escape/text/Enter byte sequences in the pty,
+    // producing one corrupted prompt.
+    const { withKeyedLock } = await import('./async-mutex.ts');
     try {
-      await session.sendKey('Escape');
-      await sleepP(200);
-      await session.sendText(prompt);
-      await sleepP(250);
-      await session.sendKey('Enter');
+      await withKeyedLock(`dispatch:${instanceId}`, async () => {
+        // Wait-for-idle gate (provider-opt-in). For Copilot/Agency, watch
+        // ~/.copilot/session-state/<sessionId>/events.jsonl for
+        // assistant.turn_end / session.task_complete BEFORE sending. If
+        // the wait times out, we still send (the conductor's previous
+        // behavior) but log so a real backpressure issue is visible.
+        await this.waitForInstanceIdle(instanceId).catch((err) => {
+          logger.warn(
+            { instanceId, err: err instanceof Error ? err.message : String(err) },
+            'dispatcher: waitForInstanceIdle threw (continuing with send)',
+          );
+        });
+
+        // Bytes-on-the-wire ordering. Each gap is empirically required: Copilot's
+        // TUI absorbs Enter that arrives too close to a preceding ESC or the
+        // input bytes.
+        await session.sendKey('Escape');
+        await sleepP(200);
+        await session.sendText(prompt);
+        await sleepP(250);
+        await session.sendKey('Enter');
+      });
     } catch (err) {
       logger.warn(
         { instanceId, err: err instanceof Error ? err.message : String(err) },
@@ -318,6 +338,62 @@ export class Dispatcher {
     }).catch(() => { /* swallow — registry already resolved */ });
 
     return { status: 'ok', state: 'dispatched', dispatchId };
+  }
+
+  /**
+   * Wait until the live agent for `instanceId` is idle (ready for input).
+   *
+   * Resolution path (provider-opt-in via `capabilities.idleSignal`):
+   *   1. Look up the DB row for this instance to find the agent CLI +
+   *      cli_session_id.
+   *   2. Resolve the provider from ws.agentCliProviders.
+   *   3. If the provider's capabilities declare `idleSignal === 'copilot-events'`,
+   *      tail the Copilot events.jsonl file and wait for
+   *      assistant.turn_end / session.task_complete (or timeout).
+   *   4. Providers that don't opt in resolve immediately — we trust the
+   *      caller's existing screen-snapshot gate (waitForReady) or just
+   *      send and let the TUI queue absorb it.
+   *
+   * Throws on unrecoverable infrastructure errors only; idle timeouts are
+   * swallowed (logged inside the events watcher).
+   */
+  private async waitForInstanceIdle(instanceId: string): Promise<void> {
+    const row = this.db
+      .prepare(
+        `SELECT cli_session_id, agent_cli FROM agent_sessions
+         WHERE recipe_instance_id = ? AND status = 'running'
+         ORDER BY started_at DESC LIMIT 1`,
+      )
+      .get(instanceId) as { cli_session_id: string | null; agent_cli: string } | undefined;
+    if (!row?.cli_session_id) return;
+
+    const provider = this.ws.agentCliProviders?.get(row.agent_cli);
+    if (provider?.capabilities?.idleSignal !== 'copilot-events') return;
+
+    const { waitForCopilotIdle } = await import('./agent-clis/copilot-events.ts');
+    const result = await waitForCopilotIdle(row.cli_session_id, { timeoutMs: 10_000 });
+    if (!result.ready) {
+      logger.info(
+        {
+          instanceId,
+          sessionId: row.cli_session_id,
+          reason: result.reason,
+          lastEvent: result.lastEvent,
+          waitedMs: result.waitedMs,
+        },
+        'dispatcher: copilot-events idle wait fell through; sending dispatch anyway',
+      );
+    } else {
+      logger.debug(
+        {
+          instanceId,
+          sessionId: row.cli_session_id,
+          lastEvent: result.lastEvent,
+          waitedMs: result.waitedMs,
+        },
+        'dispatcher: copilot-events confirmed idle before dispatch',
+      );
+    }
   }
 
   /**

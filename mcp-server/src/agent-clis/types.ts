@@ -57,6 +57,16 @@ export interface ProviderCapabilities {
    * even if other heuristics might otherwise fire.
    */
   busyIndicators: RegExp[];
+  /**
+   * Out-of-band idle signal source. When set to `'copilot-events'`, the
+   * dispatcher waits on `<copilotDir>/session-state/<sessionId>/events.jsonl`
+   * for `assistant.turn_end` / `session.task_complete` before sending the
+   * next prompt. Defaults to `'none'` (rely on TUI snapshot + glyph only).
+   *
+   * Copilot CLI and Agency (which wraps Copilot under the hood) both
+   * write to the same Copilot events stream — both should set this.
+   */
+  idleSignal?: 'copilot-events' | 'none';
 }
 
 /**

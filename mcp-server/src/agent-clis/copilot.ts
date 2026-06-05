@@ -42,6 +42,12 @@ const copilotCapabilities: ProviderCapabilities = {
   promptSubmitStrategy: 'split-cr-250ms',
   promptReadyRegex: /❯[^\S\n]*$/m,
   busyIndicators: [/Working/i, /Queued \(\d+\)/i, /\[pending\]/i],
+  // Copilot writes a structured event stream to
+  // ~/.copilot/session-state/<sessionId>/events.jsonl which is more
+  // reliable than glyph-on-tail for "is the agent ready for input".
+  // The dispatcher uses this to gate the next prompt on
+  // assistant.turn_end (idle) instead of pushing into a busy TUI.
+  idleSignal: 'copilot-events',
 };
 
 export const copilotProvider: AgentCliProvider = {

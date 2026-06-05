@@ -472,7 +472,9 @@ export async function runRecipe(opts: RunRecipeOptions): Promise<RunRecipeResult
     const { tmuxSessionRegistry } = await import('./cli-sessions/tmux-session-runtime.ts');
     const session = tmuxSessionRegistry.get(instanceId);
     if (session) {
-      void deliverInitialPromptAfterReady(instanceId, session, opts.prompt);
+      void deliverInitialPromptAfterReady(instanceId, session, opts.prompt, {
+        agentCli, sessionId, ws: opts.ws,
+      });
     }
   }
 
@@ -503,6 +505,7 @@ async function deliverInitialPromptAfterReady(
   instanceId: string,
   session: CliSession,
   prompt: string,
+  ctx: { agentCli: string; sessionId: string; ws: Workspace },
 ): Promise<void> {
   try {
     const { waitForReady } = await import('./cli-sessions/wait-for-ready.ts');
@@ -522,6 +525,36 @@ async function deliverInitialPromptAfterReady(
       'recipe-runner: waitForReady failed; dispatching initial prompt anyway',
     );
   }
+
+  // Belt-and-suspenders: if the provider opts into the copilot-events
+  // idle signal, also wait for assistant.turn_end / first-idle in the
+  // structured event stream before sending. This catches the case where
+  // the glyph is on-screen but the readline buffer isn't accepting input
+  // yet (Copilot's initial render races vs MCP server connect).
+  try {
+    const provider = ctx.ws.agentCliProviders?.get(ctx.agentCli);
+    if (provider?.capabilities?.idleSignal === 'copilot-events') {
+      const { waitForCopilotIdle } = await import('./agent-clis/copilot-events.ts');
+      const r = await waitForCopilotIdle(ctx.sessionId, { timeoutMs: 15_000 });
+      if (!r.ready) {
+        logger.info(
+          { instanceId, sessionId: ctx.sessionId, reason: r.reason, lastEvent: r.lastEvent, waitedMs: r.waitedMs },
+          'recipe-runner: copilot-events idle wait fell through; sending initial prompt anyway',
+        );
+      } else {
+        logger.debug(
+          { instanceId, sessionId: ctx.sessionId, lastEvent: r.lastEvent, waitedMs: r.waitedMs },
+          'recipe-runner: copilot-events confirmed idle before initial prompt',
+        );
+      }
+    }
+  } catch (err) {
+    logger.warn(
+      { instanceId, err: err instanceof Error ? err.message : String(err) },
+      'recipe-runner: copilot-events wait threw (continuing to send prompt)',
+    );
+  }
+
   try {
     // Send Escape + text + Enter via the session API. We don't go through
     // dispatcher.dispatchToInstance here to avoid a circular dep — and the
