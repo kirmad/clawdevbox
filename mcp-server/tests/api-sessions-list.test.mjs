@@ -15,7 +15,7 @@ import { runMigrations } from '../src/db/index.ts';
 import { Dispatcher } from '../src/dispatcher.ts';
 import { Scheduler } from '../src/scheduler.ts';
 import { handleCronApi } from '../src/cli/cron-api.ts';
-import { registerPty, hasSession, killPty, subscribe } from '../src/pty-registry.ts';
+import { registerPty, hasSession, killPty, subscribe, _resetForTests as resetPtyRegistry } from '../src/pty-registry.ts';
 
 function makeFakePty() {
   const dataListeners = [];
@@ -154,17 +154,17 @@ function cleanupRegistry(...instanceIds) {
   for (const id of instanceIds) {
     if (hasSession(id)) {
       try { killPty(id); } catch { /* ignore */ }
-      // killPty fires our fake pty's onExit synchronously, marking
-      // session.exited=true with no subscribers. Add+remove a subscriber
-      // to trip pty-registry's "exited && subscribers===0 → delete"
-      // branch and fully evict the session immediately (otherwise the
-      // 10s EXIT_RETAIN_MS keeps it visible across tests).
+      // killPty fires our fake pty's onExit synchronously on POSIX. On
+      // Windows the production tree-kill path does not invoke the fake pty's
+      // kill(), so force-reset the in-memory registry after the per-id best
+      // effort cleanup below.
       try {
         const { unsubscribe } = subscribe(id, () => {});
         unsubscribe();
       } catch { /* ignore */ }
     }
   }
+  resetPtyRegistry();
 }
 
 test('GET /api/sessions — no sessions returns empty items', async () => {

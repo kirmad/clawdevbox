@@ -467,6 +467,60 @@ test('13. session.list: returns just-spawned sessions', async () => {
   } finally { h.cleanup(); }
 });
 
+test('13a. session.send: same alias dispatches to a tmux-backed live session', async () => {
+  const h = await setupHarness();
+  try {
+    const r1 = await spawnDispatchOrResume(h.ctx, {
+      prompt: 'first', session_id: 'tmux-live-alias', default_workspace_path: h.ctx.ws.projectDir,
+    });
+    assert.equal(r1.mode, 'spawn');
+    resetPtyRegistry();
+    tmuxSessionRegistry.__register(r1.instance_id, {
+      name: `cdb_${r1.instance_id}`,
+      exited: new Promise(() => {}),
+      pid: async () => -1,
+      sendText: async () => {},
+      sendKey: async () => {},
+      resize: async () => {},
+      snapshot: async () => '',
+      kill: async () => {},
+    });
+
+    const r2 = await spawnDispatchOrResume(h.ctx, {
+      prompt: 'second', session_id: 'tmux-live-alias', default_workspace_path: h.ctx.ws.projectDir,
+    });
+    assert.equal(r2.mode, 'dispatch');
+    assert.equal(r2.instance_id, r1.instance_id);
+    assert.equal(h.dispatches.length, 1);
+  } finally { h.cleanup(); }
+});
+
+test('13b. session.list includes session_alias for tmux-backed sessions', async () => {
+  const h = await setupHarness();
+  try {
+    const r1 = await spawnDispatchOrResume(h.ctx, {
+      prompt: 'first', session_id: 'listed-alias', default_workspace_path: h.ctx.ws.projectDir,
+    });
+    assert.equal(r1.mode, 'spawn');
+    resetPtyRegistry();
+    tmuxSessionRegistry.__register(r1.instance_id, {
+      name: `cdb_${r1.instance_id}`,
+      exited: new Promise(() => {}),
+      pid: async () => -1,
+      sendText: async () => {},
+      sendKey: async () => {},
+      resize: async () => {},
+      snapshot: async () => '',
+      kill: async () => {},
+    });
+
+    const r = await listSessions(h.ctx, { status: 'active', include_foreign: false });
+    const item = r.items.find((i) => i.instance_id === r1.instance_id);
+    assert.ok(item, `expected ${r1.instance_id} in ${r.items.map((i) => i.instance_id).join(',')}`);
+    assert.equal(item.session_alias, 'listed-alias');
+  } finally { h.cleanup(); }
+});
+
 test('14. session.list: status=archived filter', async () => {
   const h = await setupHarness();
   try {

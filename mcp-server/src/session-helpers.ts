@@ -381,6 +381,7 @@ export interface SessionListItem {
   kind: 'main' | 'recipe' | 'adhoc' | 'foreign';
   label: string;
   foreign?: true;
+  session_alias?: string | null;
 }
 
 export interface ListSessionsResult {
@@ -508,7 +509,7 @@ export async function listSessions(
       label: '',
     }));
 
-  // Enrich with recipe_id (label/kind).
+  // Enrich with recipe_id (label/kind) and friendly aliases.
   const archivedInstanceIds = archived.map((a) => a.instance_id).filter(Boolean);
   let recipeMap: Record<string, string> = {};
   if (archivedInstanceIds.length > 0) {
@@ -516,6 +517,22 @@ export async function listSessions(
     const rows = db.prepare(`SELECT id, recipe_id FROM recipe_instances WHERE id IN (${ph})`)
       .all(...archivedInstanceIds) as Array<{ id: string; recipe_id: string }>;
     recipeMap = Object.fromEntries(rows.map((r) => [r.id, r.recipe_id]));
+  }
+
+  const sessionIds = [...new Set([...live, ...archived]
+    .map((item) => item.cli_session_id)
+    .filter((id): id is string => typeof id === 'string' && id.length > 0))];
+  const aliasBySessionId = new Map<string, string>();
+  if (sessionIds.length > 0) {
+    const ph = sessionIds.map(() => '?').join(',');
+    const rows = db.prepare(
+      `SELECT alias, session_id FROM session_aliases
+       WHERE session_id IN (${ph})
+       ORDER BY created_at ASC`,
+    ).all(...sessionIds) as Array<{ alias: string; session_id: string }>;
+    for (const row of rows) {
+      if (!aliasBySessionId.has(row.session_id)) aliasBySessionId.set(row.session_id, row.alias);
+    }
   }
 
   const enrich = (item: SessionListItem) => {
@@ -531,7 +548,10 @@ export async function listSessions(
         : kind === 'main' ? 'Main Agent'
         : kind === 'adhoc' ? `Spawn ${item.instance_id.slice(-8)}`
         : recipeId ?? item.instance_id;
-    return { ...item, recipe_id: recipeId, kind, label };
+    const sessionAlias = item.cli_session_id
+      ? aliasBySessionId.get(item.cli_session_id) ?? null
+      : null;
+    return { ...item, recipe_id: recipeId, kind, label, session_alias: sessionAlias };
   };
 
   const items: SessionListItem[] = [];

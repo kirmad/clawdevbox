@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadWorkspaceFromEnv } from '../src/workspace.ts';
@@ -210,6 +210,24 @@ for (const row of MATRIX) {
     assert.equal(handle.pid, 12345);
   });
 }
+
+test('echo-stub interactive script stays open for dispatch smoke tests', async () => {
+  const ws = await makeWs();
+  const ctx = captureSpawnCtx(buildProviderCtx(ws, {}));
+  const handle = await echoStubProvider.spawnSession(ctx, baseOpts({
+    ws,
+    mode: 'interactive',
+    kind: 'new',
+    sessionId: 'sess-echo-interactive',
+    prompt: 'seed prompt',
+  }));
+  await handle.exited;
+  const c = ctx._captured();
+  assert.ok(c, 'spawnPty should have been called');
+  const script = readFileSync(c.args[0], 'utf8');
+  assert.match(script, /\[echo-stub\] READY_FOR_DISPATCH/);
+  assert.match(script, /\[echo-stub\] DISPATCH_RX:/);
+});
 
 // ----- agent flag passthrough -----------------------------------------------
 

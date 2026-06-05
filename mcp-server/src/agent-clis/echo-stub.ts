@@ -7,6 +7,7 @@ import type { AgentCliProvider, AgentHandle, ProviderCtx, SpawnSessionOpts } fro
 
 function renderScriptBody(opts: SpawnSessionOpts): string {
   const isResume = opts.init.kind === 'resume';
+  const isInteractive = opts.mode === 'interactive';
   const agentLabel = opts.agent ? ` agent=${opts.agent}` : '';
   const banner = isResume
     ? `[echo-stub] resume session=${opts.init.session_id}${agentLabel} prompt=${JSON.stringify(opts.prompt ?? '')}`
@@ -14,6 +15,7 @@ function renderScriptBody(opts: SpawnSessionOpts): string {
   return `// echo-stub generated script for session ${opts.init.session_id}
 const fs = require('node:fs');
 const path = require('node:path');
+const interactive = ${JSON.stringify(isInteractive)};
 process.stdout.write(${JSON.stringify(banner + '\n')});
 const artifactsRoot = path.join(process.env.CLAWDEVBOX_PROJECT_DIR || '.', 'artifacts');
 const artifactId = 'echo-stub-' + Date.now();
@@ -49,14 +51,34 @@ const body = [
 ].join('\\n');
 fs.writeFileSync(path.join(dir, 'content.md'), body);
 process.stdout.write('[echo-stub] wrote artifact ' + artifactId + '\\n');
-process.exit(0);
+if (interactive) {
+  process.stdout.write('[echo-stub] READY_FOR_DISPATCH\\n');
+  const readline = require('node:readline');
+  const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+  rl.on('line', (line) => {
+    const trimmed = String(line).replace(/\\x1b/g, '').replace(/\\r$/, '').trim();
+    if (!trimmed) return;
+    if (trimmed === '__EXIT__') {
+      process.stdout.write('[echo-stub] EXIT_RECEIVED\\n');
+      process.exit(0);
+    }
+    process.stdout.write('[echo-stub] DISPATCH_RX: ' + trimmed + '\\n');
+  });
+  const timer = setTimeout(() => {
+    process.stdout.write('[echo-stub] TIMEOUT_5M\\n');
+    process.exit(0);
+  }, 5 * 60 * 1000);
+  timer.unref?.();
+} else {
+  process.exit(0);
+}
 `;
 }
 
 export const echoStubProvider: AgentCliProvider = {
   id: 'echo-stub',
   displayName: 'Echo Stub (testing)',
-  description: 'A no-network test fixture provider. Writes a small artifact and exits successfully.',
+  description: 'A no-network test fixture provider. Writes a small artifact; interactive spawns stay open for dispatch smoke tests.',
   source: 'builtin',
   internal: true,
   supportsResume: false,

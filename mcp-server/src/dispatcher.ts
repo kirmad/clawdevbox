@@ -321,11 +321,9 @@ export class Dispatcher {
   }
 
   /**
-   * Find the live pty instance_id for a given cli_session_id (GUID),
-   * if any. Joins the `agent_sessions` DB row to the in-memory
-   * pty-registry: a session is "live" iff it's marked status='running'
-   * AND the pty is still in the registry (not exited, even briefly
-   * retained for late attaches).
+   * Find the live instance_id for a given cli_session_id (GUID), if any.
+   * A session is live iff the DB row is still running and either the legacy
+   * pty registry or the tmux session registry still has the instance.
    *
    * Returns the newest matching live instance_id, or null.
    */
@@ -340,8 +338,10 @@ export class Dispatcher {
       .all(cliSessionId) as Row[];
     if (rows.length === 0) return null;
     const { isSessionLive } = await import('./pty-registry.ts');
+    const { tmuxSessionRegistry } = await import('./cli-sessions/tmux-session-runtime.ts');
     for (const r of rows) {
       if (isSessionLive(r.recipe_instance_id)) return r.recipe_instance_id;
+      if (tmuxSessionRegistry.get(r.recipe_instance_id)) return r.recipe_instance_id;
     }
     return null;
   }
