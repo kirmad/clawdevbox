@@ -924,6 +924,26 @@ export async function runStart(flags: Flags): Promise<void> {
   // handler internally; request dispatch is composed above).
   await startTerminalServer({ workspace: ws, sharedServer: httpServer });
 
+  // Construct the dispatcher and bind the session-helper context before
+  // listen, so MCP session.* tools cannot observe an uninitialized context
+  // after the HTTP server starts accepting requests.
+  const dispatcher = new Dispatcher(opened.db, ws, {
+    maxConcurrent: cfg.cron.max_concurrent,
+    drainMs: cfg.cron.dispatcher_drain_ms,
+    callbackUrlBase: `http://${cfg.http.host}:${cfg.http.port}`,
+    defaultAgentCli: cfg.defaultAgentCli ?? 'copilot',
+  });
+
+  // Late-bind the session-helper context so MCP tools in tools/session.ts
+  // can access dispatcher + db + cfg + ws at call time (they're registered
+  // during buildServer(), before these values exist).
+  (globalThis as Record<string, unknown>).__clawdevboxSessionHelperCtx = {
+    db: opened.db,
+    dispatcher,
+    ws,
+    cfg,
+  };
+
   const listenResult = await listenOrConfirmExisting(
     httpServer,
     cfg.http.host,
@@ -953,26 +973,6 @@ export async function runStart(flags: Flags): Promise<void> {
 
   // Bring up the trigger kernel — dispatcher first (it accepts pickUp()
   // calls immediately), then the scheduler that pokes it on each wake.
-  // The HTTP server is already bound so the script-binding callback URL
-  // (`http://127.0.0.1:<port>/callback/<fire_id>`) is reachable when
-  // Phase 8 lands the route.
-  const dispatcher = new Dispatcher(opened.db, ws, {
-    maxConcurrent: cfg.cron.max_concurrent,
-    drainMs: cfg.cron.dispatcher_drain_ms,
-    callbackUrlBase: `http://${cfg.http.host}:${boundPort}`,
-    defaultAgentCli: cfg.defaultAgentCli ?? 'copilot',
-  });
-
-  // Late-bind the session-helper context so MCP tools in tools/session.ts
-  // can access dispatcher + db + cfg + ws at call time (they're registered
-  // during buildServer(), before these values exist).
-  (globalThis as Record<string, unknown>).__clawdevboxSessionHelperCtx = {
-    db: opened.db,
-    dispatcher,
-    ws,
-    cfg,
-  };
-
   testHookDispatcher = dispatcher;
   dispatcher.start();
   const scheduler = new Scheduler(opened.db, dispatcher, ws);
