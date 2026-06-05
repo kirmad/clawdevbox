@@ -289,4 +289,67 @@ export const migrations: Migration[] = [
       `);
     },
   },
+  {
+    version: 7,
+    up: (db) => {
+      // Daemon supervisor — desired-state "always running" supervision for
+      // long-lived scripts (e.g. the Teams trouter listener).
+      //
+      // Two tables: `daemons` is the desired-state spec; `daemon_runs` is
+      // the audit log of every spawn attempt. Partial unique index on
+      // daemon_runs(daemon_id) WHERE status IN ('starting','running')
+      // enforces at-most-one-live-run-per-daemon at the DB level — the
+      // supervisor races claim a starting row inside a transaction, and
+      // the loser observes a UNIQUE-constraint failure and backs off.
+      //
+      // `generation` on the daemon row + on each run guards against the
+      // "stale exit handler restarts after disable" race: when the user
+      // disables or reconfigures, the daemon's generation bumps, and any
+      // in-flight runner's exit handler skips restart if its generation
+      // no longer matches.
+      db.exec(`
+        CREATE TABLE daemons (
+          id                  TEXT PRIMARY KEY,
+          name                TEXT NOT NULL,
+          workspace_id        TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+          kind                TEXT NOT NULL CHECK(kind IN ('script')),
+          runtime             TEXT NOT NULL CHECK(runtime IN ('node','tsx','python','bash','pwsh','direct')),
+          command_json        TEXT NOT NULL,
+          cwd                 TEXT,
+          env_json            TEXT NOT NULL DEFAULT '{}',
+          enabled             INTEGER NOT NULL DEFAULT 1,
+          generation          INTEGER NOT NULL DEFAULT 1,
+          restart_policy_json TEXT NOT NULL DEFAULT '{}',
+          backoff_ms          INTEGER NOT NULL DEFAULT 0,
+          restart_count       INTEGER NOT NULL DEFAULT 0,
+          last_exit_at        INTEGER,
+          last_error          TEXT,
+          next_restart_at     INTEGER,
+          stable_since        INTEGER,
+          created_at          INTEGER NOT NULL,
+          updated_at          INTEGER NOT NULL
+        );
+        CREATE INDEX idx_daemons_enabled ON daemons(enabled, next_restart_at) WHERE enabled=1;
+        CREATE INDEX idx_daemons_workspace ON daemons(workspace_id);
+
+        CREATE TABLE daemon_runs (
+          id           TEXT PRIMARY KEY,
+          daemon_id    TEXT NOT NULL REFERENCES daemons(id) ON DELETE CASCADE,
+          generation   INTEGER NOT NULL,
+          status       TEXT NOT NULL CHECK(status IN ('starting','running','exited','failed','stopped')),
+          pid          INTEGER,
+          started_at   INTEGER NOT NULL,
+          exited_at    INTEGER,
+          exit_code    INTEGER,
+          signal       TEXT,
+          error        TEXT,
+          log_path     TEXT
+        );
+        CREATE INDEX idx_daemon_runs_daemon ON daemon_runs(daemon_id, started_at DESC);
+        CREATE INDEX idx_daemon_runs_status ON daemon_runs(status);
+        CREATE UNIQUE INDEX idx_daemon_runs_live ON daemon_runs(daemon_id)
+          WHERE status IN ('starting','running');
+      `);
+    },
+  },
 ];

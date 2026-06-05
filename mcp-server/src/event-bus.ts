@@ -24,7 +24,8 @@ export type ChangeTopic =
   | 'approvals'
   | 'fires'
   | 'sessions'
-  | 'artifacts';
+  | 'artifacts'
+  | 'daemons';
 
 const bus = new EventEmitter();
 // Many SSE clients can subscribe concurrently — lift the default 10 cap.

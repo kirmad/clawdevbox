@@ -85,6 +85,7 @@ import { readTriggersFile } from '../triggers-store.ts';
 import { loadWorkspaceFromEnv, triggersJsonPath, WorkspaceConfigError } from '../workspace.ts';
 import { Dispatcher } from '../dispatcher.ts';
 import { Scheduler } from '../scheduler.ts';
+import { DaemonSupervisor } from '../daemon-supervisor.ts';
 import { handleCronApi, type CronApiContext } from './cron-api.ts';
 import { handleAgentCliApi } from './agent-clis-api.ts';
 import type { Flags } from './index.ts';
@@ -460,6 +461,7 @@ export async function runStart(flags: Flags): Promise<void> {
   // time the listener is actually accepting requests it's been assigned.
   let cronApiCtx: CronApiContext | null = null;
   let testHookDispatcher: Dispatcher | null = null;
+  let testHookDaemonSupervisor: DaemonSupervisor | null = null;
 
   // ── Fast response caches for list endpoints ─────────────────────────────
   // /api/inbox and /api/recipes are now fully SQL-backed (V6+) and read in
@@ -977,6 +979,24 @@ export async function runStart(flags: Flags): Promise<void> {
   dispatcher.start();
   const scheduler = new Scheduler(opened.db, dispatcher, ws);
   scheduler.start();
+
+  // Daemon supervisor — keeps `enabled=1` script daemons always running.
+  // Looks up each daemon's workspace path through the workspaces table on
+  // demand so a new workspace mid-session also resolves.
+  const daemonSupervisor = new DaemonSupervisor(opened.db, {
+    resolveWorkspacePath: (workspace_id: string) => {
+      const row = opened.db.prepare('SELECT path FROM workspaces WHERE id = ?')
+        .get(workspace_id) as { path: string } | undefined;
+      return row?.path ?? null;
+    },
+  });
+  daemonSupervisor.start();
+  (globalThis as Record<string, unknown>).__clawdevboxDaemonToolCtx = {
+    db: opened.db,
+    supervisor: daemonSupervisor,
+    defaultWorkspacePath: cfg.projectDir,
+  };
+  testHookDaemonSupervisor = daemonSupervisor;
   cronApiCtx = {
     db: opened.db,
     scheduler,
@@ -1127,6 +1147,14 @@ export async function runStart(flags: Flags): Promise<void> {
     // → close DB → close HTTP. We give the dispatcher its configured drain
     // window before the hard 5s exit timeout below kicks in.
     scheduler.stop();
+    // Daemon supervisor: gracefully stop every supervised daemon. Best-
+    // effort; bounded by the supervisor's drainMs.
+    daemonSupervisor.stop().catch((err) => {
+      logger.warn(
+        { err: err instanceof Error ? err.message : String(err) },
+        'daemon-supervisor.stop threw',
+      );
+    });
     dispatcher
       .stop()
       .catch((err) => {

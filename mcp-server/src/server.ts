@@ -31,6 +31,7 @@ import { registerFeedbackEntries } from './tools/feedback.ts';
 import { registerPathsEntries } from './tools/paths.ts';
 import { registerUpdateStatusEntries } from './tools/update-status.ts';
 import { registerSessionEntries } from './tools/session.ts';
+import { registerDaemonEntries } from './tools/daemon.ts';
 import { discoverAndRegisterHostedTools, type HostedToolError } from './tools/hosted.ts';
 
 export interface BuiltServer {
@@ -70,6 +71,7 @@ function registerAllBuiltinEntries(ws: Workspace): void {
   registerPathsEntries(ws);
   registerUpdateStatusEntries(ws);
   registerSessionEntries(ws);
+  registerDaemonEntries(ws);
 }
 
 /**
