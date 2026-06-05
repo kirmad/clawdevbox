@@ -445,15 +445,20 @@ export async function handleCronApi(
     // /exit command). Idempotent: 200 whether or not the session existed.
     if (m && method === 'DELETE') {
       const { killSession } = await import('../session-helpers.ts');
-      const { getAlias, isGuid } = await import('../db/session-aliases-store.ts');
+      const { getAlias, isGuid, resolveSessionId } = await import('../db/session-aliases-store.ts');
       const instanceId = decodeURIComponent(m[1]!);
       const shouldRemoveMintedAlias = !isGuid(instanceId) && getAlias(ctx.db, instanceId) === null;
-      const result = await killSession(sessionHelperCtx(ctx), instanceId);
+      let ourMintedGuid: string | null = null;
       if (shouldRemoveMintedAlias) {
-        const minted = getAlias(ctx.db, instanceId);
-        if (minted) {
+        const { guid } = resolveSessionId(ctx.db, instanceId);
+        ourMintedGuid = guid;
+      }
+      const result = await killSession(sessionHelperCtx(ctx), instanceId);
+      if (shouldRemoveMintedAlias && ourMintedGuid) {
+        const current = getAlias(ctx.db, instanceId);
+        if (current?.session_id === ourMintedGuid) {
           ctx.db.prepare('DELETE FROM session_aliases WHERE alias = ? AND session_id = ?')
-            .run(instanceId, minted.session_id);
+            .run(instanceId, ourMintedGuid);
         }
       }
       if (result.kind === 'not_live') {
