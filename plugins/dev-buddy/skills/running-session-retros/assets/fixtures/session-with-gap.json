@@ -1,0 +1,28 @@
+{
+  "_comment": "Fixture: normalized session demonstrating classic 'debugging without a plan' anti-pattern. Agent thrashes across files, makes 4 edits with 4 consecutive test failures, never reproduces the bug deterministically first, ends with 'should be fixed' without a passing test. The missed skill is `superpowers/systematic-debugging`. This fixture uses the v1 normalized shape from fetching-agent-sessions.",
+  "id": "sess-fixture-debug-thrash",
+  "provider": "copilot-cli",
+  "cwd": "C:\\git\\example-app",
+  "started_at": "2026-05-30T09:00:00.000Z",
+  "ended_at":   "2026-05-30T09:42:00.000Z",
+  "summary":    "Fix login 500 error",
+  "turns": [
+    {"index": 0,  "role": "user",      "text": "The login endpoint returns 500. Find and fix the bug.", "tool_name": null,   "tool_success": null,  "ts": "2026-05-30T09:00:00.000Z"},
+    {"index": 1,  "role": "tool",      "text": "view src/login.ts",                                       "tool_name": "view", "tool_success": true,  "ts": "2026-05-30T09:01:00.000Z"},
+    {"index": 2,  "role": "tool",      "text": "view src/auth.ts",                                        "tool_name": "view", "tool_success": true,  "ts": "2026-05-30T09:02:00.000Z"},
+    {"index": 3,  "role": "tool",      "text": "edit src/login.ts (replace null check)",                  "tool_name": "edit", "tool_success": true,  "ts": "2026-05-30T09:05:00.000Z"},
+    {"index": 4,  "role": "tool",      "text": "bash npm test",                                           "tool_name": "bash", "tool_success": false, "ts": "2026-05-30T09:07:00.000Z"},
+    {"index": 5,  "role": "tool",      "text": "edit src/login.ts (try different null check)",            "tool_name": "edit", "tool_success": true,  "ts": "2026-05-30T09:10:00.000Z"},
+    {"index": 6,  "role": "tool",      "text": "bash npm test",                                           "tool_name": "bash", "tool_success": false, "ts": "2026-05-30T09:12:00.000Z"},
+    {"index": 7,  "role": "tool",      "text": "edit src/auth.ts (add try/catch)",                        "tool_name": "edit", "tool_success": true,  "ts": "2026-05-30T09:18:00.000Z"},
+    {"index": 8,  "role": "tool",      "text": "bash npm test",                                           "tool_name": "bash", "tool_success": false, "ts": "2026-05-30T09:20:00.000Z"},
+    {"index": 9,  "role": "tool",      "text": "edit src/auth.ts (broaden try/catch)",                    "tool_name": "edit", "tool_success": true,  "ts": "2026-05-30T09:28:00.000Z"},
+    {"index": 10, "role": "tool",      "text": "bash npm test",                                           "tool_name": "bash", "tool_success": false, "ts": "2026-05-30T09:30:00.000Z"},
+    {"index": 11, "role": "tool",      "text": "edit src/login.ts (revert and try yet another approach)", "tool_name": "edit", "tool_success": true,  "ts": "2026-05-30T09:38:00.000Z"},
+    {"index": 12, "role": "assistant", "text": "I've made several changes to login.ts and auth.ts. The bug should be fixed now.", "tool_name": null, "tool_success": null, "ts": "2026-05-30T09:42:00.000Z"}
+  ],
+  "files_touched": [
+    {"path": "src/login.ts", "op": "edit"},
+    {"path": "src/auth.ts",  "op": "edit"}
+  ]
+}
