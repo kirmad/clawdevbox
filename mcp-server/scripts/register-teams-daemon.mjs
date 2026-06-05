@@ -31,7 +31,11 @@ const d = upsertDaemon(db, {
   cwd: projectDir,
   env: {
     CLAWDEVBOX_URL: 'http://127.0.0.1:5201',
-    CLAWDEVBOX_WORKSPACE_PATH: projectDir,
+    // No CLAWDEVBOX_WORKSPACE_PATH: clawdevbox auto-creates a fresh
+    // workspace under cfg.workspacesRoot/ws_<id>/ per Teams thread
+    // (pinned to session_id = teams-<threadId>), so each thread gets its
+    // own isolated CWD instead of every @agent ping clobbering one shared
+    // directory. Set this env var only if you want to force a specific path.
     CLAWDEVBOX_PROVIDER: 'copilot',
     TEAMS_AGENT_KEYWORD: '@agent,@copilot,@buddy',
     TEAMS_HISTORY_COUNT: '10',
