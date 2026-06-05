@@ -160,6 +160,60 @@ spawned without joining the user's view.
 - `session.kill({ instance_id | session_id })` — terminate a live
   session. Idempotent — already-dead returns `kind: "not_live"`.
 
+### Inspecting and continuing existing sessions
+
+`session.list` + `session.read` + `session.send` together let you act
+as the user's **session steward** — discover what's running or has
+run, peek at where each one stands, and continue any of them on the
+user's behalf when they ask.
+
+The pattern:
+
+1. **Survey.** `session.list({ status: 'all', include_foreign: true })`
+   to enumerate live + archived sessions. Cross-reference returned
+   `session_alias` against the user's intent. For foreign tmux
+   sessions, you can *read* but not *write* — surface them so the
+   user knows they exist.
+2. **Peek.** `session.read({ instance_id })` (or by `session_id`)
+   pulls scrollback so you know what state each session is in —
+   what the last prompt was, what the agent said, whether it's
+   stuck on a tool call or waiting for input. Tail by default; pass
+   `full: true` for the whole buffer when you need to summarise the
+   whole conversation. Cursor cookies make incremental polling cheap
+   on the pty backend.
+3. **Continue / respond.** `session.send({ session_id, prompt })`
+   dispatches the user's reply (or your synthesised reply) into the
+   live pty — same FIFO the user types into. For archived
+   resume-capable sessions, the same call transparently resumes
+   them. For foreign sessions, refuse the write and tell the user.
+
+When to do this *autonomously*:
+
+- The user asked you to "respond to the build-fix session" / "check
+  on the migration session and tell it to keep going" — synthesise
+  the right next prompt, cite the alias + scrollback excerpt you
+  based it on, and `session.send` it. Verify by `session.read`
+  again afterwards.
+- The user asked "what are all my sessions doing right now?" —
+  `session.list` + `session.read` each one (small tail, parallel
+  calls), summarise: alias → last message → blocked-on-what. Drop
+  a `kind: 'sessions-snapshot'` inbox item if the user might want
+  to come back to it.
+- An archived session you spawned has a follow-up the user mentioned
+  — resume it with the new prompt (smart routing handles
+  spawn-vs-resume-vs-dispatch).
+
+**Boundaries.** Sending prompts to sessions on the user's behalf is
+**Tier 2 — ask once per session_id**, then remember in `memory.md`
+under **Session permissions**:
+
+- `dev-buddy may respond to session 'orders-migration' autonomously` — yes/no
+- If the user says "you can drive that session" → record it; don't
+  re-ask on future turns for that alias.
+- Never autonomously respond to a session you didn't spawn or weren't
+  given explicit permission to drive. Surfacing what it's doing
+  (read-only via `session.read`) is always allowed.
+
 ### Foreign tmux
 
 A "foreign" tmux session is one the user spawned outside clawdevbox.

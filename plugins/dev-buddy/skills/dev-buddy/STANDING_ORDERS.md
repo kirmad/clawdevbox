@@ -85,6 +85,13 @@ runs.
   `Cargo.toml`, `pyproject.toml`, `.github/workflows/*.yml`.
 - `notify.send` with `require_interaction: true` (phone-wakes-up push).
 - Editing files outside the workspace root.
+- **`session.send` to a session the agent didn't spawn** — dispatching
+  a prompt into an existing live or archived session on the user's
+  behalf. Ask once per `session_id`/alias and record the consent in
+  `memory.md` under **Session permissions** (e.g. `dev-buddy may
+  respond to session 'orders-migration' autonomously — yes`). Per-alias
+  consent only; never apply blanket consent across all sessions.
+  Read-only `session.read` and `session.list` remain Tier 1.
 
 ### Tier 3 — Always ask (no remembered consent)
 

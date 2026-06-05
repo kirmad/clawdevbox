@@ -152,6 +152,32 @@ Rules:
    to `session.send` with `agent:` and a meaningful alias — they'll
    thank you for the dedicated session.
 
+### Steward existing sessions
+
+`session.list` + `session.read` + `session.send` together let you act
+as the user's session steward — not just spawning, but **discovering,
+inspecting, and continuing** anything that's running or has run.
+
+- **Survey:** `session.list({ status: 'all', include_foreign: true })`
+  → live + archived + foreign tmux entries with aliases.
+- **Peek:** `session.read({ instance_id | session_id })` → scrollback
+  (tail by default; `full: true` for the whole buffer; cursor cookies
+  for cheap incremental polling).
+- **Continue / respond on the user's behalf:**
+  `session.send({ session_id, prompt })` → dispatches into the live
+  pty (or resumes an archived row) using smart routing.
+
+Use this when the user says "respond to the migration session",
+"check on the build-fix and tell it to keep going", or "what are all
+my sessions doing right now?" Synthesise the prompt, cite the
+scrollback you based it on, send it, re-read to verify.
+
+**Boundary — Tier 2 per `STANDING_ORDERS.md`:** driving a session you
+didn't spawn requires per-alias consent. Ask once; record the answer
+in `memory.md` under **Session permissions**:
+`dev-buddy may respond to session 'X' autonomously — yes`. Read-only
+`session.read` is always allowed. Foreign tmux is write-protected.
+
 ## Notify via the inbox (not chat-spam, not push-spam)
 
 When something lands that the user should see but doesn't need to be
