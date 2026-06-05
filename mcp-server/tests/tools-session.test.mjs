@@ -360,8 +360,9 @@ test('8. session.read: cursor with mismatched spawnTs → truncated_before', asy
     await registerFakePty('fake-ptyC');
     const old = await readScrollbackHelper(h.ctx, { instance_id: 'fake-ptyC' });
     assert.equal(old.ok, true);
+    const meta1 = { spawnTs: Number(old.result.cursor.split(':')[1]) };
     resetPtyRegistry();
-    await waitFor(5);
+    await waitFor(25);
     const fake2 = await registerFakePty('fake-ptyC');
     fake2.emitData('new');
 
@@ -371,6 +372,8 @@ test('8. session.read: cursor with mismatched spawnTs → truncated_before', asy
     });
     assert.equal(r.ok, true);
     assert.equal(r.result.content, 'new');
+    const meta2 = { spawnTs: Number(r.result.cursor.split(':')[1]) };
+    assert.notEqual(meta2.spawnTs, meta1.spawnTs, 'spawnTs must differ — bump wait if same');
     assert.equal(r.result.truncated_before, true);
   } finally { h.cleanup(); }
 });
