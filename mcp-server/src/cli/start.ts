@@ -991,6 +991,7 @@ export async function runStart(flags: Flags): Promise<void> {
     },
     expectedToken,
     ws,
+    cfg,
   };
   logger.info(
     {

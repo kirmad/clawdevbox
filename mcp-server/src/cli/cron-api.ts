@@ -31,6 +31,8 @@ import {
 import { join } from 'node:path';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Database } from 'better-sqlite3';
+import type { ResolvedConfig } from '../config.ts';
+import type { SessionHelperCtx } from '../session-helpers.ts';
 import {
   attemptDir,
   getFire,
@@ -66,6 +68,7 @@ export interface CronApiContext {
    * test harnesses that don't exercise the resume endpoint.
    */
   ws?: Workspace;
+  cfg?: ResolvedConfig;
   /**
    * Test seam — override the resume endpoint's call into `runRecipe`.
    * Production wiring leaves this unset; tests inject a stub that
@@ -73,6 +76,25 @@ export interface CronApiContext {
    * spawning a real pty.
    */
   runRecipeFn?: typeof RunRecipeFn;
+}
+
+function sessionHelperCtx(ctx: CronApiContext): SessionHelperCtx {
+  const ws = ctx.ws ?? (ctx.dispatcher as unknown as { ws?: Workspace }).ws;
+  if (!ws) throw new Error('workspace not available in this server context');
+  const cfg = ctx.cfg ?? ({
+    projectDir: ws.projectDir,
+    globalDir: ws.globalDir,
+    workspacesRoot: join(ws.globalDir, 'workspaces'),
+    http: { port: 0, host: '127.0.0.1', token: null },
+    tunnel: { kind: 'none', name: null, allow_anonymous: false, auto_start: false },
+    notifications: { enabled: false, vapid: null },
+    cron: { max_concurrent: 4, dispatcher_drain_ms: 15_000 },
+    configPath: null,
+    defaultAgentCli: 'copilot',
+    clientSync: { mode: 'off', bidirectionalUninstall: false, discoveredPlugins: [] },
+    vaults: [],
+  } satisfies ResolvedConfig);
+  return { db: ctx.db, dispatcher: ctx.dispatcher, ws, cfg };
 }
 
 function constantTimeEquals(a: string, b: string): boolean {
@@ -195,19 +217,22 @@ export async function handleCronApi(
     const instanceId = url.searchParams.get('instance_id')
       ?? (typeof body.instance_id === 'string' ? body.instance_id : null);
 
-    let result;
-    if (instanceId) {
-      result = await ctx.dispatcher.dispatchToInstance(instanceId, body.prompt);
-    } else if (fireId) {
-      result = await ctx.dispatcher.dispatchToConductor(fireId, body.prompt);
-    } else {
-      sendJson(res, 400, { error: 'instance_id or fire_id required (query string or body)' });
+    const { dispatchOnly } = await import('../session-helpers.ts');
+    const result = await dispatchOnly(sessionHelperCtx(ctx), {
+      prompt: body.prompt,
+      instance_id: instanceId,
+      session_id: null,
+      fire_id: fireId,
+    });
+    if (!result.ok) {
+      const httpStatus =
+        result.code === 'NOT_FOUND_FIRE' ? 404 :
+        result.code === 'NO_DISPATCH_TARGET' ? 404 :
+        result.code === 'TARGET_UNAVAILABLE' ? 404 :
+        400;
+      sendJson(res, httpStatus, { error: result.message, code: result.code, fire_id: fireId });
       return true;
     }
-
-    if (result.status === 'not_found_fire')    { sendJson(res, 404, { error: 'fire not found or not in flight', fire_id: fireId }); return true; }
-    if (result.status === 'no_dispatch_target'){ sendJson(res, 404, { error: 'no dispatch target for this fire' }); return true; }
-    if (result.status === 'target_unavailable'){ sendJson(res, 404, { error: 'dispatch target pty has exited' }); return true; }
     sendJson(res, 200, { ok: true, queued_at: Date.now(), state: result.state });
     return true;
   }
@@ -220,17 +245,15 @@ export async function handleCronApi(
   //      like "my-feature" or "pr-4547615").
   //   2. Resolve workspace from workspace_id or workspace_path (auto-creates
   //      the row if it doesn't exist yet).
-  //   3. Check if a live pty exists for that GUID:
-  //        live → DISPATCH the prompt as a follow-up (no second pty spawned)
-  //        not live → SPAWN with the GUID (copilot's --session-id resumes
-  //                   from the on-disk jsonl if one exists, else creates new)
+  //   3. Delegate to the shared session router: live sessions dispatch,
+  //      resumable archived sessions resume, and otherwise a fresh pty spawns.
   //
   // Body: { prompt, session_id?, provider?, workspace_path?, workspace_id?,
   //         agent?, fire_id? }
   // Query: ?fire_id=<id>
   //
-  // Response: { ok, mode: 'spawn' | 'dispatch', instance_id, session_id,
-  //             session_alias?, workspace_id }
+  // Response: { ok, mode: 'spawn' | 'dispatch' | 'resume', instance_id,
+  //             session_id, session_alias?, resumed_from? }
   if (path === '/spawn') {
     if (method !== 'POST') { sendJson(res, 405, { error: 'method not allowed' }); return true; }
     const body = (await readJson<{
@@ -249,57 +272,42 @@ export async function handleCronApi(
     }
     const fireId = url.searchParams.get('fire_id')
       ?? (typeof body.fire_id === 'string' ? body.fire_id : null);
-    const sessionInput = typeof body.session_id === 'string' ? body.session_id : null;
 
-    // Resolve session_id → canonical GUID. Imported lazily to keep the
-    // module loadable in test contexts that don't run migrations.
-    const { resolveSessionId } = await import('../db/session-aliases-store.ts');
-    const { guid: sessionGuid, alias: sessionAlias } = resolveSessionId(ctx.db, sessionInput);
-
-    // Check live state BEFORE spawning. If a pty already exists for this
-    // GUID, route the prompt as a follow-up to that pty's conductor.
-    const liveInstance = await ctx.dispatcher.findLiveInstanceForSession(sessionGuid);
-    if (liveInstance) {
-      const dr = await ctx.dispatcher.dispatchToInstance(liveInstance, body.prompt);
-      if (dr.status === 'target_unavailable') {
-        // Live in DB but conductor missing — fall through to spawn path so
-        // copilot can resume the session from its on-disk state.
-      } else {
-        sendJson(res, 200, {
-          ok: true,
-          mode: 'dispatch',
-          instance_id: liveInstance,
-          session_id: sessionGuid,
-          session_alias: sessionAlias,
-          state: dr.state,
-        });
-        return true;
-      }
+    const { spawnDispatchOrResume } = await import('../session-helpers.ts');
+    const result = await spawnDispatchOrResume(sessionHelperCtx(ctx), {
+      prompt: body.prompt,
+      session_id: typeof body.session_id === 'string' ? body.session_id : null,
+      provider: typeof body.provider === 'string' ? body.provider : null,
+      agent: typeof body.agent === 'string' ? body.agent : null,
+      model: typeof body.model === 'string' ? body.model : null,
+      workspace_id: typeof body.workspace_id === 'string' ? body.workspace_id : null,
+      workspace_path: typeof body.workspace_path === 'string' ? body.workspace_path : null,
+      default_workspace_path: null,
+      fire_id: fireId,
+    });
+    if (!result.ok) {
+      const httpStatus =
+        result.code === 'NOT_FOUND_FIRE' ? 404 :
+        result.code === 'SPAWN_FAILED' ? 500 :
+        result.code === 'RESUME_FAILED' ? 500 :
+        result.code === 'PROVIDER_REQUIRED' ? 400 :
+        result.code === 'FOREIGN_NOT_WRITABLE' ? 403 :
+        500;
+      sendJson(res, httpStatus, {
+        error: result.message,
+        code: result.code,
+        ...(result.code === 'NOT_FOUND_FIRE' ? { fire_id: fireId } : {}),
+      });
+      return true;
     }
-
-    // Not live → spawn (copilot --session-id resumes from disk if jsonl
-    // exists, else creates). We always pass the resolved GUID so subsequent
-    // /spawn calls with the same alias hit the same session.
-    const result = await ctx.dispatcher.spawnFromCallback(
-      fireId,
-      body.prompt,
-      {
-        agent: typeof body.agent === 'string' ? body.agent : undefined,
-        model: typeof body.model === 'string' ? body.model : undefined,
-        workspaceId: typeof body.workspace_id === 'string' ? body.workspace_id : undefined,
-        workspacePath: typeof body.workspace_path === 'string' ? body.workspace_path : undefined,
-        provider: typeof body.provider === 'string' ? body.provider : undefined,
-        sessionId: sessionGuid,
-      },
-    );
-    if (result.status === 'not_found_fire') { sendJson(res, 404, { error: 'fire not found or not in flight', fire_id: fireId }); return true; }
-    if (result.status === 'spawn_failed')   { sendJson(res, 500, { error: `spawn failed: ${result.message}` }); return true; }
     sendJson(res, 200, {
       ok: true,
-      mode: 'spawn',
-      instance_id: result.instanceId,
-      session_id: result.sessionId,
-      session_alias: sessionAlias,
+      mode: result.mode,
+      instance_id: result.instance_id,
+      session_id: result.session_id,
+      session_alias: result.session_alias ?? null,
+      ...(result.state ? { state: result.state } : {}),
+      ...(result.resumed_from ? { resumed_from: result.resumed_from } : {}),
     });
     return true;
   }
@@ -313,184 +321,14 @@ export async function handleCronApi(
   // because the singular regex `/^\/api\/sessions\/([^/]+)\/?$/` would
   // otherwise match `/api/sessions` (empty id) and shadow it.
   if (path === '/api/sessions' && method === 'GET') {
-    const status = (url.searchParams.get('status') ?? 'all') as 'active' | 'archived' | 'all';
-    const since = Number(url.searchParams.get('since') ?? 0) || 0;
-    const limit = Math.min(Math.max(Number(url.searchParams.get('limit') ?? 50) || 50, 1), 200);
-    const { listSessions, getSessionMeta } = await import('../pty-registry.ts');
-    const { tmuxSessionRegistry, tmuxSessionRuntime } = await import('../cli-sessions/tmux-session-runtime.ts');
-    const { listAllSessions } = await import('../db/agent-sessions-store.ts');
-    const db = ctx.db;
-
-    // 1) Legacy pty-registry live entries (e2e-test-runner + anything not yet
-    // tmux-migrated).
-    const ptyLive = listSessions();
-    const liveIds = new Set(ptyLive.map((s) => s.instanceId));
-    const live: Array<{
-      instance_id: string;
-      live: true;
-      state: string;
-      queue_depth: number;
-      provider_id: string | null;
-      recipe_id: string | null;
-      cli_session_id: string | null;
-      workspace_id: string;
-      started_at: number;
-      ended_at: number | null;
-    }> = ptyLive.map((s) => {
-      const meta = getSessionMeta(s.instanceId);
-      return {
-        instance_id: s.instanceId,
-        live: true as const,
-        state: (s.exited ? 'exited' : 'unknown'),
-        queue_depth: 0,
-        provider_id: meta?.agentCli ?? null,
-        recipe_id: meta?.recipeId ?? null,
-        cli_session_id: meta?.sessionId ?? null,
-        workspace_id: s.workspaceId,
-        started_at: meta?.startedAt ?? 0,
-        ended_at: null,
-      };
+    const { listSessions } = await import('../session-helpers.ts');
+    const result = await listSessions(sessionHelperCtx(ctx), {
+      status: (url.searchParams.get('status') as 'all' | 'active' | 'archived') ?? 'all',
+      include_foreign: url.searchParams.get('include_foreign') !== 'false',
+      since: Number(url.searchParams.get('since') ?? 0) || 0,
+      limit: Math.min(Math.max(Number(url.searchParams.get('limit') ?? 50) || 50, 1), 200),
     });
-
-    // 2) Tmux-backed live entries (T19+): copilot, claude, agency, echo-stub
-    // all spawn into tmuxSessionRegistry. Look up workspace + agent_cli from
-    // agent_sessions rows so the UI gets useful labels.
-    const tmuxEntries = tmuxSessionRegistry.list();
-    if (tmuxEntries.length > 0) {
-      const ids = tmuxEntries.map((e) => e.instanceId).filter((id) => !liveIds.has(id));
-      if (ids.length > 0) {
-        const placeholders = ids.map(() => '?').join(',');
-        const rows = db
-          .prepare(
-            `SELECT id, cli_session_id, recipe_instance_id, workspace_id, agent_cli,
-                    started_at, status_text, needs_user_input
-             FROM agent_sessions
-             WHERE recipe_instance_id IN (${placeholders})`,
-          )
-          .all(...ids) as Array<{
-          id: string;
-          cli_session_id: string | null;
-          recipe_instance_id: string;
-          workspace_id: string;
-          agent_cli: string;
-          started_at: number;
-          status_text: string | null;
-          needs_user_input: number;
-        }>;
-        const rowByInstance = new Map(rows.map((r) => [r.recipe_instance_id, r]));
-        for (const e of tmuxEntries) {
-          if (liveIds.has(e.instanceId)) continue;
-          const row = rowByInstance.get(e.instanceId);
-          live.push({
-            instance_id: e.instanceId,
-            live: true as const,
-            state: row?.needs_user_input ? 'needs_user_input' : (row?.status_text || 'running'),
-            queue_depth: 0,
-            provider_id: row?.agent_cli ?? null,
-            recipe_id: null,
-            cli_session_id: row?.cli_session_id ?? null,
-            workspace_id: row?.workspace_id ?? '',
-            started_at: row?.started_at ?? 0,
-            ended_at: null,
-          });
-          liveIds.add(e.instanceId);
-        }
-      }
-    }
-
-    // 3) Foreign tmux sessions — anything live in tmux that we didn't spawn
-    // (e.g., user's own `tmux new -s test1` session). Surfaces them in the
-    // UI with kind='foreign' so the user can attach for visibility, but
-    // distinguished visually from clawdevbox-owned sessions.
-    const foreignList: Array<typeof live[number] & { foreign: true }> = [];
-    try {
-      const allTmux = await tmuxSessionRuntime().list();
-      for (const s of allTmux) {
-        // Skip if already accounted for under its cdb_ instance id mapping.
-        // cdb_<id> sessions correspond to instance id `<id>` (no prefix).
-        const asInstance = s.name.startsWith('cdb_') ? s.name.slice(4) : s.name;
-        if (liveIds.has(asInstance)) continue;
-        foreignList.push({
-          instance_id: s.name,
-          live: true as const,
-          state: 'foreign',
-          queue_depth: 0,
-          provider_id: null,
-          recipe_id: null,
-          cli_session_id: null,
-          workspace_id: '',
-          started_at: 0,
-          ended_at: null,
-          foreign: true,
-        });
-        liveIds.add(s.name);
-      }
-    } catch {
-      // tmux runtime not initialized or tmux not on PATH — skip foreign list.
-    }
-    live.push(...foreignList);
-
-    // Archived rows from agent_sessions; filter out anything already in
-    // `live` so the dedupe key (instance_id) only carries the
-    // authoritative live entry.
-    const archivedAll = listAllSessions(db, { since, limit });
-    const archived = archivedAll
-      .filter((row) => !liveIds.has(row.recipe_instance_id ?? ''))
-      .map((row) => ({
-        instance_id: row.recipe_instance_id ?? row.id,
-        live: false as const,
-        state: 'archived' as const,
-        queue_depth: 0,
-        provider_id: row.agent_cli,
-        recipe_id: null as string | null,
-        cli_session_id: row.cli_session_id,
-        workspace_id: row.workspace_id,
-        started_at: row.started_at,
-        ended_at: row.ended_at,
-      }));
-
-    // Join archived rows with recipe_instances to get recipe_id for labels.
-    const archivedInstanceIds = archived.map((a) => a.instance_id).filter(Boolean);
-    let recipeMap: Record<string, string> = {};
-    if (archivedInstanceIds.length > 0) {
-      const placeholders = archivedInstanceIds.map(() => '?').join(',');
-      const rows = db
-        .prepare(`SELECT id, recipe_id FROM recipe_instances WHERE id IN (${placeholders})`)
-        .all(...archivedInstanceIds) as Array<{ id: string; recipe_id: string }>;
-      recipeMap = Object.fromEntries(rows.map((r) => [r.id, r.recipe_id]));
-    }
-
-    const enrich = (item: typeof live[number] | typeof archived[number]) => {
-      const isForeign = (item as { foreign?: boolean }).foreign === true;
-      const recipeId = item.recipe_id ?? recipeMap[item.instance_id] ?? null;
-      const kind: 'main' | 'recipe' | 'adhoc' | 'foreign' =
-        isForeign ? 'foreign'
-          : item.instance_id === 'main' ? 'main'
-          : (recipeId && recipeId.startsWith('__adhoc_')) ? 'adhoc'
-          : 'recipe';
-      const label =
-        kind === 'foreign' ? `tmux: ${item.instance_id}`
-          : kind === 'main' ? 'Main Agent'
-          : kind === 'adhoc' ? `Spawn ${item.instance_id.slice(-8)}`
-          : recipeId ?? item.instance_id;
-      return { ...item, recipe_id: recipeId, kind, label };
-    };
-
-    const items: unknown[] = [];
-    if (status === 'all' || status === 'active') items.push(...live.map(enrich));
-    if (status === 'all' || status === 'archived') items.push(...archived.map(enrich));
-
-    // Pagination cursor: use the OLDEST row pulled by listAllSessions
-    // (before dedup), not the post-dedup `archived` array. Otherwise, when
-    // dedup removes archived rows that are also live, `archived.length`
-    // may be < `limit` even though more pages exist in the DB. The cursor
-    // is exclusive (`started_at < since` in the next query), so passing
-    // the oldest row's exact started_at moves the next page strictly past it.
-    const nextSince = archivedAll.length === limit && archivedAll.length > 0
-      ? archivedAll[archivedAll.length - 1]!.started_at
-      : undefined;
-
-    sendJson(res, 200, { items, ...(nextSince !== undefined ? { next_since: nextSince } : {}) });
+    sendJson(res, 200, result);
     return true;
   }
 
@@ -606,44 +444,23 @@ export async function handleCronApi(
     // graceful /exit isn't an option (copilot doesn't have a built-in
     // /exit command). Idempotent: 200 whether or not the session existed.
     if (m && method === 'DELETE') {
-      const { hasSession, killPty } = await import('../pty-registry.ts');
-      const { tmuxSessionRegistry } = await import('../cli-sessions/tmux-session-runtime.ts');
+      const { killSession } = await import('../session-helpers.ts');
+      const { getAlias, isGuid } = await import('../db/session-aliases-store.ts');
       const instanceId = decodeURIComponent(m[1]!);
-
-      // 1) Owned tmux session (in registry) — kill via session.kill() so the
-      // auto-unregister hook fires.
-      const owned = tmuxSessionRegistry.get(instanceId);
-      if (owned) {
-        try { await owned.kill(); } catch { /* best effort */ }
-        sendJson(res, 200, { ok: true, killed: true, kind: 'tmux' });
-        return true;
+      const shouldRemoveMintedAlias = !isGuid(instanceId) && getAlias(ctx.db, instanceId) === null;
+      const result = await killSession(sessionHelperCtx(ctx), instanceId);
+      if (shouldRemoveMintedAlias) {
+        const minted = getAlias(ctx.db, instanceId);
+        if (minted) {
+          ctx.db.prepare('DELETE FROM session_aliases WHERE alias = ? AND session_id = ?')
+            .run(instanceId, minted.session_id);
+        }
       }
-
-      // 2) Legacy IPty path.
-      if (hasSession(instanceId)) {
-        const ok = killPty(instanceId);
-        sendJson(res, 200, { ok: true, killed: ok, kind: 'pty' });
-        return true;
+      if (result.kind === 'not_live') {
+        sendJson(res, 200, { ok: true, killed: false, reason: 'not_live' });
+      } else {
+        sendJson(res, 200, { ok: true, killed: result.killed, kind: result.kind });
       }
-
-      // 3) Foreign / leftover tmux session — `tmux kill-session -t <name>`.
-      // Probe first (cheap) so we can distinguish "killed" from "not_live".
-      const { spawnSync } = await import('node:child_process');
-      const tmuxBin = process.platform === 'win32' ? 'tmux.exe' : 'tmux';
-      const probe = spawnSync(tmuxBin, ['has-session', '-t', instanceId], {
-        encoding: 'utf8',
-        timeout: 1500,
-      });
-      if (probe.status === 0) {
-        const killed = spawnSync(tmuxBin, ['kill-session', '-t', instanceId], {
-          encoding: 'utf8',
-          timeout: 3000,
-        });
-        sendJson(res, 200, { ok: true, killed: killed.status === 0, kind: 'foreign-tmux' });
-        return true;
-      }
-
-      sendJson(res, 200, { ok: true, killed: false, reason: 'not_live' });
       return true;
     }
   }
