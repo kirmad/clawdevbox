@@ -320,13 +320,15 @@ export async function killSession(
   ctx: SessionHelperCtx,
   idOrAlias: string,
 ): Promise<KillResult> {
-  // Resolve alias → live instance_id (if any). Otherwise treat idOrAlias as
-  // raw instance_id / tmux session name (same precedence as DELETE /api/sessions/:id).
+  // Resolve existing alias/GUID → live instance_id (if any). Otherwise treat
+  // idOrAlias as a raw instance_id / tmux session name.
   let instanceId = idOrAlias;
-  const { resolveSessionId } = await import('./db/session-aliases-store.ts');
-  const { guid } = resolveSessionId(ctx.db, idOrAlias);
-  const live = await ctx.dispatcher.findLiveInstanceForSession(guid);
-  if (live) instanceId = live;
+  const { lookupAlias } = await import('./db/session-aliases-store.ts');
+  const resolved = lookupAlias(ctx.db, idOrAlias);
+  if (resolved) {
+    const live = await ctx.dispatcher.findLiveInstanceForSession(resolved.guid);
+    if (live) instanceId = live;
+  }
 
   const { hasSession, killPty } = await import('./pty-registry.ts');
   const { tmuxSessionRegistry } = await import('./cli-sessions/tmux-session-runtime.ts');
@@ -611,9 +613,11 @@ export async function readScrollbackHelper(
   // Resolve instance_id.
   let instanceId = args.instance_id ?? null;
   if (!instanceId && args.session_id) {
-    const { resolveSessionId } = await import('./db/session-aliases-store.ts');
-    const { guid } = resolveSessionId(ctx.db, args.session_id);
-    instanceId = await ctx.dispatcher.findLiveInstanceForSession(guid);
+    const { lookupAlias } = await import('./db/session-aliases-store.ts');
+    const resolved = lookupAlias(ctx.db, args.session_id);
+    instanceId = resolved
+      ? await ctx.dispatcher.findLiveInstanceForSession(resolved.guid)
+      : null;
     if (!instanceId) {
       return { ok: false, code: 'SESSION_NOT_FOUND',
                message: `No live instance for session_id '${args.session_id}'` };

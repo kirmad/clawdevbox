@@ -47,6 +47,17 @@ export function insertAlias(db: Database, alias: string, sessionId: string): Ses
   return getAlias(db, alias)!;
 }
 
+export function lookupAlias(
+  db: Database,
+  input: string | undefined | null,
+): { guid: string; alias: string | null } | null {
+  if (!input || typeof input !== 'string' || input.length === 0) return null;
+  if (isGuid(input)) return { guid: input.toLowerCase(), alias: null };
+  const existing = getAlias(db, input);
+  if (!existing) return null;
+  return { guid: existing.session_id, alias: input };
+}
+
 /**
  * Resolve a caller-supplied session identifier to a canonical GUID.
  *
