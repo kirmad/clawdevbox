@@ -962,6 +962,17 @@ export async function runStart(flags: Flags): Promise<void> {
     callbackUrlBase: `http://${cfg.http.host}:${boundPort}`,
     defaultAgentCli: cfg.defaultAgentCli ?? 'copilot',
   });
+
+  // Late-bind the session-helper context so MCP tools in tools/session.ts
+  // can access dispatcher + db + cfg + ws at call time (they're registered
+  // during buildServer(), before these values exist).
+  (globalThis as Record<string, unknown>).__clawdevboxSessionHelperCtx = {
+    db: opened.db,
+    dispatcher,
+    ws,
+    cfg,
+  };
+
   testHookDispatcher = dispatcher;
   dispatcher.start();
   const scheduler = new Scheduler(opened.db, dispatcher, ws);
