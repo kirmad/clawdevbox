@@ -14,6 +14,7 @@ import {
   fetchSessions,
   resumeSession,
   deleteSession,
+  spawnSession,
   fetchInboxItem,
   fetchPushStatus,
   fetchPushVapid,
@@ -35,6 +36,8 @@ import {
   type RecipeInstance,
   type RegisteredTrigger,
   type Session,
+  type SpawnSessionRequest,
+  type SpawnSessionResponse,
   type TunnelStatus,
 } from '../api';
 
@@ -673,6 +676,22 @@ export const useUiStore = defineStore('ui', {
       this.terminals.selectedInstanceId = r.new_instance_id;
       // Optimistic — the 'sessions' topic event will refresh authoritatively.
       await this.refreshTerminals({ status: 'all' });
+    },
+
+    /**
+     * Spawn a brand-new agent CLI session via POST /spawn.
+     *
+     * When workspace_id/workspace_path are both omitted, the server
+     * auto-creates and pins a fresh workspace under
+     * `<workspaces_root>/ws_<id>/`. The returned instance is auto-selected
+     * so the xterm switches to the new session immediately.
+     */
+    async spawnTerminal(req: SpawnSessionRequest): Promise<SpawnSessionResponse> {
+      const r = await spawnSession(req);
+      this.terminals.selectedInstanceId = r.instance_id;
+      // Optimistic refresh — the 'sessions' topic event will also fire.
+      await this.refreshTerminals({ status: 'all' });
+      return r;
     },
 
     async killTerminal(instanceId: string): Promise<void> {

@@ -395,3 +395,74 @@ export async function deleteSession(instanceId: string): Promise<void> {
     throw new Error(`delete session failed: ${res.status} ${txt.slice(0, 200)}`);
   }
 }
+
+// -- Spawn / agent CLIs ------------------------------------------------------
+
+export interface SpawnSessionRequest {
+  /** First user-style message for the agent. Required, non-empty. */
+  prompt: string;
+  /** Friendly alias for the session (becomes the canonical GUID's display name). */
+  session_id?: string;
+  /** Agent CLI id (e.g. 'copilot', 'agency'). Omit to use the server default. */
+  provider?: string;
+  /** Persona / agent flag passed to the CLI. */
+  agent?: string;
+  /** Model override (e.g. 'claude-opus-4.7-1m-internal'). */
+  model?: string;
+  /** Existing workspace id to run in. If both id and path are omitted, a fresh
+   *  workspace is auto-created and pinned to the session_id for reuse. */
+  workspace_id?: string;
+  /** Absolute workspace path. */
+  workspace_path?: string;
+}
+
+export interface SpawnSessionResponse {
+  ok: true;
+  mode: 'spawn' | 'dispatch' | 'resume';
+  instance_id: string;
+  session_id: string;
+  session_alias: string | null;
+  workspace_id?: string;
+  workspace_path?: string;
+  state?: 'dispatched';
+  resumed_from?: string;
+}
+
+export async function spawnSession(req: SpawnSessionRequest): Promise<SpawnSessionResponse> {
+  const res = await fetch('/spawn', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(req),
+  });
+  const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+  if (!res.ok) {
+    const msg = (body.error as string | undefined) ?? `spawn failed: HTTP ${res.status}`;
+    throw new Error(msg);
+  }
+  return body as unknown as SpawnSessionResponse;
+}
+
+export interface AgentCliDetect {
+  available: boolean;
+  reason?: string;
+  version?: string;
+}
+
+export interface AgentCliInfo {
+  id: string;
+  display_name: string;
+  description?: string;
+  source: string;
+  internal: boolean;
+  detect: AgentCliDetect;
+}
+
+export interface AgentClisResponse {
+  configured: string | null;
+  providers: AgentCliInfo[];
+  errors: unknown[];
+}
+
+export function fetchAgentClis(): Promise<AgentClisResponse> {
+  return fetchJson<AgentClisResponse>('/api/agent-clis');
+}

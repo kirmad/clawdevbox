@@ -12,6 +12,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { useUiStore } from '../stores/ui';
 import type { Session } from '../api';
+import { fetchAgentClis, type AgentCliInfo } from '../api';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
@@ -60,10 +61,20 @@ function stateClass(state: Session['state']): string {
  * chance to settle before measurement (FitAddon reads computed CSS
  * dimensions; reading too early returns stale 0×0). No-ops if any
  * piece isn't ready yet.
+ *
+ * IMPORTANT: skip when the host has zero dimensions. PrimeVue eagerly
+ * mounts every TabPanel (even inactive ones), so this component runs
+ * `attach()` while `.xterm-host` is still hidden (clientWidth/Height === 0).
+ * In that state `fit.fit()` no-ops but `term.cols` / `term.rows` still
+ * hold xterm's 80×24 defaults — sending those over the WS would resize
+ * (shrink!) the live pty. ResizeObserver re-fires this function when
+ * the host becomes visible, at which point fit can actually measure.
  */
 function refit(): void {
   if (!term || !fit) return;
   requestAnimationFrame(() => {
+    const host = termHost.value;
+    if (!host || host.clientWidth === 0 || host.clientHeight === 0) return;
     try {
       fit!.fit();
       if (ws && ws.readyState === WebSocket.OPEN && term) {
@@ -160,6 +171,64 @@ async function resume(s: Session): Promise<void> {
   }
 }
 
+// --- Spawn dialog -----------------------------------------------------------
+// + button next to "Active" opens this dialog. The user supplies a prompt
+// (required) and optional alias / provider. The server auto-creates a
+// workspace pinned to the resulting session_id.
+
+const spawnOpen = ref(false);
+const spawnPrompt = ref('');
+const spawnAlias = ref('');
+const spawnProvider = ref<string>('');
+const spawnBusy = ref(false);
+const spawnError = ref<string | null>(null);
+const spawnProviders = ref<AgentCliInfo[]>([]);
+const spawnConfigured = ref<string | null>(null);
+
+async function openSpawn(): Promise<void> {
+  spawnPrompt.value = '';
+  spawnAlias.value = '';
+  spawnError.value = null;
+  spawnProvider.value = '';
+  spawnOpen.value = true;
+  try {
+    const r = await fetchAgentClis();
+    spawnProviders.value = r.providers.filter((p) => p.detect.available);
+    spawnConfigured.value = r.configured ?? null;
+    // Pre-select: server-configured default if available; else the only
+    // available provider; else the first available provider. The server
+    // rejects spawns with no provider and no `cfg.defaultAgentCli`, so
+    // it's friendlier to pick a sensible default the user can override.
+    if (r.configured && spawnProviders.value.some((p) => p.id === r.configured)) {
+      spawnProvider.value = r.configured;
+    } else if (spawnProviders.value.length >= 1) {
+      spawnProvider.value = spawnProviders.value[0]!.id;
+    }
+  } catch (err) {
+    // Non-fatal: user can still spawn with the server-default provider.
+    console.warn('fetchAgentClis failed', err);
+  }
+}
+
+async function submitSpawn(): Promise<void> {
+  const prompt = spawnPrompt.value.trim();
+  if (!prompt) return;
+  spawnBusy.value = true;
+  spawnError.value = null;
+  try {
+    await store.spawnTerminal({
+      prompt,
+      session_id: spawnAlias.value.trim() || undefined,
+      provider: spawnProvider.value || undefined,
+    });
+    spawnOpen.value = false;
+  } catch (err) {
+    spawnError.value = err instanceof Error ? err.message : String(err);
+  } finally {
+    spawnBusy.value = false;
+  }
+}
+
 onMounted(async () => {
   await store.refreshTerminals({ status: 'all' });
   await attach();
@@ -175,7 +244,17 @@ watch(selectedId, () => { attach(); });
 <template>
   <div class="terminals-panel">
     <aside class="tab-list">
-      <div class="group-header">Active</div>
+      <div class="group-header active-header">
+        <span>Active</span>
+        <button
+          class="spawn-btn"
+          title="Start a new session"
+          aria-label="Start a new session"
+          @click="openSpawn"
+        >
+          <i class="pi pi-plus" />
+        </button>
+      </div>
       <div v-if="activeSessions.length === 0" class="empty">No active terminals.</div>
       <button
         v-for="s in activeSessions"
@@ -249,6 +328,78 @@ watch(selectedId, () => { attach(); });
       </details>
     </aside>
     <main class="xterm-host" ref="termHost" />
+
+    <Dialog
+      :visible="spawnOpen"
+      @update:visible="spawnOpen = $event"
+      modal
+      header="New session"
+      :style="{ width: 'min(440px, 92vw)' }"
+      :closable="!spawnBusy"
+      :draggable="false"
+    >
+      <div class="spawn-form">
+        <label class="field">
+          <span class="field-label">First prompt <span class="req">*</span></span>
+          <Textarea
+            v-model="spawnPrompt"
+            placeholder="What should the new agent work on?"
+            rows="4"
+            autoResize
+            autofocus
+            :disabled="spawnBusy"
+            class="w-full"
+          />
+        </label>
+
+        <label class="field">
+          <span class="field-label">Alias <span class="hint">(optional)</span></span>
+          <InputText
+            v-model="spawnAlias"
+            placeholder="e.g. refactor-auth, pr-4547615"
+            :disabled="spawnBusy"
+            class="w-full"
+          />
+          <span class="muted small">Friendly name for the session — lets you send follow-up prompts via session.send later.</span>
+        </label>
+
+        <label class="field" v-if="spawnProviders.length > 0">
+          <span class="field-label">Provider</span>
+          <Select
+            v-model="spawnProvider"
+            :options="spawnProviders"
+            optionLabel="display_name"
+            optionValue="id"
+            :disabled="spawnBusy || spawnProviders.length < 2"
+            class="w-full"
+          />
+          <span class="muted small" v-if="spawnConfigured">
+            Server default: {{ spawnConfigured }}
+          </span>
+        </label>
+
+        <div v-if="spawnError" class="spawn-error">
+          <i class="pi pi-exclamation-triangle" /> {{ spawnError }}
+        </div>
+      </div>
+      <template #footer>
+        <Button
+          label="Cancel"
+          severity="secondary"
+          size="small"
+          :disabled="spawnBusy"
+          @click="spawnOpen = false"
+        />
+        <Button
+          :label="spawnBusy ? 'Spawning…' : 'Spawn'"
+          icon="pi pi-play"
+          size="small"
+          severity="primary"
+          :disabled="spawnBusy || !spawnPrompt.trim()"
+          @click="submitSpawn"
+        />
+      </template>
+    </Dialog>
   </div>
 </template>
 
@@ -256,6 +407,17 @@ watch(selectedId, () => { attach(); });
 .terminals-panel { display: flex; height: 100%; width: 100%; min-height: 0; min-width: 0; }
 .tab-list { width: 280px; min-width: 280px; max-width: 280px; overflow-y: auto; border-right: 1px solid #23262d; padding: 8px 4px; }
 .group-header { font-size: 11px; color: #7c8290; text-transform: uppercase; padding: 8px 10px 4px; cursor: pointer; }
+.active-header { display: flex; align-items: center; justify-content: space-between; cursor: default; }
+.spawn-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px; padding: 0;
+  background: #1c2029; color: #d8dee9;
+  border: 1px solid #3a3f4a; border-radius: 4px;
+  cursor: pointer; line-height: 1;
+}
+.spawn-btn:hover { background: #2a3140; border-color: #4a8be8; color: #e8eef8; }
+.spawn-btn:focus-visible { outline: 2px solid #4a8be8; outline-offset: 1px; }
+.spawn-btn i { font-size: 11px; }
 .group { margin-top: 8px; }
 .empty { font-size: 12px; color: #7c8290; padding: 8px 10px; }
 .tab-row { display: block; width: 100%; text-align: left; background: transparent; border: none; padding: 10px; border-left: 3px solid transparent; cursor: pointer; color: #d8dee9; position: relative; }
@@ -292,4 +454,20 @@ watch(selectedId, () => { attach(); });
 .xterm-host :deep(.xterm) { width: 100%; height: 100%; }
 .xterm-host :deep(.xterm-viewport) { width: 100% !important; }
 .xterm-host :deep(.xterm-screen) { width: 100% !important; }
+
+/* Spawn dialog */
+.spawn-form { display: flex; flex-direction: column; gap: 14px; padding: 4px 0; }
+.field { display: flex; flex-direction: column; gap: 4px; }
+.field-label { font-size: 12px; font-weight: 600; color: var(--p-text-color); }
+.field .hint { color: var(--p-text-color-secondary); font-weight: 400; margin-left: 4px; }
+.field .req { color: #e06c75; font-weight: 700; }
+.field .small { font-size: 11px; }
+.spawn-form .w-full { width: 100%; }
+.spawn-error {
+  display: flex; align-items: center; gap: 6px;
+  padding: 8px 10px; font-size: 12px;
+  color: #e06c75; background: #2a1818; border: 1px solid #5a2222;
+  border-radius: 4px;
+}
+.spawn-error i { font-size: 12px; }
 </style>
