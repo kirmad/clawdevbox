@@ -176,10 +176,20 @@ export async function runRecipe(opts: RunRecipeOptions): Promise<RunRecipeResult
   // requires a valid UUID; Copilot accepts arbitrary strings, so UUIDs work
   // for both. A caller can still pass a custom opts.sessionId — but it must
   // be UUID-shaped if agentCli is claude/agency-with-claude.
+  //
+  // RESUME semantics: when opts.resumeOf is set, we MUST reuse the original
+  // cli_session_id (that's the whole point of resume — copilot/claude/agency
+  // look up scrollback + context by --session-id, and a fresh UUID would
+  // silently start a new session with no history). Precedence:
+  //   1. explicit opts.sessionId  (caller override; rarely used)
+  //   2. opts.resumeOf            (the prior cli_session_id we want to resume)
+  //   3. randomUUID()             (brand-new spawn)
   const sessionId =
     typeof opts.sessionId === 'string' && opts.sessionId.length > 0
       ? opts.sessionId
-      : randomUUID();
+      : typeof opts.resumeOf === 'string' && opts.resumeOf.length > 0
+        ? opts.resumeOf
+        : randomUUID();
   const isResume = !!opts.resumeOf;
   // The bearer the agent uses to call back into /mcp must match the server's
   // `cfg.http.token` (the only credential the HTTP MCP transport accepts).
