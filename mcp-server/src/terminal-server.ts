@@ -60,6 +60,36 @@ import { listWorkspaces, resolveWorkspacesRoot } from './workspaces-store.ts';
 import { readRecipeInstance } from './recipe-instances-store.ts';
 
 /**
+ * Quietly terminate a viewer ipty (tmux attach). On Windows, calling
+ * `ipty.kill()` triggers node-pty's conpty_console_list_agent fork, which
+ * crashes with "AttachConsole failed" almost every time after the target
+ * console has already torn down (i.e. after the tmux session was killed,
+ * which is the normal case for viewer teardown). The crashed helper's
+ * stderr noise has historically been benign, but rapid-fire helper deaths
+ * have been observed to take the parent down in the wild.
+ *
+ * Skip the conpty path entirely: `taskkill /F /PID <pid>` is a clean
+ * Win32 TerminateProcess that doesn't need to enumerate console children.
+ * No /T tree-kill — the tmux attach client has no children to worry about.
+ *
+ * On POSIX `ipty.kill()` is fine (SIGHUP via pty controller, no buggy
+ * helper fork).
+ */
+function killViewerIpty(ipty: { pid?: number; kill: (s?: string) => void }): void {
+  const pid = ipty.pid;
+  if (process.platform === 'win32' && typeof pid === 'number' && pid > 0) {
+    try {
+      spawnSync('taskkill', ['/F', '/PID', String(pid)], {
+        windowsHide: true,
+        timeout: 5000,
+      });
+      return;
+    } catch { /* fall through to ipty.kill */ }
+  }
+  try { ipty.kill(); } catch { /* ignore */ }
+}
+
+/**
  * Resolve the absolute path to `tmux.exe` (Windows) / `tmux` (Unix). node-pty
  * doesn't search PATH the way child_process.spawn does on Windows, so we need
  * an absolute path. Result is cached for the process lifetime.
@@ -985,7 +1015,7 @@ function attachWebsocketViaTmux(
     // 'kill' on a tmux-attach viewer just detaches (kill the attach IPty),
     // not the agent. Use DELETE /api/sessions/<id> for full agent kill.
     if (m.type === 'kill') {
-      try { ipty.kill(); } catch { /* ignore */ }
+      killViewerIpty(ipty);
       closed = true;
     }
   });
@@ -993,7 +1023,7 @@ function attachWebsocketViaTmux(
   const cleanup = (): void => {
     if (closed) return;
     closed = true;
-    try { ipty.kill(); } catch { /* ignore */ }
+    killViewerIpty(ipty);
   };
   ws.on('close', cleanup);
   ws.on('error', cleanup);

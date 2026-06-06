@@ -318,6 +318,40 @@ function bool(flags: Flags, key: string): boolean {
 }
 
 export async function runStart(flags: Flags): Promise<void> {
+  // Global last-resort error handlers. clawdevbox is a long-running daemon
+  // and MUST not die from a Promise that nobody caught. node-pty's
+  // conpty_console_list_agent.ts in particular crashes on Windows whenever
+  // it tries to AttachConsole() to a console that's already torn down,
+  // and the resulting unhandledRejection on the parent's _getConsoleProcessList
+  // Promise has been observed to take the process down. Log + survive.
+  //
+  // CAUTION: do not also exit here. The whole point is that the process
+  // KEEPS RUNNING. If a handler itself throws, default behavior re-applies
+  // (process exit + crash dump), which is the right escape hatch.
+  process.on('uncaughtException', (err, origin) => {
+    try {
+      logger.error(
+        {
+          err: err instanceof Error ? { message: err.message, stack: err.stack, name: err.name } : String(err),
+          origin,
+        },
+        'uncaughtException — surviving (daemon)',
+      );
+    } catch { /* logging itself broken; nothing we can do */ }
+  });
+  process.on('unhandledRejection', (reason, _promise) => {
+    try {
+      logger.error(
+        {
+          reason: reason instanceof Error
+            ? { message: reason.message, stack: reason.stack, name: reason.name }
+            : String(reason),
+        },
+        'unhandledRejection — surviving (daemon)',
+      );
+    } catch { /* logging itself broken; nothing we can do */ }
+  });
+
   let cfg: ResolvedConfig;
   try {
     cfg = resolveConfig({
