@@ -76,6 +76,13 @@ const BUSY_EVENTS = new Set([
   'assistant.message',
   'tool.execution_start',
   'subagent.started',
+  // Discovered via real-session replay (validate-events-classifier.mjs):
+  // - skill.invoked: agent is loading/running a skill mid-turn.
+  // - session.compaction_start: agent is compacting context history; pty
+  //   is unresponsive until compaction_complete fires. Sending input here
+  //   would land in the wrong context.
+  'skill.invoked',
+  'session.compaction_start',
 ]);
 
 /** Set of event types that mean "agent finished a turn — ready for next input". */
@@ -91,15 +98,42 @@ const TERMINAL_EVENTS = new Set([
   'abort',
 ]);
 
-/** Events we deliberately ignore for idle/busy classification. */
+/**
+ * Events we deliberately ignore for idle/busy classification.
+ *
+ * The expanded set was discovered by replaying 42,555 real events across
+ * 9 days of Copilot sessions (`scripts/validate-events-classifier.mjs`).
+ * Categories:
+ *   - Tool/subagent lifecycle complementary events (we treat the *_start
+ *     as busy and ignore *_complete because the assistant may continue
+ *     emitting in the same turn).
+ *   - Hook events (always fire around tool calls, neutral wrt turn state).
+ *   - System messages / notifications / info / warnings (diagnostic only,
+ *     not turn state).
+ *   - Context-management events (workspace_file_changed, plan_changed,
+ *     mode_changed, truncation, compaction_complete) — these don't tell
+ *     us anything about the turn state.
+ *   - subagent.failed — failure of one subagent doesn't necessarily end
+ *     the parent's turn; we wait for assistant.turn_end as the authority.
+ */
 const NEUTRAL_EVENTS = new Set([
   'session.context_changed',
   'hook.start',
   'hook.end',
-  'tool.execution_complete',  // see header comment — NOT a safe idle marker
+  'tool.execution_complete',  // assistant may continue same turn after
   'subagent.completed',
+  'subagent.failed',
   'session.start',
   'session.resume',
+  'system.message',
+  'system.notification',
+  'session.workspace_file_changed',
+  'session.plan_changed',
+  'session.info',
+  'session.warning',
+  'session.compaction_complete',
+  'session.truncation',
+  'session.mode_changed',
 ]);
 
 interface ParsedEvent {
