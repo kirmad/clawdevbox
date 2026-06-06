@@ -210,16 +210,50 @@ export function markResumedInto(
   emitChange('sessions');
 }
 
-export function updateStatus(
+/**
+ * Update self-reported progress text + needs_user_input flag for the live
+ * agent_sessions row matching `cliSessionId` (the agent CLI's session
+ * GUID). Called by the `update_status` MCP tool.
+ *
+ * `cli_session_id` is the right correlation key:
+ *   - recipe_instance_id is NOT unique (a multi-step recipe spawns N agent
+ *     sessions all sharing one recipe_instance_id).
+ *   - agent_sessions.id is internal (as_xxx) and never visible to agents.
+ *   - cli_session_id is the per-spawn UUID minted by recipe-runner and
+ *     plumbed to the agent via `--additional-mcp-config <path>`'s
+ *     X-Clawdevbox-Session-Id header AND via the initial-prompt prefix.
+ *
+ * Returns true iff a row was actually updated.
+ */
+export function updateStatusBySessionId(
   db: Database,
-  id: string,
+  cliSessionId: string,
   payload: { text: string | null; needs_user_input: boolean; ts: number },
-): void {
-  db.prepare(
+): boolean {
+  const r = db.prepare(
     `UPDATE agent_sessions
       SET status_text = ?, needs_user_input = ?, last_status_at = ?
-     WHERE id = ?`,
-  ).run(payload.text, payload.needs_user_input ? 1 : 0, payload.ts, id);
+     WHERE cli_session_id = ? AND ended_at IS NULL`,
+  ).run(payload.text, payload.needs_user_input ? 1 : 0, payload.ts, cliSessionId);
+  return r.changes > 0;
+}
+
+/**
+ * @deprecated Use updateStatusBySessionId. Kept temporarily for any
+ * external caller, but the production update_status tool no longer
+ * calls this. Will be removed after a deprecation cycle.
+ */
+export function updateStatus(
+  db: Database,
+  recipeInstanceId: string,
+  payload: { text: string | null; needs_user_input: boolean; ts: number },
+): boolean {
+  const r = db.prepare(
+    `UPDATE agent_sessions
+      SET status_text = ?, needs_user_input = ?, last_status_at = ?
+     WHERE recipe_instance_id = ? AND ended_at IS NULL`,
+  ).run(payload.text, payload.needs_user_input ? 1 : 0, payload.ts, recipeInstanceId);
+  return r.changes > 0;
 }
 
 /**

@@ -509,7 +509,14 @@ export async function runRecipe(opts: RunRecipeOptions): Promise<RunRecipeResult
     const { tmuxSessionRegistry } = await import('./cli-sessions/tmux-session-runtime.ts');
     const session = tmuxSessionRegistry.get(instanceId);
     if (session) {
-      void deliverInitialPromptAfterReady(instanceId, session, opts.prompt, {
+      // Prepend a clawdevbox session-id hint so the agent always knows its
+      // own cli_session_id and can pass it back as the explicit `session_id`
+      // arg to update_status (belt + suspenders correlation: header AND arg).
+      // The header path also works, but in shared-workspace / subagent
+      // scenarios the .mcp.json file on disk may be overwritten by a newer
+      // spawn, and the agent that reads it stale would send the wrong id.
+      const prefixedPrompt = buildSessionIdPromptPrefix(sessionId) + opts.prompt;
+      void deliverInitialPromptAfterReady(instanceId, session, prefixedPrompt, {
         agentCli, sessionId, ws: opts.ws,
       });
     }
@@ -530,6 +537,35 @@ export async function runRecipe(opts: RunRecipeOptions): Promise<RunRecipeResult
     log_path: logPath,
     view_url: getTerminalServer()?.url(instanceId) ?? null,
   };
+}
+
+/**
+ * Build the session-id hint that prefixes every initial dispatched prompt.
+ *
+ * Why: the update_status MCP tool resolves the agent's cli_session_id from
+ * (a) the X-Clawdevbox-Session-Id HTTP header, set in per-spawn .mcp.json,
+ * OR (b) an explicit `session_id` argument the agent can pass. Path (a)
+ * works for top-level agents but can break in two scenarios:
+ *   - Subagents that read the workspace's .mcp.json fresh (may read a
+ *     newer file written by a sibling spawn — wrong session id).
+ *   - Concurrent /spawn calls into the same workspace whose .mcp.json
+ *     files race.
+ * Path (b) is rock-solid IFF the agent knows its own id. The cheapest way
+ * to deliver that is to prepend a short note to the first prompt — the
+ * agent reads it once, remembers, and passes it back as `session_id`.
+ *
+ * Format kept intentionally machine-friendly (literal backticks around the
+ * id) so the agent can extract via regex if needed. Trailing double-newline
+ * separates the hint from the user's actual prompt.
+ */
+function buildSessionIdPromptPrefix(sessionId: string): string {
+  return (
+    '[clawdevbox] Your clawdevbox session id is `' + sessionId + '`. ' +
+    'When calling the `update_status` MCP tool, pass `session_id="' + sessionId + '"` ' +
+    'so the server can correlate your progress updates to this specific tab. ' +
+    'Always do this at the start of any major sub-task — the `status_text` ' +
+    'becomes your tab\'s visible title in the user\'s Terminals view.\n\n'
+  );
 }
 
 /**

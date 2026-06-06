@@ -450,6 +450,11 @@ export interface SessionListItem {
    * Live sessions are always null.
    */
   end_reason?: string | null;
+  /**
+   * Agent-self-reported status text via the update_status MCP tool.
+   * Used by the UI as the tab title (falls back to `label`).
+   */
+  status_text?: string | null;
 }
 
 export interface ListSessionsResult {
@@ -498,6 +503,7 @@ export async function listSessions(
       ended_at: null,
       kind: 'recipe' as const,
       label: '',
+      status_text: s.statusText,
     };
   });
 
@@ -525,11 +531,10 @@ export async function listSessions(
         // State precedence (highest to lowest):
         //   1. agent-self-reported needs_user_input → 'waiting' (block: needs you)
         //   2. events.jsonl-derived state            → 'idle' / 'thinking' / 'tool_use' / 'error'
-        //   3. agent-self-reported status_text       → legacy free-text fallback
-        //   4. default 'running'                     → live pty, no signal yet
+        //   3. default 'running'                     → live pty, no signal yet
         const liveState = row?.needs_user_input
           ? 'waiting'
-          : (row?.derived_state ?? row?.status_text ?? 'running');
+          : (row?.derived_state ?? 'running');
         live.push({
           instance_id: e.instanceId,
           live: true,
@@ -543,6 +548,7 @@ export async function listSessions(
           ended_at: null,
           kind: 'recipe' as const,
           label: '',
+          status_text: row?.status_text ?? null,
         });
         liveIds.add(e.instanceId);
       }
@@ -594,6 +600,7 @@ export async function listSessions(
       kind: 'recipe' as const,
       label: '',
       end_reason: row.end_reason,
+      status_text: row.status_text,
     }));
 
   // Enrich with recipe_id (label/kind) and friendly aliases.

@@ -64,8 +64,11 @@ export const copilotProvider: AgentCliProvider = {
 
   async spawnSession(ctx: ProviderCtx, opts: SpawnSessionOpts): Promise<AgentHandle> {
     const bin = resolveBinary();
-    writeMcpJson(ctx, opts.workspaceInfo.path, opts.mcp);
-    const mcpPath = join(opts.workspaceInfo.path, '.mcp.json');
+    // writeMcpJson now writes to a per-session file (when sessionId is set)
+    // and returns the absolute path. We must pass THAT path to copilot via
+    // --additional-mcp-config — the workspace's <wsPath>/.mcp.json may be
+    // overwritten by a concurrent spawn into the same workspace.
+    const mcpPath = writeMcpJson(ctx, opts.workspaceInfo.path, opts.mcp);
 
     // Pre-trust the workspace in copilot's config so we never hit the
     // "Do you trust the files in this folder?" modal on first launch

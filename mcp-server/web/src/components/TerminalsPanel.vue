@@ -302,7 +302,7 @@ watch(selectedId, () => { attach(); });
       >
         <div class="row-1">
           <i :class="[iconFor(s.kind), iconStateClass(s.state)]" :title="stateLabel(s.state)" />
-          <span class="label">{{ s.label }}</span>
+          <span class="label" :title="s.status_text || s.label">{{ s.status_text || s.label }}</span>
         </div>
         <div class="row-2">
           <span :class="stateClass(s.state)" />
@@ -328,7 +328,7 @@ watch(selectedId, () => { attach(); });
         >
           <div class="row-1">
             <i :class="[iconFor(s.kind), iconStateClass(s.state)]" :title="stateLabel(s.state)" />
-            <span class="label">{{ s.label }}</span>
+            <span class="label" :title="s.status_text || s.label">{{ s.status_text || s.label }}</span>
             <span v-if="s.end_reason === 'idle_reaped'" class="end-chip" title="Auto-reaped after 15 min idle with no viewer">reaped</span>
           </div>
           <div class="row-2">
@@ -350,7 +350,7 @@ watch(selectedId, () => { attach(); });
         >
           <div class="row-1">
             <i :class="[iconFor(s.kind), iconStateClass(s.state)]" :title="stateLabel(s.state)" />
-            <span class="label">{{ s.label }}</span>
+            <span class="label" :title="s.status_text || s.label">{{ s.status_text || s.label }}</span>
             <span v-if="s.end_reason === 'idle_reaped'" class="end-chip" title="Auto-reaped after 15 min idle with no viewer">reaped</span>
           </div>
           <div class="row-2">
@@ -462,7 +462,8 @@ watch(selectedId, () => { attach(); });
 .tab-row { display: block; width: 100%; text-align: left; background: transparent; border: none; padding: 10px; border-left: 3px solid transparent; cursor: pointer; color: #d8dee9; position: relative; }
 .tab-row:hover { background: #1a1d24; }
 .tab-row.selected { background: #1c2029; border-left-color: #4a8be8; }
-.tab-row .row-1 { display: flex; align-items: center; gap: 6px; font-weight: 600; }
+.tab-row .row-1 { display: flex; align-items: center; gap: 6px; font-weight: 600; min-width: 0; }
+.tab-row .row-1 .label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1 1 auto; }
 .tab-row .row-2 { display: flex; align-items: center; gap: 6px; margin-top: 2px; font-size: 11px; }
 .muted { color: #7c8290; }
 .state-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }

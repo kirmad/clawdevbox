@@ -61,13 +61,19 @@ export const claudeProvider: AgentCliProvider = {
 
   async spawnSession(ctx: ProviderCtx, opts: SpawnSessionOpts): Promise<AgentHandle> {
     const { file, argsPrefix } = resolveBinary();
-    writeMcpJson(ctx, opts.workspaceInfo.path, opts.mcp);
+    // writeMcpJson now writes to a per-session file (when sessionId is set)
+    // and returns the absolute path. Pass it to claude via --mcp-config so
+    // shared-workspace concurrent spawns don't clobber each other.
+    const mcpPath = writeMcpJson(ctx, opts.workspaceInfo.path, opts.mcp);
 
     const sessionArgs = opts.init.kind === 'new'
       ? ['--session-id', opts.init.session_id]
       : ['--resume', opts.init.session_id];
 
     const argv: string[] = [...argsPrefix, ...sessionArgs];
+    // Tell claude exactly which MCP config file to use. Without this it
+    // scans cwd/.mcp.json which a concurrent spawn may have overwritten.
+    argv.push('--mcp-config', mcpPath);
     if (opts.agent) {
       argv.push('--agent', opts.agent);
     }

@@ -71,6 +71,23 @@ export async function probeBinary(
  * spawn writes its own .mcp.json with different headers. See
  * context-resolver.ts for the read side.
  */
+/**
+ * Write the agent's MCP config file.
+ *
+ * Returns the absolute path to the written file. Per-session isolation:
+ * when `mcp.sessionId` is provided (the normal case for /spawn'd
+ * agents), the file lives at
+ * `<wsPath>/.clawdevbox/sessions/<sessionId>.mcp.json` so multiple
+ * concurrent spawns into the same workspace never overwrite each
+ * other's config. Callers MUST then pass the returned absolute path to
+ * the agent CLI via the provider's "additional MCP config" flag
+ * (e.g. `copilot --additional-mcp-config <path>` /
+ * `claude --mcp-config <path>` / agency's `--additional-mcp-config`).
+ *
+ * When `mcp.sessionId` is omitted (legacy callers / Main Agent path
+ * if not yet migrated), falls back to `<wsPath>/.mcp.json` which is
+ * the directory-default location copilot/claude scan automatically.
+ */
 export function writeMcpJson(
   _ctx: ProviderCtx,
   wsPath: string,
@@ -82,7 +99,7 @@ export function writeMcpJson(
     projectDir?: string;
     sessionId?: string;
   },
-): void {
+): string {
   // Use `type: "http"` (not `"streamable-http"`). Copilot CLI's MCP config
   // schema rejects `streamable-http` with `Invalid literal value`, and Claude
   // Code happily accepts `http` (verified against copilot 1.0.49 and claude
@@ -118,13 +135,21 @@ export function writeMcpJson(
     },
   };
 
-  // Resolve target path. Validate it doesn't try to escape via `..` etc.
-  const target = resolve(wsPath, '.mcp.json');
+  // Per-session path when sessionId provided. Sanitize: only allow chars
+  // that are safe on Windows + POSIX filesystems; if sessionId contains
+  // anything else, fall back to the workspace default to keep things
+  // simple (legacy / hand-crafted callers).
+  const safeSid = mcp.sessionId && /^[A-Za-z0-9._-]+$/.test(mcp.sessionId)
+    ? mcp.sessionId : null;
+  const target = safeSid
+    ? resolve(wsPath, '.clawdevbox', 'sessions', `${safeSid}.mcp.json`)
+    : resolve(wsPath, '.mcp.json');
   if (!target.startsWith(resolve(wsPath))) {
     throw new Error(`writeMcpJson: refusing to write outside wsPath '${wsPath}'`);
   }
   mkdirSync(dirname(target), { recursive: true });
   writeFileAtomic(target, JSON.stringify(config, null, 2) + '\n');
+  return target;
 }
 
 /**

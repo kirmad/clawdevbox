@@ -355,6 +355,7 @@ export interface Session {
   workspace_id: string;
   foreign?: boolean;
   end_reason?: string | null;
+  status_text?: string | null;
 }
 
 export interface FetchSessionsResponse {

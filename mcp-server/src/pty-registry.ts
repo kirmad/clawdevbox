@@ -160,6 +160,16 @@ interface PtySession {
    * column is empty even when the watcher is firing.
    */
   derivedState: string | null;
+  /**
+   * Agent-self-reported status text (via the update_status MCP tool),
+   * mirrored in-memory for pty-registered sessions that have no
+   * agent_sessions DB row (notably the Main Agent). For sessions with
+   * a DB row, the DB column agent_sessions.status_text is the source
+   * of truth and this field stays null.
+   */
+  statusText: string | null;
+  /** Epoch ms of last statusText update. */
+  statusTextAt: number | null;
 }
 
 // ============================================================================
@@ -229,6 +239,8 @@ export function registerPty(opts: PtyRegisterOptions): void {
     spawnTs: Date.now(),
     statusWatcher: null,
     derivedState: null,
+    statusText: null,
+    statusTextAt: null,
   };
 
   // Conductor creation removed in tmux migration; see src/pending-dispatch-registry.ts
@@ -505,13 +517,35 @@ export async function killAllSessions(gracefulMs = 2000): Promise<number> {
   return killed;
 }
 
-export function listSessions(): { instanceId: string; workspaceId: string; exited: boolean; derivedState: string | null }[] {
+export function listSessions(): { instanceId: string; workspaceId: string; exited: boolean; derivedState: string | null; statusText: string | null }[] {
   return Array.from(sessions.values()).map((s) => ({
     instanceId: s.instanceId,
     workspaceId: s.workspaceId,
     exited: s.exited,
     derivedState: s.derivedState,
+    statusText: s.statusText,
   }));
+}
+
+/**
+ * Set agent-self-reported status text for a pty-registered session
+ * (used for sessions WITHOUT an agent_sessions DB row — notably the
+ * Main Agent). Returns true iff a session matched + value changed.
+ *
+ * Looked up by `cli_session_id` (set in meta.sessionId at register time)
+ * so the lookup key matches the rest of the update_status pipeline.
+ */
+export function setPtyStatusText(cliSessionId: string, text: string | null): boolean {
+  for (const s of sessions.values()) {
+    if (s.meta.sessionId === cliSessionId) {
+      const newText = text || null;
+      if (s.statusText === newText) return false;
+      s.statusText = newText;
+      s.statusTextAt = Date.now();
+      return true;
+    }
+  }
+  return false;
 }
 
 export interface ReadScrollbackOpts {
