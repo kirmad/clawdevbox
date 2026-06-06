@@ -287,7 +287,7 @@ async function runResume(
 ): Promise<{ newInstanceId: string }> {
   const { runRecipe } = await import('./recipe-runner.ts');
   const { resolveWorkspacesRoot } = await import('./workspaces-store.ts');
-  const { markResumedInto } = await import('./db/agent-sessions-store.ts');
+  const { markResumedInto, inheritResumedTitles } = await import('./db/agent-sessions-store.ts');
 
   // Determine original recipe id (adhoc vs saved).
   let originalRecipeId: string | null = null;
@@ -326,6 +326,11 @@ async function runResume(
   if (row.recipe_instance_id) {
     try { markResumedInto(ctx.db, row.recipe_instance_id, result.recipe_instance_id); }
     catch (err) { logger.warn({ err }, 'markResumedInto failed (non-fatal)'); }
+    // Carry the sticky tab titles forward so the resumed session inherits
+    // the original goal in the UI (otherwise it would appear as a bare
+    // "Spawn xxx" until the agent calls update_status again).
+    try { inheritResumedTitles(ctx.db, row.recipe_instance_id, result.recipe_instance_id); }
+    catch (err) { logger.warn({ err }, 'inheritResumedTitles failed (non-fatal)'); }
   }
 
   // After spawn, FIFO-dispatch the prompt so the resumed copilot picks it up.
@@ -588,6 +593,12 @@ export async function listSessions(
   const archivedAll = listAllSessions(db, { since, limit });
   const archived: SessionListItem[] = archivedAll
     .filter((row) => !liveIds.has(row.recipe_instance_id ?? ''))
+    // Hide rows that have been resumed into a newer instance — the lineage
+    // continues in the resumed_into_instance_id row which is already in the
+    // listing (either live or archived). Without this filter, clicking
+    // Resume produces what looks like a "clone" tab while the original
+    // archived entry stays visible, which is confusing.
+    .filter((row) => !row.resumed_into_instance_id)
     .map((row) => ({
       instance_id: row.recipe_instance_id ?? row.id,
       live: false,

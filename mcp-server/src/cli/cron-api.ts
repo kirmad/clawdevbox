@@ -407,8 +407,13 @@ export async function handleCronApi(
           sendJson(res, 500, { error: `spawn failed: ${result.spawn_error.code}: ${result.spawn_error.message}` });
           return true;
         }
-        const { markResumedInto } = await import('../db/agent-sessions-store.ts');
+        const { markResumedInto, inheritResumedTitles } = await import('../db/agent-sessions-store.ts');
         markResumedInto(db, instanceId, result.recipe_instance_id);
+        // Carry forward the old session's task_title + subtask_title so the
+        // resumed tab visibly inherits the original goal (otherwise it would
+        // appear as a bare "Spawn xxx" until the agent re-calls update_status).
+        try { inheritResumedTitles(db, instanceId, result.recipe_instance_id); }
+        catch { /* non-fatal */ }
         sendJson(res, 200, {
           ok: true,
           new_instance_id: result.recipe_instance_id,

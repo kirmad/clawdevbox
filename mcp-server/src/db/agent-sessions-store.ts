@@ -34,6 +34,7 @@ export interface AgentSessionRow {
   result: string | null;
   error: string | null;
   resume_of_agent_session_id: string | null;
+  resumed_into_instance_id: string | null;
   interactive: number;
   status_text: string | null;
   needs_user_input: number;
@@ -192,6 +193,39 @@ export function listAllSessions(
        LIMIT ?`,
     )
     .all(since, since, limit) as AgentSessionRow[];
+}
+
+/**
+ * Copy the sticky tab-title fields (task_title, subtask_title) from the
+ * PRIOR live row of the old recipe_instance_id to the NEW live row of
+ * the new recipe_instance_id. Used by the resume code paths so the
+ * resumed tab visibly inherits the original's title — otherwise the
+ * resumed tab would appear as a generic "Spawn xxx" until the agent
+ * happens to call update_status again.
+ *
+ * status_text is NOT copied — it's the ephemeral one-liner ("Running
+ * tests") and the agent will set it fresh after resume.
+ *
+ * Returns true iff at least one of the two columns was actually set.
+ */
+export function inheritResumedTitles(
+  db: Database,
+  oldRecipeInstanceId: string,
+  newRecipeInstanceId: string,
+): boolean {
+  const oldRow = db.prepare(
+    `SELECT task_title, subtask_title FROM agent_sessions
+     WHERE recipe_instance_id = ?
+     ORDER BY started_at DESC LIMIT 1`,
+  ).get(oldRecipeInstanceId) as { task_title: string | null; subtask_title: string | null } | undefined;
+  if (!oldRow || (!oldRow.task_title && !oldRow.subtask_title)) return false;
+  const r = db.prepare(
+    `UPDATE agent_sessions
+       SET task_title = COALESCE(task_title, ?),
+           subtask_title = COALESCE(subtask_title, ?)
+     WHERE recipe_instance_id = ? AND ended_at IS NULL`,
+  ).run(oldRow.task_title, oldRow.subtask_title, newRecipeInstanceId);
+  return r.changes > 0;
 }
 
 /**
