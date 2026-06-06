@@ -40,6 +40,7 @@ export interface AgentSessionRow {
   last_status_at: number | null;
   derived_state: string | null;
   derived_state_at: number | null;
+  end_reason: string | null;
 }
 
 export function mintSessionId(): string {
@@ -249,5 +250,33 @@ export function updateDerivedState(
       SET derived_state = ?, derived_state_at = ?
      WHERE recipe_instance_id = ? AND ended_at IS NULL`,
   ).run(payload.state, payload.ts, recipeInstanceId);
+  return true;
+}
+
+/**
+ * Mark the live agent_sessions row for `recipeInstanceId` as ended with
+ * a reason. Used by the idle-reaper (and any other code paths that want
+ * to record WHY a session was closed). Sets ended_at if not already set.
+ * Idempotent — never reopens an already-closed row.
+ */
+export function markSessionEnded(
+  db: Database,
+  recipeInstanceId: string,
+  reason: string,
+  ts: number = Date.now(),
+): boolean {
+  const row = db.prepare(
+    `SELECT id FROM agent_sessions
+     WHERE recipe_instance_id = ? AND ended_at IS NULL
+     ORDER BY started_at DESC LIMIT 1`,
+  ).get(recipeInstanceId) as { id: string } | undefined;
+  if (!row) return false;
+  db.prepare(
+    `UPDATE agent_sessions
+      SET ended_at = COALESCE(ended_at, ?),
+          end_reason = ?
+     WHERE id = ?`,
+  ).run(ts, reason, row.id);
+  emitChange('sessions');
   return true;
 }

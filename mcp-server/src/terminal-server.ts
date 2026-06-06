@@ -60,33 +60,43 @@ import { listWorkspaces, resolveWorkspacesRoot } from './workspaces-store.ts';
 import { readRecipeInstance } from './recipe-instances-store.ts';
 
 /**
- * Quietly terminate a viewer ipty (tmux attach). On Windows, calling
- * `ipty.kill()` triggers node-pty's conpty_console_list_agent fork, which
- * crashes with "AttachConsole failed" almost every time after the target
- * console has already torn down (i.e. after the tmux session was killed,
- * which is the normal case for viewer teardown). The crashed helper's
- * stderr noise has historically been benign, but rapid-fire helper deaths
- * have been observed to take the parent down in the wild.
+ * Quietly terminate a viewer ipty (tmux attach).
  *
- * Skip the conpty path entirely: `taskkill /F /PID <pid>` is a clean
- * Win32 TerminateProcess that doesn't need to enumerate console children.
- * No /T tree-kill — the tmux attach client has no children to worry about.
+ * Two-step cleanup so tmux sees a clean detach and doesn't leave phantom
+ * client entries in its server-side table:
  *
- * On POSIX `ipty.kill()` is fine (SIGHUP via pty controller, no buggy
- * helper fork).
+ *   1. Write `\x02d` (tmux prefix Ctrl-B + 'd' = detach-key) into the pty.
+ *      tmux processes the prefix + detach key and exits the attach client
+ *      normally — its server-side client table is updated. This avoids
+ *      the "phantom client" problem where tmux list-clients keeps showing
+ *      a now-dead viewer indefinitely (observed on Windows after the
+ *      taskkill-only path).
+ *
+ *   2. After a short delay (200ms is enough for tmux to ack), force-kill
+ *      anything that's still alive. On Windows, `taskkill /F /PID <pid>`
+ *      bypasses the buggy node-pty conpty_console_list_agent fork that
+ *      crashes with "AttachConsole failed" after console teardown.
+ *
+ * On POSIX `ipty.kill()` is fine (SIGHUP via pty controller).
  */
-function killViewerIpty(ipty: { pid?: number; kill: (s?: string) => void }): void {
+function killViewerIpty(ipty: { pid?: number; write?: (s: string) => void; kill: (s?: string) => void }): void {
+  // Step 1: clean detach.
+  try { ipty.write?.('\x02d'); } catch { /* pipe already closed; fine */ }
+
   const pid = ipty.pid;
-  if (process.platform === 'win32' && typeof pid === 'number' && pid > 0) {
-    try {
-      spawnSync('taskkill', ['/F', '/PID', String(pid)], {
-        windowsHide: true,
-        timeout: 5000,
-      });
-      return;
-    } catch { /* fall through to ipty.kill */ }
-  }
-  try { ipty.kill(); } catch { /* ignore */ }
+  // Step 2: defer the hard kill so tmux can process the detach cleanly.
+  setTimeout(() => {
+    if (process.platform === 'win32' && typeof pid === 'number' && pid > 0) {
+      try {
+        spawnSync('taskkill', ['/F', '/PID', String(pid)], {
+          windowsHide: true,
+          timeout: 5000,
+        });
+        return;
+      } catch { /* fall through to ipty.kill */ }
+    }
+    try { ipty.kill(); } catch { /* ignore */ }
+  }, 200).unref?.();
 }
 
 /**
@@ -927,6 +937,22 @@ async function attachWebsocket(ws: WebSocket, instanceId: string): Promise<void>
 }
 
 /**
+ * Live count of active viewer WebSockets per instance_id (tmux-backed
+ * sessions). Incremented on attach, decremented on close/error. Used by
+ * `idle-reaper.ts` to decide whether a session has any actual viewer:
+ * `tmux list-clients` is unreliable on psmux (always reports a phantom
+ * `/dev/pts/0` client even on a never-attached session), so we keep our
+ * own count instead.
+ *
+ * Exposed via `viewerCountForInstance(instanceId)`.
+ */
+const tmuxViewerCounts = new Map<string, number>();
+
+export function viewerCountForInstance(instanceId: string): number {
+  return tmuxViewerCounts.get(instanceId) ?? 0;
+}
+
+/**
  * T19: spawn a per-viewer `tmux attach -t cdb_<instanceId>` IPty and wire it
  * to the WebSocket. Each viewer gets its own attach process; closing the WS
  * kills only that viewer's attach without affecting other viewers OR the
@@ -978,6 +1004,14 @@ function attachWebsocketViaTmux(
   }
 
   let closed = false;
+  // Bump the live-viewer counter; decrement on close/error/exit.
+  tmuxViewerCounts.set(instanceId, (tmuxViewerCounts.get(instanceId) ?? 0) + 1);
+  const decrementViewerCount = (): void => {
+    const cur = tmuxViewerCounts.get(instanceId) ?? 0;
+    if (cur <= 1) tmuxViewerCounts.delete(instanceId);
+    else tmuxViewerCounts.set(instanceId, cur - 1);
+  };
+
   ipty.onData((chunk) => {
     if (closed || ws.readyState !== ws.OPEN) return;
     try { ws.send(JSON.stringify({ type: 'data', chunk })); } catch { /* viewer drop */ }
@@ -1017,6 +1051,7 @@ function attachWebsocketViaTmux(
     if (m.type === 'kill') {
       killViewerIpty(ipty);
       closed = true;
+      decrementViewerCount();
     }
   });
 
@@ -1024,6 +1059,7 @@ function attachWebsocketViaTmux(
     if (closed) return;
     closed = true;
     killViewerIpty(ipty);
+    decrementViewerCount();
   };
   ws.on('close', cleanup);
   ws.on('error', cleanup);

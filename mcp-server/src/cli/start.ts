@@ -29,6 +29,7 @@ import { onChange } from '../event-bus.ts';
 import { renderHomePage, resolveSpaAsset } from '../home-page.ts';
 import { logger } from '../logger.ts';
 import { startHeapMonitor, type HeapMonitorHandle } from '../heap-monitor.ts';
+import { startIdleReaper } from '../idle-reaper.ts';
 import { cleanCopilotStaleLocks } from '../stale-locks.ts';
 import { startMainAgent, getMainAgentStatus } from '../main-agent.ts';
 import { buildProviderCtx } from '../agent-clis/shared.ts';
@@ -420,6 +421,10 @@ export async function runStart(flags: Flags): Promise<void> {
   // Initialize tmux session runtime: required for tmux-migrated providers
   // (copilot, claude, agency, echo-stub). Probes the tmux binary first;
   // fatal-exit if missing.
+  //
+  // Hoisted to function scope so downstream subsystems (e.g. idle-reaper)
+  // can issue their own tmux queries with the same socket/config.
+  let tmuxClient: { socket: string | null; configPath: string | null };
   {
     // Default to the shared tmux server (no -L). psmux on Windows creates a
     // SEPARATE server per `new-session -L <name>` invocation rather than
@@ -430,7 +435,7 @@ export async function runStart(flags: Flags): Promise<void> {
     // (e.g., multiple clawdevbox instances on the same machine).
     const tmuxSocket = cfg.tmux?.socket ?? null;
     const tmuxConfPath = bundledTmuxConfPath();
-    const tmuxClient = { socket: tmuxSocket, configPath: tmuxConfPath };
+    tmuxClient = { socket: tmuxSocket, configPath: tmuxConfPath };
 
     const probe = await tmuxRunAsync({ socket: null, configPath: null }, ['-V']);
     if (probe.exitCode !== 0) {
@@ -1122,6 +1127,15 @@ export async function runStart(flags: Flags): Promise<void> {
     defaultWorkspacePath: cfg.projectDir,
   };
   testHookDaemonSupervisor = daemonSupervisor;
+
+  // Idle-session reaper — kills tmux-backed sessions that have sat idle
+  // with no viewer attached for > 15 min, so /spawn'd copilot/agency
+  // processes don't accumulate after the user closes their browser tab.
+  // Exempts the Main Agent.
+  const idleReaper = startIdleReaper({
+    db: opened.db,
+    tmuxClient,
+  });
   cronApiCtx = {
     db: opened.db,
     scheduler,
@@ -1273,6 +1287,7 @@ export async function runStart(flags: Flags): Promise<void> {
     // window before the hard 5s exit timeout below kicks in.
     scheduler.stop();
     heapMonitor.stop();
+    idleReaper.stop();
     // Daemon supervisor: gracefully stop every supervised daemon. Best-
     // effort; bounded by the supervisor's drainMs.
     daemonSupervisor.stop().catch((err) => {

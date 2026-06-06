@@ -354,6 +354,7 @@ export interface Session {
   queue_depth: number;
   workspace_id: string;
   foreign?: boolean;
+  end_reason?: string | null;
 }
 
 export interface FetchSessionsResponse {

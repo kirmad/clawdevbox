@@ -329,6 +329,7 @@ watch(selectedId, () => { attach(); });
           <div class="row-1">
             <i :class="[iconFor(s.kind), iconStateClass(s.state)]" :title="stateLabel(s.state)" />
             <span class="label">{{ s.label }}</span>
+            <span v-if="s.end_reason === 'idle_reaped'" class="end-chip" title="Auto-reaped after 15 min idle with no viewer">reaped</span>
           </div>
           <div class="row-2">
             <span :class="stateClass(s.state)" />
@@ -350,6 +351,7 @@ watch(selectedId, () => { attach(); });
           <div class="row-1">
             <i :class="[iconFor(s.kind), iconStateClass(s.state)]" :title="stateLabel(s.state)" />
             <span class="label">{{ s.label }}</span>
+            <span v-if="s.end_reason === 'idle_reaped'" class="end-chip" title="Auto-reaped after 15 min idle with no viewer">reaped</span>
           </div>
           <div class="row-2">
             <span :class="stateClass(s.state)" />
@@ -513,6 +515,20 @@ watch(selectedId, () => { attach(); });
 /* Honor reduced-motion preference — drop animations entirely. */
 @media (prefers-reduced-motion: reduce) {
   .row-1 i { animation: none !important; }
+}
+
+/* End-reason chip on archived rows (e.g. 'reaped' for idle-reaped sessions). */
+.end-chip {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: #2a2218;
+  color: #d4a857;
+  border: 1px solid #5a4622;
+  margin-left: 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
 }
 .resume-btn { position: absolute; right: 8px; top: 10px; padding: 2px 8px; font-size: 11px; background: #23262d; color: #d8dee9; border: 1px solid #3a3f4a; border-radius: 3px; cursor: pointer; display: none; }
 .archived:hover .resume-btn { display: inline-block; }

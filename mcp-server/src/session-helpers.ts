@@ -444,6 +444,12 @@ export interface SessionListItem {
   label: string;
   foreign?: true;
   session_alias?: string | null;
+  /**
+   * For archived sessions: WHY the session ended.
+   * 'user_killed' | 'agent_exited' | 'idle_reaped' | 'shutdown' | NULL for unknown.
+   * Live sessions are always null.
+   */
+  end_reason?: string | null;
 }
 
 export interface ListSessionsResult {
@@ -587,6 +593,7 @@ export async function listSessions(
       ended_at: row.ended_at,
       kind: 'recipe' as const,
       label: '',
+      end_reason: row.end_reason,
     }));
 
   // Enrich with recipe_id (label/kind) and friendly aliases.

@@ -369,4 +369,15 @@ export const migrations: Migration[] = [
       `);
     },
   },
+  {
+    version: 9,
+    up: (db) => {
+      // Audit how a session ended. NULL while running. Filled in by
+      // closeSession() callers and the idle-reaper.
+      // Values: 'user_killed' | 'agent_exited' | 'idle_reaped' | 'shutdown' | NULL.
+      db.exec(`
+        ALTER TABLE agent_sessions ADD COLUMN end_reason TEXT;
+      `);
+    },
+  },
 ];
