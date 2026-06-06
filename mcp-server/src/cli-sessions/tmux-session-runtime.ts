@@ -6,6 +6,7 @@ import type { Database } from 'better-sqlite3';
 import { tmuxRun, tmuxRunAsync, type TmuxClientOpts } from './tmux-client.ts';
 import { createTmuxSession, adoptTmuxSession } from './tmux-session.ts';
 import type { CliSession, CliSessionRuntime, CliSessionSpawnOpts } from './types.ts';
+import { emitChange } from '../event-bus.ts';
 
 // ============================================================================
 // Runtime factory (unchanged from T6)
@@ -78,11 +79,18 @@ class TmuxSessionRegistry {
   /**
    * Production registration: registers and hooks auto-unregister on the
    * session's exit promise. Use from provider spawnSession paths.
+   *
+   * Emits 'sessions' on both register and exit so the SPA's realtime
+   * channel refreshes the Terminals tab without manual reload.
    */
   register(instanceId: string, session: CliSession): void {
     this.map.set(instanceId, session);
+    emitChange('sessions');
     session.exited.then(() => {
-      if (this.map.get(instanceId) === session) this.map.delete(instanceId);
+      if (this.map.get(instanceId) === session) {
+        this.map.delete(instanceId);
+        emitChange('sessions');
+      }
     });
   }
 
