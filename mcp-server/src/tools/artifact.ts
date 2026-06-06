@@ -49,6 +49,9 @@ import {
   listWorkspaces,
   resolveWorkspacesRoot,
 } from '../workspaces-store.ts';
+import { getDatabase } from '../db/index.ts';
+import { emitChange } from '../event-bus.ts';
+import { logger } from '../logger.ts';
 
 // ============================================================================
 // Workspace resolution
@@ -192,6 +195,63 @@ export function registerArtifactEntries(ws: Workspace): void {
         manifest,
         files: inlineFiles,
       });
+
+      // Mirror to the DB `artifacts` table so attach lookups (e.g.
+      // recipe.steps.update_status with attach_artifact_ids) succeed.
+      // Without this, the disk write succeeds but downstream tools that
+      // look up the artifact by id in the DB fail with ARTIFACT_NOT_FOUND
+      // — a long-standing bug that forced agents into retry loops.
+      //
+      // We do NOT pre-populate recipe_step_id even when args.step_id is
+      // provided: that column is a FK to `recipe_steps.id` (the random
+      // rs_xxx PK), while args.step_id is the agent-facing step name
+      // (e.g. "list-files"). Trying to insert the agent-facing name into
+      // a FK column violates the constraint. The wiring to a specific
+      // step is established when the agent calls
+      // recipe.steps.update_status with attach_artifact_ids — that path
+      // looks up the rs_xxx PK and UPDATEs the artifact row.
+      const onDiskDir = artifactDir(target.workspacePath, args.id);
+      try {
+        const db = getDatabase();
+        const existsInDb = db.prepare('SELECT id FROM artifacts WHERE id = ?').get(args.id);
+        if (existsInDb) {
+          db.prepare(
+            `UPDATE artifacts SET type = ?, title = ?, recipe_instance_id = ?, dir_path = ?, updated_at = ? WHERE id = ?`,
+          ).run(
+            args.type,
+            args.title,
+            manifest.recipe_instance_id ?? null,
+            onDiskDir,
+            Date.now(),
+            args.id,
+          );
+          emitChange('artifacts');
+        } else {
+          const now = Date.now();
+          db.prepare(
+            `INSERT INTO artifacts (
+               id, workspace_id, recipe_instance_id,
+               type, title, dir_path, metadata_json, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          ).run(
+            args.id,
+            target.workspaceId,
+            manifest.recipe_instance_id ?? null,
+            args.type,
+            args.title,
+            onDiskDir,
+            JSON.stringify(args.meta ?? {}),
+            now,
+            now,
+          );
+          emitChange('artifacts');
+        }
+      } catch (err) {
+        logger.warn(
+          { err: String(err), artifactId: args.id },
+          'artifact.add: DB mirror failed — disk write succeeded but attach_artifact_ids lookups will miss',
+        );
+      }
 
       const viewUrl = buildViewUrl(args.id);
       const onDiskFiles = listArtifactFiles(target.workspacePath, args.id);

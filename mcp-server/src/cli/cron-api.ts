@@ -507,6 +507,20 @@ export async function handleCronApi(
   // ----- GET /api/recipe-instances/<id> -------------------------------------
   // Read the recipe instance + step status array. Used by the Terminals tab
   // side panel's "Recipe" view so users can see step progress at a glance.
+  //
+  // Step resolution order:
+  //   1. DB-backed `recipe_steps` rows (live status, set by the agent via
+  //      recipe.steps.update_status) — preferred, since this is the only
+  //      surface that reflects real-time step progress.
+  //   2. `inst.steps` if the on-disk instance JSON already carries a
+  //      structured array (rare, used by some recipe runners).
+  //   3. YAML fallback: parse `recipe_snapshot` and synthesize pending
+  //      placeholders. Used for instances that bypassed the DB
+  //      materialization (legacy / hand-written test fixtures).
+  //
+  // DB step status (`done`/`failed`/`awaiting_user`) is passed through
+  // verbatim so the SPA can render the precise state — RecipePanel.vue
+  // accepts these as first-class values.
   {
     const mri = path.match(/^\/api\/recipe-instances\/([^/]+)\/?$/);
     if (mri && method === 'GET') {
@@ -522,13 +536,24 @@ export async function handleCronApi(
       const { readRecipeInstance } = await import('../recipe-instances-store.ts');
       const inst = readRecipeInstance(wsRow.workspace_path, instanceId);
       if (!inst) { sendJson(res, 404, { error: 'recipe instance not found' }); return true; }
-      // Augment with steps[] parsed from recipe_snapshot if the instance
-      // itself doesn't already carry a structured steps array. The runner
-      // stores the raw YAML in `recipe_snapshot` but doesn't always
-      // materialize `steps`; for the side-panel UI we want the structured
-      // list so users can see what the recipe is supposed to do.
       type WithSteps = typeof inst & { steps?: unknown[] };
       const withSteps = inst as WithSteps;
+
+      // 1. DB rows first — they have live status.
+      try {
+        const { listSteps } = await import('../db/recipe-steps-store.ts');
+        const dbRows = listSteps(ctx.db, instanceId);
+        if (dbRows.length > 0) {
+          withSteps.steps = dbRows.map((r) => ({
+            id: r.step_id,
+            title: r.name ?? r.goal,
+            status: r.status,
+            message: r.message ?? undefined,
+          })) as typeof withSteps.steps;
+        }
+      } catch { /* fall through to YAML */ }
+
+      // 2/3. YAML fallback only when no DB rows AND no on-disk steps.
       if (!Array.isArray(withSteps.steps) || withSteps.steps.length === 0) {
         try {
           const { parseRecipeSource } = await import('../validators.ts');
@@ -536,15 +561,13 @@ export async function handleCronApi(
           if (typeof snapshot === 'string' && snapshot.length > 0) {
             const parsed = parseRecipeSource(snapshot) as Record<string, unknown> | null;
             const parsedSteps = parsed && Array.isArray(parsed.steps) ? parsed.steps : [];
-            // Normalize each parsed step into our { id, title, status } shape
-            // so the UI doesn't need to know about the raw YAML field names.
             withSteps.steps = parsedSteps.map((s: unknown, i: number) => {
               const obj = (s && typeof s === 'object') ? s as Record<string, unknown> : {};
               return {
                 id: String(obj.id ?? i + 1),
                 title: String(obj.goal ?? obj.title ?? `Step ${i + 1}`),
                 status: 'pending' as const,
-                message: null,
+                message: undefined,
               };
             }) as typeof withSteps.steps;
           }

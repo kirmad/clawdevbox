@@ -162,25 +162,12 @@ async function rpc(url, headers, sessionId, method, params, id) {
       log('recipe.update_steps best-effort failed: ' + err.message);
     }
 
-    // 5. recipe.done — the assertion-critical call.
-    const doneResp = await rpc(cfg.url, cfg.headers, mcpSessionId, 'tools/call', {
-      name: 'run_tool',
-      arguments: {
-        tool: 'recipe.done',
-        args: {
-          status: 'success',
-          message: 'E2E_MARKER_DONE: all steps complete',
-        },
-      },
-    }, 4);
-    if (doneResp.body && doneResp.body.error) {
-      throw new Error('recipe.done returned JSON-RPC error: ' + JSON.stringify(doneResp.body.error));
-    }
-    const structured = doneResp.body && doneResp.body.result && doneResp.body.result.structuredContent;
-    if (structured && structured.error) {
-      throw new Error('recipe.done structured error: ' + JSON.stringify(structured.error));
-    }
-    log('recipe.done ok');
+    // 5. recipe.done was removed in the agent-executes-recipe redesign
+    //    (2026-06). The recipe-runner's pty exit handler treats exit code 0
+    //    as success and marks the instance terminal, so we just exit
+    //    cleanly. The E2E_MARKER_DONE log line is preserved as a regex
+    //    anchor for tests that grep for it.
+    log('E2E_MARKER_DONE: all steps complete (no recipe.done — exit code 0 cascades)');
 
     // 6. DELETE session to release transport resources.
     try {

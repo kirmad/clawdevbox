@@ -68,7 +68,15 @@ const hasRecipe = computed<boolean>(() => {
   const s = props.session;
   if (!s) return false;
   if (!s.recipe_id) return false;
-  if (s.recipe_id.startsWith('__adhoc_')) return false;
+  // Historically `__adhoc_*` meant "no recipe at all" (an interactive
+  // agent session with no workflow attached). Since the recipe.begin
+  // tool lands inline-source recipes under `__adhoc_<instanceId>` —
+  // those DO have materialized step rows — we show the Recipe tab for
+  // them too. The panel itself shows "no steps" if there's nothing
+  // to render; that's preferable to hiding the tab on a recipe that
+  // actually has steps. The kind === 'adhoc' check below was a
+  // category error: an adhoc-tagged session can legitimately be a
+  // recipe execution if the agent called recipe.begin.
   return true;
 });
 const hasArtifacts = computed<boolean>(() => {

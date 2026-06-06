@@ -153,17 +153,30 @@ function formatCommandLine(file: string, args: string[]): string {
 
 export async function runRecipe(opts: RunRecipeOptions): Promise<RunRecipeResult> {
   // Resolve agent_cli with the same fallback chain as the `recipe.run` tool:
-  // explicit opts → recipe YAML's `agent_cli` field → cfg.defaultAgentCli →
-  // 'copilot'. The dispatcher's recipe-binding path calls runRecipe without
-  // setting opts.agentCli, so we re-derive from the recipe snapshot here to
-  // honor `agent_cli: e2e-test-runner`-style declarations end-to-end.
+  // explicit opts → recipe YAML's `agent_cli` field → recipe YAML's
+  // `default_client` field → cfg.defaultAgentCli → 'copilot'.
+  //
+  // We accept BOTH `agent_cli` and `default_client` from the YAML because the
+  // spec uses `default_client` (validators.ts enforces it) while older recipes
+  // and the runtime fallback use `agent_cli`. Either name binds at the recipe
+  // level — important when a user's global config sets `default_agent_cli`
+  // to a wrapper (e.g. `agency`) but the recipe needs the direct provider
+  // (e.g. `copilot`) for header propagation to work correctly. See
+  // agent-clis/shared.ts:writeMcpJson and the agency-wrapper double
+  // --additional-mcp-config issue for the empirical motivation.
   let recipeAgentCli: string | null = null;
   if (opts.recipeId !== null) {
     try {
       const parsed = parseRecipeSource(opts.recipeSnapshot);
       if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-        const v = (parsed as Record<string, unknown>).agent_cli;
-        if (typeof v === 'string' && v.length > 0) recipeAgentCli = v;
+        const obj = parsed as Record<string, unknown>;
+        const fromAgentCli = typeof obj.agent_cli === 'string' && obj.agent_cli.length > 0
+          ? obj.agent_cli
+          : null;
+        const fromDefaultClient = typeof obj.default_client === 'string' && obj.default_client.length > 0
+          ? obj.default_client
+          : null;
+        recipeAgentCli = fromAgentCli ?? fromDefaultClient;
       }
     } catch {
       /* malformed snapshots fall through to the default chain */

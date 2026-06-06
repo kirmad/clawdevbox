@@ -619,12 +619,21 @@ export async function listSessions(
     }));
 
   // Enrich with recipe_id (label/kind) and friendly aliases.
-  const archivedInstanceIds = archived.map((a) => a.instance_id).filter(Boolean);
+  // Look up recipe_id for BOTH live and archived items — the live tmux-path
+  // serializer (above) hardcodes recipe_id=null because no per-session meta
+  // carries it, so without this map join the live recipe-child rows would
+  // never get their recipe_id populated and SPA/E2E tests that filter by
+  // recipe_id would miss them.
+  const candidateInstanceIds = [
+    ...archived.map((a) => a.instance_id),
+    ...live.map((l) => l.instance_id),
+  ].filter((id): id is string => typeof id === 'string' && id.length > 0);
   let recipeMap: Record<string, string> = {};
-  if (archivedInstanceIds.length > 0) {
-    const ph = archivedInstanceIds.map(() => '?').join(',');
+  if (candidateInstanceIds.length > 0) {
+    const uniqueIds = [...new Set(candidateInstanceIds)];
+    const ph = uniqueIds.map(() => '?').join(',');
     const rows = db.prepare(`SELECT id, recipe_id FROM recipe_instances WHERE id IN (${ph})`)
-      .all(...archivedInstanceIds) as Array<{ id: string; recipe_id: string }>;
+      .all(...uniqueIds) as Array<{ id: string; recipe_id: string }>;
     recipeMap = Object.fromEntries(rows.map((r) => [r.id, r.recipe_id]));
   }
 

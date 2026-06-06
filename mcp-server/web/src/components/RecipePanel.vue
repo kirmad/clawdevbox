@@ -46,16 +46,27 @@ const steps = computed<RecipeStepView[]>(() => instance.value?.steps ?? []);
 
 function emojiFor(status: string): string {
   switch (status) {
-    case 'success':  return '✓';
-    case 'failure':  return '✗';
-    case 'running':  return '⟳';
-    case 'pending':  return '○';
-    case 'skipped':  return '–';
-    default:         return '?';
+    case 'success':       return '✓';
+    case 'done':          return '✓';
+    case 'failure':       return '✗';
+    case 'failed':        return '✗';
+    case 'running':       return '⟳';
+    case 'awaiting_user': return '⏸';
+    case 'pending':       return '○';
+    case 'skipped':       return '–';
+    default:              return '?';
   }
 }
 function statusClass(status: string): string {
-  return `step-${status}`;
+  // Normalize DB statuses to the panel's CSS vocabulary so we get one
+  // set of color rules. `done` and `failed` come from the DB-backed
+  // recipe_steps table; `success` and `failure` come from the YAML
+  // fallback or the instance-level status field.
+  const normalized =
+    status === 'done'   ? 'success' :
+    status === 'failed' ? 'failure' :
+    status;
+  return `step-${normalized}`;
 }
 </script>
 
@@ -114,6 +125,8 @@ function statusClass(status: string): string {
 .step.step-running .step-emoji { color: #79b8ff; animation: spin 1.4s linear infinite; display: inline-block; }
 .step.step-pending { border-left-color: #3a3f4a; opacity: 0.7; }
 .step.step-skipped { border-left-color: #555b66; opacity: 0.5; }
+.step.step-awaiting_user { border-left-color: #f0b429; }
+.step.step-awaiting_user .step-emoji { color: #f0b429; }
 
 @keyframes spin {
   0%   { transform: rotate(0deg); }

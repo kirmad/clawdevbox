@@ -27,10 +27,10 @@ import { writeFileAtomic } from '../fs-util.ts';
 import {
   readRecipeInstance,
   writeRecipeInstance,
+  mintRecipeInstanceId,
   type RecipeInstance,
   type RecipeInstanceStatus,
 } from '../recipe-instances-store.ts';
-import { runRecipe } from '../recipe-runner.ts';
 import { resolveConfig } from '../config.ts';
 import {
   ensureWritableScope,
@@ -305,95 +305,91 @@ export function registerRecipeEntries(ws: Workspace): void {
     sourceFile: fileURLToPath(import.meta.url),
   });
 
-  // -- recipe.run -----------------------------------------------------------
+  // -- recipe.begin ---------------------------------------------------------
+  // Agent-executes-recipe model (new in 2026-06):
+  //
+  // The CALLING agent — not a child — executes the recipe. recipe.begin
+  // just records the start of a run: it mints a recipe-instance row,
+  // materializes the declared steps into the DB, and returns the
+  // recipe_instance_id + initial step list. The agent then iterates the
+  // steps in its own session by calling recipe.steps.update_status (and
+  // optionally artifact.add) with the returned recipe_instance_id.
+  //
+  // No agent CLI is spawned by recipe.begin. No prompt is delivered. No
+  // workspace is freshly created unless the caller asks for one — by
+  // default the recipe runs in the caller's current workspace context.
+  //
+  // For collaboration (multiple CLIs working on the same instance): the
+  // caller hands the returned recipe_instance_id to other agents (via
+  // prompts, dispatch, inbox cards, etc.). Each agent calls update_status
+  // with the same id. The step machine's monotonic transitions + DB row
+  // locking give first-writer-wins "claim" semantics for free.
+  //
+  // Replaces the deleted recipe.run tool, which spawned a child agent and
+  // tried to propagate identity via HTTP headers (fragile when wrappers
+  // like agency redeclared the MCP server entry).
   defineTool({
-    name: 'recipe.run',
-    description: 'Spawn a fresh agent CLI session running a recipe in a workspace. Two ways to specify the recipe: (a) `id` — load an already-saved recipe via the scope chain (project→plugin→global); or (b) `source` — pass the recipe YAML inline for an ad-hoc run without persisting it. Exactly one of `id` or `source` is required. Either way, mints a recipe-instance row in `<workspace>/.clawdevbox/recipe-instances/`, writes `.mcp.json` so the spawned CLI sees the Clawdevbox MCP server, then detach-spawns the agent CLI and returns immediately with ids + pid. The spawned agent calls `recipe.done` to signal completion.',
+    name: 'recipe.begin',
+    description: 'Start executing a recipe IN THE CALLING AGENT\'S SESSION. Creates a recipe-instance row, materializes the declared steps into the DB, and returns the recipe_instance_id plus the initial step list. The calling agent then iterates the steps itself using recipe.steps.update_status (status: running → done/failed/skipped) with the returned recipe_instance_id. For multi-agent collaboration, hand the returned recipe_instance_id to other agents (via prompts, dispatch, inbox) — they call update_status with the same id. First-writer-wins via the monotonic step machine. Specify the recipe by either `template_id` (load saved recipe via scope chain) or inline `source` YAML.',
     parameters: z.object({
-        id: z
-          .string()
-          .min(1)
-          .optional()
-          .describe('Recipe id to load from the scope chain. Mutually exclusive with `source`.'),
-        source: z
-          .string()
-          .min(1)
-          .optional()
-          .describe(
-            'Inline recipe YAML for an ad-hoc run (not persisted to disk). The YAML must include valid `id`, `name`, and `description` fields — they validate against the same rules as `recipe.upsert`. Mutually exclusive with `id`.',
-          ),
-        prompt: z.string().min(1).describe('The first user message handed to the spawned agent.'),
-        params: z
-          .record(z.string(), z.unknown())
-          .optional()
-          .describe('Optional parameter overrides recorded on the instance.'),
-        workspace_id: z
-          .string()
-          .min(1)
-          .optional()
-          .describe('Existing workspace id to run in. If omitted, a new workspace is created with `inherit_plugins: true`.'),
-        attach_to_inbox_item_id: z
-          .string()
-          .min(1)
-          .optional()
-          .describe('Optional inbox item to associate the instance with.'),
-        agent_cli: z
-          .string()
-          .min(1)
-          .optional()
-          .describe('Which agent-CLI provider to spawn (must be a registered provider id; defaults to config.default_agent_cli or "copilot"). `echo-stub` is a no-op spawn for tests.'),
-        agent: z
-          .string()
-          .min(1)
-          .optional()
-          .describe('Optional agent persona name. Maps to the CLI\'s `--agent <name>` flag (supported by copilot, claude, and agency). When omitted, falls back to the recipe YAML\'s `agent:` field if it has one, else no `--agent` flag is passed.'),
-        model: z
-          .string()
-          .min(1)
-          .optional()
-          .describe('Optional AI model name. Maps to the CLI\'s `--model <name>` flag. Examples: `gpt-5.2` (copilot), `opus`/`sonnet`/`claude-sonnet-4-6` (claude), `claude-opus-4.7-1m-internal` (copilot/agency). When omitted, the CLI uses its configured default.'),
-        session_id: z
-          .string()
-          .min(1)
-          .optional()
-          .describe('Explicit CLI session id. Recommended — lets the UI offer a "Resume" action later. Auto-minted if omitted.'),
-        resume_of: z
-          .string()
-          .min(1)
-          .optional()
-          .describe('Recipe-instance id to resume. When set, the agent CLI is spawned with --resume <session_id_of_resume_of> and the new instance is recorded as a continuation.'),
-        spawn_mode: z.enum(['interactive', 'headless']).optional().describe(
-          "Spawn mode. 'headless' (default) exits when the prompt is complete. 'interactive' keeps the tmux session alive so external callers can dispatch follow-up prompts via the /dispatch endpoint.",
-        ),
-      }),
-    handler: async (args) => {
-      // 1. Resolve the recipe — either by id (saved) or by inline source (ad-hoc).
-      //    Exactly one of {id, source} must be supplied.
-      const hasId = typeof args.id === 'string' && args.id.length > 0;
+      template_id: z
+        .string()
+        .min(1)
+        .optional()
+        .describe('Saved recipe id to load via the scope chain (project → plugin → global). Mutually exclusive with `source`.'),
+      source: z
+        .string()
+        .min(1)
+        .optional()
+        .describe('Inline recipe YAML for an ad-hoc run (not persisted). Must include `id`, `name`, `description`. Mutually exclusive with `template_id`.'),
+      params: z
+        .record(z.string(), z.unknown())
+        .optional()
+        .describe('Optional parameter overrides recorded on the instance.'),
+      workspace_id: z
+        .string()
+        .min(1)
+        .optional()
+        .describe('Workspace to bind the instance to. Defaults to the calling agent\'s current workspace (resolved via context).'),
+      name: z
+        .string()
+        .min(1)
+        .optional()
+        .describe('Optional display name for this run (overrides the recipe\'s `name` field for the instance only).'),
+      attach_to_inbox_item_id: z
+        .string()
+        .min(1)
+        .optional()
+        .describe('Optional inbox item id to associate this run with.'),
+    }),
+    handler: async (args, extra) => {
+      // 1. Validate args — exactly one of template_id / source.
+      const hasId = typeof args.template_id === 'string' && args.template_id.length > 0;
       const hasSource = typeof args.source === 'string' && args.source.length > 0;
       if (hasId && hasSource) {
         return structuredError(
           'INVALID_REQUEST',
-          'Pass either `id` (load saved recipe) or `source` (inline ad-hoc YAML), not both.',
+          'Pass either `template_id` (load saved recipe) or `source` (inline YAML), not both.',
         );
       }
       if (!hasId && !hasSource) {
         return structuredError(
           'INVALID_REQUEST',
-          'Either `id` (load saved recipe) or `source` (inline ad-hoc YAML) is required.',
+          'Either `template_id` (load saved recipe) or `source` (inline YAML) is required.',
         );
       }
 
+      // 2. Resolve recipe — id-load or inline-parse.
       let recipeId: string;
       let recipeSnapshot: string;
       let isAdhoc: boolean;
       let parsedRecipe: Record<string, unknown> | null = null;
       if (hasId) {
-        const idCheck = validateId(args.id!);
+        const idCheck = validateId(args.template_id!);
         if (!idCheck.ok) return structuredError('INVALID_ID', idCheck.message!);
-        const hit = resolveRead(ws, 'all', 'recipe', args.id!, recipePath);
-        if (!hit) return notFound('recipe', args.id!);
-        recipeId = args.id!;
+        const hit = resolveRead(ws, 'all', 'recipe', args.template_id!, recipePath);
+        if (!hit) return notFound('recipe', args.template_id!);
+        recipeId = args.template_id!;
         recipeSnapshot = hit.source;
         isAdhoc = false;
         try {
@@ -402,14 +398,17 @@ export function registerRecipeEntries(ws: Workspace): void {
             parsedRecipe = p as Record<string, unknown>;
           }
         } catch {
-          // saved recipe failed to parse — leave parsedRecipe null; spawn
-          // path will surface its own failure.
+          // Saved recipe failed to parse — surface the failure rather than
+          // silently materializing zero steps.
+          return structuredError(
+            'RECIPE_PARSE_FAILED',
+            `Saved recipe ${args.template_id} failed to parse as YAML.`,
+            { template_id: args.template_id },
+          );
         }
       } else {
         const validation = validateRecipeSource(args.source!);
-        if (!validation.ok) {
-          return validationError(validation.errors);
-        }
+        if (!validation.ok) return validationError(validation.errors);
         const parsed = parseRecipeSource(args.source!) as { id: string } & Record<string, unknown>;
         recipeId = parsed.id;
         recipeSnapshot = args.source!;
@@ -417,209 +416,123 @@ export function registerRecipeEntries(ws: Workspace): void {
         parsedRecipe = parsed;
       }
 
-      // Strict default_client check (spec §7.5): recipe.run is about to spawn,
-      // so a missing provider must fail loudly rather than warn.
-      const declaredClient =
-        parsedRecipe && typeof parsedRecipe.default_client === 'string'
-          ? (parsedRecipe.default_client as string)
-          : null;
-      if (declaredClient && !ws.agentCliProviders.has(declaredClient)) {
-        const available = [...ws.agentCliProviders.entries()]
-          .filter(([, p]) => !p.internal)
-          .map(([id]) => id);
-        return structuredError(
-          'UNKNOWN_AGENT_CLI',
-          `recipe default_client '${declaredClient}' is not registered (available: ${available.join(', ') || '<none>'})`,
-          { default_client: declaredClient, available },
-        );
-      }
-
-      // 2. Resolve / create the workspace.
+      // 3. Resolve / create workspace.
+      // Default: use the calling agent's workspace (via context-resolver
+      // chain). Explicit workspace_id arg always wins. We do NOT auto-mint
+      // a new workspace here — recipe.begin runs IN-PROCESS for the calling
+      // agent, so its workspace is the natural binding. Callers that want
+      // a fresh workspace (e.g. an orchestrator wanting per-run isolation)
+      // can pass workspace_id explicitly after a `workspace.create` call.
       const workspacesRoot = resolveWorkspacesRoot();
-      let workspaceInfo;
+      let workspaceInfo: { id: string; path: string };
       if (args.workspace_id) {
-        workspaceInfo = getWorkspace(workspacesRoot, args.workspace_id);
-        if (!workspaceInfo) {
+        const wsInfo = getWorkspace(workspacesRoot, args.workspace_id);
+        if (!wsInfo) {
           return structuredError(
             'WORKSPACE_NOT_FOUND',
             `Workspace ${args.workspace_id} not found in registry.`,
             { id: args.workspace_id },
           );
         }
+        workspaceInfo = { id: wsInfo.id, path: wsInfo.path };
       } else {
-        try {
-          const created = createWorkspace({
-            inherit_plugins: true,
-            callerProjectDir: ws.projectDir,
-          });
-          workspaceInfo = created.info;
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return structuredError('WORKSPACE_CREATE_FAILED', msg);
-        }
+        const resolved = resolveWorkspaceContext(extra as ResolveExtra | undefined, {});
+        if (!resolved.ok) return resolved.error;
+        workspaceInfo = {
+          id: resolved.ctx.workspaceInfo.id,
+          path: resolved.ctx.workspaceInfo.path,
+        };
       }
 
-      // 3. Delegate spawn to the recipe-runner.
-      const cfg = resolveConfig({ projectDir: ws.projectDir, globalDir: ws.globalDir });
-      const agentCli = args.agent_cli ?? cfg.defaultAgentCli ?? 'copilot';
-      if (!ws.agentCliProviders.has(agentCli)) {
-        const available = [...ws.agentCliProviders.entries()]
-          .filter(([, p]) => !p.internal)
-          .map(([id]) => id);
-        return structuredError(
-          'UNKNOWN_AGENT_CLI',
-          `agent_cli provider '${agentCli}' is not registered (available: ${available.join(', ') || '<none>'})`,
-          { agent_cli: agentCli, available },
+      // 4. Mint instance + write the instance row (file + DB mirror).
+      const instanceId = mintRecipeInstanceId();
+      const instance: RecipeInstance = {
+        id: instanceId,
+        recipe_id: isAdhoc ? `__adhoc_${instanceId}` : recipeId,
+        recipe_snapshot: recipeSnapshot,
+        workspace_id: workspaceInfo.id,
+        workspace_path: workspaceInfo.path,
+        // No prompt — agent executes inline. Empty string keeps disk JSON
+        // schema consistent with legacy readers.
+        prompt: '',
+        params: args.params ?? {},
+        // Bookkeeping: there's no spawned CLI, but the calling agent IS the
+        // executor. We record its session id (best-effort via the standard
+        // resolver) so the SPA can link the recipe-instance to the agent.
+        agent_cli: 'inline',
+        pid: null,
+        started_at: Date.now(),
+        status: 'running',
+        completed_at: null,
+        result: null,
+        message: null,
+        session_id: resolveAgentSessionId(extra as ResolveExtra | undefined) ?? '',
+        resume_of: null,
+        parent_recipe_instance_id: null,
+      };
+      writeRecipeInstance(workspaceInfo.path, instance, { interactive: false });
+
+      // 5. Materialize step rows from the recipe's `steps:` declaration.
+      // This is what lets the agent immediately call update_status without
+      // first having to call recipe.update_steps to recreate what the
+      // template already declared.
+      const materializedSteps: Array<{ id: string; goal: string; status: 'pending' }> = [];
+      try {
+        const rawSteps = parsedRecipe && Array.isArray(parsedRecipe.steps)
+          ? parsedRecipe.steps as unknown[]
+          : [];
+        const stepDecls: Step[] = rawSteps
+          .filter((s): s is Record<string, unknown> => s !== null && typeof s === 'object')
+          .map((s) => ({
+            id: String(s.id ?? ''),
+            name: typeof s.name === 'string' ? s.name : undefined,
+            goal: String(s.goal ?? s.title ?? ''),
+            depends: Array.isArray(s.depends) ? s.depends.map(String) : undefined,
+          }))
+          .filter((s) => s.id && s.goal);
+        if (stepDecls.length > 0) {
+          const { materializeSteps } = await import('../db/recipe-steps-store.ts');
+          const rows = materializeSteps(getDatabase(), instanceId, stepDecls);
+          for (const r of rows) {
+            materializedSteps.push({ id: r.step_id, goal: r.goal, status: 'pending' });
+          }
+        }
+      } catch (err) {
+        // Materialization failure is non-fatal — the instance still exists
+        // and the agent can call recipe.update_steps to retry. Log loudly
+        // so we notice infrastructure bugs.
+        logger.warn(
+          { err: String(err), instanceId },
+          'recipe.begin: step materialization failed — agent must call recipe.update_steps before update_status',
         );
       }
-      // Resolve the agent persona to launch the CLI with:
-      //   1. explicit `args.agent` runtime override (recipe.run input)
-      //   2. recipe YAML's `agent:` field
-      //   3. nothing — provider's spawnSession will skip the --agent flag
-      // We don't fail-loudly here when the agent name isn't currently
-      // registered: plugins are loaded lazily and the CLI will surface
-      // a clean error if `--agent <missing>` doesn't resolve at runtime.
-      // We do an idempotent best-effort lookup across all loaded plugin
-      // capabilities for an early diagnostic stderr line.
-      const recipeAgent =
-        parsedRecipe && typeof parsedRecipe.agent === 'string'
-          ? (parsedRecipe.agent as string)
-          : null;
-      const agent: string | undefined =
-        (typeof args.agent === 'string' && args.agent.length > 0
-          ? args.agent
-          : recipeAgent) ?? undefined;
-      if (agent) {
-        const knownAgents = new Set<string>();
-        for (const plugin of ws.plugins.values()) {
-          for (const a of plugin.capabilities.agents ?? []) knownAgents.add(a.id);
-        }
-        if (!knownAgents.has(agent)) {
-          logger.warn(
-            { agent, available: [...knownAgents].sort() },
-            'recipe.run: agent persona not currently registered; passing through to the CLI anyway',
-          );
-        }
-      }
 
-      const result = await runRecipe({
-        recipeId,
-        recipeSnapshot,
-        isAdhoc,
-        prompt: args.prompt,
-        params: args.params as Record<string, unknown> | undefined,
-        workspaceInfo: { id: workspaceInfo.id, path: workspaceInfo.path },
-        attachToInboxItemId: args.attach_to_inbox_item_id,
-        agentCli,
-        agent,
-        model: args.model,
-        sessionId: args.session_id,
-        resumeOf: args.resume_of,
-        spawnMode: args.spawn_mode,
-        workspacesRoot,
-        ws,
-        cfg,
-      });
-
-      if (result.spawn_error) {
-        return structuredError(result.spawn_error.code, result.spawn_error.message, {
-          agent_cli: agentCli,
-          instance_id: result.recipe_instance_id,
-        });
-      }
+      const displayName = args.name
+        ?? (parsedRecipe && typeof parsedRecipe.name === 'string' ? parsedRecipe.name : recipeId);
 
       return {
         content: [
           {
             type: 'text',
-            text: `Spawned ${agentCli} for recipe ${recipeId}${isAdhoc ? ' (ad-hoc)' : ''} (instance=${result.recipe_instance_id}, session=${result.session_id}, workspace=${workspaceInfo.id}, pid=${result.pid ?? 'n/a'}${result.resume_of ? `, resume_of=${result.resume_of}` : ''}).`,
-          },
-        ],
-        structuredContent: {
-          recipe_instance_id: result.recipe_instance_id,
-          recipe_id: result.recipe_id,
-          adhoc: result.adhoc,
-          workspace_id: result.workspace_id,
-          workspace_path: result.workspace_path,
-          attach_to_inbox_item_id: result.attach_to_inbox_item_id,
-          pid: result.pid,
-          agent_cli: result.agent_cli,
-          session_id: result.session_id,
-          resume_of: result.resume_of,
-          status: result.status,
-          log_path: result.log_path,
-          view_url: result.view_url,
-        },
-      };
-    },
-    source: 'builtin',
-    sourceFile: fileURLToPath(import.meta.url),
-  });
-
-  // -- recipe.done ----------------------------------------------------------
-  defineTool({
-    name: 'recipe.done',
-    description: 'Called by the agent inside a spawned recipe-run session to signal completion. Requires CLAWDEVBOX_RECIPE_INSTANCE_ID and CLAWDEVBOX_WORKSPACE_ID env vars (set automatically by recipe.run). Updates the instance file with status / completed_at / result / message.',
-    parameters: z.object({
-        status: z
-          .enum(['success', 'failure', 'cancelled'])
-          .optional()
-          .describe('Final status. Default: success.'),
-        result: z
-          .unknown()
-          .optional()
-          .describe('Optional structured result the parent can consume.'),
-        message: z.string().optional().describe('Optional human summary.'),
-      }),
-    handler: async (args, extra) => {
-      const instanceId = resolveRecipeInstanceId(extra);
-      const wsResult = resolveWorkspaceContext(extra);
-      if (!instanceId) {
-        return structuredError(
-          'NOT_IN_RECIPE_INSTANCE',
-          'recipe.done could not resolve a recipe instance id from X-Clawdevbox-Recipe-Instance-Id header or CLAWDEVBOX_RECIPE_INSTANCE_ID env. recipe.done can only run inside a spawned recipe-run session.',
-        );
-      }
-      if (!wsResult.ok) {
-        return wsResult.error;
-      }
-      const wsInfo = wsResult.ctx.workspaceInfo;
-      const workspaceId = wsResult.ctx.workspaceId;
-      const instance = readRecipeInstance(wsInfo.path, instanceId);
-      if (!instance) {
-        return structuredError(
-          'RECIPE_INSTANCE_NOT_FOUND',
-          `Recipe instance ${instanceId} not found in workspace ${workspaceId}.`,
-          { instance_id: instanceId, workspace_id: workspaceId },
-        );
-      }
-      const status: RecipeInstanceStatus = args.status ?? 'success';
-      const completedAt = Date.now();
-      const updated: RecipeInstance = {
-        ...instance,
-        status,
-        completed_at: completedAt,
-        result: args.result ?? null,
-        message: args.message ?? null,
-      };
-      writeRecipeInstance(wsInfo.path, updated);
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Recorded recipe.done for ${instanceId} (status=${status}).`,
+            text: `Started recipe ${recipeId}${isAdhoc ? ' (ad-hoc)' : ''} as instance ${instanceId} with ${materializedSteps.length} step(s). Iterate by calling recipe.steps.update_status with recipe_instance_id="${instanceId}".`,
           },
         ],
         structuredContent: {
           recipe_instance_id: instanceId,
-          recorded_at: completedAt,
-          status,
+          recipe_id: recipeId,
+          adhoc: isAdhoc,
+          name: displayName,
+          status: 'running' as const,
+          workspace_id: workspaceInfo.id,
+          workspace_path: workspaceInfo.path,
+          steps: materializedSteps,
         },
       };
     },
     source: 'builtin',
     sourceFile: fileURLToPath(import.meta.url),
   });
+
 
   // -- recipe.instance_info -------------------------------------------------
   defineTool({
