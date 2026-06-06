@@ -470,10 +470,19 @@ export async function listSessions(
   const liveIds = new Set(ptyLive.map((s) => s.instanceId));
   const live: SessionListItem[] = ptyLive.map((s) => {
     const meta = getSessionMeta(s.instanceId);
+    // State precedence (same as the tmux path below):
+    //   1. exited        → 'exited' (terminal)
+    //   2. derivedState  → events.jsonl-derived ('idle' / 'thinking' / 'tool_use' / 'error')
+    //   3. fallback      → 'unknown' (pty alive, no signal yet)
+    // The Main Agent goes through this path; without (2) it would always
+    // show 'unknown' since it has no agent_sessions DB row to fall back on.
+    const liveState = s.exited
+      ? 'exited'
+      : (s.derivedState ?? 'unknown');
     return {
       instance_id: s.instanceId,
       live: true,
-      state: s.exited ? 'exited' : 'unknown',
+      state: liveState,
       queue_depth: 0,
       provider_id: meta?.agentCli ?? null,
       recipe_id: meta?.recipeId ?? null,

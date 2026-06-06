@@ -151,6 +151,15 @@ interface PtySession {
    * sessionId. Stopped in onExit. null otherwise.
    */
   statusWatcher: StatusWatcher | null;
+  /**
+   * Most recent live state emitted by the statusWatcher
+   * ('idle' | 'thinking' | 'tool_use' | 'error'), or null if no event
+   * has been observed yet. This is the SOURCE OF TRUTH for live UI state
+   * on pty-registered sessions — many of them (notably the Main Agent)
+   * have no `agent_sessions` DB row, so the DB-backed derived_state
+   * column is empty even when the watcher is firing.
+   */
+  derivedState: string | null;
 }
 
 // ============================================================================
@@ -219,6 +228,7 @@ export function registerPty(opts: PtyRegisterOptions): void {
     headCodeUnits: 0,
     spawnTs: Date.now(),
     statusWatcher: null,
+    derivedState: null,
   };
 
   // Conductor creation removed in tmux migration; see src/pending-dispatch-registry.ts
@@ -244,21 +254,29 @@ export function registerPty(opts: PtyRegisterOptions): void {
   emitChange('sessions');
 
   // Start the events.jsonl-based live status watcher when the provider
-  // exposes the copilot-events idle signal. Updates agent_sessions.derived_state
-  // so the UI dot reflects real-time agent state without the agent having
-  // to opt in to update_status. Stopped in onExit below.
+  // exposes the copilot-events idle signal. Updates:
+  //   1. session.derivedState (in-memory; source of truth for pty-registered
+  //      sessions that may not have an agent_sessions DB row, e.g. the
+  //      Main Agent).
+  //   2. agent_sessions.derived_state (DB; harmless no-op when row absent).
+  // Stopped in onExit below.
   if (opts.provider?.capabilities?.idleSignal === 'copilot-events'
       && session.meta.sessionId) {
     const sessionId = session.meta.sessionId;
     const recipeInstanceId = opts.instanceId;
     try {
       session.statusWatcher = watchCopilotStatus(sessionId, (cls) => {
+        // In-memory write — always succeeds; primary surface for UI.
+        if (session.derivedState !== cls.state) {
+          session.derivedState = cls.state;
+          emitChange('sessions');
+        }
+        // DB write — best-effort; only changes anything if there's a row.
         try {
-          const changed = updateDerivedState(getDatabase(), recipeInstanceId, {
+          updateDerivedState(getDatabase(), recipeInstanceId, {
             state: cls.state,
             ts: Date.now(),
           });
-          if (changed) emitChange('sessions');
         } catch (err) {
           logger.debug({ err: String(err), recipeInstanceId },
             'pty-registry: updateDerivedState failed');
@@ -487,11 +505,12 @@ export async function killAllSessions(gracefulMs = 2000): Promise<number> {
   return killed;
 }
 
-export function listSessions(): { instanceId: string; workspaceId: string; exited: boolean }[] {
+export function listSessions(): { instanceId: string; workspaceId: string; exited: boolean; derivedState: string | null }[] {
   return Array.from(sessions.values()).map((s) => ({
     instanceId: s.instanceId,
     workspaceId: s.workspaceId,
     exited: s.exited,
+    derivedState: s.derivedState,
   }));
 }
 

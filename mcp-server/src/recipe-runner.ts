@@ -24,6 +24,12 @@ import { resolve as resolvePath } from 'node:path';
 import { registerPty } from './pty-registry.ts';
 import { getTerminalServer } from './terminal-server.ts';
 import {
+  watchCopilotStatus,
+  type StatusWatcher,
+} from './agent-clis/copilot-events.ts';
+import { updateDerivedState } from './db/agent-sessions-store.ts';
+import { emitChange } from './event-bus.ts';
+import {
   mintRecipeInstanceId,
   readRecipeInstance,
   recipeInstancesDir,
@@ -390,7 +396,38 @@ export async function runRecipe(opts: RunRecipeOptions): Promise<RunRecipeResult
       // tmuxSessionRegistry — registered by the provider. The exited promise
       // drives the status writeback.
       try { logStream.end(); } catch { /* ignore */ }
+
+      // Start the events.jsonl-based live status watcher when the provider
+      // exposes the copilot-events idle signal. Writes to
+      // agent_sessions.derived_state so the Terminals-tab icon reflects the
+      // live agent state (thinking/tool_use/idle/error). pty-registry has the
+      // mirror of this for the legacy IPty path; this is the tmux equivalent.
+      let statusWatcher: StatusWatcher | null = null;
+      if (provider.capabilities?.idleSignal === 'copilot-events' && sessionId) {
+        try {
+          statusWatcher = watchCopilotStatus(sessionId, (cls) => {
+            try {
+              const changed = updateDerivedState(getDatabase(), instanceId, {
+                state: cls.state,
+                ts: Date.now(),
+              });
+              if (changed) emitChange('sessions');
+            } catch (err) {
+              logger.debug({ err: String(err), instanceId },
+                'recipe-runner: updateDerivedState failed');
+            }
+          });
+        } catch (err) {
+          logger.warn({ err: String(err), sessionId, instanceId },
+            'recipe-runner: watchCopilotStatus failed to start');
+        }
+      }
+
       handle.exited.then(({ exitCode, signal }) => {
+        if (statusWatcher) {
+          try { statusWatcher.stop(); } catch { /* idempotent */ }
+          statusWatcher = null;
+        }
         const current = readRecipeInstance(opts.workspaceInfo.path, instanceId);
         if (current && current.status === 'running') {
           const ok = (signal === undefined || signal === '0') && exitCode === 0;

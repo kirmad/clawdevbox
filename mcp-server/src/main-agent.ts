@@ -199,7 +199,10 @@ export async function startMainAgent(opts: MainAgentOptions): Promise<MainAgentS
       ipty: handle.pty!,
       provider,
       agentHandle: handle,
-      meta: { agentCli: providerId },
+      // sessionId is REQUIRED for the events.jsonl status watcher to start
+      // (gate in pty-registry.registerPty). Without it, the Main Agent tab
+      // icon would stay 'unknown' even while the agent is actively working.
+      meta: { agentCli: providerId, sessionId: handle.sessionId },
     });
 
     // Spawn succeeded — clear any stale reason from earlier attempts.
