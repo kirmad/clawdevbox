@@ -16,6 +16,8 @@ import { fetchAgentClis, type AgentCliInfo } from '../api';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
+import ResizeHandle from './ResizeHandle.vue';
+import SessionSidePanel from './SessionSidePanel.vue';
 
 const store = useUiStore();
 const termHost = ref<HTMLDivElement | null>(null);
@@ -27,6 +29,9 @@ let onWindowResize: (() => void) | null = null;
 
 const selectedId = computed(() => store.terminals.selectedInstanceId);
 const activeSessions = computed(() => store.terminals.items.filter((s) => s.live));
+const selectedSession = computed<Session | null>(
+  () => store.terminals.items.find((s) => s.instance_id === selectedId.value) ?? null,
+);
 const recentArchived = computed(() => {
   const cutoff = Date.now() - 24 * 60 * 60 * 1000;
   return store.terminals.items.filter((s) => !s.live && (s.ended_at ?? s.started_at) >= cutoff);
@@ -35,6 +40,28 @@ const olderArchived = computed(() => {
   const cutoff = Date.now() - 24 * 60 * 60 * 1000;
   return store.terminals.items.filter((s) => !s.live && (s.ended_at ?? s.started_at) < cutoff);
 });
+
+// ---------------------------------------------------------------------------
+// Resizable layout — tab-list width + side-panel width are user-draggable,
+// persisted to localStorage, and trigger xterm refit via the existing
+// ResizeObserver on .xterm-host.
+// ---------------------------------------------------------------------------
+const LS_TAB_WIDTH = 'clawdevbox.terminals.tabListWidth';
+const LS_SIDE_WIDTH = 'clawdevbox.terminals.sidePanelWidth';
+
+function loadWidth(key: string, def: number, min: number, max: number): number {
+  try {
+    const v = Number(localStorage.getItem(key));
+    if (Number.isFinite(v) && v >= min && v <= max) return v;
+  } catch { /* ignore */ }
+  return def;
+}
+const tabListWidth = ref<number>(loadWidth(LS_TAB_WIDTH, 280, 180, 600));
+const sidePanelWidth = ref<number>(loadWidth(LS_SIDE_WIDTH, 360, 240, 900));
+const sideCollapsed = ref<boolean>(false);
+watch(tabListWidth, (v) => { try { localStorage.setItem(LS_TAB_WIDTH, String(v)); } catch { /* ignore */ } });
+watch(sidePanelWidth, (v) => { try { localStorage.setItem(LS_SIDE_WIDTH, String(v)); } catch { /* ignore */ } });
+
 
 function relTime(ts: number): string {
   const diff = Date.now() - ts;
@@ -306,7 +333,7 @@ watch(selectedId, () => { attach(); });
 
 <template>
   <div class="terminals-panel">
-    <aside class="tab-list">
+    <aside class="tab-list" :style="{ flexBasis: tabListWidth + 'px' }">
       <div class="group-header active-header">
         <span>Active</span>
         <button
@@ -323,6 +350,7 @@ watch(selectedId, () => { attach(); });
         v-for="s in activeSessions"
         :key="s.instance_id"
         class="tab-row"
+        :data-instance-id="s.instance_id"
         :class="{ selected: s.instance_id === selectedId, foreign: s.kind === 'foreign' }"
         @click="select(s)"
       >
@@ -350,6 +378,7 @@ watch(selectedId, () => { attach(); });
           v-for="s in recentArchived"
           :key="s.instance_id"
           class="tab-row archived"
+          :data-instance-id="s.instance_id"
           :class="{ selected: s.instance_id === selectedId }"
           @click="select(s)"
         >
@@ -373,6 +402,7 @@ watch(selectedId, () => { attach(); });
           v-for="s in olderArchived"
           :key="s.instance_id"
           class="tab-row archived"
+          :data-instance-id="s.instance_id"
           :class="{ selected: s.instance_id === selectedId }"
           @click="select(s)"
         >
@@ -395,7 +425,32 @@ watch(selectedId, () => { attach(); });
         >Show more</button>
       </details>
     </aside>
+    <ResizeHandle
+      :width="tabListWidth"
+      :min="180"
+      :max="600"
+      side="right"
+      @update:width="(w) => (tabListWidth = w)"
+    />
     <main class="xterm-host" ref="termHost" />
+    <ResizeHandle
+      v-if="selectedSession && !sideCollapsed"
+      :width="sidePanelWidth"
+      :min="240"
+      :max="900"
+      side="left"
+      @update:width="(w) => (sidePanelWidth = w)"
+    />
+    <div
+      v-if="selectedSession"
+      class="side-pane-host"
+      :style="sideCollapsed ? { flexBasis: '28px' } : { flexBasis: sidePanelWidth + 'px' }"
+    >
+      <SessionSidePanel
+        :session="selectedSession"
+        @update:collapsed="(v) => (sideCollapsed = v)"
+      />
+    </div>
 
     <Dialog
       :visible="spawnOpen"
@@ -473,7 +528,22 @@ watch(selectedId, () => { attach(); });
 
 <style scoped>
 .terminals-panel { display: flex; height: 100%; width: 100%; min-height: 0; min-width: 0; }
-.tab-list { width: 280px; min-width: 280px; max-width: 280px; overflow-y: auto; border-right: 1px solid #23262d; padding: 8px 4px; }
+.tab-list {
+  flex: 0 0 auto;       /* width controlled via inline flex-basis */
+  overflow-y: auto;
+  overflow-x: hidden;
+  border-right: 1px solid #23262d;
+  padding: 8px 4px;
+  min-width: 0;
+}
+.side-pane-host {
+  flex: 0 0 auto;       /* width controlled via inline flex-basis */
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  background: #15171d;
+}
+.side-pane-host > * { flex: 1 1 auto; min-width: 0; min-height: 0; }
 .group-header { font-size: 11px; color: #7c8290; text-transform: uppercase; padding: 8px 10px 4px; cursor: pointer; }
 .active-header { display: flex; align-items: center; justify-content: space-between; cursor: default; }
 .spawn-btn {

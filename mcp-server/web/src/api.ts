@@ -400,6 +400,48 @@ export async function deleteSession(instanceId: string): Promise<void> {
   }
 }
 
+// -- Session side-panel data ------------------------------------------------
+
+export interface SessionArtifact {
+  id: string;
+  type: string;
+  title: string | null;
+  recipe_instance_id: string | null;
+  recipe_step_id: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export async function fetchSessionArtifacts(instanceId: string): Promise<{ items: SessionArtifact[] }> {
+  const res = await fetch(`/api/sessions/${encodeURIComponent(instanceId)}/artifacts`);
+  if (!res.ok) return { items: [] };
+  return (await res.json()) as { items: SessionArtifact[] };
+}
+
+export interface RecipeStepView {
+  id: string;
+  title: string;
+  status: 'pending' | 'running' | 'success' | 'failure' | 'skipped' | string;
+  message?: string | null;
+  started_at?: number | null;
+  completed_at?: number | null;
+}
+
+export interface RecipeInstanceView {
+  id: string;
+  recipe_id: string;
+  status: 'running' | 'success' | 'failure' | 'cancelled' | string;
+  steps?: RecipeStepView[];
+  workspace_path: string;
+  message?: string | null;
+}
+
+export async function fetchRecipeInstance(instanceId: string): Promise<RecipeInstanceView | null> {
+  const res = await fetch(`/api/recipe-instances/${encodeURIComponent(instanceId)}`);
+  if (!res.ok) return null;
+  return (await res.json()) as RecipeInstanceView;
+}
+
 // -- Spawn / agent CLIs ------------------------------------------------------
 
 export interface SpawnSessionRequest {

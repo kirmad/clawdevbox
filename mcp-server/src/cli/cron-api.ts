@@ -459,6 +459,100 @@ export async function handleCronApi(
       }
       return true;
     }
+    // GET /api/sessions/<instance_id>/artifacts — list artifacts emitted by
+    // this session's recipe instance. Used by the Terminals tab side panel
+    // to surface "what files / outputs has this agent produced".
+    {
+      const ma = path.match(/^\/api\/sessions\/([^/]+)\/artifacts\/?$/);
+      if (ma && method === 'GET') {
+        const instanceId = decodeURIComponent(ma[1]!);
+        // Special-case 'main': it has no DB row, so the SPA shouldn't list
+        // artifacts for it.
+        if (instanceId === 'main') {
+          sendJson(res, 200, { items: [] });
+          return true;
+        }
+        // Look up workspace_path from the agent_sessions row.
+        const row = ctx.db.prepare(
+          `SELECT w.path AS workspace_path
+           FROM agent_sessions s JOIN workspaces w ON w.id = s.workspace_id
+           WHERE s.recipe_instance_id = ?
+           ORDER BY s.started_at DESC LIMIT 1`,
+        ).get(instanceId) as { workspace_path: string } | undefined;
+        if (!row) { sendJson(res, 404, { error: 'session not found' }); return true; }
+        // Read artifacts from disk (manifest scanner). The artifact.add
+        // tool writes manifests to <ws>/artifacts/<id>/manifest.json but
+        // does NOT currently mirror to the artifacts DB table, so the
+        // on-disk scanner is the authoritative source.
+        const { listArtifacts } = await import('../artifact-store.ts');
+        const all = listArtifacts(row.workspace_path);
+        const items = all
+          .filter((a) => a.manifest.recipe_instance_id === instanceId)
+          .map((a) => ({
+            id: a.manifest.id,
+            type: a.manifest.type,
+            title: a.manifest.title,
+            recipe_instance_id: a.manifest.recipe_instance_id ?? null,
+            recipe_step_id: a.manifest.step_id ?? null,
+            created_at: a.manifest.created_at ?? 0,
+            updated_at: a.manifest.created_at ?? 0,
+          }))
+          .sort((a, b) => b.created_at - a.created_at);
+        sendJson(res, 200, { items });
+        return true;
+      }
+    }
+  }
+
+  // ----- GET /api/recipe-instances/<id> -------------------------------------
+  // Read the recipe instance + step status array. Used by the Terminals tab
+  // side panel's "Recipe" view so users can see step progress at a glance.
+  {
+    const mri = path.match(/^\/api\/recipe-instances\/([^/]+)\/?$/);
+    if (mri && method === 'GET') {
+      const instanceId = decodeURIComponent(mri[1]!);
+      const wsRow = ctx.db.prepare(
+        `SELECT w.id AS workspace_id, w.path AS workspace_path
+         FROM agent_sessions s
+         JOIN workspaces w ON w.id = s.workspace_id
+         WHERE s.recipe_instance_id = ?
+         ORDER BY s.started_at DESC LIMIT 1`,
+      ).get(instanceId) as { workspace_id: string; workspace_path: string } | undefined;
+      if (!wsRow) { sendJson(res, 404, { error: 'recipe instance not found' }); return true; }
+      const { readRecipeInstance } = await import('../recipe-instances-store.ts');
+      const inst = readRecipeInstance(wsRow.workspace_path, instanceId);
+      if (!inst) { sendJson(res, 404, { error: 'recipe instance not found' }); return true; }
+      // Augment with steps[] parsed from recipe_snapshot if the instance
+      // itself doesn't already carry a structured steps array. The runner
+      // stores the raw YAML in `recipe_snapshot` but doesn't always
+      // materialize `steps`; for the side-panel UI we want the structured
+      // list so users can see what the recipe is supposed to do.
+      type WithSteps = typeof inst & { steps?: unknown[] };
+      const withSteps = inst as WithSteps;
+      if (!Array.isArray(withSteps.steps) || withSteps.steps.length === 0) {
+        try {
+          const { parseRecipeSource } = await import('../validators.ts');
+          const snapshot = (inst as { recipe_snapshot?: string }).recipe_snapshot;
+          if (typeof snapshot === 'string' && snapshot.length > 0) {
+            const parsed = parseRecipeSource(snapshot) as Record<string, unknown> | null;
+            const parsedSteps = parsed && Array.isArray(parsed.steps) ? parsed.steps : [];
+            // Normalize each parsed step into our { id, title, status } shape
+            // so the UI doesn't need to know about the raw YAML field names.
+            withSteps.steps = parsedSteps.map((s: unknown, i: number) => {
+              const obj = (s && typeof s === 'object') ? s as Record<string, unknown> : {};
+              return {
+                id: String(obj.id ?? i + 1),
+                title: String(obj.goal ?? obj.title ?? `Step ${i + 1}`),
+                status: 'pending' as const,
+                message: null,
+              };
+            }) as typeof withSteps.steps;
+          }
+        } catch { /* leave steps unset */ }
+      }
+      sendJson(res, 200, withSteps);
+      return true;
+    }
   }
 
   // ----- GET /api/cron/status -----------------------------------------------

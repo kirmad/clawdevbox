@@ -46,6 +46,15 @@ export function setupRealtime(): () => void {
       if (t === 'sessions')  schedule('sessions', () => store.refreshTerminals({ status: 'active' }));
       // 'notifications' is handled separately via refreshPush — most
       // pages don't need to react to it here.
+
+      // Per-topic window events for components that observe directly
+      // (e.g. SessionSidePanel re-fetches its data on sessions/recipes/
+      // artifacts events without going through the Pinia store).
+      if (typeof t === 'string') {
+        try {
+          window.dispatchEvent(new CustomEvent(`clawdevbox:sse:${t}`));
+        } catch { /* ignore */ }
+      }
     });
     es.onerror = () => store.setLive('offline');
   }
