@@ -444,16 +444,12 @@ export interface SessionListItem {
   label: string;
   foreign?: true;
   session_alias?: string | null;
-  /**
-   * For archived sessions: WHY the session ended.
-   * 'user_killed' | 'agent_exited' | 'idle_reaped' | 'shutdown' | NULL for unknown.
-   * Live sessions are always null.
-   */
   end_reason?: string | null;
-  /**
-   * Agent-self-reported status text via the update_status MCP tool.
-   * Used by the UI as the tab title (falls back to `label`).
-   */
+  /** Sticky overall goal (agent-self-set via update_status, line 1 of the tab). */
+  task_title?: string | null;
+  /** Current sub-goal (agent-self-set via update_status, line 2 of the tab). */
+  subtask_title?: string | null;
+  /** Brief state (agent-self-set via update_status, line 3 of the tab). Legacy alias: status_text. */
   status_text?: string | null;
 }
 
@@ -503,6 +499,8 @@ export async function listSessions(
       ended_at: null,
       kind: 'recipe' as const,
       label: '',
+      task_title: s.taskTitle,
+      subtask_title: s.subtaskTitle,
       status_text: s.statusText,
     };
   });
@@ -515,7 +513,8 @@ export async function listSessions(
       const placeholders = ids.map(() => '?').join(',');
       const rows = db.prepare(
         `SELECT id, cli_session_id, recipe_instance_id, workspace_id, agent_cli,
-                started_at, status_text, needs_user_input, derived_state
+                started_at, status_text, needs_user_input, derived_state,
+                task_title, subtask_title
          FROM agent_sessions
          WHERE recipe_instance_id IN (${placeholders})`,
       ).all(...ids) as Array<{
@@ -523,6 +522,7 @@ export async function listSessions(
         workspace_id: string; agent_cli: string; started_at: number;
         status_text: string | null; needs_user_input: number;
         derived_state: string | null;
+        task_title: string | null; subtask_title: string | null;
       }>;
       const byInstance = new Map(rows.map((r) => [r.recipe_instance_id, r]));
       for (const e of tmuxEntries) {
@@ -548,6 +548,8 @@ export async function listSessions(
           ended_at: null,
           kind: 'recipe' as const,
           label: '',
+          task_title: row?.task_title ?? null,
+          subtask_title: row?.subtask_title ?? null,
           status_text: row?.status_text ?? null,
         });
         liveIds.add(e.instanceId);
@@ -600,6 +602,8 @@ export async function listSessions(
       kind: 'recipe' as const,
       label: '',
       end_reason: row.end_reason,
+      task_title: row.task_title,
+      subtask_title: row.subtask_title,
       status_text: row.status_text,
     }));
 

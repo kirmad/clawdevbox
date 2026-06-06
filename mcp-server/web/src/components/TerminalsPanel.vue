@@ -93,6 +93,32 @@ function stateClass(state: Session['state']): string {
 }
 
 /**
+ * Top-line label for a tab. Prefers the agent-self-set task_title; falls
+ * back to the spawn label ("Spawn xxx_yyy"). Always a non-empty string.
+ */
+function tabLine1(s: Session): string {
+  return s.task_title || s.label || 'Untitled session';
+}
+
+/**
+ * Second line: the current sub-goal if set. Empty string when not set
+ * (template uses v-if to hide the row entirely).
+ */
+function tabLine2(s: Session): string {
+  return s.subtask_title || '';
+}
+
+/**
+ * Third line: brief status + provider + age. Agent-self-set status falls
+ * back to the derived state label (e.g. "Thinking…") when not set.
+ */
+function tabLine3(s: Session): string {
+  const status = s.status_text || stateLabel(s.state);
+  const provider = s.provider_id ?? (s.kind === 'foreign' ? '(foreign tmux)' : '—');
+  return `${status} · ${provider}`;
+}
+
+/**
  * Refit the xterm to its container and inform the server-side pty of
  * the new cols/rows. Wrapped in requestAnimationFrame so layout has a
  * chance to settle before measurement (FitAddon reads computed CSS
@@ -302,11 +328,12 @@ watch(selectedId, () => { attach(); });
       >
         <div class="row-1">
           <i :class="[iconFor(s.kind), iconStateClass(s.state)]" :title="stateLabel(s.state)" />
-          <span class="label" :title="s.status_text || s.label">{{ s.status_text || s.label }}</span>
+          <span class="tab-task" :title="tabLine1(s)">{{ tabLine1(s) }}</span>
         </div>
-        <div class="row-2">
+        <div v-if="tabLine2(s)" class="row-subtask" :title="tabLine2(s)">{{ tabLine2(s) }}</div>
+        <div class="row-status">
           <span :class="stateClass(s.state)" />
-          <span class="muted">{{ s.provider_id ?? (s.kind === 'foreign' ? '(foreign tmux)' : '—') }} · {{ relTime(s.started_at) }}</span>
+          <span class="muted">{{ tabLine3(s) }} · {{ relTime(s.started_at) }}</span>
         </div>
         <button
           v-if="s.instance_id !== 'main'"
@@ -328,12 +355,13 @@ watch(selectedId, () => { attach(); });
         >
           <div class="row-1">
             <i :class="[iconFor(s.kind), iconStateClass(s.state)]" :title="stateLabel(s.state)" />
-            <span class="label" :title="s.status_text || s.label">{{ s.status_text || s.label }}</span>
+            <span class="tab-task" :title="tabLine1(s)">{{ tabLine1(s) }}</span>
             <span v-if="s.end_reason === 'idle_reaped'" class="end-chip" title="Auto-reaped after 15 min idle with no viewer">reaped</span>
           </div>
-          <div class="row-2">
+          <div v-if="tabLine2(s)" class="row-subtask" :title="tabLine2(s)">{{ tabLine2(s) }}</div>
+          <div class="row-status">
             <span :class="stateClass(s.state)" />
-            <span class="muted">{{ s.provider_id ?? '—' }} · {{ relTime(s.ended_at ?? s.started_at) }}</span>
+            <span class="muted">{{ tabLine3(s) }} · {{ relTime(s.ended_at ?? s.started_at) }}</span>
           </div>
           <button class="resume-btn" @click.stop="resume(s)">Resume</button>
         </button>
@@ -350,12 +378,13 @@ watch(selectedId, () => { attach(); });
         >
           <div class="row-1">
             <i :class="[iconFor(s.kind), iconStateClass(s.state)]" :title="stateLabel(s.state)" />
-            <span class="label" :title="s.status_text || s.label">{{ s.status_text || s.label }}</span>
+            <span class="tab-task" :title="tabLine1(s)">{{ tabLine1(s) }}</span>
             <span v-if="s.end_reason === 'idle_reaped'" class="end-chip" title="Auto-reaped after 15 min idle with no viewer">reaped</span>
           </div>
-          <div class="row-2">
+          <div v-if="tabLine2(s)" class="row-subtask" :title="tabLine2(s)">{{ tabLine2(s) }}</div>
+          <div class="row-status">
             <span :class="stateClass(s.state)" />
-            <span class="muted">{{ s.provider_id ?? '—' }} · {{ relTime(s.ended_at ?? s.started_at) }}</span>
+            <span class="muted">{{ tabLine3(s) }} · {{ relTime(s.ended_at ?? s.started_at) }}</span>
           </div>
           <button class="resume-btn" @click.stop="resume(s)">Resume</button>
         </button>
@@ -462,9 +491,28 @@ watch(selectedId, () => { attach(); });
 .tab-row { display: block; width: 100%; text-align: left; background: transparent; border: none; padding: 10px; border-left: 3px solid transparent; cursor: pointer; color: #d8dee9; position: relative; }
 .tab-row:hover { background: #1a1d24; }
 .tab-row.selected { background: #1c2029; border-left-color: #4a8be8; }
-.tab-row .row-1 { display: flex; align-items: center; gap: 6px; font-weight: 600; min-width: 0; }
-.tab-row .row-1 .label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1 1 auto; }
-.tab-row .row-2 { display: flex; align-items: center; gap: 6px; margin-top: 2px; font-size: 11px; }
+.tab-row .row-1 {
+  display: flex; align-items: center; gap: 6px;
+  font-weight: 600; min-width: 0; font-size: 13px;
+}
+.tab-row .row-1 .tab-task {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  min-width: 0; flex: 1 1 auto;
+}
+/* Line 2: subtask. Medium weight, slightly muted, smaller than title. */
+.tab-row .row-subtask {
+  margin-top: 1px; padding-left: 22px;        /* indent under icon */
+  font-size: 12px; font-weight: 500;
+  color: #b8c0cd;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* Line 3: status + provider + age. Smallest + dimmest. */
+.tab-row .row-status {
+  display: flex; align-items: center; gap: 6px;
+  margin-top: 2px; padding-left: 22px;        /* indent under icon */
+  font-size: 11px;
+}
+.tab-row .row-status .state-dot { margin-left: -22px; margin-right: 14px; }
 .muted { color: #7c8290; }
 .state-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
 .state-idle { background: #4caf50; }

@@ -380,4 +380,23 @@ export const migrations: Migration[] = [
       `);
     },
   },
+  {
+    version: 10,
+    up: (db) => {
+      // Split agent-self-reported tab text into three fields. status_text
+      // (added in v5) becomes the "status" line; the new columns hold the
+      // sticky goal (task_title) and the current sub-goal (subtask_title).
+      // UI renders them as three lines with different font weights so the
+      // user can at a glance see WHAT the terminal is doing.
+      //
+      // All three are nullable. The MCP tool's update semantics:
+      //   - undefined  → leave column unchanged (sticky)
+      //   - ""         → CLEAR (e.g. when subtask finishes)
+      //   - non-empty  → SET
+      db.exec(`
+        ALTER TABLE agent_sessions ADD COLUMN task_title TEXT;
+        ALTER TABLE agent_sessions ADD COLUMN subtask_title TEXT;
+      `);
+    },
+  },
 ];

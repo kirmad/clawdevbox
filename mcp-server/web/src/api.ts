@@ -355,6 +355,8 @@ export interface Session {
   workspace_id: string;
   foreign?: boolean;
   end_reason?: string | null;
+  task_title?: string | null;
+  subtask_title?: string | null;
   status_text?: string | null;
 }
 

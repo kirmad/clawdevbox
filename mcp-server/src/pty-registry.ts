@@ -168,7 +168,11 @@ interface PtySession {
    * of truth and this field stays null.
    */
   statusText: string | null;
-  /** Epoch ms of last statusText update. */
+  /** Sticky overall goal (mirror of agent_sessions.task_title). */
+  taskTitle: string | null;
+  /** Current sub-goal (mirror of agent_sessions.subtask_title). */
+  subtaskTitle: string | null;
+  /** Epoch ms of last status field update. */
   statusTextAt: number | null;
 }
 
@@ -240,6 +244,8 @@ export function registerPty(opts: PtyRegisterOptions): void {
     statusWatcher: null,
     derivedState: null,
     statusText: null,
+    taskTitle: null,
+    subtaskTitle: null,
     statusTextAt: null,
   };
 
@@ -517,35 +523,68 @@ export async function killAllSessions(gracefulMs = 2000): Promise<number> {
   return killed;
 }
 
-export function listSessions(): { instanceId: string; workspaceId: string; exited: boolean; derivedState: string | null; statusText: string | null }[] {
+export function listSessions(): {
+  instanceId: string;
+  workspaceId: string;
+  exited: boolean;
+  derivedState: string | null;
+  statusText: string | null;
+  taskTitle: string | null;
+  subtaskTitle: string | null;
+}[] {
   return Array.from(sessions.values()).map((s) => ({
     instanceId: s.instanceId,
     workspaceId: s.workspaceId,
     exited: s.exited,
     derivedState: s.derivedState,
     statusText: s.statusText,
+    taskTitle: s.taskTitle,
+    subtaskTitle: s.subtaskTitle,
   }));
 }
 
 /**
- * Set agent-self-reported status text for a pty-registered session
- * (used for sessions WITHOUT an agent_sessions DB row — notably the
- * Main Agent). Returns true iff a session matched + value changed.
- *
- * Looked up by `cli_session_id` (set in meta.sessionId at register time)
- * so the lookup key matches the rest of the update_status pipeline.
+ * Tri-state status update for a pty-registered session.
+ * Same semantics as agent-sessions-store.updateStatusBySessionId:
+ *   - undefined → leave unchanged (sticky)
+ *   - ""        → clear
+ *   - non-empty → set
+ * Returns true iff any field actually changed.
  */
-export function setPtyStatusText(cliSessionId: string, text: string | null): boolean {
+export interface PtyStatusUpdate {
+  taskTitle?: string;
+  subtaskTitle?: string;
+  status?: string;
+}
+
+export function setPtyStatusFields(cliSessionId: string, update: PtyStatusUpdate): boolean {
   for (const s of sessions.values()) {
-    if (s.meta.sessionId === cliSessionId) {
-      const newText = text || null;
-      if (s.statusText === newText) return false;
-      s.statusText = newText;
-      s.statusTextAt = Date.now();
-      return true;
+    if (s.meta.sessionId !== cliSessionId) continue;
+    let changed = false;
+    if (update.taskTitle !== undefined) {
+      const v = update.taskTitle === '' ? null : update.taskTitle;
+      if (s.taskTitle !== v) { s.taskTitle = v; changed = true; }
     }
+    if (update.subtaskTitle !== undefined) {
+      const v = update.subtaskTitle === '' ? null : update.subtaskTitle;
+      if (s.subtaskTitle !== v) { s.subtaskTitle = v; changed = true; }
+    }
+    if (update.status !== undefined) {
+      const v = update.status === '' ? null : update.status;
+      if (s.statusText !== v) { s.statusText = v; changed = true; }
+    }
+    if (changed) s.statusTextAt = Date.now();
+    return changed;
   }
   return false;
+}
+
+/**
+ * @deprecated Use setPtyStatusFields. Kept for the v9 single-text-field
+ * path. Will be removed once nothing imports it.
+ */
+export function setPtyStatusText(cliSessionId: string, text: string | null): boolean {
+  return setPtyStatusFields(cliSessionId, { status: text ?? '' });
 }
 
 export interface ReadScrollbackOpts {

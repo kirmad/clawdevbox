@@ -540,7 +540,8 @@ export async function runRecipe(opts: RunRecipeOptions): Promise<RunRecipeResult
 }
 
 /**
- * Build the session-id hint that prefixes every initial dispatched prompt.
+ * Build the session-id + update_status hint that prefixes every initial
+ * dispatched prompt.
  *
  * Why: the update_status MCP tool resolves the agent's cli_session_id from
  * (a) the X-Clawdevbox-Session-Id HTTP header, set in per-spawn .mcp.json,
@@ -554,17 +555,21 @@ export async function runRecipe(opts: RunRecipeOptions): Promise<RunRecipeResult
  * to deliver that is to prepend a short note to the first prompt — the
  * agent reads it once, remembers, and passes it back as `session_id`.
  *
- * Format kept intentionally machine-friendly (literal backticks around the
- * id) so the agent can extract via regex if needed. Trailing double-newline
- * separates the hint from the user's actual prompt.
+ * Also teaches the three update_status text fields so the agent knows
+ * the expected shape (task_title sticky, subtask + status ephemeral).
+ * Trailing double-newline separates the hint from the user's prompt.
  */
 function buildSessionIdPromptPrefix(sessionId: string): string {
   return (
-    '[clawdevbox] Your clawdevbox session id is `' + sessionId + '`. ' +
-    'When calling the `update_status` MCP tool, pass `session_id="' + sessionId + '"` ' +
-    'so the server can correlate your progress updates to this specific tab. ' +
-    'Always do this at the start of any major sub-task — the `status_text` ' +
-    'becomes your tab\'s visible title in the user\'s Terminals view.\n\n'
+    '[clawdevbox] Your session id is `' + sessionId + '`. ' +
+    'Before starting major work, and as you progress, call the `update_status` ' +
+    'MCP tool with these fields (all optional, all sticky unless cleared with ""):\n' +
+    '  - task_title:    THIS TERMINAL\'S OVERALL GOAL (set once per major goal change). Line 1, bold.\n' +
+    '  - subtask_title: the sub-step you\'re currently on (clear with "" when done). Line 2.\n' +
+    '  - status:        brief one-line state ("Reading X", "Running tests"). Line 3.\n' +
+    'Always pass `session_id="' + sessionId + '"` for rock-solid correlation. ' +
+    'These render as three lines in the user\'s clawdevbox Terminals tab so they see ' +
+    'at a glance what you\'re working on.\n\n'
   );
 }
 

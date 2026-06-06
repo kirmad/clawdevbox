@@ -41,6 +41,8 @@ export interface AgentSessionRow {
   derived_state: string | null;
   derived_state_at: number | null;
   end_reason: string | null;
+  task_title: string | null;
+  subtask_title: string | null;
 }
 
 export function mintSessionId(): string {
@@ -211,37 +213,70 @@ export function markResumedInto(
 }
 
 /**
- * Update self-reported progress text + needs_user_input flag for the live
- * agent_sessions row matching `cliSessionId` (the agent CLI's session
- * GUID). Called by the `update_status` MCP tool.
+ * Payload for updateStatusBySessionId. Each text field has tri-state
+ * semantics so the agent can leave parts unchanged while updating others:
+ *   - `undefined` → leave the column unchanged (sticky)
+ *   - `""`        → CLEAR the column (NULL in DB)
+ *   - non-empty   → SET to the new value
  *
- * `cli_session_id` is the right correlation key:
- *   - recipe_instance_id is NOT unique (a multi-step recipe spawns N agent
- *     sessions all sharing one recipe_instance_id).
- *   - agent_sessions.id is internal (as_xxx) and never visible to agents.
- *   - cli_session_id is the per-spawn UUID minted by recipe-runner and
- *     plumbed to the agent via `--additional-mcp-config <path>`'s
- *     X-Clawdevbox-Session-Id header AND via the initial-prompt prefix.
+ * `needsUserInput` is always boolean (not nullable).
+ */
+export interface StatusUpdatePayload {
+  taskTitle?: string;
+  subtaskTitle?: string;
+  status?: string;
+  needsUserInput: boolean;
+  ts: number;
+}
+
+/**
+ * Update self-reported tab text for the live agent_sessions row matching
+ * `cliSessionId` (the agent CLI's session GUID). Called by the
+ * `update_status` MCP tool.
  *
+ * Three text fields render as three lines in the UI:
+ *   task_title    — bold, primary    (sticky overall goal)
+ *   subtask_title — medium, muted    (current sub-goal, optional)
+ *   status_text   — small, dim       (brief one-line state)
+ *
+ * Each field uses tri-state semantics — see StatusUpdatePayload above.
  * Returns true iff a row was actually updated.
  */
 export function updateStatusBySessionId(
   db: Database,
   cliSessionId: string,
-  payload: { text: string | null; needs_user_input: boolean; ts: number },
+  payload: StatusUpdatePayload,
 ): boolean {
+  // Build SET clause dynamically so we only touch the fields the caller
+  // actually wants to mutate. Always update needs_user_input + last_status_at
+  // (they're effectively always-set semantics from the tool's perspective).
+  const sets: string[] = ['needs_user_input = ?', 'last_status_at = ?'];
+  const args: unknown[] = [payload.needsUserInput ? 1 : 0, payload.ts];
+  if (payload.taskTitle !== undefined) {
+    sets.push('task_title = ?');
+    args.push(payload.taskTitle === '' ? null : payload.taskTitle);
+  }
+  if (payload.subtaskTitle !== undefined) {
+    sets.push('subtask_title = ?');
+    args.push(payload.subtaskTitle === '' ? null : payload.subtaskTitle);
+  }
+  if (payload.status !== undefined) {
+    sets.push('status_text = ?');
+    args.push(payload.status === '' ? null : payload.status);
+  }
+  args.push(cliSessionId);
   const r = db.prepare(
     `UPDATE agent_sessions
-      SET status_text = ?, needs_user_input = ?, last_status_at = ?
+       SET ${sets.join(', ')}
      WHERE cli_session_id = ? AND ended_at IS NULL`,
-  ).run(payload.text, payload.needs_user_input ? 1 : 0, payload.ts, cliSessionId);
+  ).run(...args);
   return r.changes > 0;
 }
 
 /**
- * @deprecated Use updateStatusBySessionId. Kept temporarily for any
- * external caller, but the production update_status tool no longer
- * calls this. Will be removed after a deprecation cycle.
+ * @deprecated Legacy helper that updates only status_text by
+ * recipe_instance_id. Kept temporarily for any external caller; the
+ * production update_status tool no longer calls it.
  */
 export function updateStatus(
   db: Database,
