@@ -38,6 +38,8 @@ export interface AgentSessionRow {
   status_text: string | null;
   needs_user_input: number;
   last_status_at: number | null;
+  derived_state: string | null;
+  derived_state_at: number | null;
 }
 
 export function mintSessionId(): string {
@@ -217,4 +219,35 @@ export function updateStatus(
       SET status_text = ?, needs_user_input = ?, last_status_at = ?
      WHERE id = ?`,
   ).run(payload.text, payload.needs_user_input ? 1 : 0, payload.ts, id);
+}
+
+/**
+ * Update events.jsonl-derived live state (idle/thinking/tool_use/waiting/error).
+ *
+ * Distinct from `updateStatus`: the latter is the agent's self-reported
+ * progress text via the update_status MCP tool. This setter is driven by
+ * the copilot-events watcher and reflects observable agent activity even
+ * when the agent doesn't opt in to update_status.
+ *
+ * Idempotent — does nothing if the same state was last reported (the
+ * watcher already debounces, but a second guard here keeps the DB write
+ * count down under heavy assistant.message streams).
+ */
+export function updateDerivedState(
+  db: Database,
+  recipeInstanceId: string,
+  payload: { state: string; ts: number },
+): boolean {
+  const row = db.prepare(
+    `SELECT derived_state FROM agent_sessions
+     WHERE recipe_instance_id = ? AND ended_at IS NULL
+     ORDER BY started_at DESC LIMIT 1`,
+  ).get(recipeInstanceId) as { derived_state: string | null } | undefined;
+  if (!row || row.derived_state === payload.state) return false;
+  db.prepare(
+    `UPDATE agent_sessions
+      SET derived_state = ?, derived_state_at = ?
+     WHERE recipe_instance_id = ? AND ended_at IS NULL`,
+  ).run(payload.state, payload.ts, recipeInstanceId);
+  return true;
 }

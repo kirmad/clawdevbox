@@ -265,3 +265,131 @@ export function isCopilotIdleNow(sessionId: string, copilotDir?: string): boolea
   const cls = classifyTail(tailEvents(path));
   return cls?.kind === 'idle';
 }
+
+// ---------------------------------------------------------------------------
+// Live status watcher (drives the tab indicator)
+// ---------------------------------------------------------------------------
+
+/**
+ * Fine-grained UI states derived from the events stream.
+ *
+ * `idle`     — agent finished its turn, ready for next input
+ * `thinking` — assistant.turn_start or assistant.message (no tool block)
+ * `tool_use` — tool.execution_start, subagent.started, skill.invoked
+ * `waiting`  — agent self-reported needs_user_input (set elsewhere, NOT here)
+ * `error`    — session.error / session.shutdown(non-routine) / abort
+ *
+ * Note: `waiting` is NOT emitted by this watcher because it requires
+ * agent self-reporting via the update_status MCP tool. The UI combines
+ * `derived_state` with `needs_user_input` and prefers the latter when set.
+ */
+export type DerivedState = 'idle' | 'thinking' | 'tool_use' | 'error';
+
+const THINKING_EVENTS = new Set([
+  'assistant.turn_start',
+  'assistant.message',
+  'user.message',         // we just sent input — agent is about to think
+  'session.compaction_start',
+]);
+
+const TOOL_USE_EVENTS = new Set([
+  'tool.execution_start',
+  'subagent.started',
+  'skill.invoked',
+]);
+
+/**
+ * Classify the most recent status-bearing event into a fine-grained
+ * UI state. Returns null when no classifiable event has happened yet.
+ *
+ * Walks the tail backward and returns on the first matching event.
+ * Same precedence as `classifyTail`: terminal > tool_use > thinking > idle,
+ * which matches what an operator would see (a tool execution that hasn't
+ * completed beats a stale assistant.message earlier in the stream).
+ */
+function classifyTailForUi(events: ParsedEvent[]):
+  | { state: DerivedState; lastEvent: string }
+  | null
+{
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const t = events[i]!.type;
+    if (TERMINAL_EVENTS.has(t)) return { state: 'error', lastEvent: t };
+    if (TOOL_USE_EVENTS.has(t)) return { state: 'tool_use', lastEvent: t };
+    if (THINKING_EVENTS.has(t)) return { state: 'thinking', lastEvent: t };
+    if (IDLE_EVENTS.has(t)) return { state: 'idle', lastEvent: t };
+    // Skip NEUTRAL_EVENTS and unknown types.
+  }
+  return null;
+}
+
+export interface WatchOpts {
+  copilotDir?: string;
+  /** Poll interval ms (default 250). */
+  pollIntervalMs?: number;
+  /** Minimum gap between consecutive emissions of the SAME state (default 0 — always emit on change). */
+  debounceMs?: number;
+}
+
+export interface StatusWatcher {
+  /** Stop polling. Idempotent. */
+  stop(): void;
+  /** Current derived state (last emitted), or null if never seen one. */
+  current(): { state: DerivedState; lastEvent: string } | null;
+}
+
+/**
+ * Start a long-lived watcher on a Copilot session's events.jsonl.
+ *
+ * Calls `onChange` exactly when the derived state transitions to a NEW
+ * value. The watcher is the source of truth for the live UI dot:
+ *   - polls every 250ms (cheap — tails last 64 KB only)
+ *   - reads the same idle/busy classifier as `waitForCopilotIdle` so the
+ *     two stay consistent
+ *   - tolerates the file not existing yet (newly-spawned sessions)
+ *
+ * Caller MUST call `.stop()` when the agent session ends. Otherwise the
+ * watcher keeps polling forever (small but real leak — ~1 stat + 1 read
+ * per session per 250 ms).
+ *
+ * Returns the watcher handle synchronously; the first poll runs after
+ * one pollIntervalMs delay (not immediately) so callers can attach
+ * other state without racing the first emission.
+ */
+export function watchCopilotStatus(
+  sessionId: string,
+  onChange: (s: { state: DerivedState; lastEvent: string }) => void,
+  opts: WatchOpts = {},
+): StatusWatcher {
+  const path = eventsJsonlPath(sessionId, opts.copilotDir);
+  const pollMs = opts.pollIntervalMs ?? 250;
+  let stopped = false;
+  let last: { state: DerivedState; lastEvent: string } | null = null;
+
+  const tick = (): void => {
+    if (stopped) return;
+    try {
+      const events = tailEvents(path);
+      const cls = classifyTailForUi(events);
+      if (cls && (!last || last.state !== cls.state)) {
+        last = cls;
+        try { onChange(cls); } catch (err) {
+          logger.warn({ err: String(err), sessionId },
+            'copilot-events: watcher onChange threw');
+        }
+      }
+    } catch (err) {
+      // tailEvents may throw if the file disappears mid-read. Log + retry.
+      logger.debug({ err: String(err), sessionId },
+        'copilot-events: tail failed, will retry');
+    } finally {
+      if (!stopped) setTimeout(tick, pollMs).unref();
+    }
+  };
+
+  setTimeout(tick, pollMs).unref();
+
+  return {
+    stop(): void { stopped = true; },
+    current(): { state: DerivedState; lastEvent: string } | null { return last; },
+  };
+}

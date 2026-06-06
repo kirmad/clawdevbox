@@ -352,4 +352,21 @@ export const migrations: Migration[] = [
       `);
     },
   },
+  {
+    version: 8,
+    up: (db) => {
+      // Events-driven status indicators. The events.jsonl watcher
+      // (copilot-events.ts) writes the agent's derived live state here.
+      // Kept separate from status_text (which is agent-supplied free text
+      // via the update_status MCP tool) so the two channels don't fight.
+      //
+      // Values: 'idle' | 'thinking' | 'tool_use' | 'waiting' | 'error'.
+      // NULL means the watcher has not yet observed any classifiable event
+      // (e.g. session just spawned, events.jsonl not yet flushed).
+      db.exec(`
+        ALTER TABLE agent_sessions ADD COLUMN derived_state TEXT;
+        ALTER TABLE agent_sessions ADD COLUMN derived_state_at INTEGER;
+      `);
+    },
+  },
 ];

@@ -33,6 +33,9 @@ import type { AgentCliProvider, AgentHandle } from './agent-clis/types.ts';
 type SessionConductor = never;
 import { emitChange } from './event-bus.ts';
 import { logger } from './logger.ts';
+import { watchCopilotStatus, type StatusWatcher } from './agent-clis/copilot-events.ts';
+import { updateDerivedState } from './db/agent-sessions-store.ts';
+import { getDatabase } from './db/index.ts';
 
 // ============================================================================
 // Tunables
@@ -142,6 +145,12 @@ interface PtySession {
   headCodeUnits: number;
   /** Epoch ms at register time. Encoded into cursor so respawn invalidates. */
   spawnTs: number;
+  /**
+   * Live status watcher tailing the agent's events.jsonl. Set when the
+   * provider declares `idleSignal: 'copilot-events'` AND the meta has a
+   * sessionId. Stopped in onExit. null otherwise.
+   */
+  statusWatcher: StatusWatcher | null;
 }
 
 // ============================================================================
@@ -209,6 +218,7 @@ export function registerPty(opts: PtyRegisterOptions): void {
     totalCodeUnits: 0,
     headCodeUnits: 0,
     spawnTs: Date.now(),
+    statusWatcher: null,
   };
 
   // Conductor creation removed in tmux migration; see src/pending-dispatch-registry.ts
@@ -233,6 +243,33 @@ export function registerPty(opts: PtyRegisterOptions): void {
   sessions.set(opts.instanceId, session);
   emitChange('sessions');
 
+  // Start the events.jsonl-based live status watcher when the provider
+  // exposes the copilot-events idle signal. Updates agent_sessions.derived_state
+  // so the UI dot reflects real-time agent state without the agent having
+  // to opt in to update_status. Stopped in onExit below.
+  if (opts.provider?.capabilities?.idleSignal === 'copilot-events'
+      && session.meta.sessionId) {
+    const sessionId = session.meta.sessionId;
+    const recipeInstanceId = opts.instanceId;
+    try {
+      session.statusWatcher = watchCopilotStatus(sessionId, (cls) => {
+        try {
+          const changed = updateDerivedState(getDatabase(), recipeInstanceId, {
+            state: cls.state,
+            ts: Date.now(),
+          });
+          if (changed) emitChange('sessions');
+        } catch (err) {
+          logger.debug({ err: String(err), recipeInstanceId },
+            'pty-registry: updateDerivedState failed');
+        }
+      });
+    } catch (err) {
+      logger.warn({ err: String(err), sessionId, recipeInstanceId },
+        'pty-registry: watchCopilotStatus failed to start');
+    }
+  }
+
   opts.ipty.onData((data) => {
     appendToBuffer(session, data);
     for (const sub of session.subscribers) {
@@ -243,6 +280,10 @@ export function registerPty(opts: PtyRegisterOptions): void {
   opts.ipty.onExit(({ exitCode, signal }) => {
     session.exited = true;
     session.exitCode = exitCode ?? 0;
+    if (session.statusWatcher) {
+      try { session.statusWatcher.stop(); } catch { /* idempotent */ }
+      session.statusWatcher = null;
+    }
     for (const sub of session.subscribers) {
       try { sub({ type: 'exit', exitCode: exitCode ?? 0, signal }); } catch { /* viewer drop */ }
     }

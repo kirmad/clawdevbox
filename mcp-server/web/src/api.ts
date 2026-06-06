@@ -343,7 +343,7 @@ export async function postPushTest(): Promise<{ ok: boolean; error?: string }> {
 export interface Session {
   instance_id: string;
   kind: 'main' | 'recipe' | 'adhoc' | 'foreign';
-  state: 'starting' | 'idle' | 'busy' | 'exited' | 'archived' | 'unknown' | 'running' | 'needs_user_input' | 'foreign';
+  state: 'starting' | 'idle' | 'busy' | 'exited' | 'archived' | 'unknown' | 'running' | 'needs_user_input' | 'foreign' | 'thinking' | 'tool_use' | 'waiting' | 'error';
   provider_id: string | null;
   cli_session_id: string | null;
   recipe_id: string | null;

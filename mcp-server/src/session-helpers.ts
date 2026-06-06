@@ -494,22 +494,31 @@ export async function listSessions(
       const placeholders = ids.map(() => '?').join(',');
       const rows = db.prepare(
         `SELECT id, cli_session_id, recipe_instance_id, workspace_id, agent_cli,
-                started_at, status_text, needs_user_input
+                started_at, status_text, needs_user_input, derived_state
          FROM agent_sessions
          WHERE recipe_instance_id IN (${placeholders})`,
       ).all(...ids) as Array<{
         id: string; cli_session_id: string | null; recipe_instance_id: string;
         workspace_id: string; agent_cli: string; started_at: number;
         status_text: string | null; needs_user_input: number;
+        derived_state: string | null;
       }>;
       const byInstance = new Map(rows.map((r) => [r.recipe_instance_id, r]));
       for (const e of tmuxEntries) {
         if (liveIds.has(e.instanceId)) continue;
         const row = byInstance.get(e.instanceId);
+        // State precedence (highest to lowest):
+        //   1. agent-self-reported needs_user_input → 'waiting' (block: needs you)
+        //   2. events.jsonl-derived state            → 'idle' / 'thinking' / 'tool_use' / 'error'
+        //   3. agent-self-reported status_text       → legacy free-text fallback
+        //   4. default 'running'                     → live pty, no signal yet
+        const liveState = row?.needs_user_input
+          ? 'waiting'
+          : (row?.derived_state ?? row?.status_text ?? 'running');
         live.push({
           instance_id: e.instanceId,
           live: true,
-          state: row?.needs_user_input ? 'needs_user_input' : (row?.status_text || 'running'),
+          state: liveState,
           queue_depth: 0,
           provider_id: row?.agent_cli ?? null,
           recipe_id: null,

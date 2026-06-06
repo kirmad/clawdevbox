@@ -51,6 +51,43 @@ function iconFor(kind: Session['kind']): string {
   return 'pi pi-bolt';
 }
 
+/**
+ * Compute a CSS class for the row's kind-icon that conveys live agent state.
+ * The base icon stays the same (preserves at-a-glance "what kind of session")
+ * while color + animation reflect the agent's current activity:
+ *   - idle      → dim green, no animation
+ *   - thinking  → yellow, pulse
+ *   - tool_use  → orange, spin
+ *   - waiting   → bright yellow, bounce + halo (operator action needed)
+ *   - error     → red, no animation
+ *   - exited    → grey, no animation
+ *   - foreign   → grey, no animation
+ *   - other     → blue (running/unknown/etc.)
+ */
+function iconStateClass(state: Session['state']): string {
+  return `icon-state-${state}`;
+}
+
+/** Human-readable label for the title tooltip. */
+function stateLabel(state: Session['state']): string {
+  switch (state) {
+    case 'idle': return 'Idle — ready for input';
+    case 'thinking': return 'Thinking…';
+    case 'tool_use': return 'Using a tool…';
+    case 'waiting': return 'Waiting on you';
+    case 'error': return 'Error';
+    case 'busy': return 'Busy';
+    case 'starting': return 'Starting…';
+    case 'running': return 'Running';
+    case 'exited': return 'Exited';
+    case 'archived': return 'Archived';
+    case 'needs_user_input': return 'Needs your input';
+    case 'foreign': return 'Foreign tmux session';
+    case 'unknown':
+    default: return 'Unknown';
+  }
+}
+
 function stateClass(state: Session['state']): string {
   return `state-dot state-${state}`;
 }
@@ -264,7 +301,7 @@ watch(selectedId, () => { attach(); });
         @click="select(s)"
       >
         <div class="row-1">
-          <i :class="iconFor(s.kind)" />
+          <i :class="[iconFor(s.kind), iconStateClass(s.state)]" :title="stateLabel(s.state)" />
           <span class="label">{{ s.label }}</span>
         </div>
         <div class="row-2">
@@ -290,7 +327,7 @@ watch(selectedId, () => { attach(); });
           @click="select(s)"
         >
           <div class="row-1">
-            <i :class="iconFor(s.kind)" />
+            <i :class="[iconFor(s.kind), iconStateClass(s.state)]" :title="stateLabel(s.state)" />
             <span class="label">{{ s.label }}</span>
           </div>
           <div class="row-2">
@@ -311,7 +348,7 @@ watch(selectedId, () => { attach(); });
           @click="select(s)"
         >
           <div class="row-1">
-            <i :class="iconFor(s.kind)" />
+            <i :class="[iconFor(s.kind), iconStateClass(s.state)]" :title="stateLabel(s.state)" />
             <span class="label">{{ s.label }}</span>
           </div>
           <div class="row-2">
@@ -436,6 +473,47 @@ watch(selectedId, () => { attach(); });
 .state-archived { background: transparent; border: 1px solid #7c8290; }
 .state-unknown { background: #7c8290; }
 .state-foreign { background: #555b66; }
+.state-thinking { background: #d4b94a; }
+.state-tool_use { background: #e57b3a; }
+.state-waiting { background: #f5c542; box-shadow: 0 0 4px #f5c542; }
+.state-error { background: #d44; }
+
+/* Live state on the kind icon. Base color + animation per state.
+ * The icon transitions in 200ms when state changes to avoid jarring
+ * pulses when a tool finishes and the agent goes straight back to
+ * thinking. */
+.row-1 i { transition: color 200ms ease; color: #7c8290; }
+.row-1 i.icon-state-idle { color: #4caf50; }
+.row-1 i.icon-state-thinking { color: #d4b94a; animation: icon-pulse 1.4s ease-in-out infinite; }
+.row-1 i.icon-state-tool_use { color: #e57b3a; animation: icon-spin 1.6s linear infinite; }
+.row-1 i.icon-state-waiting { color: #f5c542; animation: icon-bounce 1s ease-in-out infinite; filter: drop-shadow(0 0 3px #f5c542); }
+.row-1 i.icon-state-error { color: #e06c75; }
+.row-1 i.icon-state-exited { color: #5a2222; }
+.row-1 i.icon-state-needs_user_input { color: #ff9800; animation: icon-bounce 1s ease-in-out infinite; }
+.row-1 i.icon-state-busy { color: #4a8be8; animation: icon-pulse 1.4s ease-in-out infinite; }
+.row-1 i.icon-state-running { color: #4a8be8; }
+.row-1 i.icon-state-starting { color: #a0a0a0; animation: icon-pulse 1.4s ease-in-out infinite; }
+.row-1 i.icon-state-foreign { color: #555b66; }
+.row-1 i.icon-state-archived { color: #4a4f58; }
+.row-1 i.icon-state-unknown { color: #7c8290; }
+
+@keyframes icon-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.35; }
+}
+@keyframes icon-spin {
+  0%   { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+@keyframes icon-bounce {
+  0%, 100% { transform: translateY(0); }
+  50%      { transform: translateY(-2px); }
+}
+
+/* Honor reduced-motion preference — drop animations entirely. */
+@media (prefers-reduced-motion: reduce) {
+  .row-1 i { animation: none !important; }
+}
 .resume-btn { position: absolute; right: 8px; top: 10px; padding: 2px 8px; font-size: 11px; background: #23262d; color: #d8dee9; border: 1px solid #3a3f4a; border-radius: 3px; cursor: pointer; display: none; }
 .archived:hover .resume-btn { display: inline-block; }
 .kill-btn { position: absolute; right: 8px; top: 50%; transform: translateY(-50%); padding: 2px 7px; font-size: 11px; background: #2c1a1a; color: #e06c75; border: 1px solid #5a2222; border-radius: 3px; cursor: pointer; display: none; line-height: 1.4; }

@@ -160,3 +160,114 @@ test('9. only session.start events → not idle yet (waiting for first turn)', a
     assert.equal(r.reason, 'timeout');
   } finally { h.cleanup(); }
 });
+
+// ----------------------------------------------------------------------------
+// watchCopilotStatus — live UI state derivation
+// ----------------------------------------------------------------------------
+
+import { watchCopilotStatus } from '../src/agent-clis/copilot-events.ts';
+
+function waitForState(states, target, timeoutMs = 2500) {
+  const deadline = Date.now() + timeoutMs;
+  return new Promise((resolve, reject) => {
+    const check = () => {
+      if (states.some((s) => s.state === target)) return resolve(true);
+      if (Date.now() >= deadline) return reject(new Error(`timeout waiting for ${target}; saw: ${states.map((s) => s.state).join(',')}`));
+      setTimeout(check, 50);
+    };
+    check();
+  });
+}
+
+test('10. watchCopilotStatus: emits thinking on assistant.turn_start', async () => {
+  const h = fresh('w10');
+  try {
+    writeFileSync(h.file, '');
+    const seen = [];
+    const w = watchCopilotStatus(h.sessionId, (cls) => seen.push(cls), { copilotDir: h.copilotDir, pollIntervalMs: 75 });
+    try {
+      appendFileSync(h.file, evt('user.message') + evt('assistant.turn_start'));
+      await waitForState(seen, 'thinking');
+      assert.equal(seen.at(-1).state, 'thinking');
+    } finally { w.stop(); }
+  } finally { h.cleanup(); }
+});
+
+test('11. watchCopilotStatus: emits tool_use on tool.execution_start', async () => {
+  const h = fresh('w11');
+  try {
+    writeFileSync(h.file, evt('user.message') + evt('assistant.turn_start'));
+    const seen = [];
+    const w = watchCopilotStatus(h.sessionId, (cls) => seen.push(cls), { copilotDir: h.copilotDir, pollIntervalMs: 75 });
+    try {
+      appendFileSync(h.file, evt('tool.execution_start'));
+      await waitForState(seen, 'tool_use');
+      assert.equal(seen.at(-1).state, 'tool_use');
+    } finally { w.stop(); }
+  } finally { h.cleanup(); }
+});
+
+test('12. watchCopilotStatus: emits idle on assistant.turn_end and transitions back to thinking', async () => {
+  const h = fresh('w12');
+  try {
+    writeFileSync(h.file, '');
+    const seen = [];
+    const w = watchCopilotStatus(h.sessionId, (cls) => seen.push(cls), { copilotDir: h.copilotDir, pollIntervalMs: 75 });
+    try {
+      appendFileSync(h.file, evt('user.message') + evt('assistant.turn_end'));
+      await waitForState(seen, 'idle');
+      appendFileSync(h.file, evt('assistant.turn_start'));
+      await waitForState(seen, 'thinking');
+      // Last two emissions should be idle then thinking.
+      const lastTwo = seen.slice(-2).map((s) => s.state);
+      assert.deepEqual(lastTwo, ['idle', 'thinking']);
+    } finally { w.stop(); }
+  } finally { h.cleanup(); }
+});
+
+test('13. watchCopilotStatus: emits error on session.error', async () => {
+  const h = fresh('w13');
+  try {
+    writeFileSync(h.file, evt('user.message') + evt('assistant.turn_start'));
+    const seen = [];
+    const w = watchCopilotStatus(h.sessionId, (cls) => seen.push(cls), { copilotDir: h.copilotDir, pollIntervalMs: 75 });
+    try {
+      appendFileSync(h.file, evt('session.error'));
+      await waitForState(seen, 'error');
+      assert.equal(seen.at(-1).state, 'error');
+    } finally { w.stop(); }
+  } finally { h.cleanup(); }
+});
+
+test('14. watchCopilotStatus: does NOT emit twice for the same state', async () => {
+  const h = fresh('w14');
+  try {
+    writeFileSync(h.file, '');
+    const seen = [];
+    const w = watchCopilotStatus(h.sessionId, (cls) => seen.push(cls), { copilotDir: h.copilotDir, pollIntervalMs: 75 });
+    try {
+      appendFileSync(h.file, evt('user.message'));
+      appendFileSync(h.file, evt('assistant.turn_start'));
+      appendFileSync(h.file, evt('assistant.message'));
+      await sleepP(400);
+      // All three events classify as 'thinking' → expect exactly ONE emission.
+      assert.equal(seen.length, 1);
+      assert.equal(seen[0].state, 'thinking');
+    } finally { w.stop(); }
+  } finally { h.cleanup(); }
+});
+
+test('15. watchCopilotStatus: tolerates missing file at start, picks up when created', async () => {
+  const h = fresh('w15');
+  try {
+    // intentionally NOT writing the file
+    const seen = [];
+    const w = watchCopilotStatus(h.sessionId, (cls) => seen.push(cls), { copilotDir: h.copilotDir, pollIntervalMs: 75 });
+    try {
+      await sleepP(200);
+      assert.equal(seen.length, 0);  // no file, no emissions
+      writeFileSync(h.file, evt('user.message') + evt('assistant.turn_end'));
+      await waitForState(seen, 'idle');
+    } finally { w.stop(); }
+  } finally { h.cleanup(); }
+});
