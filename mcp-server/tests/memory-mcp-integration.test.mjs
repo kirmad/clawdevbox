@@ -107,10 +107,11 @@ test('full MCP integration: register, init, add×4, search, get, status', async 
     clearRegistry();
     registerMemoryEntries(ws);
 
-    // All 9 tools should be registered
+    // All 13+ tools should be registered (14 with memory_sync)
     const expected = [
       'add_memory', 'add_lesson', 'add_session_summary', 'add_wiki_page',
       'get_memory', 'memory_status', 'memory_init', 'search_memory', 'get_wiki_index',
+      'vote_memory', 'vote_lesson', 'vote_wiki', 'update_wiki', 'memory_sync',
     ];
     for (const name of expected) {
       assert.ok(getRegistry().has(name), `${name} should be registered`);
