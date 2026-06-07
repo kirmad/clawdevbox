@@ -49,7 +49,7 @@ import {
   type SessionFrontmatter, type WikiFrontmatter,
 } from './memory-frontmatter.ts';
 import { appendEvent, readEvents, foldEvents, decayConfidence } from './memory-events.ts';
-import { commitInline } from './memory-git.ts';
+import { commitInline, getRepoState, syncRepo, type SyncOutcome } from './memory-git.ts';
 import {
   getStore, registerVaultCollections, registerProjectContexts,
   scheduleReindex, flushReindex, searchAcrossCollections,
@@ -484,17 +484,41 @@ export async function handleMemoryStatus(
   ctx: ToolCtx,
   _args: MemoryStatusArgs,
 ): Promise<MemoryStatusResult> {
+  // Per-vault git state (best-effort — missing repos report nothing).
+  const git: Record<string, unknown> = {};
+  for (const vault of ctx.chain) {
+    try {
+      const state = getRepoState(vault.path);
+      git[vault.id] = state;
+    } catch (err) {
+      git[vault.id] = { error: (err as Error).message };
+    }
+  }
+
+  // qmd stats (only when store has been initialized for the configured dbPath).
+  let qmdSection: MemoryStatusResult['qmd'] = {
+    db_path: ctx.config.qmd_db_path,
+    db_size_bytes: 0,
+    collections: [],
+    models_loaded: ctx.config.qmd_search_mode !== 'lex',
+    last_embed: null,
+    last_embed_error: null,
+    pending_index_queue: 0,
+  };
+  try {
+    const store = await getStore(ctx.config);
+    const cols = await store.listCollections();
+    qmdSection = {
+      ...qmdSection,
+      collections: cols.map((c) => ({ name: c.name, doc_count: c.doc_count ?? 0 })),
+    };
+  } catch {
+    // qmd not yet initialized — that's fine.
+  }
+
   return {
-    git: {},
-    qmd: {
-      db_path: ctx.config.qmd_db_path,
-      db_size_bytes: 0,
-      collections: [],
-      models_loaded: false,
-      last_embed: null,
-      last_embed_error: null,
-      pending_index_queue: 0,
-    },
+    git,
+    qmd: qmdSection,
     config: {
       vaults: ctx.chain.map((v) => ({
         id: v.id,
@@ -510,6 +534,51 @@ export async function handleMemoryStatus(
     identity: ctx.identity,
     warnings: [],
   };
+}
+
+// ---------------------------------------------------------------------------
+// memory_sync — manual fetch + pull --rebase + push for each vault
+// ---------------------------------------------------------------------------
+
+const memorySyncSchema = z.object({
+  vault_id: z.string().optional(),
+  scope: z.enum(['personal', 'team', 'all']).optional(),
+}).strict();
+
+export type MemorySyncArgs = z.infer<typeof memorySyncSchema>;
+
+export interface MemorySyncResult {
+  outcomes: Array<{ vault_id: string } & SyncOutcome>;
+  any_conflicts: boolean;
+  any_errors: boolean;
+}
+
+export async function handleMemorySync(
+  ctx: ToolCtx,
+  args: MemorySyncArgs,
+): Promise<MemorySyncResult> {
+  const scope = args.scope ?? 'all';
+  const vaults = args.vault_id
+    ? ctx.chain.filter((v) => v.id === args.vault_id)
+    : scope === 'all'
+      ? ctx.chain
+      : ctx.chain.filter((v) => v.kind === scope);
+
+  const outcomes: MemorySyncResult['outcomes'] = [];
+  let anyConflicts = false;
+  let anyErrors = false;
+  for (const vault of vaults) {
+    const outcome = await withVaultLock(vault.id, async () => syncRepo(vault.path));
+    outcomes.push({ vault_id: vault.id, ...outcome });
+    if (outcome.conflict) anyConflicts = true;
+    if (!outcome.conflict && !outcome.pushed && vault.remote !== null) {
+      // remote exists but push didn't succeed (and it wasn't a conflict)
+      if (outcome.message !== 'ok' && outcome.message !== 'no remote configured; skipped') {
+        anyErrors = true;
+      }
+    }
+  }
+  return { outcomes, any_conflicts: anyConflicts, any_errors: anyErrors };
 }
 
 // ---------------------------------------------------------------------------
@@ -1545,6 +1614,18 @@ export function registerMemoryEntries(
       'commits, and schedules a qmd reindex.',
     parameters: updateWikiSchema,
     handler: async (args) => asJson(await handleUpdateWiki(await buildCtx(), args as UpdateWikiArgs)),
+    source: 'builtin',
+    sourceFile,
+  });
+
+  defineTool({
+    name: 'memory_sync',
+    description:
+      'Manually fetch + pull --rebase + push each registered vault that has a git ' +
+      'remote configured. Optional scope/vault_id filters limit which vaults to sync. ' +
+      'Returns per-vault outcomes including conflict detection.',
+    parameters: memorySyncSchema,
+    handler: async (args) => asJson(await handleMemorySync(await buildCtx(), args as MemorySyncArgs)),
     source: 'builtin',
     sourceFile,
   });
