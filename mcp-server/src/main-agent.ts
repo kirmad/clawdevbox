@@ -165,9 +165,10 @@ export async function startMainAgent(opts: MainAgentOptions): Promise<MainAgentS
   }
 
   try {
+    const sessionId = mintMainAgentSessionId();
     const handle = await provider.spawnSession(providerCtx, {
       mode: 'interactive',
-      init: { kind: 'new', session_id: mintMainAgentSessionId() },
+      init: { kind: 'new', session_id: sessionId },
       role: 'main-agent',
       agent: 'dev-buddy:dev-buddy',
       workspaceInfo: { id: 'project', path: opts.workspace.projectDir },
@@ -184,6 +185,14 @@ export async function startMainAgent(opts: MainAgentOptions): Promise<MainAgentS
         // registered for this projectDir yet, tools that need a workspace
         // surface NO_TARGET_WORKSPACE and prompt the user to `workspace.create`.
         projectDir: opts.workspace.projectDir,
+        // Include sessionId so writeMcpJson injects the X-Clawdevbox-Session-Id
+        // header on every MCP request. The HTTP server's idle-transport sweep
+        // uses this header to bind mcp-session-id → agent-session-id, and
+        // skip-reaps transports whose agent session is still alive in the
+        // pty-registry. Without this, the main agent's transport would get
+        // idle-swept after CLAWDEVBOX_MCP_IDLE_MS (default 10m) of no LLM
+        // tool calls — and the next user message would 404.
+        sessionId,
       },
       ptyCols: 120,
       ptyRows: 30,

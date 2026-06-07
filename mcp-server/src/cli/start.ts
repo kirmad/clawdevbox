@@ -60,7 +60,8 @@ import {
   mintRecipeInstanceId,
   type RecipeInstance as RecipeInstanceRow,
 } from '../recipe-instances-store.ts';
-import { registerPty, killAllSessions } from '../pty-registry.ts';
+import { registerPty, killAllSessions, listSessions as listPtySessions, getSessionMeta as getPtySessionMeta } from '../pty-registry.ts';
+import { tmuxSessionRegistry } from '../cli-sessions/tmux-session-runtime.ts';
 import { buildServer, createSessionServer } from '../server.ts';
 import {
   fetchTunnelStatus,
@@ -189,9 +190,19 @@ async function handleMcpRequest(
   res: ServerResponse,
   ws: Workspace,
   transports: Map<string, StreamableHTTPServerTransport>,
+  recordAgentSessionId?: (mcpSessionId: string, agentSessionId: string | null) => void,
 ): Promise<void> {
   const method = req.method ?? 'GET';
   const sessionId = getSessionIdHeader(req);
+
+  // Capture the agent session id from the request header so the idle
+  // sweep can keep transports for alive sessions. The header is the
+  // X-Clawdevbox-Session-Id value the per-session .mcp.json injects.
+  if (sessionId && recordAgentSessionId) {
+    const hdr = req.headers['x-clawdevbox-session-id'];
+    const asid = Array.isArray(hdr) ? hdr[0] : hdr;
+    recordAgentSessionId(sessionId, asid ?? null);
+  }
 
   // Existing session: dispatch to its transport. Any HTTP method is fine —
   // POST = JSON-RPC call, GET = SSE notification stream, DELETE = terminate.
@@ -512,7 +523,164 @@ export async function runStart(flags: Flags): Promise<void> {
   //   - `onclose`: underlying transport finalized (covers HTTP close paths)
   //   - request-handler `.catch` logs but does NOT delete (the transport
   //     itself decides whether the session is still usable).
-  const mcpTransports = new Map<string, StreamableHTTPServerTransport>();
+  //
+  // **Idle sweep**: the MCP Streamable HTTP transport has NO server-side
+  // way to detect that a client (agent process) has died — each request
+  // opens a fresh HTTP connection keyed by mcp-session-id, so there's no
+  // persistent socket whose closure would trigger `onclose`. Without a
+  // sweep, every crashed/killed agent leaks one transport entry plus
+  // whatever it references (recently-pushed messages, response buffers,
+  // etc.). Observed in production: ~+30 MB RSS per leaked transport;
+  // after ~100 spawns (one busy day) the heap OOMs.
+  //
+  // Sweep policy:
+  //   1. Each transport entry tracks `lastActivity` (bumped on every
+  //      request) and `lastAgentSessionId` (captured from
+  //      X-Clawdevbox-Session-Id header when present).
+  //   2. Periodically (every CLAWDEVBOX_MCP_SWEEP_MS, default 60s), walk
+  //      the transport map. For each entry:
+  //        - If the bound agent session is still alive (in
+  //          tmuxSessionRegistry OR pty-registry OR the main agent),
+  //          KEEP regardless of idle. Identified agents — like
+  //          recipe-spawned children whose per-session .mcp.json has
+  //          a session-id header that survives — get pinned to liveness.
+  //        - Else if idle > CLAWDEVBOX_MCP_IDLE_MS, REAP. Default is
+  //          24 hours — long enough that the main agent waiting for
+  //          human input is never surprised by a 404, short enough that
+  //          crashed / abandoned spawned agents don't accumulate
+  //          indefinitely. (The main agent's session id is invisible
+  //          to us when the spawn goes through a wrapper like agency
+  //          that re-emits the `clawdevbox` MCP server entry without
+  //          our headers — so isAgentSessionAlive can't pin it. Until
+  //          we have a header-independent identification path (URL
+  //          tokens etc.), the long idle timeout is the pragmatic
+  //          correctness/cleanup trade-off.)
+  //   3. Reaping calls transport.close() so the SDK releases sockets
+  //      and message buffers, then drops the map entry.
+  const MCP_IDLE_MS = Number(process.env.CLAWDEVBOX_MCP_IDLE_MS) || 24 * 60 * 60 * 1000;
+  const MCP_SWEEP_MS = Number(process.env.CLAWDEVBOX_MCP_SWEEP_MS) || 60 * 1000;
+  interface TransportEntry {
+    transport: StreamableHTTPServerTransport;
+    lastActivity: number;
+    lastAgentSessionId: string | null;
+  }
+  const mcpTransportEntries = new Map<string, TransportEntry>();
+
+  // Helper: is the agent session that this transport claims still alive?
+  // "Alive" means we know about it through one of the runtime registries.
+  // Returns true if we know it's alive; false if we know it's dead OR if
+  // we have no agent-session binding (those fall back to idle-based sweep).
+  // The main agent is included automatically: it registers in pty-registry
+  // with sessionId=handle.sessionId (see main-agent.ts), so the
+  // pty-registry walk below catches it as long as the main agent process
+  // is still running.
+  const isAgentSessionAlive = (asid: string | null | undefined): boolean => {
+    if (!asid) return false;
+    try {
+      for (const e of tmuxSessionRegistry.list()) {
+        if (e.instanceId === asid) return true;
+      }
+    } catch { /* registry not yet initialized */ }
+    try {
+      for (const s of listPtySessions()) {
+        const meta = getPtySessionMeta(s.instanceId);
+        if (meta?.sessionId === asid) return true;
+      }
+    } catch { /* registry not yet initialized */ }
+    return false;
+  };
+
+  // Backward-compat proxy: existing call sites (and the SDK) want a
+  // Map<string, transport>. We expose a get/set/delete proxy that keeps
+  // the entries map in sync.
+  const mcpTransports = new Proxy(new Map<string, StreamableHTTPServerTransport>(), {
+    get(_target, prop, _receiver) {
+      if (prop === 'get') {
+        return (key: string) => {
+          const entry = mcpTransportEntries.get(key);
+          if (entry) entry.lastActivity = Date.now();
+          return entry?.transport;
+        };
+      }
+      if (prop === 'set') {
+        return (key: string, value: StreamableHTTPServerTransport) => {
+          mcpTransportEntries.set(key, {
+            transport: value,
+            lastActivity: Date.now(),
+            lastAgentSessionId: null,
+          });
+          return mcpTransports;
+        };
+      }
+      if (prop === 'delete') {
+        return (key: string) => mcpTransportEntries.delete(key);
+      }
+      if (prop === 'has') {
+        return (key: string) => mcpTransportEntries.has(key);
+      }
+      if (prop === 'size') {
+        return mcpTransportEntries.size;
+      }
+      if (prop === Symbol.iterator || prop === 'entries') {
+        return () => {
+          const it = mcpTransportEntries.entries();
+          return {
+            [Symbol.iterator]() { return this; },
+            next() {
+              const r = it.next();
+              if (r.done) return { done: true, value: undefined } as IteratorResult<[string, StreamableHTTPServerTransport]>;
+              const [k, v] = r.value;
+              return { done: false, value: [k, v.transport] as [string, StreamableHTTPServerTransport] };
+            },
+          };
+        };
+      }
+      if (prop === 'forEach') {
+        return (cb: (v: StreamableHTTPServerTransport, k: string) => void) => {
+          for (const [k, entry] of mcpTransportEntries) cb(entry.transport, k);
+        };
+      }
+      return undefined;
+    },
+  }) as unknown as Map<string, StreamableHTTPServerTransport>;
+
+  // Track the agent session id per MCP request so the sweep can keep
+  // transports that belong to alive agents. Exported so handleMcpRequest
+  // can call it on every inbound HTTP request.
+  const recordAgentSessionIdForMcpRequest = (
+    mcpSessionId: string,
+    agentSessionId: string | null,
+  ): void => {
+    const entry = mcpTransportEntries.get(mcpSessionId);
+    if (entry && agentSessionId) entry.lastAgentSessionId = agentSessionId;
+  };
+
+  // Periodic idle sweep.
+  const mcpSweepTimer = setInterval(() => {
+    const now = Date.now();
+    let reaped = 0;
+    let kept = 0;
+    for (const [sid, entry] of mcpTransportEntries) {
+      if (isAgentSessionAlive(entry.lastAgentSessionId)) {
+        kept++;
+        continue;
+      }
+      if (now - entry.lastActivity <= MCP_IDLE_MS) {
+        kept++;
+        continue;
+      }
+      try { entry.transport.close?.(); } catch { /* ignore */ }
+      mcpTransportEntries.delete(sid);
+      reaped++;
+    }
+    if (reaped > 0) {
+      logger.info(
+        { reaped, kept, idleMs: MCP_IDLE_MS },
+        'mcp: reaped idle transports',
+      );
+    }
+  }, MCP_SWEEP_MS);
+  if (mcpSweepTimer.unref) mcpSweepTimer.unref();
 
   const expectedToken = cfg.http.token;
   const homePageHtml = renderHomePage({
@@ -642,10 +810,8 @@ export async function runStart(flags: Flags): Promise<void> {
         // Enrich the heap sample with per-subsystem counters so the next
         // climb is diagnosable from /api/heap-status alone (no need to
         // walk a heap snapshot for the obvious suspects).
-        const { listSessions: ptyListSessions } = await import('../pty-registry.ts');
         const { pendingDispatchStats } = await import('../pending-dispatch-registry.ts');
-        const { tmuxSessionRegistry } = await import('../cli-sessions/tmux-session-runtime.ts');
-        const ptyLive = ptyListSessions();
+        const ptyLive = listPtySessions();
         const pendingStats = pendingDispatchStats();
         const enriched = {
           ...heapMonitor.lastSample(),
@@ -703,7 +869,7 @@ export async function runStart(flags: Flags): Promise<void> {
           return;
         }
       }
-      await handleMcpRequest(req, res, ws, mcpTransports);
+      await handleMcpRequest(req, res, ws, mcpTransports, recordAgentSessionIdForMcpRequest);
       return;
     }
 
