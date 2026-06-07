@@ -35,11 +35,12 @@
     "test:e2e": "playwright test"
   },
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=22.0.0"
   },
   "dependencies": {
     "@clack/prompts": "^0.7.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "@tobilu/qmd": "^2.5.3",
     "@toon-format/toon": "^2.1.0",
     "@types/qrcode-terminal": "^0.12.2",
     "@types/ws": "^8.18.1",
@@ -60,7 +61,7 @@
     "@playwright/test": "^1.59.1",
     "@types/better-sqlite3": "^7.6.13",
     "@types/js-yaml": "^4.0.9",
-    "@types/node": "^20.0.0",
+    "@types/node": "^22.0.0",
     "@types/web-push": "^3.6.4",
     "esbuild": "^0.24.0",
     "playwright": "^1.59.1",
