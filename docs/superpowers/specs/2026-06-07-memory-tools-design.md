@@ -42,9 +42,9 @@ Replaces ad-hoc memory in two failure modes:
 | File | Purpose |
 |---|---|
 | `mcp-server/src/tools/memory.ts` | All 13 tools — handlers + MCP registration |
-| `mcp-server/src/tools/memory-sync.ts` | Per-repo background sync daemon (commit / push / pull / index) |
+| `mcp-server/src/tools/memory-sync.ts` | Per-vault background sync daemon (commit / push / pull / index) |
 | `mcp-server/src/tools/memory-events.ts` | `events.jsonl` fold + decay function + voter dedup |
-| `mcp-server/src/tools/memory-config.ts` | Config loading + validation + identity resolution |
+| `mcp-server/src/tools/memory-config.ts` | Thin layer: `loadVaultChain()` re-export + memory-specific settings loader + identity resolution |
 | `mcp-server/src/tools/memory-qmd.ts` | qmd SDK lifecycle (collections, contexts, debounced update+embed) |
 | `mcp-server/package.json` | Add `@tobilu/qmd` dependency (pulls in `node-llama-cpp`) |
 
@@ -89,17 +89,40 @@ qmd README reading requirement.
 
 ## Per-user configuration
 
-`~/.clawdevbox/memory-config.json`:
+### Vault chain — already in clawdevbox
+
+**Repo paths come from clawdevbox's existing vault chain.** No new repo
+config needed. See `mcp-server/src/vault-chain.ts` and the `paths.get`
+MCP tool: every clawdevbox install already exposes:
+
+```typescript
+interface VaultInfo {
+  id: string;                              // stable user-facing id
+  path: string;                            // absolute path on disk
+  kind: 'personal' | 'team';
+  remote: string | null;                   // git URL or null
+  title?: string;                          // from vault.yaml
+  tierLabel?: string;
+  description?: string;
+}
+```
+
+Vaults are loaded via `loadVaultChain()` returning the chain ordered
+**personal first, then team**, preserving registration order within
+each tier. Multiple personal AND multiple team vaults are supported.
+
+This subsystem treats every registered vault as a memory store. The
+vault's `kind` maps directly to the `scope` tool arg; the vault's `id`
+is both the qmd collection name and the optional `vault_id` tool arg
+used to disambiguate when multiple vaults of the same kind exist.
+
+### Memory-specific config
+
+`~/.clawdevbox/memory-config.json` holds only memory tunings — **never
+repo paths**:
 
 ```jsonc
 {
-  "personal_repo": "C:/git/my-memory",
-  "teams": {
-    "default": "C:/git/team-memory"
-    // future-proof: "infra": "C:/git/infra-memory"
-  },
-  "default_team": "default",
-
   "decay": { "floor": 0.2, "half_life_days": 30 },
   "duplicate_threshold": 0.85,
 
@@ -121,25 +144,28 @@ qmd README reading requirement.
 }
 ```
 
-- `personal_repo` is required. `teams` is optional (personal-only is
-  valid). When `teams` is present, `default_team` must name one of the
-  keys.
+All fields have sensible defaults; the entire file is optional.
+
+- At least one vault must be registered in clawdevbox; otherwise
+  memory tools refuse to write with a setup hint pointing at the
+  clawdevbox vault-add documentation.
 - Identity: resolved at startup as `git config user.email` →
-  `git config user.name` → `os.userInfo().username` fallback. Stamped on
-  every write and vote event.
-- Missing config or unresolvable identity → tool calls fail with a
-  setup-hint error.
+  `git config user.name` → `os.userInfo().username` fallback. Stamped
+  on every write and vote event.
+- (v1.1) Per-vault overrides for these settings via a `memory:` block
+  in each `vault.yaml`.
 
 ## Repository layout
 
-Same shape for personal and every team repo. **Project-first nesting**,
-type as subfolder.
+Same shape for every registered vault, regardless of `kind`.
+**Project-first nesting**, type as subfolder.
 
 ```
-<scope-repo>/
+<vault.path>/
   README.md                    # auto-generated, committed; humans browsing on GitHub
   .gitignore                   # auto-generated
   .memory-meta/                # gitignored — per-clone scratch (locks, pids)
+  vault.yaml                   # clawdevbox's existing vault metadata — NOT managed by us
 
   _general/                    # cross-project knowledge (no specific project)
     memories/
@@ -228,8 +254,8 @@ agent calls add_memory()
 6. git fetch && git pull --rebase                              ← async
 ```
 
-Two debounced timers + one periodic timer per repo, all async, all
-draining independent queues. Each repo gets its own state machine and
+Two debounced timers + one periodic timer per vault, all async, all
+draining independent queues. Each vault gets its own state machine and
 mutex.
 
 ## Runtime picture
@@ -261,24 +287,23 @@ mutex.
    │                    │   GGUF models stay loaded  │    │
    │                    └────────────────────────────┘    │
    │  ┌─────────────────────────────────────────────────┐ │
-   │  │ memory-sync.ts (per-repo background daemons)    │ │
-   │  │   per-repo mutex                                │ │
+   │  │ memory-sync.ts (per-vault background daemons)   │ │
+   │  │   per-vault mutex                               │ │
    │  │   debounced push (30s) + idle pull (5min)       │ │
    │  │   conflict auto-resolve (optional, spawned)     │ │
    │  └────────────────────┬────────────────────────────┘ │
    └───────────────────────┼──────────────────────────────┘
                            │
                            ▼
-              ┌────────────────────────────────────┐
-              │  ~/git/my-memory       (personal)  │
-              │  ~/git/team-memory     (team-default) │
-              │    <project>/<type>/*.md           │
-              │    <project>/<type>/.events/*.jsonl │
-              └────────────────────────────────────┘
+              ┌────────────────────────────────────────┐
+              │  loadVaultChain() — clawdevbox vaults  │
+              │    <vault.path>/                       │
+              │      <project>/<type>/*.md             │
+              │      <project>/<type>/.events/*.jsonl  │
+              └────────────────────────────────────────┘
                            ▲
-                           │ indexes via qmd.addCollection()
-                           │   personal collection
-                           │   team-default collection
+                           │ indexes via qmd.addCollection(vault.id, ...)
+                           │   one collection per vault in the chain
                            ▼
               ┌────────────────────────────────────┐
               │  ~/.cache/qmd/clawdevbox-memory.sqlite │
@@ -308,7 +333,7 @@ MCP server.
 | `search_memory` | Hybrid search across one/more scopes/types/projects via qmd | `{ results: [{ path, type, project, score, snippet, confidence?, votes }], total }` |
 | `get_memory` | Fetch a single item by path or slug, with folded events | `{ path, type, body, frontmatter, events_summary }` |
 | `get_wiki_index` | Navigable tree of wiki structure (folders + pages + summaries) | `{ root, total_pages, truncated_at_depth, tree: TreeNode[] }` |
-| `memory_init` | One-time setup — scaffold folders, write config, register qmd collections + contexts | `{ personal_repo_status, team_repos_status, qmd_status }` |
+| `memory_init` | One-time setup — scaffold folders inside each vault, register qmd collections + contexts | `{ vaults: [...], qmd_status }` |
 | `memory_status` | Report sync state, qmd index health, last push/pull, queue depth | `{ git, qmd, queues, config, warnings }` |
 
 ## Naming convention
@@ -326,13 +351,14 @@ genuinely sub-group within a single namespace.
 {
   // required
   content: string;            // 1-3 sentences — the fact itself
-  scope: "personal" | "team"; // routes to repo
+  scope: "personal" | "team"; // selects from vault chain by kind
   project: string;            // slug; "_general" for cross-project
   citations: string;          // "path/file.ts:42" OR 'User input: "..."'
   reason: string;             // ≥ 2 sentences — why durable, what future tasks benefit
 
   // optional
-  team?: string;              // team key from config.teams; falls back to default_team when omitted
+  vault_id?: string;          // disambiguates when multiple vaults of `scope` kind exist;
+                              // defaults to first matching vault in chain registration order
   category?: "pattern" | "preference" | "architecture" | "bug" | "workflow" | "fact";
   concepts?: string[];        // free tags; normalized to frontmatter `tags`
   title?: string;             // defaults to first 60 chars of content, slugified
@@ -340,18 +366,22 @@ genuinely sub-group within a single namespace.
 ```
 
 **Side effects**
-1. Writes `<repo>/<project>/memories/<YYYY-MM-DD>-<slug>.md` with
+1. Resolves `scope` + optional `vault_id` → target `VaultInfo` from the
+   vault chain.
+2. Writes `<vault.path>/<project>/memories/<YYYY-MM-DD>-<slug>.md` with
    frontmatter (see §3).
-2. Appends `created` event to sidecar
-   `<repo>/<project>/memories/.events/<stem>.jsonl`.
-3. `git add` + `git commit -m "memory: <title>"` synchronously
-   (per-repo mutex).
-4. Schedules qmd `update` + `embed` (debounced 5s).
-5. Schedules `git push` (debounced 30s).
+3. Appends `created` event to sidecar
+   `<vault.path>/<project>/memories/.events/<stem>.jsonl`.
+4. `git add` + `git commit -m "memory: <title>"` synchronously
+   (per-vault mutex).
+5. Schedules qmd `update` + `embed` (debounced 5s).
+6. Schedules `git push` (debounced 30s) — only if `vault.remote` is set.
 
 **Errors**
-- Missing config repo path → setup hint.
-- `scope: team` + invalid `team` → list valid team keys.
+- No vault registered with the requested `kind` → setup hint
+  ("run `paths.get` to see registered vaults; add one via clawdevbox
+  vault config").
+- `vault_id` doesn't match any registered vault → list valid ids.
 - `project` contains path traversal (`..`, `/`) → reject.
 - Git not configured (no `user.email` and no fallback username) →
   refuse with `git config --global user.email` hint.
@@ -366,7 +396,7 @@ genuinely sub-group within a single namespace.
   project: string;
 
   // optional
-  team?: string;
+  vault_id?: string;
   context?: string;           // what triggered the lesson (situation)
   confidence?: number;        // 0-1; default 0.5
   tags?: string[];
@@ -375,7 +405,7 @@ genuinely sub-group within a single namespace.
 ```
 
 **Dedup flow**
-1. `store.searchVector(content, { collection: <scope-coll>, limit: 1 })`
+1. `store.searchVector(content, { collection: <vault.id>, limit: 1 })`
    then post-filter to `<project>/lessons/`.
 2. **If top hit's score ≥ `config.duplicate_threshold` (default 0.85)**:
    - Append `{ type: "reinforced", source_content: content, confidence_delta: +0.1 }`
@@ -393,7 +423,7 @@ genuinely sub-group within a single namespace.
 
   // optional filters
   scope?: "personal" | "team" | "all";        // default: "all"
-  team?: string;                              // when scope=team, optional team key
+  vault_id?: string;                          // narrow to a single vault by id
   types?: ("memory" | "lesson" | "session" | "wiki")[]; // default: all 4
   project?: string;                           // default: all projects
   limit?: number;                             // default: 10
@@ -406,10 +436,10 @@ genuinely sub-group within a single namespace.
 ```typescript
 {
   results: Array<{
-    path: string;                  // repo-relative
+    path: string;                  // vault-relative
     type: "memory" | "lesson" | "session" | "wiki";
     scope: "personal" | "team";
-    team?: string;
+    vault_id: string;              // origin vault
     project: string;
     title: string;
     snippet: string;               // qmd's matched-region snippet
@@ -425,8 +455,10 @@ genuinely sub-group within a single namespace.
 ```
 
 **Internal flow**
-1. Resolve `scope` → qmd collection list (e.g. `"all"` →
-   `["personal", "team-default", "team-infra"]`).
+1. Resolve `scope` + optional `vault_id` → qmd collection list. For
+   example, `scope: "all"` with no `vault_id` →
+   `vaultChain.map(v => v.id)`; `scope: "personal"` →
+   `vaultChain.filter(v => v.kind === "personal").map(v => v.id)`.
 2. Call `store.search({ query, collections, minScore: min_score, limit: limit*3 })`
    (over-fetch 3× for post-filtering).
 3. Post-filter results by `types` and `project` using path-glob match.
@@ -448,6 +480,9 @@ genuinely sub-group within a single namespace.
   project: string;
   operation: "replace_section" | "append" | "prepend" | "find_replace" | "full_replace";
   content: string;
+
+  // optional
+  vault_id?: string;
 
   // operation-specific
   section?: string;           // for replace_section — markdown header text
@@ -476,15 +511,19 @@ genuinely sub-group within a single namespace.
 
 ## The other 9 tools
 
+All accept the same `vault_id?: string` optional arg as the four
+detailed above. Repo paths are never passed in by the caller — they
+come from the vault chain.
+
 | Tool | Notable shape |
 |---|---|
-| `add_session_summary` | Required: `title`, `narrative`, `scope`, `project`. Optional: `decisions[]`, `files[]`, `concepts[]`, `session_id`. Always appends, no dedup. |
-| `add_wiki_page` | Required: `path` (under `<project>/wiki/`), `content`, `scope`, `project`. Optional: `keywords[]`, `title`. Errors if `path` exists (use `update_wiki` instead). |
-| `vote_memory` / `vote_lesson` / `vote_wiki` | Required: `path` (or `slug`), `direction: "up" \| "down"`, `scope`, `project`. Optional: `reason` (short string, becomes part of event). Per-actor latest vote wins (anti-double-vote). |
-| `get_memory` | Required: `path` OR `slug`. Returns full body + frontmatter + folded events summary (votes, current confidence, last reinforced, edit count, etc.). |
+| `add_session_summary` | Required: `title`, `narrative`, `scope`, `project`. Optional: `vault_id`, `decisions[]`, `files[]`, `concepts[]`, `session_id`. Always appends, no dedup. |
+| `add_wiki_page` | Required: `path` (under `<project>/wiki/`), `content`, `scope`, `project`. Optional: `vault_id`, `keywords[]`, `title`. Errors if `path` exists (use `update_wiki` instead). |
+| `vote_memory` / `vote_lesson` / `vote_wiki` | Required: `path` (or `slug`), `direction: "up" \| "down"`, `scope`, `project`. Optional: `vault_id`, `reason` (short string, becomes part of event). Per-actor latest vote wins (anti-double-vote). |
+| `get_memory` | Required: `path` OR `slug`. Optional: `vault_id` (needed only when `path` is ambiguous across vaults). Returns full body + frontmatter + folded events summary (votes, current confidence, last reinforced, edit count, etc.). |
 | `get_wiki_index` | See [§2.x — get_wiki_index](#get_wiki_index-details). |
-| `memory_init` | No args. Reads config, scaffolds repos, writes README.md per repo, registers qmd collections + per-path contexts. Idempotent. |
-| `memory_status` | No args. Returns sync state, qmd health, queue depths, config snapshot. See [§4 — Operations](#memory_status-shape). |
+| `memory_init` | No args. Reads vault chain + memory-config.json, scaffolds folder skeleton inside each vault, writes README.md per vault, registers qmd collections + per-path contexts. Idempotent. |
+| `memory_status` | No args. Returns sync state per vault, qmd health, queue depths, config snapshot. See [§4 — Operations](#memory_status-shape). |
 
 ### `get_wiki_index` details
 
@@ -492,7 +531,7 @@ genuinely sub-group within a single namespace.
 {
   // all optional — defaults give a useful overview
   scope?: "personal" | "team" | "all";   // default: "all"
-  team?: string;
+  vault_id?: string;                     // narrow to a single vault by id
   project?: string;                      // default: all projects
   root?: string;                         // subpath start, e.g. "architecture/"; default: "/"
   depth?: number;                        // tree depth from root; default: 2; -1 = unlimited
@@ -540,7 +579,7 @@ filters.
 - **`list_memories`.** `search_memory` with empty query + filters is the same call.
 - **`expand_memory` / `summarize_memory`.** Agent's job, not ours.
 - **`get_wiki_backlinks(path)`.** Expensive (whole-corpus scan). v1.1.
-- **Per-team variants** (`add_memory_to_team_infra`). Single tool with `team` arg keeps the surface flat.
+- **Per-team variants** (`add_memory_to_team_infra`). Single tool with `vault_id` arg keeps the surface flat.
 
 ---
 
@@ -568,8 +607,8 @@ id: 7f3a9c1e-...                  # stable UUID — survives renames; used by vo
 title: "JWT validation pitfall"
 created: 2026-06-07T07:30:00Z
 created_by: jane@team.com
-scope: team                       # personal | team
-team: default                     # only when scope=team
+scope: team                       # personal | team — mirrors vault.kind
+vault_id: engineering             # vault.id from clawdevbox's vault chain
 project: clawdevbox               # slug; "_general" for cross-project
 type: memory                      # memory | lesson | session | wiki
 tags: [auth, jwt, security]       # unified "tags/concepts/keywords"
@@ -712,7 +751,7 @@ never been `reinforced`, `last_reinforced` is the `created` timestamp.
 Decay is computed at read time. Never mutated. Events log is the source
 of truth.
 
-## Auto-generated `README.md` per repo
+## Auto-generated `README.md` per vault
 
 Regenerated after each commit by the sync daemon. Pure derived data —
 not edited by humans.
@@ -743,10 +782,11 @@ Maintained by clawdevbox memory tools. Generated 2026-06-07T00:38:00Z.
 
 ## Sync daemon
 
-One sync daemon per configured repo, started on MCP-server boot, stopped
-on shutdown.
+One sync daemon per registered vault, started on MCP-server boot,
+stopped on shutdown. Vaults with `remote: null` still get a daemon for
+inline commits but skip the push/pull cycle.
 
-### State machine (per repo)
+### State machine (per vault)
 
 ```
       ┌─────► IDLE ◄─────┐
@@ -773,15 +813,15 @@ on shutdown.
         └── "auto"   → spawn agent (see below)
 ```
 
-### Per-repo mutex
+### Per-vault mutex
 
 JS is single-threaded but git operations spawn async child processes.
-Per-repo mutex serializes write-and-commit and prevents push/pull from
+Per-vault mutex serializes write-and-commit and prevents push/pull from
 interleaving with each other.
 
 ```typescript
-async function withRepoLock<T>(repoPath: string, fn: () => Promise<T>): Promise<T> {
-  // chain a Promise per repoPath in a Map; new callers wait on the prior.
+async function withVaultLock<T>(vaultId: string, fn: () => Promise<T>): Promise<T> {
+  // chain a Promise per vaultId in a Map; new callers wait on the prior.
 }
 ```
 
@@ -807,10 +847,10 @@ rebase per §2).
 clawdevbox MCP starts
    │
    ▼
-1. Read memory-config.json; resolve all repo paths.
+1. Load vault chain + memory-config.json defaults.
 2. createStore({ dbPath, config: { collections: {...} } })
       ↳ models NOT loaded yet — qmd is lazy
-3. Start sync daemons per repo (don't trigger qmd yet)
+3. Start sync daemons per vault (don't trigger qmd yet)
 4. Return; agent is ready
 
 agent calls search_memory()
@@ -831,33 +871,46 @@ agent calls add_memory()
 
 ### qmd collection registration (via `memory_init`)
 
-```typescript
-await store.addCollection("personal", {
-  path: cfg.personal_repo,
-  pattern: "**/*.md",
-  ignore: ["**/.events/**", "**/.git/**", "README.md"],
-});
+One collection per registered vault, named by `vault.id`:
 
-for (const [team, path] of Object.entries(cfg.teams ?? {})) {
-  await store.addCollection(`team-${team}`, {
-    path,
+```typescript
+const chain = loadVaultChain();
+for (const vault of chain) {
+  await store.addCollection(vault.id, {
+    path: vault.path,
     pattern: "**/*.md",
-    ignore: ["**/.events/**", "**/.git/**", "README.md"],
+    ignore: [
+      "**/.events/**",
+      "**/.git/**",
+      "README.md",
+      "vault.yaml",
+    ],
   });
 }
 ```
 
+Vault `id` becomes the qmd collection name — naturally stable, naturally
+unique, naturally matches the `vault_id` arg the agent passes to tool
+calls.
+
 ### qmd context registration (free search-quality boost)
 
+Set once at `memory_init`, then again whenever a new
+`<project>/<type>` subtree first gets content:
+
 ```typescript
-await store.addContext("team-default", "/clawdevbox/memories",
-  "High-confidence facts about clawdevbox internals — voted by the team");
-await store.addContext("team-default", "/clawdevbox/lessons",
-  "Lessons learned while working on clawdevbox; confidence decays over time");
-await store.addContext("team-default", "/clawdevbox/wiki",
-  "Curated team documentation for clawdevbox");
-await store.addContext("team-default", "/clawdevbox/sessions",
-  "Session retrospectives from agent work on clawdevbox");
+for (const vault of chain) {
+  for (const project of discoverProjectsIn(vault)) {
+    await store.addContext(vault.id, `/${project}/memories`,
+      `${vault.kind} memories about ${project} — high-confidence facts`);
+    await store.addContext(vault.id, `/${project}/lessons`,
+      `${vault.kind} lessons learned about ${project}; confidence decays over time`);
+    await store.addContext(vault.id, `/${project}/wiki`,
+      `${vault.kind} curated documentation for ${project}`);
+    await store.addContext(vault.id, `/${project}/sessions`,
+      `${vault.kind} session retrospectives from agent work on ${project}`);
+  }
+}
 ```
 
 Per qmd docs, context strings are returned alongside results and help
@@ -878,53 +931,61 @@ the LLM make better contextual choices.
 
 ```typescript
 memory_init() {
-  // 1. Validate config
-  const cfg = readConfig();
-  assert(cfg.personal_repo, "personal_repo required in memory-config.json");
-  if (cfg.teams) assert(cfg.default_team in cfg.teams);
-
-  // 2. Per repo: scaffold or validate
-  for (const repoPath of [cfg.personal_repo, ...Object.values(cfg.teams ?? {})]) {
-    if (!exists(repoPath)) {
-      // Use clawdevbox's existing approval tool (mcp-server/src/tools/approval.ts)
-      // to ask the user before creating a fresh git repo on disk.
-      const approved = await approval.request({
-        prompt: `memory_init wants to create a new git repo at ${repoPath}. Continue?`,
-        default: false,
-      });
-      if (!approved) {
-        throw new Error(
-          `Repo at ${repoPath} does not exist and creation was declined. ` +
-          `Either create it manually (git init + first commit) and re-run memory_init, ` +
-          `or update memory-config.json to point at an existing repo.`
-        );
-      }
-      mkdirP(repoPath);
-      git("init", { cwd: repoPath });
-      writeFile(`${repoPath}/.gitignore`, ".memory-meta/\n*.log\n");
-      writeFile(`${repoPath}/README.md`, renderRepoReadme(repoPath));
-      git("add . && commit -m 'initial: memory tools scaffold'");
-    } else {
-      assert(isGitRepo(repoPath), `${repoPath} is not a git repository`);
-      // ensure folder skeleton exists, write missing README sections
-    }
+  // 1. Load vault chain (clawdevbox owns vault creation — we don't)
+  const chain = loadVaultChain();
+  if (chain.length === 0) {
+    throw new Error(
+      "No vaults registered. Run clawdevbox's vault setup first; " +
+      "see paths.get to inspect the current chain."
+    );
   }
 
-  // 3. Register qmd collections (see above)
-  // 4. Set per-path contexts (see above)
+  // 2. Load memory-specific settings (all optional with defaults)
+  const cfg = readMemoryConfig();
 
-  // 5. Initial index + embed
+  // 3. Per vault: ensure folder skeleton + auto-generated README.
+  //    No git init, no approval flow — the vault repo already exists.
+  for (const vault of chain) {
+    assert(isGitRepo(vault.path), `Vault ${vault.id} at ${vault.path} is not a git repository`);
+    ensureDir(`${vault.path}/_general/memories`);
+    ensureDir(`${vault.path}/_general/lessons`);
+    ensureDir(`${vault.path}/_general/sessions`);
+    ensureDir(`${vault.path}/_general/wiki`);
+    // .events/ subfolders created lazily on first write into that type
+    writeReadmeIfMissingOrStale(vault);
+  }
+
+  // 4. Register qmd collections (see "qmd collection registration" above)
+  // 5. Set per-path contexts (see "qmd context registration" above)
+
+  // 6. Initial index + embed
   await store.update();
   await store.embed({ chunkStrategy: "auto" });
 
-  // 6. Start sync daemons
-  for (const repo of allRepos) startSyncDaemon(repo);
+  // 7. Start sync daemons — one per vault. Vaults with `remote: null`
+  //    still get a daemon for inline commits, but skip push/pull.
+  for (const vault of chain) startSyncDaemon(vault);
 
-  return { personal_repo_status, team_repos_status, qmd_status };
+  return {
+    vaults: chain.map(v => ({
+      id: v.id,
+      kind: v.kind,
+      path: v.path,
+      has_remote: v.remote !== null,
+      skeleton_status: "ok",
+    })),
+    qmd_status: {
+      collections: chain.length,
+      indexed_docs: await store.getStatus().then(s => s.totalDocuments),
+      models_loaded: true,
+    },
+  };
 }
 ```
 
-Idempotent — re-running validates and reconciles without re-init.
+Idempotent — re-running validates and reconciles without re-init. No
+`approval.request` flow needed; vault creation is clawdevbox's concern,
+not ours.
 
 ## Conflict auto-resolution
 
@@ -1072,7 +1133,7 @@ type.
 ```typescript
 {
   git: {
-    [repoName: string]: {
+    [vaultId: string]: {                       // vault.id from loadVaultChain()
       branch: "main",
       ahead: 0,
       behind: 0,
@@ -1095,8 +1156,10 @@ type.
     pending_index_queue: 0,
   },
   config: {
-    personal_repo: "C:/git/my-memory",
-    teams: { default: "C:/git/team-memory" },
+    vaults: [                                  // from loadVaultChain()
+      { id: "my-notes", kind: "personal", path: "C:/git/my-notes", has_remote: false },
+      { id: "engineering", kind: "team", path: "C:/git/team-engineering", has_remote: true },
+    ],
     decay: { floor: 0.2, half_life_days: 30 },
     duplicate_threshold: 0.85,
     auto_resolve_conflicts: "manual",
@@ -1116,10 +1179,10 @@ a usable subset of the surface; phases compose rather than block.
 
 | Phase | Scope | Output |
 |---|---|---|
-| **0 — Plumbing** | `memory-config.ts` (load + validate + identity); test-config fixtures; per-repo mutex helper; `mcp-server/package.json` adds `@tobilu/qmd`; smoke-test `createStore + search` on Windows | Foundational utilities; no agent-facing tools yet |
-| **1 — Write tools (no sync)** | `add_memory`, `add_lesson` (without dedup), `add_session_summary`, `add_wiki_page`; file naming; common + per-type frontmatter; events.jsonl `created` events; inline `git add + commit` per write | 4 tools that produce well-formed files in a configured repo |
+| **0 — Plumbing** | `memory-config.ts` (re-exports `loadVaultChain()` + loads memory-config.json defaults + identity resolution); test-config fixtures with a stub vault chain; per-vault mutex helper; `mcp-server/package.json` adds `@tobilu/qmd`; smoke-test `createStore + search` on Windows | Foundational utilities; no agent-facing tools yet |
+| **1 — Write tools (no sync)** | `add_memory`, `add_lesson` (without dedup), `add_session_summary`, `add_wiki_page`; file naming; common + per-type frontmatter; events.jsonl `created` events; inline `git add + commit` per write | 4 tools that produce well-formed files in a registered vault |
 | **2 — Read tools (no qmd yet)** | `get_memory`, `events fold` + decay function, `memory_status` (config-only sections) | Round-trip: write a memory, read it back with folded state |
-| **3 — qmd integration** | `memory-qmd.ts`; collection + context registration; debounced `update + embed`; `memory_init` (with `approval.request` flow); `search_memory` with confidence-weighted ranking; `get_wiki_index` | Fully searchable substrate; `memory_init` becomes the canonical onboarding entry |
+| **3 — qmd integration** | `memory-qmd.ts`; collection + context registration (looping over vault chain); debounced `update + embed`; `memory_init` (no approval flow — vaults already exist); `search_memory` with confidence-weighted ranking; `get_wiki_index` | Fully searchable substrate; `memory_init` becomes the canonical onboarding entry |
 | **4 — Lesson dedup** | qmd vector-similarity dedup in `add_lesson`; `reinforced` events; confidence delta application | Lessons auto-strengthen on near-duplicate content |
 | **5 — Voting** | `vote_memory`, `vote_lesson`, `vote_wiki`; `voted` events; per-actor latest-vote dedup; rank uplift in `search_memory` | Voting changes search ranking |
 | **6 — Background sync** | `memory-sync.ts` (push debounce, idle pull, state machine); `memory_status.git` populated; inbox-routed failure escalation | Tool calls return fast; sync runs in background |
@@ -1164,7 +1227,7 @@ Before writing any SDK code:
 - Multi-machine cache reconciliation (each clone embeds independently
   today; not a problem since git is source of truth)
 - `.obsidian/` vault scaffold management
-- Per-repo `auto_resolve_conflicts` override (today it's global)
+- Per-vault `auto_resolve_conflicts` override via `vault.yaml`'s `memory:` block (today it's global)
 
 # Open questions
 
@@ -1175,9 +1238,16 @@ implementation plan.
 
 # Glossary
 
-- **Scope**: `personal` or `team`. Routes to a configured git repo.
+- **Scope**: `personal` or `team`. Maps to `vault.kind` in clawdevbox's
+  vault chain. Selects which vault(s) the tool operates on.
+- **Vault**: A clawdevbox-registered memory store (`VaultInfo` from
+  `loadVaultChain()`). Has stable `id`, on-disk `path`, `kind`
+  (personal/team), and optional `remote` git URL.
+- **Vault id**: The stable user-facing identifier for a vault. Also
+  used as the qmd collection name. Passed as the `vault_id` tool arg
+  when more than one vault of a given `kind` is registered.
 - **Project**: Project slug (e.g., `clawdevbox`, `billing-service`, or
-  `_general`). Top-level folder inside a scope repo.
+  `_general`). Top-level folder inside a vault.
 - **Type**: `memory`, `lesson`, `session`, or `wiki`. Second-level
   folder inside `<project>/`.
 - **Slug**: Slugified title used in filenames. Date-prefixed for
