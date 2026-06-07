@@ -76,15 +76,22 @@ export interface SyncOutcome {
   pushed: boolean;
   conflict: boolean;
   message: string;
+  /** When conflict=true: SHAs needed by auto-resolve. */
+  base_sha?: string;
+  our_sha?: string;
+  their_sha?: string;
+  /** When conflict=true: vault-relative paths of files in conflict. */
+  conflict_paths?: string[];
 }
 
 /**
  * Sync a single repo with its remote: fetch + pull --rebase + push.
  * If no remote is configured, returns a no-op outcome. If pull-rebase
- * encounters a conflict, returns conflict=true; the working tree is
- * LEFT IN the conflict state (rebase --abort would discard the user's
- * pending changes). The caller is responsible for surfacing this to
- * the user via inbox.
+ * encounters a conflict, returns conflict=true plus the base/ours/theirs
+ * SHAs needed by auto-resolve. The working tree is LEFT IN the conflict
+ * state (rebase --abort would discard local changes); the caller is
+ * responsible for either invoking attemptAutoResolve, aborting, or
+ * surfacing to the user via inbox.
  */
 export function syncRepo(repoPath: string): SyncOutcome {
   const branch = getCurrentBranch(repoPath);
@@ -93,7 +100,10 @@ export function syncRepo(repoPath: string): SyncOutcome {
     return { branch, pulled: false, pushed: false, conflict: false, message: 'no remote configured; skipped' };
   }
 
-  // Fetch first so we have an up-to-date view.
+  // Capture our HEAD BEFORE the rebase attempt so auto-resolve can revert.
+  const oursBefore = runAllowFailure(repoPath, ['rev-parse', 'HEAD']).stdout.trim();
+
+  // Fetch first.
   const fetched = runAllowFailure(repoPath, ['fetch', '--quiet']);
   if (fetched.status !== 0) {
     return {
@@ -102,17 +112,21 @@ export function syncRepo(repoPath: string): SyncOutcome {
     };
   }
 
-  // Try to rebase onto remote.
+  // Capture remote head (FETCH_HEAD) and the merge base for context if conflict.
+  const theirsSha = runAllowFailure(repoPath, ['rev-parse', 'FETCH_HEAD']).stdout.trim();
+
+  // Try rebase.
   const rebased = runAllowFailure(repoPath, ['pull', '--rebase', '--quiet', '--no-edit']);
-  let pulled = rebased.status === 0;
   if (rebased.status !== 0) {
-    // Detect conflict via in-progress rebase marker.
-    const isRebasing = runAllowFailure(repoPath, ['rev-parse', '--git-path', 'rebase-merge']);
-    const isApplying = runAllowFailure(repoPath, ['rev-parse', '--git-path', 'rebase-apply']);
-    const hint = `${rebased.stderr.trim()} (rebase-merge=${isRebasing.stdout.trim()}, rebase-apply=${isApplying.stdout.trim()})`;
+    const baseSha = runAllowFailure(repoPath, ['merge-base', oursBefore, theirsSha]).stdout.trim();
+    const conflictPaths = listConflictPaths(repoPath);
     return {
       branch, pulled: false, pushed: false, conflict: true,
-      message: `pull --rebase conflict: ${hint}`,
+      message: `pull --rebase conflict: ${rebased.stderr.trim()}`,
+      base_sha: baseSha || undefined,
+      our_sha: oursBefore || undefined,
+      their_sha: theirsSha || undefined,
+      conflict_paths: conflictPaths,
     };
   }
 
@@ -120,12 +134,31 @@ export function syncRepo(repoPath: string): SyncOutcome {
   const pushed = runAllowFailure(repoPath, ['push', '--quiet', 'origin', branch]);
   if (pushed.status !== 0) {
     return {
-      branch, pulled, pushed: false, conflict: false,
+      branch, pulled: true, pushed: false, conflict: false,
       message: `git push failed: ${pushed.stderr.trim() || `exit ${pushed.status}`}`,
     };
   }
 
-  return { branch, pulled, pushed: true, conflict: false, message: 'ok' };
+  return { branch, pulled: true, pushed: true, conflict: false, message: 'ok' };
+}
+
+function listConflictPaths(repoPath: string): string[] {
+  const r = runAllowFailure(repoPath, ['diff', '--name-only', '--diff-filter=U']);
+  if (r.status !== 0) return [];
+  return r.stdout.split('\n').map((s) => s.trim()).filter(Boolean);
+}
+
+/** Abort an in-progress rebase. Best-effort; safe to call when no rebase active. */
+export function abortRebase(repoPath: string): void {
+  runAllowFailure(repoPath, ['rebase', '--abort']);
+}
+
+/** Try a single-file fast-forward push for an already-resolved conflict. */
+export function tryPush(repoPath: string, branch?: string): { ok: boolean; message: string } {
+  const b = branch ?? getCurrentBranch(repoPath);
+  const r = runAllowFailure(repoPath, ['push', '--quiet', 'origin', b]);
+  if (r.status === 0) return { ok: true, message: 'ok' };
+  return { ok: false, message: r.stderr.trim() || `exit ${r.status}` };
 }
 
 /**

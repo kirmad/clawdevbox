@@ -28,6 +28,7 @@ import { randomUUID } from 'node:crypto';
 import {
   existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, statSync,
 } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { dirname, join, relative, sep } from 'node:path';
 import { z } from 'zod';
 import { defineTool } from './registry.ts';
@@ -49,7 +50,12 @@ import {
   type SessionFrontmatter, type WikiFrontmatter,
 } from './memory-frontmatter.ts';
 import { appendEvent, readEvents, foldEvents, decayConfidence } from './memory-events.ts';
-import { commitInline, getRepoState, syncRepo, type SyncOutcome } from './memory-git.ts';
+import {
+  commitInline, getRepoState, syncRepo, abortRebase, tryPush, type SyncOutcome,
+} from './memory-git.ts';
+import {
+  attemptAutoResolve, type SpawnAgentFn, type AutoResolveResult,
+} from './memory-autoresolve.ts';
 import {
   getStore, registerVaultCollections, registerProjectContexts,
   scheduleReindex, flushReindex, searchAcrossCollections,
@@ -66,6 +72,11 @@ export interface ToolCtx {
   identity: Identity;
   config: MemoryConfig;
   now: () => Date;
+  /** Phase 8 — injected so handlers can spawn a sub-agent for conflict
+   *  auto-resolution. Tests pass a stub; production wires to session.send. */
+  spawnAgent?: SpawnAgentFn;
+  /** Optional inbox hook (best-effort). Tests pass a stub. */
+  inbox?: (entry: { severity: 'info' | 'warning'; title: string; hint: string }) => Promise<void> | void;
 }
 
 // ---------------------------------------------------------------------------
@@ -548,7 +559,9 @@ const memorySyncSchema = z.object({
 export type MemorySyncArgs = z.infer<typeof memorySyncSchema>;
 
 export interface MemorySyncResult {
-  outcomes: Array<{ vault_id: string } & SyncOutcome>;
+  outcomes: Array<{ vault_id: string } & SyncOutcome & {
+    auto_resolve?: AutoResolveResult;
+  }>;
   any_conflicts: boolean;
   any_errors: boolean;
 }
@@ -568,17 +581,73 @@ export async function handleMemorySync(
   let anyConflicts = false;
   let anyErrors = false;
   for (const vault of vaults) {
-    const outcome = await withVaultLock(vault.id, async () => syncRepo(vault.path));
-    outcomes.push({ vault_id: vault.id, ...outcome });
+    let outcome = await withVaultLock(vault.id, async () => syncRepo(vault.path));
+    let autoResolve: AutoResolveResult | undefined;
+
+    // Phase 8: if conflict and config opted in, try auto-resolve.
+    if (outcome.conflict && ctx.config.auto_resolve_conflicts === 'auto' && ctx.spawnAgent) {
+      autoResolve = await runAutoResolveForOutcome(ctx, vault, outcome);
+      if (autoResolve.resolved) {
+        // Merge worked — retry the push step.
+        const push = await withVaultLock(vault.id, async () => tryPush(vault.path));
+        outcome = {
+          ...outcome,
+          conflict: false,
+          pulled: true,
+          pushed: push.ok,
+          message: push.ok ? 'auto-resolved + pushed' : `auto-resolved but push failed: ${push.message}`,
+        };
+      } else {
+        // Couldn't resolve — abort the rebase so the working tree returns
+        // to a clean state.
+        await withVaultLock(vault.id, async () => { abortRebase(vault.path); });
+        outcome = { ...outcome, message: `${outcome.message}; auto-resolve declined: ${autoResolve.reason}` };
+      }
+    }
+
+    outcomes.push({ vault_id: vault.id, ...outcome, ...(autoResolve ? { auto_resolve: autoResolve } : {}) });
     if (outcome.conflict) anyConflicts = true;
     if (!outcome.conflict && !outcome.pushed && vault.remote !== null) {
-      // remote exists but push didn't succeed (and it wasn't a conflict)
-      if (outcome.message !== 'ok' && outcome.message !== 'no remote configured; skipped') {
+      if (outcome.message !== 'ok' && !outcome.message.startsWith('no remote') && !outcome.message.startsWith('auto-resolved')) {
         anyErrors = true;
       }
     }
   }
   return { outcomes, any_conflicts: anyConflicts, any_errors: anyErrors };
+}
+
+async function runAutoResolveForOutcome(
+  ctx: ToolCtx,
+  vault: VaultInfo,
+  outcome: SyncOutcome,
+): Promise<AutoResolveResult> {
+  // syncRepo may have surfaced multiple conflicting paths — try them
+  // one at a time. If any succeed, we count the overall as resolved.
+  const paths = outcome.conflict_paths ?? [];
+  if (paths.length === 0 || !outcome.base_sha || !outcome.our_sha || !outcome.their_sha) {
+    return {
+      attempted: false,
+      resolved: false,
+      reason: 'missing conflict context (paths or SHAs)',
+    };
+  }
+  // Attempt only the first conflicting path for now; a multi-file
+  // auto-resolve loop is future work.
+  return attemptAutoResolve(
+    {
+      vault,
+      conflictPath: paths[0],
+      base_sha: outcome.base_sha,
+      our_sha: outcome.our_sha,
+      their_sha: outcome.their_sha,
+    },
+    {
+      config: ctx.config,
+      spawnAgent: ctx.spawnAgent!,
+      now: ctx.now,
+      inbox: ctx.inbox,
+    },
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -1447,6 +1516,8 @@ export function registerMemoryEntries(
       identity,
       config,
       now: () => new Date(),
+      spawnAgent: makeProductionSpawnAgent(),
+      inbox: undefined, // could be wired to inbox.upsert in a follow-on
     };
   }
 
@@ -1638,6 +1709,69 @@ function defaultConfigPath(ws: Workspace): string {
 function loadVaultChainSafe(ws: Workspace): VaultInfo[] {
   const cfg = resolveConfig({ projectDir: ws.projectDir, globalDir: ws.globalDir });
   return loadVaultChain(cfg.vaults);
+}
+
+/**
+ * Production spawnAgent for Phase 8 conflict auto-resolve. Uses the
+ * global session-helper ctx (set by `clawdevbox start`) to call
+ * spawnDispatchOrResume. Polls every 2s for up to timeoutMs for a new
+ * merge commit on the conflicting branch. If the global isn't set
+ * (e.g., MCP server running in a test or stdio mode without the live
+ * dispatcher), returns exit_code 1 immediately with a clear reason.
+ */
+function makeProductionSpawnAgent(): SpawnAgentFn {
+  return async ({ cwd, prompt, sessionId, timeoutMs }) => {
+    type GlobalCtx = {
+      __clawdevboxSessionHelperCtx?: {
+        db: unknown;
+        dispatcher: unknown;
+        ws: unknown;
+        cfg: unknown;
+      };
+    };
+    const g = globalThis as unknown as GlobalCtx;
+    const sessionCtx = g.__clawdevboxSessionHelperCtx;
+    if (!sessionCtx) {
+      return {
+        exit_code: 1,
+        reason: 'session-helper ctx not initialized; auto-resolve requires `clawdevbox start`',
+      };
+    }
+    // Lazy-import to avoid eager dependency cycles.
+    const { spawnDispatchOrResume } = await import('../session-helpers.ts');
+    const startSha = currentShaOf(cwd);
+    const r = await (spawnDispatchOrResume as any)(sessionCtx, {
+      prompt,
+      session_id: sessionId,
+      provider: null,
+      agent: null,
+      model: null,
+      workspace_id: null,
+      workspace_path: cwd,
+    });
+    if (!r?.ok) {
+      return { exit_code: 1, reason: `spawn failed: ${r?.code ?? 'UNKNOWN'} ${r?.message ?? ''}` };
+    }
+    // Poll for a new commit on HEAD (every 2s, up to timeoutMs).
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      const nowSha = currentShaOf(cwd);
+      if (nowSha && nowSha !== startSha) {
+        return { exit_code: 0, merged_commit: nowSha, reason: 'detected new commit' };
+      }
+    }
+    return { exit_code: 1, reason: `spawn timed out after ${timeoutMs}ms without producing a merge commit` };
+  };
+}
+
+function currentShaOf(cwd: string): string {
+  try {
+    const r = spawnSync('git', ['rev-parse', 'HEAD'], { cwd, encoding: 'utf8', windowsHide: true });
+    return (r.stdout ?? '').trim();
+  } catch {
+    return '';
+  }
 }
 
 // Re-export DEFAULT_MEMORY_CONFIG for tests that want a baseline config

@@ -4,15 +4,16 @@
 **Spec:** `docs/superpowers/specs/2026-06-07-memory-tools-design.md`
 **Plan:** `docs/superpowers/plans/2026-06-07-memory-tools-mvp.md`
 
-## What shipped — ALL spec phases except 8
+## What shipped — ALL spec phases except 6 (daemon)
 
 The full memory subsystem is complete. Agents can write, read, search,
 vote on, and edit Obsidian-compatible markdown memories/lessons/sessions/
 wiki pages stored as git-versioned files in clawdevbox-registered
 vaults, indexed by `@tobilu/qmd` in **BM25-only `lex` mode** so it
-runs on machines without a GPU. Manual git sync ships out of the box;
-the full background sync daemon is deferred (the manual `memory_sync`
-tool covers the use case while keeping complexity small).
+runs on machines without a GPU. Manual git sync ships out of the box,
+along with **opt-in wiki conflict auto-resolution via spawned agent
+(Phase 8)**. The full background sync daemon is deferred (the manual
+`memory_sync` tool covers the use case while keeping complexity small).
 
 ## 14 MCP tools registered
 
@@ -38,7 +39,36 @@ tool covers the use case while keeping complexity small).
 | Phase | Feature | Status |
 |---|---|---|
 | 6 | Background sync **daemon** with debounced timers + state machine + inbox escalation | Deferred — manual `memory_sync` is the working surface. Add the daemon if usage shows the manual step is friction. |
-| 8 | Conflict auto-resolve via `session.send` sub-agent | Deferred — opt-in only per spec; default config (`"manual"`) is the working behaviour. |
+
+## Phase 8 — wiki conflict auto-resolve (opt-in)
+
+`memory_sync` now detects rebase conflicts and — when the user opts in
+via `auto_resolve_conflicts: "auto"` in `memory-config.json` — spawns
+a fresh agent session (using clawdevbox's existing `session.send`
+mechanism) to merge the conflict. Four safety gates throttle this:
+
+| Gate | Default |
+|---|---|
+| Opt-in flag | `manual` (off) |
+| Wiki-only paths (`<project>/wiki/...`) | enforced |
+| Max diff lines | 100 |
+| Max conflicts per file per hour | 3 |
+| Spawn timeout | 5 min |
+
+Two pre-merge git tags (`memory-pre-merge/<ms>-ours` and `-theirs`)
+are **always** created before any merge attempt, so the pre-conflict
+state is recoverable for 30 days via `git reset --hard <tag>`. The
+inbox is notified on both success (`info`: "Auto-merged — please
+review") and failure (`warning`: "Auto-merge declined ...").
+
+Implementation: `mcp-server/src/tools/memory-autoresolve.ts` (~320
+LOC). The `spawnAgent` callback is dependency-injected: tests pass
+a stub, and production wires it to `spawnDispatchOrResume` with a
+polling loop that watches for a new HEAD commit. If the session-
+helper context isn't initialized (e.g., running under stdio-only
+MCP), the production stub returns `exit_code: 1` with a clear
+reason — auto-resolve halts gracefully and the conflict is surfaced
+to the user as if `auto_resolve_conflicts` were `manual`.
 
 ## 8 source modules + 11 test files
 
