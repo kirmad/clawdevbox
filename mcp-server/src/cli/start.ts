@@ -2056,23 +2056,60 @@ function handleSse(req: IncomingMessage, res: ServerResponse): void {
   res.write(`retry: 5000\n\n`);
   res.write(`event: hello\ndata: {}\n\n`);
 
-  const sendChange = (topic: string) => {
-    try {
-      res.write(`event: change\ndata: ${JSON.stringify({ topic })}\n\n`);
-    } catch {
-      /* client disconnected — cleanup below will fire */
+  // SSE write backpressure guard. If the client connection is half-open
+  // (TCP didn't notice the peer is gone, or a proxy is buffering), naïve
+  // res.write() returns true but the data piles up in Node's send buffer
+  // indefinitely. Over hours of background `change` events from the
+  // event bus this can balloon into hundreds of MB per dead-but-not-
+  // closed connection.
+  //
+  // Fix: when res.write() returns false (buffer above highWaterMark),
+  // pause emitting until 'drain' fires. If 'drain' doesn't come within
+  // a short timeout, treat the client as dead and tear the connection
+  // down so cleanup() runs and the change-bus listener is unsubscribed.
+  const DRAIN_TIMEOUT_MS = 30_000;
+  let drainTimer: NodeJS.Timeout | null = null;
+  let waitingForDrain = false;
+  const safeWrite = (chunk: string): boolean => {
+    if (waitingForDrain) {
+      // Already backpressured — drop the chunk. This is the SSE
+      // contract: clients are responsible for reconnecting and
+      // doing a full re-sync via /api/* after the gap.
+      return false;
     }
+    let ok = false;
+    try { ok = res.write(chunk); } catch { return false; }
+    if (!ok) {
+      waitingForDrain = true;
+      drainTimer = setTimeout(() => {
+        // Client hasn't drained in 30s — assume dead, force-close so
+        // cleanup() runs. This is the only way to release the backed-up
+        // buffer.
+        try { res.destroy(); } catch { /* already closed */ }
+      }, DRAIN_TIMEOUT_MS);
+      if (drainTimer.unref) drainTimer.unref();
+      res.once('drain', () => {
+        waitingForDrain = false;
+        if (drainTimer) { clearTimeout(drainTimer); drainTimer = null; }
+      });
+    }
+    return ok;
+  };
+
+  const sendChange = (topic: string) => {
+    safeWrite(`event: change\ndata: ${JSON.stringify({ topic })}\n\n`);
   };
   const unsubscribe = onChange(sendChange);
 
   const heartbeat = setInterval(() => {
-    try { res.write(`: ping ${Date.now()}\n\n`); } catch { /* ignore */ }
+    safeWrite(`: ping ${Date.now()}\n\n`);
   }, 25_000);
   // Don't keep the event loop alive for the heartbeat.
   if (typeof heartbeat.unref === 'function') heartbeat.unref();
 
   const cleanup = () => {
     clearInterval(heartbeat);
+    if (drainTimer) { clearTimeout(drainTimer); drainTimer = null; }
     unsubscribe();
   };
   req.on('close', cleanup);
