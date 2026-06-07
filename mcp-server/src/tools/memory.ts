@@ -4,11 +4,19 @@
  * MCP tools for the memory subsystem:
  *
  *   Writes (Phase 1):
- *     - add_memory, add_lesson (no dedup), add_session_summary, add_wiki_page
+ *     - add_memory, add_lesson, add_session_summary, add_wiki_page
  *   Reads  (Phase 2):
  *     - get_memory, memory_status
- *   qmd-backed (Phase 3 — added in memory-qmd-tools.ts):
+ *   qmd-backed (Phase 3):
  *     - memory_init, search_memory, get_wiki_index
+ *   Voting (Phase 4):
+ *     - vote_memory, vote_lesson, vote_wiki
+ *   Lesson dedup (Phase 4):
+ *     - add_lesson auto-strengthens existing duplicate via exact-content
+ *       match (lex mode) or qmd vector similarity (hybrid mode)
+ *   Wiki updates (Phase 7):
+ *     - update_wiki with replace_section/append/prepend/find_replace/
+ *       full_replace operations
  *
  * Each handler is exported as a pure function (testable in isolation)
  * with its own `ToolCtx` argument so tests can stub the vault chain,
@@ -197,7 +205,7 @@ export async function handleAddMemory(ctx: ToolCtx, args: AddMemoryArgs): Promis
 }
 
 // ---------------------------------------------------------------------------
-// add_lesson (Phase 1 — no dedup; Phase 4 adds qmd vector dedup)
+// add_lesson — with Phase 4 auto-strengthen-on-duplicate
 // ---------------------------------------------------------------------------
 
 const addLessonSchema = z.object({
@@ -213,10 +221,53 @@ const addLessonSchema = z.object({
 
 export type AddLessonArgs = z.infer<typeof addLessonSchema>;
 
-export async function handleAddLesson(ctx: ToolCtx, args: AddLessonArgs): Promise<WriteResult> {
+export interface AddLessonResult {
+  vault_id: string;
+  path: string;
+  slug: string;
+  action: 'created' | 'reinforced';
+  similarity?: number;     // when action='reinforced'
+  target?: string;         // existing slug when action='reinforced'
+}
+
+export async function handleAddLesson(
+  ctx: ToolCtx,
+  args: AddLessonArgs,
+): Promise<AddLessonResult> {
+  const vault = resolveVault(ctx.chain, args.scope, args.vault_id);
+
+  // Phase 4: check for duplicate first.
+  const dup = await findDuplicateLesson(ctx, vault, args.project, args.content);
+  if (dup) {
+    return withVaultLock(vault.id, async () => {
+      // Append a `reinforced` event to the existing lesson.
+      const segments = dup.vaultRelPath.split('/').filter(Boolean);
+      const restAfterType = segments.slice(2).join('/');
+      const eventsPath = eventsPathFor(vault, args.project, 'lesson', restAfterType);
+      appendEvent(eventsPath, {
+        ts: ctx.now().toISOString(),
+        actor: ctx.identity.email,
+        type: 'reinforced',
+        source_content: args.content,
+        confidence_delta: 0.1,
+      });
+      const relEvents = relative(vault.path, eventsPath).split(sep).join('/');
+      commitInline(vault.path, [relEvents], `lesson: reinforced ${dup.vaultRelPath}`);
+      return {
+        vault_id: vault.id,
+        path: dup.vaultRelPath,
+        slug: restAfterType,
+        action: 'reinforced',
+        similarity: dup.similarity,
+        target: dup.vaultRelPath,
+      };
+    });
+  }
+
+  // No duplicate — create new lesson.
   const title = args.title ?? deriveTitle(args.content);
   const confidence = args.confidence ?? 0.5;
-  return writeNewDoc(ctx, {
+  const result = await writeNewDoc(ctx, {
     type: 'lesson',
     scope: args.scope,
     vault_id: args.vault_id,
@@ -232,6 +283,7 @@ export async function handleAddLesson(ctx: ToolCtx, args: AddLessonArgs): Promis
       initial_confidence: confidence,
     } as LessonFrontmatter),
   });
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -949,6 +1001,341 @@ function normalizeLink(link: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Lesson dedup (Phase 4)
+//
+// In lex mode (default): exact normalized-content match against existing
+//   lessons in the same vault+project. Cheap and deterministic.
+// In hybrid/vec mode: qmd vector similarity with config.duplicate_threshold.
+//
+// On duplicate, append a `reinforced` event to the existing file's
+// events.jsonl instead of creating a new file.
+// ---------------------------------------------------------------------------
+
+function normalizeContent(s: string): string {
+  return s.toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+interface DedupHit {
+  vaultRelPath: string;     // <project>/lessons/<slug>.md
+  similarity: number;       // 0-1
+}
+
+async function findDuplicateLesson(
+  ctx: ToolCtx,
+  vault: VaultInfo,
+  project: string,
+  content: string,
+): Promise<DedupHit | null> {
+  // Both modes start by scanning existing lesson files in the project —
+  // this is fast (small directory listing) and avoids racing the qmd
+  // index, which may not yet contain a just-written lesson.
+  const lessonsDir = vaultPathFor(vault, project, 'lesson', '');
+  if (!existsSync(lessonsDir)) return null;
+  let entries: string[];
+  try {
+    entries = readdirSync(lessonsDir).filter((f) => f.endsWith('.md'));
+  } catch {
+    return null;
+  }
+  const normalizedNew = normalizeContent(content);
+
+  // Phase 4a: exact normalized content match (works in any mode).
+  for (const filename of entries) {
+    const abs = join(lessonsDir, filename);
+    try {
+      const raw = readFileSync(abs, 'utf8');
+      const { body } = splitFrontmatterAndBody(raw);
+      if (normalizeContent(body) === normalizedNew) {
+        return {
+          vaultRelPath: `${project}/lessons/${filename}`,
+          similarity: 1.0,
+        };
+      }
+    } catch { /* ignore unparseable */ }
+  }
+
+  // Phase 4b: qmd vector similarity (hybrid/vec modes only).
+  if (ctx.config.qmd_search_mode === 'lex') return null;
+  try {
+    const store = await getStore(ctx.config);
+    await registerVaultCollections(store, ctx.chain);
+    const results = await store.searchVector(content, { collection: vault.id, limit: 3 });
+    for (const r of results) {
+      const display = (r as any).displayPath ?? (r as any).path ?? '';
+      const stripped = display.startsWith(`${vault.id}/`)
+        ? display.slice(vault.id.length + 1)
+        : display;
+      const dec = decomposeDisplayPath(stripped);
+      if (!dec || dec.project !== project || dec.type !== 'lesson') continue;
+      const score = typeof (r as any).score === 'number' ? (r as any).score : 0;
+      if (score >= ctx.config.duplicate_threshold) {
+        return { vaultRelPath: stripped, similarity: score };
+      }
+    }
+  } catch { /* qmd unavailable; treat as no-dup */ }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Voting (Phase 4)
+// ---------------------------------------------------------------------------
+
+const voteSchema = z.object({
+  path: z.string().min(1),
+  direction: z.enum(['up', 'down']),
+  scope: z.enum(['personal', 'team']).optional(),
+  vault_id: z.string().optional(),
+  project: z.string().optional(),
+  reason: z.string().optional(),
+});
+
+export type VoteArgs = z.infer<typeof voteSchema>;
+
+export interface VoteResult {
+  vault_id: string;
+  path: string;
+  action: 'voted';
+  votes: { up: number; down: number };
+  /** For lessons: decay-adjusted confidence after this vote. */
+  confidence?: number;
+}
+
+async function handleVote(
+  ctx: ToolCtx,
+  args: VoteArgs,
+  expectedType: MemoryType,
+): Promise<VoteResult> {
+  // Locate the file in the vault chain.
+  const relPath = args.path.endsWith('.md') ? args.path : `${args.path}.md`;
+  const candidates: VaultInfo[] = args.vault_id
+    ? ctx.chain.filter((v) => v.id === args.vault_id)
+    : args.scope
+      ? ctx.chain.filter((v) => v.kind === args.scope)
+      : [...ctx.chain];
+  if (candidates.length === 0) {
+    throw new Error('no vaults match the requested scope/vault_id');
+  }
+  let target: { vault: VaultInfo; abs: string } | null = null;
+  for (const v of candidates) {
+    const abs = join(v.path, relPath);
+    if (existsSync(abs)) {
+      target = { vault: v, abs };
+      break;
+    }
+  }
+  if (!target) {
+    throw new Error(`vote target not found: ${relPath} (searched ${candidates.map((v) => v.id).join(', ')})`);
+  }
+
+  // Parse frontmatter to validate type + derive project.
+  const raw = readFileSync(target.abs, 'utf8');
+  const { frontmatter } = splitFrontmatterAndBody(raw);
+  if (frontmatter.type !== expectedType) {
+    throw new Error(
+      `vote_${expectedType} called on a ${frontmatter.type} document. ` +
+      `Use vote_${frontmatter.type} instead.`,
+    );
+  }
+  const project = args.project ?? frontmatter.project;
+
+  return withVaultLock(target.vault.id, async () => {
+    const segments = relPath.split('/').filter(Boolean);
+    const restAfterType = segments.slice(2).join('/');
+    const eventsPath = eventsPathFor(target.vault, project, expectedType, restAfterType);
+    const ts = ctx.now().toISOString();
+    appendEvent(eventsPath, {
+      ts,
+      actor: ctx.identity.email,
+      type: 'voted',
+      direction: args.direction,
+      ...(args.reason ? { reason: args.reason } : {}),
+    });
+
+    // Commit the new events line.
+    const relEvents = relative(target.vault.path, eventsPath).split(sep).join('/');
+    commitInline(target.vault.path, [relEvents], `vote: ${args.direction} ${relPath}`);
+
+    // Recompute folded state for the return payload.
+    const folded = foldEvents(readEvents(eventsPath), {
+      isLesson: expectedType === 'lesson',
+      isWiki: expectedType === 'wiki',
+    });
+    const result: VoteResult = {
+      vault_id: target.vault.id,
+      path: relPath,
+      action: 'voted',
+      votes: { ...folded.votes },
+    };
+    if (expectedType === 'lesson' && typeof folded.confidence_stored === 'number') {
+      const lastReinforcedAt = folded.last_reinforced
+        ? new Date(folded.last_reinforced).getTime()
+        : new Date(folded.created.at || ts).getTime();
+      result.confidence = decayConfidence({
+        confidence_stored: folded.confidence_stored,
+        last_reinforced_at: lastReinforcedAt,
+        now: ctx.now().getTime(),
+        floor: ctx.config.decay.floor,
+        half_life_days: ctx.config.decay.half_life_days,
+      });
+    }
+    return result;
+  });
+}
+
+export async function handleVoteMemory(ctx: ToolCtx, args: VoteArgs): Promise<VoteResult> {
+  return handleVote(ctx, args, 'memory');
+}
+export async function handleVoteLesson(ctx: ToolCtx, args: VoteArgs): Promise<VoteResult> {
+  return handleVote(ctx, args, 'lesson');
+}
+export async function handleVoteWiki(ctx: ToolCtx, args: VoteArgs): Promise<VoteResult> {
+  return handleVote(ctx, args, 'wiki');
+}
+
+// ---------------------------------------------------------------------------
+// update_wiki (Phase 7)
+// ---------------------------------------------------------------------------
+
+const updateWikiSchema = z.object({
+  path: z.string().min(1),
+  scope: z.enum(['personal', 'team']),
+  project: z.string().min(1),
+  vault_id: z.string().optional(),
+  operation: z.enum(['replace_section', 'append', 'prepend', 'find_replace', 'full_replace']),
+  content: z.string(),
+  section: z.string().optional(),
+  find_text: z.string().optional(),
+  expected_replacements: z.number().int().nonnegative().optional(),
+});
+
+export type UpdateWikiArgs = z.infer<typeof updateWikiSchema>;
+
+export interface UpdateWikiResult {
+  vault_id: string;
+  path: string;
+  action: 'updated';
+  operation: UpdateWikiArgs['operation'];
+  lines_changed: number;
+}
+
+export async function handleUpdateWiki(
+  ctx: ToolCtx,
+  args: UpdateWikiArgs,
+): Promise<UpdateWikiResult> {
+  const vault = resolveVault(ctx.chain, args.scope, args.vault_id);
+  // Accept either a wiki-relative path ("architecture/data-flow") or a
+  // full vault-relative path ("p/wiki/architecture/data-flow.md"). The
+  // latter is what get_memory and search_memory return, so it's
+  // natural to round-trip.
+  let wikiRelPath = args.path.endsWith('.md') ? args.path : `${args.path}.md`;
+  const projectWikiPrefix = `${args.project}/wiki/`;
+  if (wikiRelPath.startsWith(projectWikiPrefix)) {
+    wikiRelPath = wikiRelPath.slice(projectWikiPrefix.length);
+  }
+  const abs = vaultPathFor(vault, args.project, 'wiki', wikiRelPath);
+  if (!existsSync(abs)) {
+    throw new Error(`wiki page not found: ${args.project}/wiki/${wikiRelPath}`);
+  }
+
+  return withVaultLock(vault.id, async () => {
+    const raw = readFileSync(abs, 'utf8');
+    const { frontmatter, body } = splitFrontmatterAndBody(raw);
+    const newBody = applyWikiOperation(body, args);
+    const linesChanged = Math.abs(newBody.split('\n').length - body.split('\n').length);
+
+    const fmYaml = buildFrontmatter(frontmatter);
+    const full = `${fmYaml}\n${newBody.endsWith('\n') ? newBody : newBody + '\n'}`;
+    writeFileSync(abs, full, 'utf8');
+
+    // Append edited event
+    const eventsPath = eventsPathFor(vault, args.project, 'wiki', wikiRelPath);
+    appendEvent(eventsPath, {
+      ts: ctx.now().toISOString(),
+      actor: ctx.identity.email,
+      type: 'edited',
+      operation: args.operation,
+      ...(args.section ? { section: args.section } : {}),
+      lines_changed: linesChanged,
+    });
+
+    const relFile = relative(vault.path, abs).split(sep).join('/');
+    const relEvents = relative(vault.path, eventsPath).split(sep).join('/');
+    commitInline(vault.path, [relFile, relEvents], `wiki: ${relFile} (${args.operation})`);
+
+    // Schedule reindex
+    try {
+      const store = await getStore(ctx.config);
+      scheduleReindex(store, vault.id, ctx.config);
+    } catch { /* ignore */ }
+
+    return {
+      vault_id: vault.id,
+      path: relFile,
+      action: 'updated',
+      operation: args.operation,
+      lines_changed: linesChanged,
+    };
+  });
+}
+
+function applyWikiOperation(body: string, args: UpdateWikiArgs): string {
+  switch (args.operation) {
+    case 'full_replace':
+      return args.content;
+    case 'append':
+      return body + (body.endsWith('\n') ? '' : '\n') + args.content;
+    case 'prepend':
+      return args.content + (args.content.endsWith('\n') ? '' : '\n') + body;
+    case 'find_replace': {
+      if (!args.find_text) {
+        throw new Error('find_replace operation requires `find_text`');
+      }
+      const occurrences = body.split(args.find_text).length - 1;
+      if (typeof args.expected_replacements === 'number' && occurrences !== args.expected_replacements) {
+        throw new Error(
+          `find_replace expected ${args.expected_replacements} replacement(s) but found ${occurrences}`,
+        );
+      }
+      return body.split(args.find_text).join(args.content);
+    }
+    case 'replace_section': {
+      if (!args.section) {
+        throw new Error('replace_section operation requires `section` (the markdown header)');
+      }
+      return replaceMarkdownSection(body, args.section, args.content);
+    }
+  }
+}
+
+function replaceMarkdownSection(body: string, sectionHeader: string, replacement: string): string {
+  const header = sectionHeader.trim();
+  // Determine header level (number of leading #)
+  const headerMatch = header.match(/^(#+)\s/);
+  if (!headerMatch) {
+    throw new Error(`section header "${header}" must start with one or more # followed by a space`);
+  }
+  const headerLevel = headerMatch[1].length;
+  const lines = body.split('\n');
+  const startIdx = lines.findIndex((l) => l.trim() === header);
+  if (startIdx === -1) {
+    throw new Error(`section header "${header}" not found in document`);
+  }
+  // End: next header of same or higher level, or EOF.
+  let endIdx = lines.length;
+  for (let i = startIdx + 1; i < lines.length; i++) {
+    const m = lines[i].match(/^(#+)\s/);
+    if (m && m[1].length <= headerLevel) {
+      endIdx = i;
+      break;
+    }
+  }
+  const before = lines.slice(0, startIdx).join('\n');
+  const after = lines.slice(endIdx).join('\n');
+  const newSection = `${header}\n\n${replacement.trim()}\n`;
+  return [before, newSection, after].filter((s) => s.length > 0).join('\n');
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -1113,6 +1500,51 @@ export function registerMemoryEntries(
       'depth/root to drill in. Includes title + summary + tags + outbound links per page.',
     parameters: getWikiIndexSchema,
     handler: async (args) => asJson(await handleGetWikiIndex(await buildCtx(), args as GetWikiIndexArgs)),
+    source: 'builtin',
+    sourceFile,
+  });
+
+  defineTool({
+    name: 'vote_memory',
+    description:
+      'Upvote or downvote a memory. Appends a vote event to the memory\'s sidecar log, ' +
+      'commits it, and returns the updated vote tally. Per-actor latest vote wins.',
+    parameters: voteSchema,
+    handler: async (args) => asJson(await handleVoteMemory(await buildCtx(), args as VoteArgs)),
+    source: 'builtin',
+    sourceFile,
+  });
+
+  defineTool({
+    name: 'vote_lesson',
+    description:
+      'Upvote or downvote a lesson. Appends a vote event, commits, and returns the new ' +
+      'vote tally + decay-adjusted confidence. Per-actor latest vote wins.',
+    parameters: voteSchema,
+    handler: async (args) => asJson(await handleVoteLesson(await buildCtx(), args as VoteArgs)),
+    source: 'builtin',
+    sourceFile,
+  });
+
+  defineTool({
+    name: 'vote_wiki',
+    description:
+      'Upvote or downvote a wiki page. Appends a vote event and commits. ' +
+      'Per-actor latest vote wins.',
+    parameters: voteSchema,
+    handler: async (args) => asJson(await handleVoteWiki(await buildCtx(), args as VoteArgs)),
+    source: 'builtin',
+    sourceFile,
+  });
+
+  defineTool({
+    name: 'update_wiki',
+    description:
+      'Edit an existing wiki page. Operations: replace_section, append, prepend, ' +
+      'find_replace, full_replace. Appends an edit event to the sidecar log, ' +
+      'commits, and schedules a qmd reindex.',
+    parameters: updateWikiSchema,
+    handler: async (args) => asJson(await handleUpdateWiki(await buildCtx(), args as UpdateWikiArgs)),
     source: 'builtin',
     sourceFile,
   });
