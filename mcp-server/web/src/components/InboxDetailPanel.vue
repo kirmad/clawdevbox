@@ -18,11 +18,11 @@
  *   ⤢  Toggle fullscreen for this pane.
  *   ←  Back (mobile only).
  */
-import { computed, ref } from 'vue';
+import { computed, ref, watch } from 'vue';
 import { renderInboxBody } from '../markdown';
 import { useUiStore } from '../stores/ui';
 import { useFullscreen } from '../composables/useFullscreen';
-import type { InboxAttachment, InboxItem } from '../api';
+import type { InboxAttachment, InboxItem, InboxQuestion, InboxReply } from '../api';
 
 const props = defineProps<{
   itemId: string;
@@ -153,6 +153,101 @@ function openAttachment(att: InboxAttachment): void {
     kind: fromTab ? 'inbox-tab' : 'inbox-list',
     inboxId: props.itemId,
   });
+}
+
+// ---------------------------------------------------------------------------
+// Question + reply chain
+// ---------------------------------------------------------------------------
+
+const question = computed<InboxQuestion | undefined>(() => item.value?.question);
+const replies = computed<InboxReply[]>(() => item.value?.replies ?? []);
+
+const questionMode = computed<'single' | 'multi' | 'text'>(() => {
+  const q = question.value;
+  if (!q) return 'single';
+  if (q.mode) return q.mode;
+  return q.options && q.options.length > 0 ? 'single' : 'text';
+});
+const allowFreeform = computed(() =>
+  !!question.value && (question.value.allow_freeform === true || questionMode.value === 'text'),
+);
+const questionClosed = computed(() => question.value?.closed === true);
+
+// Selection state — reset whenever the active item changes.
+const selectedOptionIds = ref<string[]>([]);
+const freeformText = ref('');
+const submitting = ref(false);
+const submitError = ref<string | null>(null);
+
+watch(
+  () => props.itemId,
+  () => {
+    selectedOptionIds.value = [];
+    freeformText.value = '';
+    submitError.value = null;
+  },
+);
+
+function toggleOption(optId: string): void {
+  if (questionClosed.value) return;
+  if (questionMode.value === 'single') {
+    selectedOptionIds.value = [optId];
+  } else if (questionMode.value === 'multi') {
+    const set = new Set(selectedOptionIds.value);
+    if (set.has(optId)) set.delete(optId);
+    else set.add(optId);
+    selectedOptionIds.value = [...set];
+  }
+}
+
+const canSubmit = computed(() => {
+  if (!question.value || questionClosed.value || submitting.value) return false;
+  const mode = questionMode.value;
+  const hasText = freeformText.value.trim().length > 0;
+  const hasSelection = selectedOptionIds.value.length > 0;
+  if (mode === 'text') return hasText;
+  if (mode === 'single') return hasSelection || (allowFreeform.value && hasText);
+  if (mode === 'multi') return hasSelection || (allowFreeform.value && hasText);
+  return false;
+});
+
+async function onSubmitReply(): Promise<void> {
+  if (!canSubmit.value || !item.value) return;
+  submitting.value = true;
+  submitError.value = null;
+  try {
+    await store.submitInboxReply(item.value.id, {
+      option_ids: selectedOptionIds.value.length > 0 ? selectedOptionIds.value : undefined,
+      text: freeformText.value.trim() || undefined,
+    });
+    // Reset local form on success — chain bubble renders from item.replies.
+    selectedOptionIds.value = [];
+    freeformText.value = '';
+  } catch (err) {
+    submitError.value = err instanceof Error ? err.message : String(err);
+  } finally {
+    submitting.value = false;
+  }
+}
+
+function isOptionSelected(optId: string): boolean {
+  return selectedOptionIds.value.includes(optId);
+}
+
+function formatReplyTime(ts: number): string {
+  return new Date(ts).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+}
+
+function dispatchBadge(r: InboxReply): { label: string; severity: 'success' | 'warn' | 'info' | 'secondary' } | null {
+  const d = r.dispatch;
+  if (!d) return null;
+  if (d.mode === 'failed') return { label: `dispatch failed: ${d.code ?? d.error ?? 'error'}`, severity: 'warn' };
+  if (d.mode === 'noop') return { label: 'no dispatch', severity: 'secondary' };
+  return { label: `→ ${d.mode}`, severity: 'success' };
+}
+
+function openReplyAttachment(att: InboxAttachment): void {
+  openAttachment(att);
 }
 
 function popOut(): void {
@@ -303,7 +398,113 @@ function formatSnoozeUntil(ts?: number): string {
         </div>
         <div v-else class="markdown-body" v-html="bodyHtml" />
       </div>
-      <div v-else class="muted no-body">No body. {{ item.preview ? '' : 'Inbox item is metadata-only.' }}</div>
+      <div v-else-if="!question" class="muted no-body">No body. {{ item.preview ? '' : 'Inbox item is metadata-only.' }}</div>
+
+      <!-- Question card + reply chain -->
+      <div v-if="question" class="question-section">
+        <div class="question-prompt">{{ question.prompt }}</div>
+
+        <!-- Existing replies (chat-style) -->
+        <div v-if="replies.length > 0" class="reply-chain">
+          <div
+            v-for="r in replies"
+            :key="r.id"
+            class="reply-bubble"
+            :class="{ 'reply-user': r.author === 'user', 'reply-agent': r.author === 'agent' }"
+          >
+            <div class="reply-head">
+              <span class="reply-author">{{ r.author === 'user' ? 'You' : 'Agent' }}</span>
+              <span class="reply-time">{{ formatReplyTime(r.created_at) }}</span>
+              <Tag
+                v-if="dispatchBadge(r)"
+                :severity="dispatchBadge(r)!.severity"
+                :value="dispatchBadge(r)!.label"
+                class="reply-badge"
+              />
+            </div>
+            <div class="reply-text">{{ r.text }}</div>
+            <div v-if="(r.attachments?.length ?? 0) > 0" class="reply-attachments">
+              <Button
+                v-for="att in (r.attachments ?? [])"
+                :key="att.artifact_id"
+                class="reply-att-btn"
+                size="small"
+                severity="secondary"
+                :outlined="true"
+                :disabled="!att.view_url"
+                :title="att.view_url ? `Open ${att.artifact_id}` : `Artifact ${att.artifact_id} not found`"
+                @click="openReplyAttachment(att)"
+              >
+                <i class="pi pi-paperclip" />
+                <span class="att-title">{{ att.title || att.artifact_id }}</span>
+              </Button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Answer form (hidden when closed) -->
+        <div v-if="!questionClosed" class="question-form">
+          <div
+            v-if="(question.options?.length ?? 0) > 0"
+            class="question-options"
+            :class="{ 'options-single': questionMode === 'single', 'options-multi': questionMode === 'multi' }"
+            role="group"
+            :aria-label="questionMode === 'single' ? 'Pick one option' : 'Pick one or more options'"
+          >
+            <Button
+              v-for="opt in (question.options ?? [])"
+              :key="opt.id"
+              class="question-opt-btn"
+              size="small"
+              :severity="isOptionSelected(opt.id) ? 'info' : 'secondary'"
+              :outlined="!isOptionSelected(opt.id)"
+              :aria-pressed="isOptionSelected(opt.id)"
+              @click="toggleOption(opt.id)"
+            >
+              <i v-if="isOptionSelected(opt.id)" class="pi pi-check" />
+              <span>{{ opt.label }}</span>
+            </Button>
+          </div>
+
+          <Textarea
+            v-if="allowFreeform"
+            v-model="freeformText"
+            class="question-text"
+            :placeholder="question.placeholder ?? 'Add a message…'"
+            :rows="2"
+            autoResize
+            :disabled="submitting"
+            @keydown.enter.exact.prevent="onSubmitReply"
+          />
+
+          <div v-if="submitError" class="question-error">
+            <i class="pi pi-exclamation-triangle" /> {{ submitError }}
+          </div>
+
+          <div class="question-actions">
+            <span v-if="questionMode === 'single'" class="muted small">
+              Pick one option{{ allowFreeform ? ' or type a reply' : '' }}, then Send.
+            </span>
+            <span v-else-if="questionMode === 'multi'" class="muted small">
+              Pick one or more options{{ allowFreeform ? ' (or type a reply)' : '' }}, then Send.
+            </span>
+            <span v-else class="muted small">Type your reply, then Send.</span>
+            <Button
+              icon="pi pi-send"
+              label="Send"
+              size="small"
+              severity="info"
+              :loading="submitting"
+              :disabled="!canSubmit"
+              @click="onSubmitReply"
+            />
+          </div>
+        </div>
+
+        <div v-else class="question-closed muted small">
+          <i class="pi pi-check-circle" /> Question closed.
+        </div>
+      </div>
 
       <div v-if="attachments.length > 0" class="detail-section">
         <div class="detail-section-head">
@@ -489,4 +690,116 @@ function formatSnoozeUntil(ts?: number): string {
   background: #0f1115; padding: 10px 12px; border-radius: 4px;
   overflow-x: auto; white-space: pre-wrap;
 }
+
+/* ─── Question + reply chain ──────────────────────────────────────────── */
+.question-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--p-content-border-color, #2a2e38);
+  border-radius: 6px;
+  background: rgba(74, 138, 232, 0.04);
+}
+.question-prompt {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--p-text-color);
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.reply-chain {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 4px;
+}
+.reply-bubble {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  font-size: 13px;
+  line-height: 1.45;
+}
+.reply-bubble.reply-user {
+  background: rgba(74, 138, 232, 0.10);
+  border: 1px solid rgba(74, 138, 232, 0.30);
+  align-self: stretch;
+}
+.reply-bubble.reply-agent {
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--p-content-border-color, #2a2e38);
+  align-self: stretch;
+}
+.reply-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--p-text-color-secondary);
+}
+.reply-author { font-weight: 600; color: var(--p-text-color); }
+.reply-time { opacity: 0.7; }
+.reply-badge { font-size: 10px; margin-left: auto; }
+.reply-text {
+  color: var(--p-text-color);
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
+.reply-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 4px;
+}
+.reply-att-btn { font-size: 11px; }
+
+.question-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 4px;
+}
+.question-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.question-opt-btn { font-size: 12px; }
+.question-opt-btn i { margin-right: 4px; font-size: 10px; }
+
+.question-text {
+  width: 100%;
+  font-family: inherit;
+  font-size: 13px;
+}
+
+.question-error {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: #f59e9e;
+  font-size: 12px;
+}
+.question-error i { font-size: 12px; }
+
+.question-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.question-actions .small { font-size: 11px; }
+
+.question-closed {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 0;
+}
+.question-closed i { color: #4ade80; }
 </style>

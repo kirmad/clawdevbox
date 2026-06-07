@@ -88,6 +88,8 @@ The full `InboxItem` row stored in `inbox.json`:
 | `recipe_instance` | `{ id, workspace_id? } \| null` | optional / nullable | Link to a recipe instance (clicking jumps to the Recipes tab). Pass `null` to clear. |
 | `trigger_id` | string `\| null` | optional / nullable | Link to a registered trigger (e.g. `ado.new-pr-watcher#auth-svc`). Pass `null` to clear. |
 | `labels` | `string[]` | optional | Max 10 labels, each ≤40 chars. De-duplicated case-insensitively (first-seen casing wins). |
+| `question` | `InboxQuestion \| null` | optional / nullable | Clickable question payload (prompt + options + dispatch routing). See [Questions & reply chains](#questions--reply-chains). Pass `null` to clear. |
+| `replies` | `InboxReply[]` | optional | Append-only reply chain. Empty `[]` clears. Most agents should use `inbox.reply` to append a single message instead of rewriting this array. |
 | `agent_message` | string | optional | **Legacy** "agent banner" — kept for backwards compat. Prefer `preview`. |
 | `agent_tone` | `'info' \| 'warn' \| 'err' \| 'ok'` | optional | **Legacy** tone hint for `agent_message`. |
 | `state` | `'new' \| 'open' \| 'snoozed' \| 'archived' \| 'done'` | system | Lifecycle state. New rows always start at `'new'`. |
@@ -300,6 +302,156 @@ inbox.archive({
 **What it does.** Convenience wrapper for `set_state` with `state: 'archived'`.
 
 **How it does it.** Calls `InboxStore.archive(id)`, which is literally `this.setState(id, 'archived')`. Same persistence, same SSE event, same idempotency. The tool body references `threads` (the global thread store) to flag a future cascade — when the SQLite kernel lands, archiving an item should cancel any threads attached to it. For now, threads survive their parent item's archival and must be cleaned up via `thread.cancel`.
+
+---
+
+### `inbox.reply`
+
+```text
+inbox.reply({
+  id: string,                                  // existing item id
+  reply: {
+    author: 'user' | 'agent',                  // typically 'agent' for follow-ups
+    text: string,                              // ≤16 KB
+    option_ids?: string[],
+    freeform?: string,
+    attachments?: InboxItemAttachment[],       // same shape as item attachments
+    created_at?: number,
+    dispatch?: { mode, instance_id?, session_id?, code?, error? },
+    id?: string,                               // auto-minted as `rep_<random>` when omitted
+  },
+  reopen?: boolean,                            // clear question.closed (agent follow-up)
+  new_state?: 'new'|'open'|'snoozed'|'archived'|'done',
+})
+  → NOT_FOUND if id absent
+  → { content: [{type:'text', text:'Appended reply <rid> to <id>.'}],
+      structuredContent: { item, reply } }
+```
+
+**What it does.** Appends a reply to an existing item's `replies[]` chain. Designed for **agent-authored follow-ups** in multi-turn conversations (e.g. agent acknowledges the user's choice, then asks a refining question via `reopen: true` + a new `question` on the next `inbox.upsert`).
+
+**For user answers, the SPA POSTs `/api/inbox/<id>/reply` instead** — that path validates the selection against `question.options`, compiles a prompt via `question.dispatch.prompt_template`, and dispatches via `spawnDispatchOrResume`. `inbox.reply` does NOT dispatch.
+
+---
+
+## Questions & reply chains
+
+An inbox item can carry a **question** payload that renders as a clickable form (radio/checkbox buttons + optional freeform input) in the SPA detail pane. When the user picks an option and presses Send, the server compiles a prompt and dispatches it back to the agent via `spawnDispatchOrResume` — the same path `/spawn` uses, so the answer arrives at the live pty (dispatch) or wakes an archived session (resume) or spawns a fresh one as needed.
+
+The user's answer is persisted on the item as a `replies[]` entry, so the selection is visible across page reloads. Agents can post follow-up replies via `inbox.reply` to keep the conversation going.
+
+### Question shape
+
+```ts
+question: {
+  prompt: string,                            // shown above the option buttons
+  mode?: 'single' | 'multi' | 'text',        // default: 'single' if options exist, else 'text'
+  options?: {
+    id: string,                              // /^[A-Za-z0-9._\-:]+$/, ≤80 chars
+    label: string,                           // display, ≤200 chars
+    value?: string,                          // sent in {answer}; defaults to label
+  }[],                                       // max 20
+  allow_freeform?: boolean,                  // include a text box alongside options
+  placeholder?: string,                      // hint for the text box
+  close_on_answer?: boolean,                 // default true — close after first user reply
+  closed?: boolean,                          // server sets true on user reply (when close_on_answer)
+  dispatch?: {
+    session_id?: string,                     // GUID/alias resolved via the standard chain
+    provider?: string,                       // for fresh-spawn fallback ('copilot' | 'claude' | ...)
+    workspace_id?: string,
+    workspace_path?: string,
+    prompt_template?: string,                // default: '{answer}'
+  },
+}
+```
+
+### Reply shape
+
+```ts
+replies: {
+  id: string,                                // 'rep_<random>', server-minted when via API
+  author: 'user' | 'agent',
+  text: string,                              // rendered for the chain bubble
+  option_ids?: string[],                     // selected options (user replies)
+  freeform?: string,                         // raw freeform text
+  attachments?: InboxItemAttachment[],       // per-reply artifact chips
+  created_at: number,
+  dispatch?: {                               // populated for user replies that dispatched
+    mode: 'spawn' | 'dispatch' | 'resume' | 'noop' | 'failed',
+    instance_id?: string,
+    session_id?: string,
+    code?: string,
+    error?: string,
+  },
+}[]
+```
+
+### `POST /api/inbox/<id>/reply`
+
+User-facing endpoint the SPA calls when the user presses Send. Validates `option_ids` against `question.options`, compiles the answer text + dispatched prompt, appends a `'user'` reply, then dispatches via `spawnDispatchOrResume`.
+
+```text
+POST /api/inbox/<id>/reply
+Body: {
+  option_ids?: string[],
+  text?: string,
+  dispatch?: boolean,                        // default true; set false to skip dispatch
+}
+
+200 → { item, reply, dispatch }
+400 → {
+  code: 'UNKNOWN_OPTION' | 'TEXT_REQUIRED'
+      | 'EXPECTED_ONE_OPTION' | 'EXPECTED_OPTIONS',
+  message: string,
+  valid_ids?: string[],                       // on UNKNOWN_OPTION
+}
+404 → { error: 'inbox item not found', id }
+409 → { code: 'NO_QUESTION' | 'QUESTION_CLOSED', error, id }
+```
+
+**Validation rules (`mcp-server/src/inbox-reply.ts:validateAnswer`):**
+
+| mode | rule |
+|---|---|
+| `text` | `text` required (non-empty after trim). |
+| `single` | Exactly one `option_id`, OR `allow_freeform === true` and freeform text supplied (no options). |
+| `multi` | One or more `option_ids`, OR `allow_freeform === true` and freeform text supplied. |
+
+Unknown option ids are always rejected with `UNKNOWN_OPTION` (regardless of mode). Option ids are deduplicated server-side, preserving the order the user sent them.
+
+**Prompt compilation (`compileAnswer`):**
+
+The dispatched prompt is the question's `prompt_template` with substitutions:
+
+| Token | Replaced with |
+|---|---|
+| `{answer}` | Joined option `value`s (falling back to `label`), or freeform when no options selected. |
+| `{option_ids}` | Selected ids joined by `,` (e.g. `"yes,maybe"`). |
+| `{freeform}` | Raw freeform text (empty when none). |
+
+Default template (when unset): `{answer}`. So a question with one option `{id: 'yes', label: 'Yes', value: 'YES_SIR'}` answered with `option_ids: ['yes']` dispatches the literal prompt `YES_SIR` to the agent.
+
+**Bubble text** (rendered in the chain) prefers `label` for readability and joins with an em-dash when both options + freeform are supplied (e.g. `"Yes — but only after lunch"`).
+
+**Dispatch outcome.** After spawnDispatchOrResume returns, the server patches the reply with `dispatch: { mode, instance_id?, session_id?, code?, error? }` so the UI can render `→ dispatch` / `→ spawn` / `dispatch failed: <code>` badges next to the user bubble. `mode: 'noop'` means dispatch was skipped (no `session_id` or `dispatch: false` in the request body).
+
+**State transitions.** A user reply on a `'new'` item bumps it to `'open'`. Already-open / done / archived items keep their state. When `close_on_answer` is true (the default), the question's `closed` flag flips to `true` after the first user reply and the SPA hides the form.
+
+### Multi-turn conversations
+
+```
+Agent: inbox.upsert(id, kind, source, { question: { prompt: 'Ship?', options: [yes/no], dispatch: { session_id: my_sess } } })
+User:  POST /api/inbox/<id>/reply  { option_ids: ['yes'] }
+       → server appends user reply, dispatches "yes" to my_sess via spawnDispatchOrResume
+       → server marks question.closed = true (close_on_answer default)
+Agent: receives the prompt, does the work, then calls
+       inbox.reply(id, { reply: { author: 'agent', text: 'Shipped! See the diff →', attachments: [{...}] } })
+       inbox.upsert(id, kind, source, {
+         question: { prompt: 'Looks good?', options: [...], dispatch: { session_id: my_sess } },
+       })   // posts a NEW question, reopening the form
+```
+
+For an agent follow-up that doesn't need a new question, `inbox.reply(id, { reply: { author: 'agent', text: '...' }, reopen: true })` clears `question.closed` so the user can answer the *same* question again.
 
 ---
 

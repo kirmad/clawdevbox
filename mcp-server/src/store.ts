@@ -41,8 +41,13 @@ import {
 function rand36(): string {
   return Math.random().toString(36).slice(2, 10);
 }
-export function mintId(prefix: 'inb' | 'thr' | 'msg' | 'apr' | 'run' | 'oneoff'): string {
+export function mintId(prefix: 'inb' | 'thr' | 'msg' | 'apr' | 'run' | 'oneoff' | 'rep'): string {
   return `${prefix}_${rand36()}`;
+}
+
+/** Mint an InboxReply id (`rep_<random>`). */
+export function mintInboxReplyId(): string {
+  return mintId('rep');
 }
 
 // ============================================================================
@@ -71,6 +76,119 @@ export interface InboxItemRef {
   workspace_id?: string;
 }
 
+// ----------------------------------------------------------------------------
+// Question + reply chain
+// ----------------------------------------------------------------------------
+//
+// An inbox item can carry a `question` payload describing a user-facing
+// question with clickable options. When the user answers via
+// `POST /api/inbox/<id>/reply`, the server compiles a prompt and dispatches
+// it back to the agent's CLI session via `spawnDispatchOrResume`.
+//
+// The answer is also persisted on the item as a `replies[]` entry so the
+// chain (and the user's selection) is visible across reloads. Agents can
+// post follow-up `agent`-authored replies via `inbox.reply` to keep the
+// conversation going (multi-turn back-and-forth).
+
+export type InboxQuestionMode = 'single' | 'multi' | 'text';
+
+export interface InboxQuestionOption {
+  /** Stable id (e.g. "yes" / "opt-1") — what the API expects in `option_ids`. */
+  id: string;
+  /** Display label shown on the button. */
+  label: string;
+  /**
+   * Text sent to the agent when this option is selected. Defaults to `label`.
+   * The full set of selected option `value`s is joined into the dispatched
+   * prompt (or substituted into `prompt_template`).
+   */
+  value?: string;
+}
+
+export interface InboxQuestionDispatch {
+  /**
+   * Session id (canonical GUID or alias) to dispatch the answer to. Resolved
+   * server-side via the standard session-alias chain.
+   *
+   * If the live pty exists → dispatch.
+   * If archived + resumable → resume.
+   * Otherwise → spawn (provider + workspace must be set, or defaults available).
+   */
+  session_id?: string;
+  /** Provider hint for fresh-spawn fallback (e.g. "copilot", "claude"). */
+  provider?: string;
+  workspace_id?: string;
+  workspace_path?: string;
+  /**
+   * Prompt template — substitutions:
+   *   {answer}      → compiled answer text (option labels joined OR freeform)
+   *   {option_ids}  → joined list of selected option ids
+   *   {freeform}    → raw freeform text (empty when none)
+   * When unset, the dispatched prompt is just `{answer}`.
+   */
+  prompt_template?: string;
+}
+
+export interface InboxQuestion {
+  /** Question prompt shown above the option buttons. */
+  prompt: string;
+  /**
+   * 'single' (radio), 'multi' (checkbox), or 'text' (freeform only).
+   * Default: 'single' when options are present, else 'text'.
+   */
+  mode?: InboxQuestionMode;
+  options?: InboxQuestionOption[];
+  /** Include a freeform text box alongside the options. */
+  allow_freeform?: boolean;
+  /** Placeholder hint for the freeform input. */
+  placeholder?: string;
+  /**
+   * If true (default), the question is closed (no further replies accepted
+   * from the user) after the first user reply lands.
+   */
+  close_on_answer?: boolean;
+  /** Set automatically when the question is closed. */
+  closed?: boolean;
+  /** Routing for the answer. When unset, the reply is stored but no dispatch fires. */
+  dispatch?: InboxQuestionDispatch;
+}
+
+export type InboxReplyAuthor = 'user' | 'agent';
+
+export interface InboxReplyDispatch {
+  mode: 'spawn' | 'dispatch' | 'resume' | 'noop' | 'failed';
+  /** Resulting recipe-instance id (for spawn/dispatch/resume). */
+  instance_id?: string;
+  /** Resolved session GUID. */
+  session_id?: string;
+  /** Dispatch-error code on failure. */
+  code?: string;
+  /** Human-readable failure message. */
+  error?: string;
+}
+
+export interface InboxReply {
+  /** `rep_<random>` minted by the server. */
+  id: string;
+  author: InboxReplyAuthor;
+  /** Rendered text (option labels joined, or freeform, or both). */
+  text: string;
+  /** Selected option ids (when author === 'user' and options were chosen). */
+  option_ids?: string[];
+  /** Raw freeform text contributed by the user. */
+  freeform?: string;
+  /**
+   * Artifact attachments on this reply (e.g. an agent follow-up that links
+   * a new diff or report). Same shape + enrichment as item-level
+   * `attachments` — the SPA renders them as clickable chips beneath the
+   * reply bubble.
+   */
+  attachments?: InboxItemAttachment[];
+  created_at: number;
+  /** Populated when this reply triggered a dispatch (author === 'user'). */
+  dispatch?: InboxReplyDispatch;
+}
+
 export interface InboxItem {
   id: string;
   kind: string;                  // 'pr_review' | 'workitem' | 'incident' | 'epic' | string
@@ -95,6 +213,17 @@ export interface InboxItem {
   trigger_id?: string | null;
   /** Free-form labels/tags shown as chips on the card. Max 10, each max 40 chars. */
   labels?: string[];
+  /**
+   * Optional clickable-question payload. When set, the SPA renders a question
+   * UI in the detail pane and `POST /api/inbox/<id>/reply` dispatches the
+   * compiled answer to `question.dispatch.session_id`.
+   */
+  question?: InboxQuestion;
+  /**
+   * Append-only reply chain (user answers + optional agent follow-ups). The
+   * SPA renders these as chat-style bubbles below the question.
+   */
+  replies?: InboxReply[];
   /** Legacy "agent banner" — kept for backwards compat. Prefer `preview`. */
   agent_message?: string;
   agent_tone?: AgentTone;
@@ -120,6 +249,8 @@ export interface InboxPatch {
   recipe_instance?: InboxItemRef | null;
   trigger_id?: string | null;
   labels?: string[];
+  question?: InboxQuestion;
+  replies?: InboxReply[];
   agent_message?: string;
   agent_tone?: AgentTone;
   [k: string]: unknown;
@@ -250,6 +381,73 @@ export class InboxStore {
   archive(id: string): InboxItem | undefined {
     // setState already emits + persists.
     return this.setState(id, 'archived');
+  }
+
+  /**
+   * Append a reply (user answer or agent follow-up) to an item's `replies[]`
+   * chain. Returns the updated item and the newly-appended reply.
+   *
+   * Caller passes an already-built `InboxReply` (this layer doesn't validate
+   * against `question.options` — the HTTP / MCP boundary does that).
+   *
+   * If `closeQuestion` is true and the item has a `question`, the question
+   * is marked `closed: true`. Optionally bumps the item state.
+   */
+  appendReply(
+    id: string,
+    reply: InboxReply,
+    opts: { closeQuestion?: boolean; newState?: InboxState } = {},
+  ): { item: InboxItem; reply: InboxReply } | undefined {
+    const existing = this.globalDir
+      ? readInboxItemById(this.globalDir, id) ?? undefined
+      : this.memory.get(id);
+    if (!existing) return undefined;
+    const replies = Array.isArray(existing.replies) ? [...existing.replies, reply] : [reply];
+    const updated: InboxItem = {
+      ...existing,
+      replies,
+      updated_at: Date.now(),
+    };
+    if (opts.closeQuestion && existing.question) {
+      updated.question = { ...existing.question, closed: true };
+    }
+    if (opts.newState) {
+      updated.state = opts.newState;
+    }
+    if (this.globalDir) {
+      upsertInboxItem(this.globalDir, updated);
+    } else {
+      this.memory.set(id, updated);
+    }
+    return { item: updated, reply };
+  }
+
+  /** Patch an existing reply in place (e.g. fill in dispatch outcome). */
+  updateReply(
+    id: string,
+    replyId: string,
+    patch: Partial<InboxReply>,
+  ): { item: InboxItem; reply: InboxReply } | undefined {
+    const existing = this.globalDir
+      ? readInboxItemById(this.globalDir, id) ?? undefined
+      : this.memory.get(id);
+    if (!existing || !Array.isArray(existing.replies)) return undefined;
+    const idx = existing.replies.findIndex((r) => r.id === replyId);
+    if (idx < 0) return undefined;
+    const merged: InboxReply = { ...existing.replies[idx]!, ...patch, id: replyId };
+    const replies = [...existing.replies];
+    replies[idx] = merged;
+    const updated: InboxItem = {
+      ...existing,
+      replies,
+      updated_at: Date.now(),
+    };
+    if (this.globalDir) {
+      upsertInboxItem(this.globalDir, updated);
+    } else {
+      this.memory.set(id, updated);
+    }
+    return { item: updated, reply: merged };
   }
 }
 

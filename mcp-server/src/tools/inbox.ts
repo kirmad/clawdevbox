@@ -28,7 +28,14 @@ import {
 } from '../inbox-persistence.ts';
 import { sendNotification } from '../notifications.ts';
 import { notFound, structuredError } from '../scope.ts';
-import { inbox, threads, type InboxItem, type InboxState } from '../store.ts';
+import {
+  inbox,
+  mintInboxReplyId,
+  threads,
+  type InboxItem,
+  type InboxReply,
+  type InboxState,
+} from '../store.ts';
 import type { Workspace } from '../workspace.ts';
 import { defineTool } from './registry.ts';
 
@@ -65,6 +72,85 @@ const labelSchema = z
   .trim()
   .min(1, 'label cannot be empty')
   .max(LABEL_LEN_MAX, `label must be ≤${LABEL_LEN_MAX} chars`);
+
+// ----------------------------------------------------------------------------
+// Question + reply schemas
+// ----------------------------------------------------------------------------
+
+const QUESTION_OPTIONS_MAX = 20;
+const REPLIES_MAX = 100;
+const REPLY_TEXT_MAX = 16_000;
+const PROMPT_MAX = 4_000;
+
+const optionIdSchema = z
+  .string()
+  .trim()
+  .min(1, 'option.id cannot be empty')
+  .max(80, 'option.id must be ≤80 chars')
+  .regex(/^[A-Za-z0-9._\-:]+$/, 'option.id may contain letters, digits, ._-:');
+
+const questionOptionSchema = z.object({
+  id: optionIdSchema,
+  label: z.string().trim().min(1).max(200),
+  value: z.string().max(2_000).optional(),
+});
+
+const questionDispatchSchema = z.object({
+  session_id: z.string().min(1).max(200).optional(),
+  provider: z.string().min(1).max(80).optional(),
+  workspace_id: z.string().min(1).max(200).optional(),
+  workspace_path: z.string().min(1).max(2_000).optional(),
+  prompt_template: z.string().max(8_000).optional(),
+});
+
+const questionSchema = z.object({
+  prompt: z.string().min(1).max(PROMPT_MAX),
+  mode: z.enum(['single', 'multi', 'text']).optional(),
+  options: z.array(questionOptionSchema).max(QUESTION_OPTIONS_MAX).optional(),
+  allow_freeform: z.boolean().optional(),
+  placeholder: z.string().max(200).optional(),
+  close_on_answer: z.boolean().optional(),
+  closed: z.boolean().optional(),
+  dispatch: questionDispatchSchema.optional(),
+});
+
+const replyAttachmentSchema = attachmentSchema; // same shape as item attachments
+
+const replyDispatchSchema = z.object({
+  mode: z.enum(['spawn', 'dispatch', 'resume', 'noop', 'failed']),
+  instance_id: z.string().optional(),
+  session_id: z.string().optional(),
+  code: z.string().optional(),
+  error: z.string().optional(),
+});
+
+const replySchema = z.object({
+  id: z.string().min(1).max(80).optional(),
+  author: z.enum(['user', 'agent']),
+  text: z.string().min(1).max(REPLY_TEXT_MAX),
+  option_ids: z.array(optionIdSchema).max(QUESTION_OPTIONS_MAX).optional(),
+  freeform: z.string().max(REPLY_TEXT_MAX).optional(),
+  attachments: z.array(replyAttachmentSchema).max(ATTACHMENTS_MAX).optional(),
+  created_at: z.number().int().positive().optional(),
+  dispatch: replyDispatchSchema.optional(),
+});
+
+export function mintReplyId(): string {
+  return mintInboxReplyId();
+}
+
+function normalizeReply(input: z.infer<typeof replySchema>): InboxReply {
+  return {
+    id: input.id ?? mintReplyId(),
+    author: input.author,
+    text: input.text,
+    option_ids: input.option_ids,
+    freeform: input.freeform,
+    attachments: input.attachments,
+    created_at: input.created_at ?? Date.now(),
+    dispatch: input.dispatch,
+  };
+}
 
 function clipForPush(s: string): string {
   const t = s.trim();
@@ -199,6 +285,19 @@ export function registerInboxEntries(ws: Workspace): void {
         .describe(
           `Free-form labels/tags shown as chips on the card. Max ${LABELS_MAX} per item, each ≤${LABEL_LEN_MAX} chars. Pass \`[]\` to clear. Duplicates are removed (case-insensitive).`,
         ),
+      question: questionSchema
+        .nullable()
+        .optional()
+        .describe(
+          'Optional clickable question with options. Set `dispatch.session_id` to your CLI session id so the user\'s answer is dispatched back as a new prompt via spawnDispatchOrResume. Pass null to clear.',
+        ),
+      replies: z
+        .array(replySchema)
+        .max(REPLIES_MAX)
+        .optional()
+        .describe(
+          'Reply chain (typically agent-authored follow-ups). Empty `[]` clears the chain. Most agents should use `inbox.reply` to append a single message instead of rewriting this array.',
+        ),
       agent_message: z.string().optional(),
       agent_tone: agentToneField.optional(),
       notify: z
@@ -266,6 +365,22 @@ export function registerInboxEntries(ws: Workspace): void {
           out.push(trimmed);
         }
         patch.labels = out;
+      }
+      if (args.question !== undefined) {
+        // null → clear; object → set (defaulting close_on_answer to true).
+        if (args.question === null) {
+          patch.question = undefined;
+        } else {
+          const q = args.question;
+          patch.question = {
+            ...q,
+            close_on_answer: q.close_on_answer ?? true,
+            mode: q.mode ?? (q.options && q.options.length > 0 ? 'single' : 'text'),
+          };
+        }
+      }
+      if (args.replies !== undefined) {
+        patch.replies = args.replies.map(normalizeReply);
       }
       if (args.agent_message !== undefined) patch.agent_message = args.agent_message;
       if (args.agent_tone !== undefined) patch.agent_tone = args.agent_tone;
@@ -346,6 +461,60 @@ export function registerInboxEntries(ws: Workspace): void {
           push,
           push_error_code: pushErrorCode,
         },
+      };
+    },
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
+
+  // -- inbox.reply ----------------------------------------------------------
+  defineTool({
+    name: 'inbox.reply',
+    description:
+      'Append a reply to an existing inbox item — typically an agent follow-up to keep a multi-turn conversation going. For user answers, the SPA POSTs to `/api/inbox/<id>/reply` instead (that path validates against the question, compiles a prompt, and dispatches to the agent). Pass `author: "agent"` for agent-authored messages; `author: "user"` is reserved for the HTTP API but accepted for symmetry. Optionally pass `reopen: true` to flip `question.closed` back to false (allowing further user replies).',
+    parameters: z.object({
+      id: z.string().min(1),
+      reply: replySchema,
+      reopen: z
+        .boolean()
+        .optional()
+        .describe(
+          'If true and the item has a question, clear `question.closed` so the user can answer again (e.g. agent asks a follow-up).',
+        ),
+      new_state: z
+        .enum(['new', 'open', 'snoozed', 'archived', 'done'])
+        .optional()
+        .describe('Optionally bump the item state (e.g. "open" after an agent follow-up).'),
+    }),
+    handler: async (args) => {
+      const existing = inbox.read(args.id);
+      if (!existing) return notFound('inbox_item', args.id);
+
+      const reply = normalizeReply(args.reply);
+      const closeQuestion = false; // explicit close happens via question.closed=true on upsert or via the HTTP /reply route
+      const result = inbox.appendReply(args.id, reply, {
+        closeQuestion,
+        newState: args.new_state,
+      });
+      if (!result) return notFound('inbox_item', args.id);
+
+      // Optional reopen: clear question.closed so the user can answer again.
+      if (args.reopen && result.item.question) {
+        const reopened = inbox.upsert(
+          result.item.id,
+          result.item.kind,
+          result.item.source,
+          { question: { ...result.item.question, closed: false } },
+        );
+        return {
+          content: [{ type: 'text', text: `Appended reply ${reply.id} and reopened question on ${args.id}.` }],
+          structuredContent: { item: reopened.item, reply },
+        };
+      }
+
+      return {
+        content: [{ type: 'text', text: `Appended reply ${reply.id} to ${args.id}.` }],
+        structuredContent: { item: result.item, reply },
       };
     },
     source: 'builtin',

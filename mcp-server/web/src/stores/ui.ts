@@ -23,6 +23,7 @@ import {
   fetchTunnelStatus,
   postInboxArchive,
   postInboxDone,
+  postInboxReply,
   postInboxSnooze,
   postInboxState,
   postPushUnsubscribe,
@@ -30,6 +31,8 @@ import {
   type Bootstrap,
   type InboxAttachment,
   type InboxItem,
+  type InboxReplyRequest,
+  type InboxReplyResponse,
   type MainAgentStatus,
   type PendingApproval,
   type PushVapidInfo,
@@ -368,6 +371,29 @@ export const useUiStore = defineStore('ui', {
       // "Reopen" = back to 'open'. We don't auto-advance here — the
       // user explicitly wants to re-engage with this item.
       await this._runInboxAction(id, () => postInboxState(id, 'open'), { advance: false });
+    },
+
+    /**
+     * Submit a reply to an inbox question (clickable options + freeform).
+     * The server validates + dispatches to the agent via spawnDispatchOrResume
+     * and persists the reply on the item. Refreshes the list afterward so the
+     * chain is visible immediately (SSE will also fire a refresh).
+     */
+    async submitInboxReply(id: string, body: InboxReplyRequest): Promise<InboxReplyResponse> {
+      const result = await postInboxReply(id, body);
+      // Optimistically replace the in-memory item so the reply bubble renders
+      // before the SSE refresh round-trips.
+      const idx = this.inbox.findIndex((it) => it.id === id);
+      if (idx >= 0) {
+        this.inbox = [
+          ...this.inbox.slice(0, idx),
+          result.item,
+          ...this.inbox.slice(idx + 1),
+        ];
+      }
+      // Fire-and-forget refresh — keeps the list in sync with the server.
+      void this.refreshInbox();
+      return result;
     },
 
     // --- recipes ----------------------------------------------------------

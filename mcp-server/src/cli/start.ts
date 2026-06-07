@@ -73,7 +73,7 @@ import {
   writeServiceState,
   type ServiceState,
 } from '../service.ts';
-import { approvals, inbox } from '../store.ts';
+import { approvals, inbox, mintInboxReplyId, type InboxItem, type InboxReply, type InboxState } from '../store.ts';
 import { dispatchTerminalRequest, startTerminalServer } from '../terminal-server.ts';
 import {
   deriveTunnelName,
@@ -1024,6 +1024,19 @@ export async function runStart(flags: Flags): Promise<void> {
       }
     }
 
+    // POST /api/inbox/<id>/reply — user-side reply to a question.
+    // Validates the selection against `question.options`, compiles a
+    // prompt, dispatches to `question.dispatch.session_id` via
+    // spawnDispatchOrResume, and persists the reply on the item.
+    {
+      const m = url.pathname.match(/^\/api\/inbox\/([^/]+)\/reply\/?$/);
+      if (m && req.method === 'POST') {
+        const id = decodeURIComponent(m[1]);
+        await handleInboxReply(req, res, id, cronApiCtx);
+        return;
+      }
+    }
+
     // POST /api/recipes/<id>/resume — spawn a new agent CLI session with
     // `--resume <session_id>` and write a new recipe-instance row tied
     // back to the original via `resume_of`. Source instance must have
@@ -1698,6 +1711,179 @@ async function handleInboxAction(
   res.end(JSON.stringify({ item: enriched }));
 }
 
+interface InboxReplyRequest {
+  /** Selected option ids (validated against `question.options`). */
+  option_ids?: string[];
+  /** Optional freeform text contributed by the user. */
+  text?: string;
+  /** When false, skip the dispatch step (just persist the reply). Default: true. */
+  dispatch?: boolean;
+}
+
+interface InboxReplyResponse {
+  item: unknown;
+  reply: InboxReply;
+  dispatch: InboxReply['dispatch'];
+}
+
+/**
+ * POST /api/inbox/<id>/reply — user-side answer to a question.
+ *
+ * Steps:
+ *   1. Validate the item has a `question` and the question isn't closed.
+ *   2. Validate option_ids against `question.options` + `mode`.
+ *   3. Compile the answer text + dispatched prompt (prompt_template subst).
+ *   4. Append a user `InboxReply` to `replies[]` (close question if
+ *      `close_on_answer`).
+ *   5. If `question.dispatch.session_id` is set AND body.dispatch !== false,
+ *      route to spawnDispatchOrResume.
+ *   6. Update the reply with the dispatch outcome and respond.
+ */
+async function handleInboxReply(
+  req: IncomingMessage,
+  res: ServerResponse,
+  id: string,
+  ctx: CronApiContext | null,
+): Promise<void> {
+  const existing = inbox.read(id);
+  if (!existing) {
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'inbox item not found', id }));
+    return;
+  }
+  const question = existing.question;
+  if (!question || typeof question !== 'object') {
+    res.writeHead(409, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      error: 'inbox item has no question — cannot reply',
+      code: 'NO_QUESTION',
+      id,
+    }));
+    return;
+  }
+  if (question.closed === true) {
+    res.writeHead(409, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      error: 'question is closed — no further replies accepted',
+      code: 'QUESTION_CLOSED',
+      id,
+    }));
+    return;
+  }
+
+  const body = await readJsonBody<InboxReplyRequest>(req, res);
+  if (!body) return; // readJsonBody already responded
+
+  const { validateAnswer, compileAnswer } = await import('../inbox-reply.ts');
+  const validation = validateAnswer(question, { option_ids: body.option_ids, text: body.text });
+  if (!validation.ok) {
+    const status = validation.error.code === 'UNKNOWN_OPTION' ? 400 : 400;
+    res.writeHead(status, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(validation.error));
+    return;
+  }
+  const validated = validation.value;
+  const { answer_text: answerText, dispatch_prompt: dispatchPrompt } =
+    compileAnswer(question, validated);
+  const optionIds = validated.option_ids;
+  const freeform = validated.freeform;
+
+  // ---- Append the reply (closing the question if configured) ------------
+  const reply: InboxReply = {
+    id: mintInboxReplyId(),
+    author: 'user',
+    text: answerText,
+    option_ids: optionIds.length > 0 ? optionIds : undefined,
+    freeform: freeform || undefined,
+    created_at: Date.now(),
+  };
+  const closeOnAnswer = question.close_on_answer ?? true;
+  // After a user reply, bump state from 'new' → 'open' so the chain is
+  // visible in the "active" filter. Leave already-open / done / archived
+  // items alone.
+  const newState: InboxState | undefined = existing.state === 'new' ? 'open' : undefined;
+  const appendResult = inbox.appendReply(id, reply, {
+    closeQuestion: closeOnAnswer,
+    newState,
+  });
+  if (!appendResult) {
+    res.writeHead(500, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'failed to append reply' }));
+    return;
+  }
+
+  // ---- Dispatch to the agent ---------------------------------------------
+  let dispatchOutcome: InboxReply['dispatch'] | undefined;
+  const shouldDispatch =
+    body.dispatch !== false &&
+    !!question.dispatch?.session_id &&
+    !!dispatchPrompt;
+
+  if (shouldDispatch && ctx) {
+    try {
+      const { spawnDispatchOrResume } = await import('../session-helpers.ts');
+      const sessionCtx = sessionHelperCtxFromCron(ctx);
+      const result = await spawnDispatchOrResume(sessionCtx, {
+        prompt: dispatchPrompt,
+        session_id: question.dispatch!.session_id ?? null,
+        provider: question.dispatch!.provider ?? null,
+        workspace_id: question.dispatch!.workspace_id ?? null,
+        workspace_path: question.dispatch!.workspace_path ?? null,
+        default_workspace_path: null,
+      });
+      if (result.ok) {
+        dispatchOutcome = {
+          mode: result.mode,
+          instance_id: result.instance_id,
+          session_id: result.session_id,
+        };
+      } else {
+        dispatchOutcome = {
+          mode: 'failed',
+          code: result.code,
+          error: result.message,
+        };
+      }
+    } catch (err) {
+      dispatchOutcome = {
+        mode: 'failed',
+        code: 'EXCEPTION',
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+  } else if (!shouldDispatch) {
+    dispatchOutcome = { mode: 'noop' };
+  }
+
+  // ---- Persist dispatch outcome on the reply ----------------------------
+  let finalItem: InboxItem = appendResult.item;
+  if (dispatchOutcome) {
+    const patched = inbox.updateReply(id, reply.id, { dispatch: dispatchOutcome });
+    if (patched) finalItem = patched.item;
+  }
+
+  const [enriched] = enrichInboxItemsForList([finalItem]);
+  const response: InboxReplyResponse = {
+    item: enriched ?? finalItem,
+    reply: { ...reply, dispatch: dispatchOutcome },
+    dispatch: dispatchOutcome,
+  };
+  res.writeHead(200, { 'content-type': 'application/json' });
+  res.end(JSON.stringify(response));
+}
+
+/** Build a SessionHelperCtx from the CronApiContext that's hoisted at request time. */
+function sessionHelperCtxFromCron(ctx: CronApiContext): import('../session-helpers.ts').SessionHelperCtx {
+  const wsRef = ctx.ws ?? (ctx.dispatcher as unknown as { ws?: Workspace }).ws;
+  if (!wsRef) {
+    throw new Error('workspace not available in this server context');
+  }
+  if (!ctx.cfg) {
+    throw new Error('resolved config not available in this server context');
+  }
+  return { db: ctx.db, dispatcher: ctx.dispatcher, ws: wsRef, cfg: ctx.cfg };
+}
+
 /**
  * Resume an agent CLI session. The caller passes the recipe-instance id
  * of the original run; we look up its `session_id` + `workspace_path` +
@@ -1915,6 +2101,18 @@ function buildResolutionIndex(items: ReturnType<typeof inbox.list>): ResolutionI
         artifactIds.push(a.artifact_id);
       }
     }
+    // Reply attachments — agents can attach artifacts on follow-up replies.
+    const replies = Array.isArray(item.replies)
+      ? (item.replies as Array<{ attachments?: Array<{ artifact_id?: string }> }>)
+      : [];
+    for (const r of replies) {
+      const repAtts = Array.isArray(r.attachments) ? r.attachments : [];
+      for (const a of repAtts) {
+        if (typeof a.artifact_id === 'string' && a.artifact_id) {
+          artifactIds.push(a.artifact_id);
+        }
+      }
+    }
     const ri = item.recipe_instance as { id: string } | null | undefined;
     if (ri && typeof ri.id === 'string' && ri.id) {
       recipeInstanceIds.push(ri.id);
@@ -1980,13 +2178,12 @@ function enrichInboxItemsForList(
   const idx = buildResolutionIndex(items);
 
   return items.map((it) => {
-    const attachments = Array.isArray(it.attachments) ? (it.attachments as Array<{
+    const enrichAtt = (a: {
       artifact_id: string;
       workspace_id?: string;
       title?: string;
       type?: string;
-    }>) : [];
-    const enrichedAttachments: EnrichedAttachment[] = attachments.map((a) => {
+    }): EnrichedAttachment => {
       const hit = idx.artifactWorkspaceById.get(a.artifact_id) ?? null;
       const wsId = a.workspace_id ?? hit?.workspaceId ?? null;
       return {
@@ -1997,7 +2194,15 @@ function enrichInboxItemsForList(
         view_url: hit ? `/artifact/${encodeURIComponent(a.artifact_id)}` : null,
         resolved: !!hit,
       };
-    });
+    };
+
+    const attachments = Array.isArray(it.attachments) ? (it.attachments as Array<{
+      artifact_id: string;
+      workspace_id?: string;
+      title?: string;
+      type?: string;
+    }>) : [];
+    const enrichedAttachments: EnrichedAttachment[] = attachments.map(enrichAtt);
 
     let recipeInstance: EnrichedRecipeRef | null = null;
     const ri = it.recipe_instance as { id: string; workspace_id?: string } | null | undefined;
@@ -2010,10 +2215,27 @@ function enrichInboxItemsForList(
       };
     }
 
+    // Pass replies through; if any reply carries attachments, enrich those
+    // too so the SPA gets the same `view_url` / `resolved` hints as the
+    // item-level attachments.
+    const replies = Array.isArray(it.replies)
+      ? (it.replies as unknown as Array<Record<string, unknown> & { attachments?: Array<{
+          artifact_id: string;
+          workspace_id?: string;
+          title?: string;
+          type?: string;
+        }> }>)
+      : undefined;
+    const enrichedReplies = replies?.map((r) => {
+      const atts = Array.isArray(r.attachments) ? r.attachments.map(enrichAtt) : undefined;
+      return atts ? { ...r, attachments: atts } : r;
+    });
+
     return {
       ...it,
       attachments: enrichedAttachments,
       recipe_instance: recipeInstance,
+      ...(enrichedReplies ? { replies: enrichedReplies } : {}),
     };
   });
 }

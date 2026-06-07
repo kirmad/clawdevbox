@@ -58,6 +58,56 @@ export interface InboxRecipeRef {
   resolved?: boolean;
 }
 
+// -- Questions + replies -----------------------------------------------------
+
+export type InboxQuestionMode = 'single' | 'multi' | 'text';
+
+export interface InboxQuestionOption {
+  id: string;
+  label: string;
+  value?: string;
+}
+
+export interface InboxQuestionDispatch {
+  session_id?: string;
+  provider?: string;
+  workspace_id?: string;
+  workspace_path?: string;
+  prompt_template?: string;
+}
+
+export interface InboxQuestion {
+  prompt: string;
+  mode?: InboxQuestionMode;
+  options?: InboxQuestionOption[];
+  allow_freeform?: boolean;
+  placeholder?: string;
+  close_on_answer?: boolean;
+  closed?: boolean;
+  dispatch?: InboxQuestionDispatch;
+}
+
+export type InboxReplyAuthor = 'user' | 'agent';
+
+export interface InboxReplyDispatch {
+  mode: 'spawn' | 'dispatch' | 'resume' | 'noop' | 'failed';
+  instance_id?: string;
+  session_id?: string;
+  code?: string;
+  error?: string;
+}
+
+export interface InboxReply {
+  id: string;
+  author: InboxReplyAuthor;
+  text: string;
+  option_ids?: string[];
+  freeform?: string;
+  attachments?: InboxAttachment[];
+  created_at: number;
+  dispatch?: InboxReplyDispatch;
+}
+
 export interface InboxItem {
   id: string;
   title?: string;
@@ -76,6 +126,8 @@ export interface InboxItem {
   snoozed_until?: number;
   agent_message?: string;
   agent_tone?: 'info' | 'warn' | 'err' | 'ok';
+  question?: InboxQuestion;
+  replies?: InboxReply[];
   /** Optional legacy URL for direct artifact open. */
   view_url?: string;
 }
@@ -126,6 +178,40 @@ export function postInboxState(
 }
 export function postInboxSnooze(id: string, until: number): Promise<{ item: InboxItem }> {
   return postInboxAction(id, 'snooze', { until });
+}
+
+// -- Inbox reply -------------------------------------------------------------
+
+export interface InboxReplyRequest {
+  /** Selected option ids. */
+  option_ids?: string[];
+  /** Freeform text (when `question.mode === 'text'` or `allow_freeform === true`). */
+  text?: string;
+  /** Set false to persist the reply without dispatching to the agent. Default: true. */
+  dispatch?: boolean;
+}
+
+export interface InboxReplyResponse {
+  item: InboxItem;
+  reply: InboxReply;
+  dispatch?: InboxReplyDispatch | null;
+}
+
+export async function postInboxReply(
+  id: string,
+  body: InboxReplyRequest,
+): Promise<InboxReplyResponse> {
+  const res = await fetch(`/api/inbox/${encodeURIComponent(id)}/reply`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    let detail = '';
+    try { detail = (await res.text()).slice(0, 500); } catch { /* ignore */ }
+    throw new Error(`POST /api/inbox/${id}/reply → HTTP ${res.status} ${detail}`);
+  }
+  return (await res.json()) as InboxReplyResponse;
 }
 
 // -- Recipes -----------------------------------------------------------------
