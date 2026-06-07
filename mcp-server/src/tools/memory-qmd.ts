@@ -270,7 +270,7 @@ async function runLex(
 function adaptLex(r: any, collection: string): QmdSearchHit {
   return {
     collectionName: collection,
-    displayPath: r.displayPath ?? r.path ?? '',
+    displayPath: stripCollectionPrefix(r.displayPath ?? r.path ?? '', collection),
     title: r.title ?? '',
     docid: r.docid ?? '',
     score: typeof r.score === 'number' ? r.score : 0,
@@ -283,7 +283,7 @@ function adaptLex(r: any, collection: string): QmdSearchHit {
 function adaptHybrid(r: any, collection: string): QmdSearchHit {
   return {
     collectionName: collection,
-    displayPath: r.displayPath ?? r.path ?? '',
+    displayPath: stripCollectionPrefix(r.displayPath ?? r.path ?? '', collection),
     title: r.title ?? '',
     docid: r.docid ?? '',
     score: typeof r.score === 'number' ? r.score : 0,
@@ -291,6 +291,19 @@ function adaptHybrid(r: any, collection: string): QmdSearchHit {
     bodyLength: r.bodyLength ?? 0,
     context: r.context ?? null,
   };
+}
+
+/**
+ * qmd's displayPath is always prefixed with the collection name
+ * (e.g. "notes/sub/foo.md" when the collection is named "notes"). We
+ * strip that so downstream code can decompose the path as
+ * <project>/<type>/<rest>.
+ */
+function stripCollectionPrefix(displayPath: string, collection: string): string {
+  const normalized = displayPath.replace(/\\/g, '/');
+  const prefix = `${collection}/`;
+  if (normalized.startsWith(prefix)) return normalized.slice(prefix.length);
+  return normalized;
 }
 
 // ---------------------------------------------------------------------------
