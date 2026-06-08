@@ -38,6 +38,7 @@ import {
 } from '../store.ts';
 import type { Workspace } from '../workspace.ts';
 import { defineTool } from './registry.ts';
+import { resolveAgentSessionId } from '../context-resolver.ts';
 
 const inboxStateField = z.enum(['new', 'open', 'snoozed', 'archived', 'done']);
 const agentToneField = z.enum(['info', 'warn', 'err', 'ok']);
@@ -104,7 +105,11 @@ const questionDispatchSchema = z.object({
 });
 
 const questionSchema = z.object({
+  id: optionIdSchema
+    .optional()
+    .describe('Stable id for the question (e.g. "db", "auth"). Required when an item carries multiple questions so per-question answers can be correlated. Defaults to "q1" when omitted in a single-question item.'),
   prompt: z.string().min(1).max(PROMPT_MAX),
+  title: z.string().min(1).max(200).optional().describe('Optional short header above the prompt (e.g. "Database choice"). Helpful when an item has multiple questions.'),
   mode: z.enum(['single', 'multi', 'text']).optional(),
   options: z.array(questionOptionSchema).max(QUESTION_OPTIONS_MAX).optional(),
   allow_freeform: z.boolean().optional(),
@@ -113,6 +118,8 @@ const questionSchema = z.object({
   closed: z.boolean().optional(),
   dispatch: questionDispatchSchema.optional(),
 });
+
+const questionsArraySchema = z.array(questionSchema).max(20);
 
 const replyAttachmentSchema = attachmentSchema; // same shape as item attachments
 
@@ -124,12 +131,23 @@ const replyDispatchSchema = z.object({
   error: z.string().optional(),
 });
 
+const replyAnswerSchema = z.object({
+  question_id: optionIdSchema,
+  option_ids: z.array(optionIdSchema).max(QUESTION_OPTIONS_MAX).optional(),
+  freeform: z.string().max(REPLY_TEXT_MAX).optional(),
+  text: z.string().max(REPLY_TEXT_MAX).optional(),
+});
+
 const replySchema = z.object({
   id: z.string().min(1).max(80).optional(),
   author: z.enum(['user', 'agent']),
   text: z.string().min(1).max(REPLY_TEXT_MAX),
   option_ids: z.array(optionIdSchema).max(QUESTION_OPTIONS_MAX).optional(),
   freeform: z.string().max(REPLY_TEXT_MAX).optional(),
+  answers: z.array(replyAnswerSchema).max(20).optional(),
+  questions: questionsArraySchema
+    .optional()
+    .describe('Follow-up questions on an agent-authored reply. The SPA renders these below the reply bubble and the user answers them via POST /api/inbox/<id>/reply (the endpoint auto-targets the most recent open question batch — item-level OR latest agent reply). Use this for multi-turn batched Q&A.'),
   attachments: z.array(replyAttachmentSchema).max(ATTACHMENTS_MAX).optional(),
   created_at: z.number().int().positive().optional(),
   dispatch: replyDispatchSchema.optional(),
@@ -140,12 +158,34 @@ export function mintReplyId(): string {
 }
 
 function normalizeReply(input: z.infer<typeof replySchema>): InboxReply {
+  // Auto-id any questions on agent replies, mirroring the item-level
+  // upsert logic. Reply-level question ids are unique per-reply, not
+  // per-item, so q1, q2, ... is fine.
+  let normalizedQuestions: InboxReply['questions'];
+  if (Array.isArray(input.questions) && input.questions.length > 0) {
+    const seen = new Set<string>();
+    normalizedQuestions = input.questions.map((q: z.infer<typeof questionSchema>, idx: number) => {
+      const id = q.id ?? `q${idx + 1}`;
+      if (seen.has(id)) {
+        throw new Error(`reply.questions[${idx}]: duplicate id "${id}"`);
+      }
+      seen.add(id);
+      return {
+        ...q,
+        id,
+        mode: q.mode ?? (q.options && q.options.length > 0 ? 'single' : 'text'),
+        close_on_answer: q.close_on_answer ?? true,
+      };
+    });
+  }
   return {
     id: input.id ?? mintReplyId(),
     author: input.author,
     text: input.text,
     option_ids: input.option_ids,
     freeform: input.freeform,
+    answers: input.answers as InboxReply['answers'],
+    questions: normalizedQuestions,
     attachments: input.attachments,
     created_at: input.created_at ?? Date.now(),
     dispatch: input.dispatch,
@@ -289,7 +329,27 @@ export function registerInboxEntries(ws: Workspace): void {
         .nullable()
         .optional()
         .describe(
-          'Optional clickable question with options. Set `dispatch.session_id` to your CLI session id so the user\'s answer is dispatched back as a new prompt via spawnDispatchOrResume. Pass null to clear.',
+          'LEGACY: single question shorthand for a single-question item. New code should use `questions: [...]` for both single and multi-question items. Pass null to clear (sets `questions: []`).',
+        ),
+      questions: questionsArraySchema
+        .nullable()
+        .optional()
+        .describe(
+          'One or more clickable questions on this item. SPA renders ALL questions in one form with a single submit button (batch UX); user fills out every question then submits, the agent receives one consolidated reply. Each question MUST have a unique `id` (e.g. "db", "auth", "ui") so the answers can be correlated. The FIRST question with `dispatch.session_id` configured drives where the batched answer is dispatched. Pass null or [] to clear.',
+        ),
+      dispatch: questionDispatchSchema
+        .nullable()
+        .optional()
+        .describe(
+          'Item-level dispatch routing. Drives the always-on freeform reply box: the SPA renders a "Send a message to the agent" textarea on every item with a dispatch.session_id and routes the user\'s typed message back to your CLI session (wrapped with item context). Auto-populated from the X-Clawdevbox-Session-Id request header when not passed, so most agents don\'t need to set this explicitly. Pass null to clear.',
+        ),
+      session_id: z
+        .string()
+        .min(1)
+        .max(200)
+        .optional()
+        .describe(
+          'Convenience shorthand for `dispatch: { session_id }`. Useful when the only dispatch field you need is the session id. Setting both this and `dispatch.session_id` is a conflict (this value wins).',
         ),
       replies: z
         .array(replySchema)
@@ -307,7 +367,13 @@ export function registerInboxEntries(ws: Workspace): void {
           'Send a browser push to subscribed devices. Default: true on creation, false on update. Set explicitly to force.',
         ),
     }),
-    handler: async (args) => {
+    handler: async (args, extra) => {
+      // Auto-resolve cli session id from the request header. Used as the
+      // default for `dispatch.session_id` when the caller doesn't set one.
+      const headerSessionId = resolveAgentSessionId(
+        extra as Parameters<typeof resolveAgentSessionId>[0],
+      );
+
       // ---- handle the description body sidecar BEFORE upserting the item
       // so the description_size metadata is accurate.
       const format: 'markdown' | 'text' = args.description_format ?? 'markdown';
@@ -367,16 +433,52 @@ export function registerInboxEntries(ws: Workspace): void {
         patch.labels = out;
       }
       if (args.question !== undefined) {
-        // null → clear; object → set (defaulting close_on_answer to true).
+        // LEGACY: single-question shorthand. Promote to questions[0].
         if (args.question === null) {
+          patch.questions = [];
           patch.question = undefined;
         } else {
           const q = args.question;
-          patch.question = {
-            ...q,
-            close_on_answer: q.close_on_answer ?? true,
+          const promoted = {
+            id: q.id ?? 'q1',
+            prompt: q.prompt,
+            title: q.title,
             mode: q.mode ?? (q.options && q.options.length > 0 ? 'single' : 'text'),
+            options: q.options,
+            allow_freeform: q.allow_freeform,
+            placeholder: q.placeholder,
+            close_on_answer: q.close_on_answer ?? true,
+            closed: q.closed,
+            dispatch: q.dispatch,
           };
+          patch.questions = [promoted];
+          patch.question = undefined;          // clear legacy field, questions[] wins
+        }
+      }
+      if (args.questions !== undefined) {
+        if (args.questions === null || args.questions.length === 0) {
+          patch.questions = [];
+          patch.question = undefined;
+        } else {
+          // Each question MUST have a unique id. Auto-generate "q<N>" for
+          // entries where the caller omitted it, but warn if any duplicates
+          // result. Defensive: callers are encouraged to set ids explicitly.
+          const seenIds = new Set<string>();
+          const normalized = args.questions.map((q: z.infer<typeof questionSchema>, idx: number) => {
+            const id = q.id ?? `q${idx + 1}`;
+            if (seenIds.has(id)) {
+              throw new Error(`questions[${idx}]: duplicate id "${id}" — every question must have a unique id`);
+            }
+            seenIds.add(id);
+            return {
+              ...q,
+              id,
+              mode: q.mode ?? (q.options && q.options.length > 0 ? 'single' : 'text'),
+              close_on_answer: q.close_on_answer ?? true,
+            };
+          });
+          patch.questions = normalized;
+          patch.question = undefined;          // questions[] wins over legacy
         }
       }
       if (args.replies !== undefined) {
@@ -384,6 +486,31 @@ export function registerInboxEntries(ws: Workspace): void {
       }
       if (args.agent_message !== undefined) patch.agent_message = args.agent_message;
       if (args.agent_tone !== undefined) patch.agent_tone = args.agent_tone;
+
+      // ---- Resolve item-level dispatch routing -------------------------------
+      // Precedence:
+      //   1. Explicit `dispatch: {session_id, ...}` arg (whole object replaces).
+      //   2. `session_id` shorthand arg merged onto whatever dispatch is set.
+      //   3. X-Clawdevbox-Session-Id header auto-injection if neither set
+      //      AND the agent didn't already configure any dispatch elsewhere.
+      // Pass `dispatch: null` explicitly to clear.
+      if (args.dispatch !== undefined || args.session_id !== undefined) {
+        if (args.dispatch === null) {
+          patch.dispatch = null;
+        } else {
+          const merged = { ...(args.dispatch ?? {}) };
+          if (args.session_id) merged.session_id = args.session_id;
+          patch.dispatch = merged;
+        }
+      } else if (headerSessionId) {
+        // Auto-inject from header — only when the caller didn't set dispatch
+        // explicitly. Skipped when the existing item already has dispatch.
+        const existing = inbox.read(args.id);
+        const existingDispatch = existing?.dispatch as { session_id?: string } | undefined;
+        if (!existingDispatch?.session_id) {
+          patch.dispatch = { session_id: headerSessionId };
+        }
+      }
 
       const { item, created } = inbox.upsert(args.id, args.kind, args.source, patch);
 
@@ -471,22 +598,30 @@ export function registerInboxEntries(ws: Workspace): void {
   defineTool({
     name: 'inbox.reply',
     description:
-      'Append a reply to an existing inbox item — typically an agent follow-up to keep a multi-turn conversation going. For user answers, the SPA POSTs to `/api/inbox/<id>/reply` instead (that path validates against the question, compiles a prompt, and dispatches to the agent). Pass `author: "agent"` for agent-authored messages; `author: "user"` is reserved for the HTTP API but accepted for symmetry. Optionally pass `reopen: true` to flip `question.closed` back to false (allowing further user replies).',
+      'Append a reply to an existing inbox item. Typically used by agents to: (1) follow up after a question is answered, (2) ASK A NEW BATCH OF QUESTIONS by passing `reply.questions: [...]` — the SPA renders those below the bubble and the user answers them via the same /api/inbox/<id>/reply endpoint (which auto-targets the most recent open question batch). For user answers, the SPA POSTs to `/api/inbox/<id>/reply` instead. Pass `author: "agent"` for agent-authored messages; `author: "user"` is reserved for the HTTP API but accepted for symmetry. Optionally pass `reopen: true` to flip every question.closed back to false.',
     parameters: z.object({
       id: z.string().min(1),
       reply: replySchema,
+      session_id: z
+        .string()
+        .min(1)
+        .max(200)
+        .optional()
+        .describe(
+          'Optional cli session id for routing user follow-ups. If the item has no `dispatch` yet, this gets stamped onto the item as `dispatch: { session_id }` so subsequent user replies (freeform OR answers to this reply\'s questions) route back to your session. Auto-resolved from X-Clawdevbox-Session-Id header when not passed.',
+        ),
       reopen: z
         .boolean()
         .optional()
         .describe(
-          'If true and the item has a question, clear `question.closed` so the user can answer again (e.g. agent asks a follow-up).',
+          'If true and the item has questions, clear every question.closed so the user can answer again (e.g. agent asks a follow-up).',
         ),
       new_state: z
         .enum(['new', 'open', 'snoozed', 'archived', 'done'])
         .optional()
         .describe('Optionally bump the item state (e.g. "open" after an agent follow-up).'),
     }),
-    handler: async (args) => {
+    handler: async (args, extra) => {
       const existing = inbox.read(args.id);
       if (!existing) return notFound('inbox_item', args.id);
 
@@ -498,16 +633,38 @@ export function registerInboxEntries(ws: Workspace): void {
       });
       if (!result) return notFound('inbox_item', args.id);
 
-      // Optional reopen: clear question.closed so the user can answer again.
-      if (args.reopen && result.item.question) {
+      // Stamp item-level dispatch.session_id when:
+      //   1. Caller passed `session_id` arg explicitly, OR
+      //   2. X-Clawdevbox-Session-Id header is present
+      // AND the item doesn't already have a dispatch configured. This means
+      // ANY agent-authored reply makes the item replyable from the SPA
+      // freeform box without the agent having to manage that explicitly.
+      const explicitSid = args.session_id;
+      const headerSid = resolveAgentSessionId(
+        extra as Parameters<typeof resolveAgentSessionId>[0],
+      );
+      const sidToStamp = explicitSid ?? headerSid;
+      const currentDispatch = result.item.dispatch as { session_id?: string } | undefined;
+      if (sidToStamp && !currentDispatch?.session_id) {
+        inbox.upsert(
+          result.item.id,
+          result.item.kind,
+          result.item.source,
+          { dispatch: { session_id: sidToStamp } },
+        );
+      }
+
+      // Optional reopen: clear `closed` on every question so the user can answer again.
+      if (args.reopen && Array.isArray(result.item.questions) && result.item.questions.length > 0) {
+        const reopenedQs = result.item.questions.map((q) => ({ ...q, closed: false }));
         const reopened = inbox.upsert(
           result.item.id,
           result.item.kind,
           result.item.source,
-          { question: { ...result.item.question, closed: false } },
+          { questions: reopenedQs },
         );
         return {
-          content: [{ type: 'text', text: `Appended reply ${reply.id} and reopened question on ${args.id}.` }],
+          content: [{ type: 'text', text: `Appended reply ${reply.id} and reopened ${reopenedQs.length} question(s) on ${args.id}.` }],
           structuredContent: { item: reopened.item, reply },
         };
       }

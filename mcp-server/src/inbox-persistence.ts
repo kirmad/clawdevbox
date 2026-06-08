@@ -24,7 +24,7 @@ import { getDatabase } from './db/index.ts';
 import { emitChange } from './event-bus.ts';
 import { writeFileAtomic } from './fs-util.ts';
 import { logger } from './logger.ts';
-import type { InboxBodyFormat, InboxItem } from './store.ts';
+import type { InboxBodyFormat, InboxItem, InboxQuestion } from './store.ts';
 
 const INBOX_FILENAME = 'inbox.json';
 const BODIES_DIR = 'inbox-bodies';
@@ -108,7 +108,7 @@ function rowToItem(row: InboxRow): InboxItem {
     try {
       const parsed = JSON.parse(row.raw_json) as InboxItem;
       // Make sure the indexed fields win over any stale embedded copy.
-      return {
+      const migrated = migrateLegacyQuestion({
         ...parsed,
         id: row.id,
         kind: row.kind ?? parsed.kind,
@@ -116,7 +116,8 @@ function rowToItem(row: InboxRow): InboxItem {
         source: row.source ?? parsed.source ?? '',
         created_at: row.created_at,
         updated_at: row.updated_at,
-      };
+      });
+      return migrated;
     } catch {
       // Corrupted blob — fall through to column-based reconstruction.
     }
@@ -140,6 +141,48 @@ function rowToItem(row: InboxRow): InboxItem {
     created_at: row.created_at,
     updated_at: row.updated_at,
   } as InboxItem;
+}
+
+/**
+ * Auto-migrate legacy single-question inbox items to the multi-question
+ * shape. Items written before the multi-question feature carried a
+ * singular `question?: InboxQuestion`. New items use `questions?:
+ * InboxQuestion[]` with an explicit per-question `id`. This helper
+ * lifts the legacy field into `questions[0]` on every read so callers
+ * never see the legacy shape. The migration is read-side only — old
+ * raw_json blobs stay as-written until the item is next upsert'd.
+ */
+function migrateLegacyQuestion(item: InboxItem): InboxItem {
+  // Already migrated, or never had a question.
+  if (Array.isArray(item.questions) && item.questions.length > 0) {
+    // Also strip the legacy field if both are present (questions wins).
+    if (item.question) {
+      const { question, ...rest } = item as InboxItem & { question?: unknown };
+      void question;
+      return rest as InboxItem;
+    }
+    return item;
+  }
+  // The legacy `question` field on-disk may pre-date the `id` requirement
+  // we added in the multi-question rollout. Treat it loosely (as any) and
+  // synthesize an id of "q1" so callers can rely on the new shape.
+  const legacy = item.question as (Partial<InboxQuestion> & Record<string, unknown>) | undefined;
+  if (!legacy || typeof legacy !== 'object' || typeof legacy.prompt !== 'string') return item;
+  const migrated: InboxQuestion = {
+    id: typeof legacy.id === 'string' && legacy.id ? legacy.id : 'q1',
+    prompt: legacy.prompt,
+    mode: legacy.mode as InboxQuestion['mode'],
+    options: legacy.options as InboxQuestion['options'],
+    allow_freeform: legacy.allow_freeform as boolean | undefined,
+    placeholder: legacy.placeholder as string | undefined,
+    title: legacy.title as string | undefined,
+    close_on_answer: legacy.close_on_answer as boolean | undefined,
+    closed: legacy.closed as boolean | undefined,
+    dispatch: legacy.dispatch as InboxQuestion['dispatch'],
+  };
+  const { question, ...rest } = item as InboxItem & { question?: unknown };
+  void question;
+  return { ...rest, questions: [migrated] } as InboxItem;
 }
 
 // ============================================================================
@@ -169,7 +212,7 @@ export function loadInboxFromDisk(globalDir: string): InboxItem[] {
             typeof (it as InboxItem).state === 'string' &&
             typeof (it as InboxItem).created_at === 'number' &&
             typeof (it as InboxItem).updated_at === 'number',
-        );
+        ).map(migrateLegacyQuestion);   // run multi-question migration on JSON-path reads too
       }
     } catch (err) {
       logger.warn(

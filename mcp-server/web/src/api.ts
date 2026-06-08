@@ -77,7 +77,11 @@ export interface InboxQuestionDispatch {
 }
 
 export interface InboxQuestion {
+  /** Stable id within the parent item ("q1", "db", etc.). */
+  id: string;
   prompt: string;
+  /** Optional short header above the prompt. */
+  title?: string;
   mode?: InboxQuestionMode;
   options?: InboxQuestionOption[];
   allow_freeform?: boolean;
@@ -97,12 +101,23 @@ export interface InboxReplyDispatch {
   error?: string;
 }
 
+export interface InboxReplyAnswer {
+  question_id: string;
+  option_ids?: string[];
+  freeform?: string;
+  text?: string;
+}
+
 export interface InboxReply {
   id: string;
   author: InboxReplyAuthor;
   text: string;
   option_ids?: string[];
   freeform?: string;
+  /** Per-question batched answers (multi-question items). */
+  answers?: InboxReplyAnswer[];
+  /** Follow-up questions on agent-authored replies. */
+  questions?: InboxQuestion[];
   attachments?: InboxAttachment[];
   created_at: number;
   dispatch?: InboxReplyDispatch;
@@ -126,7 +141,10 @@ export interface InboxItem {
   snoozed_until?: number;
   agent_message?: string;
   agent_tone?: 'info' | 'warn' | 'err' | 'ok';
-  question?: InboxQuestion;
+  /** One or more clickable questions on this item (batch UX). */
+  questions?: InboxQuestion[];
+  /** Item-level dispatch — used by the always-on freeform reply box. */
+  dispatch?: InboxQuestionDispatch;
   replies?: InboxReply[];
   /** Optional legacy URL for direct artifact open. */
   view_url?: string;
@@ -183,10 +201,15 @@ export function postInboxSnooze(id: string, until: number): Promise<{ item: Inbo
 // -- Inbox reply -------------------------------------------------------------
 
 export interface InboxReplyRequest {
-  /** Selected option ids. */
+  /** Legacy single-question fields (still accepted for 1-question items). */
   option_ids?: string[];
-  /** Freeform text (when `question.mode === 'text'` or `allow_freeform === true`). */
   text?: string;
+  /** Batched per-question answers (multi-question items — one entry per question). */
+  answers?: Array<{
+    question_id: string;
+    option_ids?: string[];
+    text?: string;
+  }>;
   /** Set false to persist the reply without dispatching to the agent. Default: true. */
   dispatch?: boolean;
 }

@@ -73,7 +73,7 @@ import {
   writeServiceState,
   type ServiceState,
 } from '../service.ts';
-import { approvals, inbox, mintInboxReplyId, type InboxItem, type InboxReply, type InboxState } from '../store.ts';
+import { approvals, inbox, mintInboxReplyId, type InboxItem, type InboxQuestion, type InboxReply, type InboxState } from '../store.ts';
 import { dispatchTerminalRequest, startTerminalServer } from '../terminal-server.ts';
 import {
   deriveTunnelName,
@@ -1711,11 +1711,62 @@ async function handleInboxAction(
   res.end(JSON.stringify({ item: enriched }));
 }
 
+/**
+ * Walk an inbox item's replies (newest → oldest) looking for an
+ * agent-authored reply that carries unanswered `questions: [...]`. If
+ * one is found, those questions are the "active batch" the user should
+ * answer next. Otherwise, fall back to the item's top-level `questions`.
+ *
+ * This is what enables multi-turn batched Q&A: agent replies with new
+ * questions → user answers those, not the original item-level ones.
+ *
+ * A reply's questions are considered "active" when at least one of them
+ * has `closed !== true`. Once the user answers the batch, all questions
+ * in that batch are marked closed, so the search falls back to the
+ * next-most-recent reply (or item-level).
+ */
+function findActiveQuestionBatch(item: import('../store.ts').InboxItem): {
+  source: 'item' | 'reply';
+  reply_id?: string;
+  questions: InboxQuestion[];
+} | null {
+  const replies = Array.isArray(item.replies) ? item.replies : [];
+  for (let i = replies.length - 1; i >= 0; i--) {
+    const r = replies[i];
+    if (r.author === 'agent' && Array.isArray(r.questions) && r.questions.length > 0) {
+      const open = r.questions.some((q) => q.closed !== true);
+      if (open) {
+        return { source: 'reply', reply_id: r.id, questions: r.questions };
+      }
+    }
+  }
+  const itemQs = Array.isArray(item.questions) ? item.questions : [];
+  if (itemQs.length > 0 && itemQs.some((q) => q.closed !== true)) {
+    return { source: 'item', questions: itemQs };
+  }
+  return null;
+}
+
 interface InboxReplyRequest {
-  /** Selected option ids (validated against `question.options`). */
+  /**
+   * Legacy single-question fields. Used when the item has exactly one
+   * question — applied to that sole question. For multi-question items
+   * pass `answers` instead.
+   */
   option_ids?: string[];
   /** Optional freeform text contributed by the user. */
   text?: string;
+  /**
+   * Batched per-question answers for multi-question items. Each entry
+   * carries the user's selection for one question (matched by
+   * `question_id`). Every question on the item MUST have an entry —
+   * partial submissions are rejected.
+   */
+  answers?: Array<{
+    question_id: string;
+    option_ids?: string[];
+    text?: string;
+  }>;
   /** When false, skip the dispatch step (just persist the reply). Default: true. */
   dispatch?: boolean;
 }
@@ -1730,13 +1781,16 @@ interface InboxReplyResponse {
  * POST /api/inbox/<id>/reply — user-side answer to a question.
  *
  * Steps:
- *   1. Validate the item has a `question` and the question isn't closed.
- *   2. Validate option_ids against `question.options` + `mode`.
- *   3. Compile the answer text + dispatched prompt (prompt_template subst).
- *   4. Append a user `InboxReply` to `replies[]` (close question if
- *      `close_on_answer`).
- *   5. If `question.dispatch.session_id` is set AND body.dispatch !== false,
- *      route to spawnDispatchOrResume.
+ *   1. Validate the item has at least one question and none are closed.
+ *   2. Validate each per-question answer against its `options` + `mode`.
+ *      Multi-question items require every question to be answered
+ *      (batch UX).
+ *   3. Compile the per-question + composite answer text + dispatched
+ *      prompt (prompt_template subst).
+ *   4. Append a user `InboxReply` to `replies[]` with batch `answers[]`
+ *      breakdown (close all questions if `close_on_answer`).
+ *   5. If the routing question's `dispatch.session_id` is set AND
+ *      body.dispatch !== false, route to spawnDispatchOrResume.
  *   6. Update the reply with the dispatch outcome and respond.
  */
 async function handleInboxReply(
@@ -1751,31 +1805,50 @@ async function handleInboxReply(
     res.end(JSON.stringify({ error: 'inbox item not found', id }));
     return;
   }
-  const question = existing.question;
-  if (!question || typeof question !== 'object') {
+  const activeBatch = findActiveQuestionBatch(existing);
+
+  const body = await readJsonBody<InboxReplyRequest>(req, res);
+  if (!body) return; // readJsonBody already responded
+
+  // Two reply shapes:
+  //   - STRUCTURED: `answers[]` (or legacy `option_ids`/`text` for 1-question)
+  //     applied to the active question batch.
+  //   - FREEFORM:   `text` only, with NO active questions → dispatches the
+  //     wrapped text to the item-level `dispatch.session_id`.
+  // A request with `text` AND no `answers` AND no active batch is freeform.
+  const itemDispatch = (existing as { dispatch?: { session_id?: string; provider?: string; workspace_id?: string; workspace_path?: string; prompt_template?: string } }).dispatch;
+  const isFreeformOnly =
+    !activeBatch &&
+    typeof body.text === 'string' &&
+    body.text.trim().length > 0 &&
+    !(Array.isArray(body.answers) && body.answers.length > 0);
+
+  if (isFreeformOnly) {
+    await handleFreeformReply(req, res, id, existing, body, itemDispatch, ctx);
+    return;
+  }
+
+  if (!activeBatch) {
     res.writeHead(409, { 'content-type': 'application/json' });
     res.end(JSON.stringify({
-      error: 'inbox item has no question — cannot reply',
+      error: 'inbox item has no open questions — pass `text` for a freeform reply or omit',
       code: 'NO_QUESTION',
       id,
     }));
     return;
   }
-  if (question.closed === true) {
-    res.writeHead(409, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({
-      error: 'question is closed — no further replies accepted',
-      code: 'QUESTION_CLOSED',
-      id,
-    }));
-    return;
-  }
+  const questions = activeBatch.questions;
 
-  const body = await readJsonBody<InboxReplyRequest>(req, res);
-  if (!body) return; // readJsonBody already responded
+  const { validateBatchAnswer, compileBatchAnswer, pickDispatchRouter } =
+    await import('../inbox-reply.ts');
 
-  const { validateAnswer, compileAnswer } = await import('../inbox-reply.ts');
-  const validation = validateAnswer(question, { option_ids: body.option_ids, text: body.text });
+  // Choose the raw payload shape: prefer `answers[]` (batch); fall back
+  // to the legacy `{option_ids, text}` for single-question items.
+  const rawPayload = Array.isArray(body.answers) && body.answers.length > 0
+    ? body.answers
+    : { option_ids: body.option_ids, text: body.text };
+
+  const validation = validateBatchAnswer(questions, rawPayload);
   if (!validation.ok) {
     const status = validation.error.code === 'UNKNOWN_OPTION' ? 400 : 400;
     res.writeHead(status, { 'content-type': 'application/json' });
@@ -1783,27 +1856,40 @@ async function handleInboxReply(
     return;
   }
   const validated = validation.value;
-  const { answer_text: answerText, dispatch_prompt: dispatchPrompt } =
-    compileAnswer(question, validated);
-  const optionIds = validated.option_ids;
-  const freeform = validated.freeform;
+  const compiled = compileBatchAnswer(validated);
 
-  // ---- Append the reply (closing the question if configured) ------------
+  // Aggregate legacy fields by flattening across all answers.
+  const allOptionIds: string[] = validated.flatMap((v) => v.option_ids);
+  const flatFreeform = validated.map((v) => v.freeform).filter((s) => s.length > 0).join('\n');
+
+  // ---- Append the reply (closing all questions if configured) ------------
   const reply: InboxReply = {
     id: mintInboxReplyId(),
     author: 'user',
-    text: answerText,
-    option_ids: optionIds.length > 0 ? optionIds : undefined,
-    freeform: freeform || undefined,
+    text: compiled.answer_text,
+    option_ids: allOptionIds.length > 0 ? allOptionIds : undefined,
+    freeform: flatFreeform || undefined,
+    answers: compiled.entries.map((e) => ({
+      question_id: e.question_id,
+      option_ids: e.option_ids.length > 0 ? e.option_ids : undefined,
+      freeform: e.freeform || undefined,
+      text: e.answer_text,
+    })),
     created_at: Date.now(),
   };
-  const closeOnAnswer = question.close_on_answer ?? true;
-  // After a user reply, bump state from 'new' → 'open' so the chain is
-  // visible in the "active" filter. Leave already-open / done / archived
-  // items alone.
+
+  // Batch UX: close every question once the user submits the batch
+  // (unless any question explicitly opted out via close_on_answer:false).
+  // When the active batch lives on an agent-reply (multi-turn), we
+  // close that reply's questions; otherwise we close item-level ones.
+  const closeAll = questions.every((q) => (q.close_on_answer ?? true) === true);
   const newState: InboxState | undefined = existing.state === 'new' ? 'open' : undefined;
+  // For reply-level batches, suppress the global "close all questions"
+  // path because that closes item-level questions which may be a
+  // different batch. We handle the close via a follow-up updateReply.
+  const closeItemQuestions = closeAll && activeBatch.source === 'item';
   const appendResult = inbox.appendReply(id, reply, {
-    closeQuestion: closeOnAnswer,
+    closeQuestion: closeItemQuestions,
     newState,
   });
   if (!appendResult) {
@@ -1811,24 +1897,33 @@ async function handleInboxReply(
     res.end(JSON.stringify({ error: 'failed to append reply' }));
     return;
   }
+  // Reply-level batch: close the agent-reply's questions in place.
+  if (closeAll && activeBatch.source === 'reply' && activeBatch.reply_id) {
+    const targetReply = appendResult.item.replies?.find((r) => r.id === activeBatch.reply_id);
+    if (targetReply && Array.isArray(targetReply.questions)) {
+      const closedQs = targetReply.questions.map((q) => ({ ...q, closed: true }));
+      inbox.updateReply(id, activeBatch.reply_id, { questions: closedQs });
+    }
+  }
 
   // ---- Dispatch to the agent ---------------------------------------------
+  const router = pickDispatchRouter(questions);
   let dispatchOutcome: InboxReply['dispatch'] | undefined;
   const shouldDispatch =
     body.dispatch !== false &&
-    !!question.dispatch?.session_id &&
-    !!dispatchPrompt;
+    !!router?.dispatch?.session_id &&
+    !!compiled.dispatch_prompt;
 
-  if (shouldDispatch && ctx) {
+  if (shouldDispatch && ctx && router?.dispatch) {
     try {
       const { spawnDispatchOrResume } = await import('../session-helpers.ts');
       const sessionCtx = sessionHelperCtxFromCron(ctx);
       const result = await spawnDispatchOrResume(sessionCtx, {
-        prompt: dispatchPrompt,
-        session_id: question.dispatch!.session_id ?? null,
-        provider: question.dispatch!.provider ?? null,
-        workspace_id: question.dispatch!.workspace_id ?? null,
-        workspace_path: question.dispatch!.workspace_path ?? null,
+        prompt: compiled.dispatch_prompt,
+        session_id: router.dispatch.session_id ?? null,
+        provider: router.dispatch.provider ?? null,
+        workspace_id: router.dispatch.workspace_id ?? null,
+        workspace_path: router.dispatch.workspace_path ?? null,
         default_workspace_path: null,
       });
       if (result.ok) {
@@ -1851,6 +1946,16 @@ async function handleInboxReply(
         error: err instanceof Error ? err.message : String(err),
       };
     }
+  } else if (shouldDispatch && !ctx) {
+    // Race: HTTP server is listening but the dispatcher context isn't
+    // bound yet (only happens in the tiny window between httpServer.listen
+    // and cronApiCtx assignment in cli/start.ts). Record a clear outcome
+    // instead of silently dropping the dispatch.
+    dispatchOutcome = {
+      mode: 'failed',
+      code: 'DISPATCHER_NOT_READY',
+      error: 'cronApiCtx not yet bound — try again after the server fully boots',
+    };
   } else if (!shouldDispatch) {
     dispatchOutcome = { mode: 'noop' };
   }
@@ -1882,6 +1987,114 @@ function sessionHelperCtxFromCron(ctx: CronApiContext): import('../session-helpe
     throw new Error('resolved config not available in this server context');
   }
   return { db: ctx.db, dispatcher: ctx.dispatcher, ws: wsRef, cfg: ctx.cfg };
+}
+
+/**
+ * Handle a freeform-text-only reply (no answers, no active questions).
+ * Wraps the user's text with item context and dispatches it as a new
+ * prompt to the item-level `dispatch.session_id`. Default wrapping:
+ *   `User replied to inbox "<title>" (id=<id>): <text>`
+ * Overridable via `dispatch.prompt_template`. If the item has no
+ * dispatch configured, responds 409 with a clear error.
+ */
+async function handleFreeformReply(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  id: string,
+  existing: InboxItem,
+  body: InboxReplyRequest,
+  itemDispatch: {
+    session_id?: string;
+    provider?: string;
+    workspace_id?: string;
+    workspace_path?: string;
+    prompt_template?: string;
+  } | undefined,
+  ctx: CronApiContext | null,
+): Promise<void> {
+  if (!itemDispatch?.session_id) {
+    res.writeHead(409, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      error: 'item has no dispatch.session_id; freeform replies require an item-level dispatch target',
+      code: 'NO_DISPATCH',
+      id,
+    }));
+    return;
+  }
+  const text = (body.text ?? '').trim();
+  const title = existing.title ?? '(untitled)';
+  const template = itemDispatch.prompt_template
+    ?? `User replied to inbox "${title}" (id=${id}): {answer}`;
+  const dispatchPrompt = template
+    .replace(/\{answer\}/g, text)
+    .replace(/\{option_ids\}/g, '')
+    .replace(/\{freeform\}/g, text);
+
+  // Append the user reply (no question closing — no questions to close).
+  const reply: InboxReply = {
+    id: mintInboxReplyId(),
+    author: 'user',
+    text,
+    freeform: text,
+    created_at: Date.now(),
+  };
+  const newState: InboxState | undefined = existing.state === 'new' ? 'open' : undefined;
+  const appendResult = inbox.appendReply(id, reply, { closeQuestion: false, newState });
+  if (!appendResult) {
+    res.writeHead(500, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'failed to append reply' }));
+    return;
+  }
+
+  // Dispatch the wrapped prompt.
+  let dispatchOutcome: InboxReply['dispatch'] | undefined;
+  const shouldDispatch = body.dispatch !== false;
+  if (shouldDispatch && ctx) {
+    try {
+      const { spawnDispatchOrResume } = await import('../session-helpers.ts');
+      const sessionCtx = sessionHelperCtxFromCron(ctx);
+      const result = await spawnDispatchOrResume(sessionCtx, {
+        prompt: dispatchPrompt,
+        session_id: itemDispatch.session_id,
+        provider: itemDispatch.provider ?? null,
+        workspace_id: itemDispatch.workspace_id ?? null,
+        workspace_path: itemDispatch.workspace_path ?? null,
+        default_workspace_path: null,
+      });
+      dispatchOutcome = result.ok
+        ? { mode: result.mode, instance_id: result.instance_id, session_id: result.session_id }
+        : { mode: 'failed', code: result.code, error: result.message };
+    } catch (err) {
+      dispatchOutcome = {
+        mode: 'failed',
+        code: 'EXCEPTION',
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+  } else if (shouldDispatch && !ctx) {
+    dispatchOutcome = {
+      mode: 'failed',
+      code: 'DISPATCHER_NOT_READY',
+      error: 'cronApiCtx not yet bound — try again after the server fully boots',
+    };
+  } else {
+    dispatchOutcome = { mode: 'noop' };
+  }
+
+  let finalItem: InboxItem = appendResult.item;
+  if (dispatchOutcome) {
+    const patched = inbox.updateReply(id, reply.id, { dispatch: dispatchOutcome });
+    if (patched) finalItem = patched.item;
+  }
+
+  const [enriched] = enrichInboxItemsForList([finalItem]);
+  const response: InboxReplyResponse = {
+    item: enriched ?? finalItem,
+    reply: { ...reply, dispatch: dispatchOutcome },
+    dispatch: dispatchOutcome,
+  };
+  res.writeHead(200, { 'content-type': 'application/json' });
+  res.end(JSON.stringify(response));
 }
 
 /**

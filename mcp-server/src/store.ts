@@ -130,6 +130,14 @@ export interface InboxQuestionDispatch {
 }
 
 export interface InboxQuestion {
+  /**
+   * Stable id for this question within its parent inbox item. Used to
+   * correlate per-question answers in batched replies. Required when an
+   * item has multiple questions; for the legacy single-question case it
+   * defaults to "q1" on read-time migration. May contain letters, digits,
+   * dot, underscore, hyphen, colon.
+   */
+  id: string;
   /** Question prompt shown above the option buttons. */
   prompt: string;
   /**
@@ -142,14 +150,24 @@ export interface InboxQuestion {
   allow_freeform?: boolean;
   /** Placeholder hint for the freeform input. */
   placeholder?: string;
+  /** Optional per-question header above the prompt (e.g. "Database choice"). */
+  title?: string;
   /**
-   * If true (default), the question is closed (no further replies accepted
-   * from the user) after the first user reply lands.
+   * If true (default for single-question items), the parent item's
+   * `questions[]` collection is closed (no further user replies accepted)
+   * after the user submits their batch answer. With multiple questions
+   * the recommended pattern is to close the whole block at once, so this
+   * flag is read off `questions[0]` as the closing policy.
    */
   close_on_answer?: boolean;
   /** Set automatically when the question is closed. */
   closed?: boolean;
-  /** Routing for the answer. When unset, the reply is stored but no dispatch fires. */
+  /**
+   * Routing for the answer. When unset, the reply is stored but no
+   * dispatch fires. For multi-question items, the FIRST question with a
+   * `dispatch` configured wins — all answers are compiled into a single
+   * batched prompt and dispatched once.
+   */
   dispatch?: InboxQuestionDispatch;
 }
 
@@ -173,10 +191,31 @@ export interface InboxReply {
   author: InboxReplyAuthor;
   /** Rendered text (option labels joined, or freeform, or both). */
   text: string;
-  /** Selected option ids (when author === 'user' and options were chosen). */
+  /**
+   * Selected option ids (when author === 'user' and options were chosen).
+   * Legacy field for single-question items. New multi-question items
+   * carry the per-question selections in `answers[]` below.
+   */
   option_ids?: string[];
-  /** Raw freeform text contributed by the user. */
+  /** Raw freeform text contributed by the user. Legacy single-question field. */
   freeform?: string;
+  /**
+   * Per-question answers for multi-question items. Each entry targets a
+   * question by its `question_id` and carries the user's selection +
+   * freeform input for that specific question. When present, the
+   * top-level `option_ids` / `freeform` fields are derived (concatenated
+   * across answers) and the bubble text is the human-readable summary.
+   */
+  answers?: InboxReplyAnswer[];
+  /**
+   * Optional follow-up questions on an AGENT-authored reply. When an
+   * agent replies with `questions: [...]`, the SPA renders the new
+   * questions below the reply bubble and the user can answer them via
+   * the same `POST /api/inbox/<id>/reply` endpoint — those answers
+   * close THESE questions (not the original item-level ones). This is
+   * how multi-turn batched Q&A works.
+   */
+  questions?: InboxQuestion[];
   /**
    * Artifact attachments on this reply (e.g. an agent follow-up that links
    * a new diff or report). Same shape + enrichment as item-level
@@ -187,6 +226,17 @@ export interface InboxReply {
   created_at: number;
   /** Populated when this reply triggered a dispatch (author === 'user'). */
   dispatch?: InboxReplyDispatch;
+}
+
+/** One per-question answer within a batched reply on a multi-question item. */
+export interface InboxReplyAnswer {
+  question_id: string;
+  /** Selected option ids for this question (empty for text-only). */
+  option_ids?: string[];
+  /** Freeform text for this question (empty when only options were used). */
+  freeform?: string;
+  /** Rendered summary for this question's answer (e.g. "PostgreSQL — needs persistence"). */
+  text?: string;
 }
 
 export interface InboxItem {
@@ -214,11 +264,32 @@ export interface InboxItem {
   /** Free-form labels/tags shown as chips on the card. Max 10, each max 40 chars. */
   labels?: string[];
   /**
-   * Optional clickable-question payload. When set, the SPA renders a question
-   * UI in the detail pane and `POST /api/inbox/<id>/reply` dispatches the
-   * compiled answer to `question.dispatch.session_id`.
+   * Optional clickable-question payload(s). Items can carry one or more
+   * questions; the SPA renders all of them in one form with a single
+   * submit button (batch UX). `POST /api/inbox/<id>/reply` validates the
+   * batch against each question and dispatches the compiled batched
+   * answer to the FIRST question whose `dispatch.session_id` is set.
+   * Legacy items with a singular `question` field are auto-migrated to
+   * `questions: [{id: 'q1', ...question}]` on read.
    */
-  question?: InboxQuestion;
+  questions?: InboxQuestion[];
+  /**
+   * Item-level dispatch routing for the always-on freeform reply box.
+   * When set, the SPA renders a "Send a message to the agent" textarea
+   * even on items with no questions; the user's typed message is wrapped
+   * with item context and dispatched to `dispatch.session_id`. Default
+   * prompt template: `User replied to inbox "<title>" (id=<id>): {answer}`.
+   * Overridable via `dispatch.prompt_template`. If a question-level
+   * dispatch is configured, it takes precedence for question answers;
+   * the item-level dispatch is the fallback / freeform target.
+   */
+  dispatch?: InboxQuestionDispatch;
+  /**
+   * Legacy single-question field. Always undefined after read-time
+   * migration. Typed as `unknown` so callers can't accidentally consume
+   * the pre-migration shape — go through `questions[]`.
+   */
+  question?: unknown;
   /**
    * Append-only reply chain (user answers + optional agent follow-ups). The
    * SPA renders these as chat-style bubbles below the question.
@@ -249,7 +320,17 @@ export interface InboxPatch {
   recipe_instance?: InboxItemRef | null;
   trigger_id?: string | null;
   labels?: string[];
-  question?: InboxQuestion;
+  /**
+   * Legacy single-question field. Always undefined after read-time
+   * migration (`migrateLegacyQuestion` in inbox-persistence.ts lifts
+   * any persisted single question into `questions[0]`). New tools/writes
+   * should use `questions` exclusively. Typed as `unknown` so callers
+   * never accidentally consume the pre-migration shape — go through
+   * `questions[]`.
+   */
+  question?: unknown;
+  questions?: InboxQuestion[];
+  dispatch?: InboxQuestionDispatch | null;
   replies?: InboxReply[];
   agent_message?: string;
   agent_tone?: AgentTone;
@@ -299,10 +380,15 @@ export class InboxStore {
     const existing = this.globalDir
       ? readInboxItemById(this.globalDir, id) ?? undefined
       : this.memory.get(id);
+    // Normalize nullable patch fields: `dispatch: null` is the explicit-clear
+    // signal; we translate it to `undefined` on the stored item so downstream
+    // types stay clean (`InboxQuestionDispatch | undefined`).
+    const patchNormalized = { ...patch } as Record<string, unknown>;
+    if (patchNormalized.dispatch === null) patchNormalized.dispatch = undefined;
     let item: InboxItem;
     let created: boolean;
     if (existing) {
-      item = { ...existing, ...patch, kind, source, updated_at: now };
+      item = { ...existing, ...patchNormalized, kind, source, updated_at: now } as InboxItem;
       created = false;
     } else {
       item = {
@@ -312,10 +398,15 @@ export class InboxStore {
         state: 'new',
         created_at: now,
         updated_at: now,
-        ...patch,
-      };
+        ...patchNormalized,
+      } as InboxItem;
       created = true;
     }
+    // Auto-promote a legacy `question` field in the patch into `questions[0]`
+    // so writes that go through both paths (DB + in-memory) consistently
+    // expose the new shape. The DB read path also runs this migration on
+    // load, but doing it here means in-memory reads stay correct too.
+    item = promoteLegacyQuestion(item);
     if (this.globalDir) {
       upsertInboxItem(this.globalDir, item);
     } else {
@@ -390,8 +481,10 @@ export class InboxStore {
    * Caller passes an already-built `InboxReply` (this layer doesn't validate
    * against `question.options` — the HTTP / MCP boundary does that).
    *
-   * If `closeQuestion` is true and the item has a `question`, the question
-   * is marked `closed: true`. Optionally bumps the item state.
+   * If `closeQuestion` is true, ALL questions on the item are marked
+   * `closed: true` (batch-close semantics — a multi-question item closes
+   * its whole block once the user submits an answer). Optionally bumps
+   * the item state.
    */
   appendReply(
     id: string,
@@ -408,8 +501,15 @@ export class InboxStore {
       replies,
       updated_at: Date.now(),
     };
-    if (opts.closeQuestion && existing.question) {
-      updated.question = { ...existing.question, closed: true };
+    if (opts.closeQuestion) {
+      // Close every question in the batch.
+      if (Array.isArray(existing.questions) && existing.questions.length > 0) {
+        updated.questions = existing.questions.map((q) => ({ ...q, closed: true }));
+      }
+      // Legacy single-question form (kept for write-side back-compat in tests).
+      if (existing.question) {
+        updated.question = { ...existing.question, closed: true };
+      }
     }
     if (opts.newState) {
       updated.state = opts.newState;
@@ -628,6 +728,51 @@ export class ApprovalStore {
       .filter((a) => !threadId || a.thread_id === threadId)
       .sort((a, b) => a.created_at - b.created_at);
   }
+}
+
+// ============================================================================
+// Migration helpers
+// ============================================================================
+
+/**
+ * Lift a legacy single `question` field on an InboxItem into `questions[0]`
+ * with a synthesized id ("q1"). Called on every write so the in-memory
+ * + DB shapes stay consistent with the new multi-question model. The
+ * read-side DB / JSON loaders run the same migration via
+ * `migrateLegacyQuestion` in inbox-persistence.ts, so even rows written
+ * before this migration shipped still surface correctly.
+ */
+function promoteLegacyQuestion(item: InboxItem): InboxItem {
+  if (Array.isArray(item.questions) && item.questions.length > 0) {
+    // Already in new shape — strip the legacy slot if it lingered.
+    if (item.question !== undefined) {
+      const { question, ...rest } = item as InboxItem & { question?: unknown };
+      void question;
+      return rest as InboxItem;
+    }
+    return item;
+  }
+  const legacy = item.question as
+    | (Partial<InboxQuestion> & Record<string, unknown>)
+    | undefined;
+  if (!legacy || typeof legacy !== 'object' || typeof legacy.prompt !== 'string') {
+    return item;
+  }
+  const promoted: InboxQuestion = {
+    id: typeof legacy.id === 'string' && legacy.id ? legacy.id : 'q1',
+    prompt: legacy.prompt,
+    mode: legacy.mode as InboxQuestion['mode'],
+    options: legacy.options as InboxQuestion['options'],
+    allow_freeform: legacy.allow_freeform as boolean | undefined,
+    placeholder: legacy.placeholder as string | undefined,
+    title: legacy.title as string | undefined,
+    close_on_answer: legacy.close_on_answer as boolean | undefined,
+    closed: legacy.closed as boolean | undefined,
+    dispatch: legacy.dispatch as InboxQuestion['dispatch'],
+  };
+  const { question, ...rest } = item as InboxItem & { question?: unknown };
+  void question;
+  return { ...rest, questions: [promoted] } as InboxItem;
 }
 
 // ============================================================================

@@ -56,7 +56,9 @@ test('InboxStore.appendReply: appends and persists across instances', () => {
     assert.ok(out);
     assert.equal(out.item.replies?.length, 1);
     assert.equal(out.item.replies?.[0]?.id, reply.id);
-    assert.equal(out.item.question?.closed, true);
+    // Multi-question schema: legacy `question: {...}` was migrated to questions[0]
+    // on the upsert path, so .question is now undefined and the closed flag lives on questions[0].
+    assert.equal(out.item.questions?.[0]?.closed, true);
     assert.equal(out.item.state, 'open');
 
     // A fresh store sees the same chain.
@@ -65,7 +67,7 @@ test('InboxStore.appendReply: appends and persists across instances', () => {
     const reread = b.read('q:1');
     assert.equal(reread?.replies?.length, 1);
     assert.equal(reread?.replies?.[0]?.author, 'user');
-    assert.equal(reread?.question?.closed, true);
+    assert.equal(reread?.questions?.[0]?.closed, true);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -287,10 +289,11 @@ test('MCP inbox.upsert: accepts question + replies fields', async () => {
     });
     assert.equal(upsertResult.structuredContent.created, true);
     const item = upsertResult.structuredContent.item;
-    assert.equal(item.question?.prompt, 'Approve the PR?');
-    assert.equal(item.question?.options?.length, 2);
-    assert.equal(item.question?.close_on_answer, true, 'close_on_answer defaults to true');
-    assert.equal(item.question?.mode, 'single', 'mode defaults to single with options');
+    assert.equal(item.questions?.[0]?.prompt, 'Approve the PR?');
+    assert.equal(item.questions?.[0]?.options?.length, 2);
+    assert.equal(item.questions?.[0]?.close_on_answer, true, 'close_on_answer defaults to true');
+    assert.equal(item.questions?.[0]?.mode, 'single', 'mode defaults to single with options');
+    assert.equal(item.questions?.[0]?.id, 'q1', 'id defaults to q1 for single-question legacy shorthand');
 
     // inbox.reply appends an agent follow-up.
     const replyResult = await callRegisteredTool('inbox.reply', {
@@ -322,7 +325,7 @@ test('MCP inbox.upsert: question=null clears the question field', async () => {
       notify: false,
       question: { prompt: 'x?' },
     });
-    assert.ok(inbox.read('q-clear')?.question);
+    assert.ok((inbox.read('q-clear')?.questions ?? []).length > 0);
 
     await callRegisteredTool('inbox.upsert', {
       id: 'q-clear',
@@ -331,7 +334,7 @@ test('MCP inbox.upsert: question=null clears the question field', async () => {
       notify: false,
       question: null,
     });
-    assert.equal(inbox.read('q-clear')?.question, undefined);
+    assert.equal((inbox.read('q-clear')?.questions ?? []).length, 0);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

@@ -156,82 +156,196 @@ function openAttachment(att: InboxAttachment): void {
 }
 
 // ---------------------------------------------------------------------------
-// Question + reply chain
+// Question + reply chain (multi-question batch UX)
 // ---------------------------------------------------------------------------
 
-const question = computed<InboxQuestion | undefined>(() => item.value?.question);
 const replies = computed<InboxReply[]>(() => item.value?.replies ?? []);
 
-const questionMode = computed<'single' | 'multi' | 'text'>(() => {
-  const q = question.value;
-  if (!q) return 'single';
+/**
+ * Find the active question batch — what the user should answer next.
+ * Walks replies newest-first looking for an agent-authored reply with
+ * unanswered `questions: [...]`. Falls back to item-level `questions[]`.
+ * Mirrors the server's `findActiveQuestionBatch` in cli/start.ts.
+ */
+interface ActiveBatch {
+  source: 'item' | 'reply';
+  reply_id?: string;
+  questions: InboxQuestion[];
+}
+const activeBatch = computed<ActiveBatch | null>(() => {
+  const it = item.value;
+  if (!it) return null;
+  const rs = replies.value;
+  for (let i = rs.length - 1; i >= 0; i--) {
+    const r = rs[i];
+    if (r.author === 'agent' && Array.isArray(r.questions) && r.questions.length > 0) {
+      if (r.questions.some((q) => q.closed !== true)) {
+        return { source: 'reply', reply_id: r.id, questions: r.questions };
+      }
+    }
+  }
+  const itemQs = Array.isArray(it.questions) ? it.questions : [];
+  if (itemQs.length > 0 && itemQs.some((q) => q.closed !== true)) {
+    return { source: 'item', questions: itemQs };
+  }
+  // All closed? Surface the most recent batch (closed) for display.
+  if (itemQs.length > 0) return { source: 'item', questions: itemQs };
+  for (let i = rs.length - 1; i >= 0; i--) {
+    const r = rs[i];
+    if (r.author === 'agent' && Array.isArray(r.questions) && r.questions.length > 0) {
+      return { source: 'reply', reply_id: r.id, questions: r.questions };
+    }
+  }
+  return null;
+});
+
+const activeQuestions = computed<InboxQuestion[]>(() => activeBatch.value?.questions ?? []);
+const allClosed = computed(() =>
+  activeQuestions.value.length > 0 && activeQuestions.value.every((q) => q.closed === true),
+);
+
+function modeFor(q: InboxQuestion): 'single' | 'multi' | 'text' {
   if (q.mode) return q.mode;
   return q.options && q.options.length > 0 ? 'single' : 'text';
-});
-const allowFreeform = computed(() =>
-  !!question.value && (question.value.allow_freeform === true || questionMode.value === 'text'),
-);
-const questionClosed = computed(() => question.value?.closed === true);
+}
+function allowFreeformFor(q: InboxQuestion): boolean {
+  return q.allow_freeform === true || modeFor(q) === 'text';
+}
 
-// Selection state — reset whenever the active item changes.
-const selectedOptionIds = ref<string[]>([]);
-const freeformText = ref('');
+// Per-question selection state, keyed by question_id.
+// Reset whenever the item or active batch changes.
+const perQuestionOptionIds = ref<Record<string, string[]>>({});
+const perQuestionText = ref<Record<string, string>>({});
 const submitting = ref(false);
 const submitError = ref<string | null>(null);
 
+function resetForm() {
+  perQuestionOptionIds.value = {};
+  perQuestionText.value = {};
+  submitError.value = null;
+}
+
+watch(() => props.itemId, resetForm);
 watch(
-  () => props.itemId,
-  () => {
-    selectedOptionIds.value = [];
-    freeformText.value = '';
-    submitError.value = null;
-  },
+  () => activeBatch.value?.reply_id ?? activeBatch.value?.source ?? null,
+  resetForm,
 );
 
-function toggleOption(optId: string): void {
-  if (questionClosed.value) return;
-  if (questionMode.value === 'single') {
-    selectedOptionIds.value = [optId];
-  } else if (questionMode.value === 'multi') {
-    const set = new Set(selectedOptionIds.value);
+function toggleOption(qid: string, optId: string): void {
+  if (allClosed.value) return;
+  const q = activeQuestions.value.find((x) => x.id === qid);
+  if (!q) return;
+  const mode = modeFor(q);
+  const current = perQuestionOptionIds.value[qid] ?? [];
+  if (mode === 'single') {
+    perQuestionOptionIds.value = { ...perQuestionOptionIds.value, [qid]: [optId] };
+  } else if (mode === 'multi') {
+    const set = new Set(current);
     if (set.has(optId)) set.delete(optId);
     else set.add(optId);
-    selectedOptionIds.value = [...set];
+    perQuestionOptionIds.value = { ...perQuestionOptionIds.value, [qid]: [...set] };
   }
 }
 
-const canSubmit = computed(() => {
-  if (!question.value || questionClosed.value || submitting.value) return false;
-  const mode = questionMode.value;
-  const hasText = freeformText.value.trim().length > 0;
-  const hasSelection = selectedOptionIds.value.length > 0;
-  if (mode === 'text') return hasText;
-  if (mode === 'single') return hasSelection || (allowFreeform.value && hasText);
-  if (mode === 'multi') return hasSelection || (allowFreeform.value && hasText);
+// ---------------------------------------------------------------------------
+// Always-on freeform reply (works even when no questions are configured,
+// as long as the item has a dispatch.session_id somewhere). Coexists with
+// the structured question form.
+// ---------------------------------------------------------------------------
+
+const freeformReplyText = ref('');
+const freeformSubmitting = ref(false);
+const freeformError = ref<string | null>(null);
+
+watch(() => props.itemId, () => {
+  freeformReplyText.value = '';
+  freeformError.value = null;
+});
+
+/** True if the item has ANY dispatch config (item-level or question-level). */
+const hasAnyDispatch = computed(() => {
+  const it = item.value;
+  if (!it) return false;
+  const itemDispatch = (it as unknown as { dispatch?: { session_id?: string } }).dispatch;
+  if (itemDispatch?.session_id) return true;
+  const itemQs = Array.isArray(it.questions) ? it.questions : [];
+  if (itemQs.some((q) => q.dispatch?.session_id)) return true;
+  for (const r of replies.value) {
+    if (Array.isArray(r.questions) && r.questions.some((q) => q.dispatch?.session_id)) return true;
+  }
   return false;
 });
+
+const showFreeformReply = computed(() => hasAnyDispatch.value);
+
+const canSendFreeform = computed(() =>
+  !freeformSubmitting.value && freeformReplyText.value.trim().length > 0,
+);
+
+async function onSubmitFreeform(): Promise<void> {
+  if (!canSendFreeform.value || !item.value) return;
+  freeformSubmitting.value = true;
+  freeformError.value = null;
+  try {
+    await store.submitInboxReply(item.value.id, {
+      text: freeformReplyText.value.trim(),
+    });
+    freeformReplyText.value = '';
+  } catch (err) {
+    freeformError.value = err instanceof Error ? err.message : String(err);
+  } finally {
+    freeformSubmitting.value = false;
+  }
+}
+
+function setText(qid: string, value: string): void {
+  perQuestionText.value = { ...perQuestionText.value, [qid]: value };
+}
+
+function isOptionSelected(qid: string, optId: string): boolean {
+  return (perQuestionOptionIds.value[qid] ?? []).includes(optId);
+}
+
+function questionAnswered(q: InboxQuestion): boolean {
+  const mode = modeFor(q);
+  const sel = perQuestionOptionIds.value[q.id] ?? [];
+  const text = (perQuestionText.value[q.id] ?? '').trim();
+  if (mode === 'text') return text.length > 0;
+  if (mode === 'single') return sel.length === 1 || (allowFreeformFor(q) && text.length > 0);
+  if (mode === 'multi') return sel.length > 0 || (allowFreeformFor(q) && text.length > 0);
+  return false;
+}
+
+const canSubmit = computed(() => {
+  if (allClosed.value || submitting.value) return false;
+  const qs = activeQuestions.value;
+  if (qs.length === 0) return false;
+  return qs.every(questionAnswered);
+});
+
+const unansweredCount = computed(() =>
+  activeQuestions.value.filter((q) => !questionAnswered(q)).length,
+);
 
 async function onSubmitReply(): Promise<void> {
   if (!canSubmit.value || !item.value) return;
   submitting.value = true;
   submitError.value = null;
   try {
-    await store.submitInboxReply(item.value.id, {
-      option_ids: selectedOptionIds.value.length > 0 ? selectedOptionIds.value : undefined,
-      text: freeformText.value.trim() || undefined,
-    });
-    // Reset local form on success — chain bubble renders from item.replies.
-    selectedOptionIds.value = [];
-    freeformText.value = '';
+    const answers = activeQuestions.value.map((q) => ({
+      question_id: q.id,
+      option_ids: (perQuestionOptionIds.value[q.id] ?? []).length > 0
+        ? perQuestionOptionIds.value[q.id]
+        : undefined,
+      text: (perQuestionText.value[q.id] ?? '').trim() || undefined,
+    }));
+    await store.submitInboxReply(item.value.id, { answers });
+    resetForm();
   } catch (err) {
     submitError.value = err instanceof Error ? err.message : String(err);
   } finally {
     submitting.value = false;
   }
-}
-
-function isOptionSelected(optId: string): boolean {
-  return selectedOptionIds.value.includes(optId);
 }
 
 function formatReplyTime(ts: number): string {
@@ -398,97 +512,96 @@ function formatSnoozeUntil(ts?: number): string {
         </div>
         <div v-else class="markdown-body" v-html="bodyHtml" />
       </div>
-      <div v-else-if="!question" class="muted no-body">No body. {{ item.preview ? '' : 'Inbox item is metadata-only.' }}</div>
+      <div v-else-if="activeQuestions.length === 0 && !hasAnyDispatch" class="muted no-body">No body. {{ item.preview ? '' : 'Inbox item is metadata-only.' }}</div>
 
-      <!-- Question card + reply chain -->
-      <div v-if="question" class="question-section">
-        <div class="question-prompt">{{ question.prompt }}</div>
+      <!-- Reply chain (always rendered when replies exist) -->
+      <div v-if="replies.length > 0" class="reply-chain">
+        <div
+          v-for="r in replies"
+          :key="r.id"
+          class="reply-bubble"
+          :class="{ 'reply-user': r.author === 'user', 'reply-agent': r.author === 'agent' }"
+        >
+          <div class="reply-head">
+            <span class="reply-author">{{ r.author === 'user' ? 'You' : 'Agent' }}</span>
+            <span class="reply-time">{{ formatReplyTime(r.created_at) }}</span>
+            <Tag
+              v-if="dispatchBadge(r)"
+              :severity="dispatchBadge(r)!.severity"
+              :value="dispatchBadge(r)!.label"
+              class="reply-badge"
+            />
+          </div>
+          <div class="reply-text">{{ r.text }}</div>
+          <div v-if="(r.attachments?.length ?? 0) > 0" class="reply-attachments">
+            <Button
+              v-for="att in (r.attachments ?? [])"
+              :key="att.artifact_id"
+              class="reply-att-btn"
+              size="small"
+              severity="secondary"
+              :outlined="true"
+              :disabled="!att.view_url"
+              :title="att.view_url ? `Open ${att.artifact_id}` : `Artifact ${att.artifact_id} not found`"
+              @click="openReplyAttachment(att)"
+            >
+              <i class="pi pi-paperclip" />
+              <span class="att-title">{{ att.title || att.artifact_id }}</span>
+            </Button>
+          </div>
+        </div>
+      </div>
 
-        <!-- Existing replies (chat-style) -->
-        <div v-if="replies.length > 0" class="reply-chain">
-          <div
-            v-for="r in replies"
-            :key="r.id"
-            class="reply-bubble"
-            :class="{ 'reply-user': r.author === 'user', 'reply-agent': r.author === 'agent' }"
-          >
-            <div class="reply-head">
-              <span class="reply-author">{{ r.author === 'user' ? 'You' : 'Agent' }}</span>
-              <span class="reply-time">{{ formatReplyTime(r.created_at) }}</span>
-              <Tag
-                v-if="dispatchBadge(r)"
-                :severity="dispatchBadge(r)!.severity"
-                :value="dispatchBadge(r)!.label"
-                class="reply-badge"
-              />
-            </div>
-            <div class="reply-text">{{ r.text }}</div>
-            <div v-if="(r.attachments?.length ?? 0) > 0" class="reply-attachments">
+      <!-- Active question batch (item-level or latest agent-reply) -->
+      <div v-if="activeQuestions.length > 0" class="question-section">
+        <div v-for="q in activeQuestions" :key="q.id" class="question-block">
+          <div v-if="q.title" class="question-title">{{ q.title }}</div>
+          <div class="question-prompt">{{ q.prompt }}</div>
+          <div v-if="!allClosed" class="question-form">
+            <div
+              v-if="(q.options?.length ?? 0) > 0"
+              class="question-options"
+              :class="{ 'options-single': modeFor(q) === 'single', 'options-multi': modeFor(q) === 'multi' }"
+              role="group"
+              :aria-label="modeFor(q) === 'single' ? 'Pick one option' : 'Pick one or more options'"
+            >
               <Button
-                v-for="att in (r.attachments ?? [])"
-                :key="att.artifact_id"
-                class="reply-att-btn"
+                v-for="opt in (q.options ?? [])"
+                :key="opt.id"
+                class="question-opt-btn"
                 size="small"
-                severity="secondary"
-                :outlined="true"
-                :disabled="!att.view_url"
-                :title="att.view_url ? `Open ${att.artifact_id}` : `Artifact ${att.artifact_id} not found`"
-                @click="openReplyAttachment(att)"
+                :severity="isOptionSelected(q.id, opt.id) ? 'info' : 'secondary'"
+                :outlined="!isOptionSelected(q.id, opt.id)"
+                :aria-pressed="isOptionSelected(q.id, opt.id)"
+                @click="toggleOption(q.id, opt.id)"
               >
-                <i class="pi pi-paperclip" />
-                <span class="att-title">{{ att.title || att.artifact_id }}</span>
+                <i v-if="isOptionSelected(q.id, opt.id)" class="pi pi-check" />
+                <span>{{ opt.label }}</span>
               </Button>
             </div>
+            <Textarea
+              v-if="allowFreeformFor(q)"
+              :model-value="perQuestionText[q.id] ?? ''"
+              class="question-text"
+              :placeholder="q.placeholder ?? 'Add a message…'"
+              :rows="2"
+              autoResize
+              :disabled="submitting"
+              @update:model-value="setText(q.id, $event)"
+            />
           </div>
         </div>
 
-        <!-- Answer form (hidden when closed) -->
-        <div v-if="!questionClosed" class="question-form">
-          <div
-            v-if="(question.options?.length ?? 0) > 0"
-            class="question-options"
-            :class="{ 'options-single': questionMode === 'single', 'options-multi': questionMode === 'multi' }"
-            role="group"
-            :aria-label="questionMode === 'single' ? 'Pick one option' : 'Pick one or more options'"
-          >
-            <Button
-              v-for="opt in (question.options ?? [])"
-              :key="opt.id"
-              class="question-opt-btn"
-              size="small"
-              :severity="isOptionSelected(opt.id) ? 'info' : 'secondary'"
-              :outlined="!isOptionSelected(opt.id)"
-              :aria-pressed="isOptionSelected(opt.id)"
-              @click="toggleOption(opt.id)"
-            >
-              <i v-if="isOptionSelected(opt.id)" class="pi pi-check" />
-              <span>{{ opt.label }}</span>
-            </Button>
-          </div>
-
-          <Textarea
-            v-if="allowFreeform"
-            v-model="freeformText"
-            class="question-text"
-            :placeholder="question.placeholder ?? 'Add a message…'"
-            :rows="2"
-            autoResize
-            :disabled="submitting"
-            @keydown.enter.exact.prevent="onSubmitReply"
-          />
-
+        <div v-if="!allClosed" class="question-form question-form-actions">
           <div v-if="submitError" class="question-error">
             <i class="pi pi-exclamation-triangle" /> {{ submitError }}
           </div>
-
           <div class="question-actions">
-            <span v-if="questionMode === 'single'" class="muted small">
-              Pick one option{{ allowFreeform ? ' or type a reply' : '' }}, then Send.
+            <span class="muted small">
+              {{ activeQuestions.length === 1 ? 'Answer the question' : `Answer all ${activeQuestions.length} questions` }},
+              then Send.
+              <span v-if="unansweredCount > 0">({{ unansweredCount }} unanswered)</span>
             </span>
-            <span v-else-if="questionMode === 'multi'" class="muted small">
-              Pick one or more options{{ allowFreeform ? ' (or type a reply)' : '' }}, then Send.
-            </span>
-            <span v-else class="muted small">Type your reply, then Send.</span>
             <Button
               icon="pi pi-send"
               label="Send"
@@ -500,9 +613,41 @@ function formatSnoozeUntil(ts?: number): string {
             />
           </div>
         </div>
-
         <div v-else class="question-closed muted small">
-          <i class="pi pi-check-circle" /> Question closed.
+          <i class="pi pi-check-circle" />
+          {{ activeQuestions.length === 1 ? 'Question closed.' : `All ${activeQuestions.length} questions closed.` }}
+        </div>
+      </div>
+
+      <!-- Always-on freeform reply box (when item has any dispatch config) -->
+      <div v-if="showFreeformReply" class="freeform-reply">
+        <div class="freeform-label">
+          <i class="pi pi-comment" />
+          {{ activeQuestions.length > 0 ? 'Or send a freeform message:' : 'Send a message to the agent:' }}
+        </div>
+        <Textarea
+          v-model="freeformReplyText"
+          class="freeform-text"
+          placeholder="Type your message…"
+          :rows="2"
+          autoResize
+          :disabled="freeformSubmitting"
+          @keydown.enter.exact.prevent="onSubmitFreeform"
+        />
+        <div v-if="freeformError" class="question-error">
+          <i class="pi pi-exclamation-triangle" /> {{ freeformError }}
+        </div>
+        <div class="question-actions">
+          <span class="muted small">Press Enter or click Send. The agent will receive it as a new prompt.</span>
+          <Button
+            icon="pi pi-send"
+            label="Send"
+            size="small"
+            severity="secondary"
+            :loading="freeformSubmitting"
+            :disabled="!canSendFreeform"
+            @click="onSubmitFreeform"
+          />
         </div>
       </div>
 

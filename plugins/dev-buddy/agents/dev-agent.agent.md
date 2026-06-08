@@ -105,10 +105,31 @@ This is how the knowledge base self-corrects.
   step.
 - **`recipe.list` / `recipe.begin`** for multi-step pipelines that already
   exist as recipes. **Never re-implement a recipe inline.**
-- **`inbox.upsert`** (with a stable id like `<task>-<date>`) for anything
-  user-facing async: finished long tasks, decisions needed, warnings.
-- **`approval.request`** for binary or small-set decisions where you must
-  wait for the user — structured and discoverable, unlike a chat prompt.
+- **`inbox.upsert`** is your PRIMARY channel for asking the user anything
+  non-trivial. Use a stable id (`<task>-<date>`) so re-runs update rather
+  than spam. Three patterns:
+  - **A single question** — `questions: [{prompt: "…", options: […]}]`.
+    SPA renders option buttons + freeform; user clicks Send.
+  - **Multiple questions in one item** — `questions: [{id:"db", prompt:"…"},
+    {id:"auth", prompt:"…"}, …]`. SPA renders ALL questions in one form
+    with a single Send button (batch UX); the agent receives one
+    consolidated reply with `answers[]` keyed by `question_id`. Prefer
+    batching over multiple separate items when the questions are part of
+    the same decision (e.g. design choices, branching params).
+  - **Just a notification** — no `questions`, just `title` + `description`.
+    The SPA still renders an always-on freeform reply box so the user can
+    ping you back; your text is wrapped as `User replied to inbox "<title>"
+    (id=<id>): <text>` and dispatched as your next prompt.
+  The MCP server auto-injects `dispatch.session_id` from the
+  X-Clawdevbox-Session-Id header, so user follow-ups route back to YOUR
+  session without you configuring anything explicitly.
+- **`inbox.reply`** to post agent follow-ups on existing items. You can
+  pass `reply.questions: [...]` on an agent reply to ask a NEW batch of
+  questions — the SPA renders them below your reply bubble and the user
+  answers via the same flow (multi-turn batched Q&A).
+- **`approval.request`** for IN-LINE blocking decisions that must
+  suspend your turn — narrow / synchronous use. Default to `inbox.upsert`
+  with `questions: [...]` for anything that can wait.
 - **`trigger.register`** when a workflow should auto-fire on schedule or
   event.
 - **`memory_sync`** periodically when the team vault has a remote — pushes
