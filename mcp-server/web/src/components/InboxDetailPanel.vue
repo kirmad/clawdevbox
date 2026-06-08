@@ -145,14 +145,32 @@ function toggleSnoozeMenu(ev: Event): void {
 }
 
 function openAttachment(att: InboxAttachment): void {
-  // Tell the store where this click originated so the artifact tab can
-  // render a "← back" button. paneKey is `inbox-detail:<id>` when
-  // rendered inside a popped-out tab; `inbox-master` for master-detail.
-  const fromTab = props.paneKey.startsWith('inbox-detail:');
-  store.openInboxAttachment(att, {
-    kind: fromTab ? 'inbox-tab' : 'inbox-list',
-    inboxId: props.itemId,
-  });
+  // Open inline as a subtab inside this inbox detail panel rather than
+  // as a top-level SPA tab. This keeps the user in context — they can
+  // see the artifact alongside the inbox conversation and the close ×
+  // returns them to the item content without losing their place.
+  store.openInboxAttachmentInline(att, props.itemId);
+}
+
+// ---------------------------------------------------------------------------
+// Per-inbox artifact subtabs (rendered as Tabs at the top of the panel)
+// ---------------------------------------------------------------------------
+
+const subtabState = computed(() =>
+  store.inboxArtifactSubtabs[props.itemId] ?? { tabs: [], active: null as string | null },
+);
+const activeSubtab = computed<string | null>(() => subtabState.value.active);
+const artifactSubtabs = computed(() => subtabState.value.tabs);
+
+function selectContentSubtab(): void {
+  store.setActiveInboxSubtab(props.itemId, null);
+}
+function selectArtifactSubtab(artifactId: string): void {
+  store.setActiveInboxSubtab(props.itemId, artifactId);
+}
+function closeArtifactSubtab(artifactId: string, ev?: Event): void {
+  ev?.stopPropagation();
+  store.closeInboxArtifactSubtab(props.itemId, artifactId);
 }
 
 // ---------------------------------------------------------------------------
@@ -538,7 +556,67 @@ function formatSnoozeUntil(ts?: number): string {
       </div>
     </header>
 
-    <div class="detail-scroll">
+    <!-- Per-inbox artifact subtabs: renders ONLY when at least one artifact
+         has been opened from this item. The "Item" subtab shows the
+         inbox content (description + question form + reply chain + freeform
+         reply box); each artifact subtab embeds the artifact iframe inline,
+         preserving inbox context. Close × on each artifact tab returns to
+         the Item subtab. -->
+    <div v-if="artifactSubtabs.length > 0" class="subtab-strip" role="tablist" aria-label="Inbox item views">
+      <button
+        type="button"
+        role="tab"
+        class="subtab"
+        :class="{ active: activeSubtab === null }"
+        :aria-selected="activeSubtab === null"
+        @click="selectContentSubtab"
+      >
+        <i class="pi pi-envelope" />
+        <span>Item</span>
+      </button>
+      <button
+        v-for="tab in artifactSubtabs"
+        :key="tab.id"
+        type="button"
+        role="tab"
+        class="subtab"
+        :class="{ active: activeSubtab === tab.id }"
+        :aria-selected="activeSubtab === tab.id"
+        :title="tab.title || tab.id"
+        @click="selectArtifactSubtab(tab.id)"
+      >
+        <i class="pi pi-paperclip" />
+        <span class="subtab-label">{{ tab.title || tab.id }}</span>
+        <i
+          class="pi pi-times subtab-close"
+          role="button"
+          tabindex="0"
+          aria-label="Close artifact tab"
+          :title="`Close ${tab.title || tab.id}`"
+          @click="closeArtifactSubtab(tab.id, $event)"
+        />
+      </button>
+    </div>
+
+    <!-- Artifact subtab content: when an artifact subtab is active, render
+         the artifact iframe instead of the inbox content. The iframe is
+         sandboxed identically to the top-level ArtifactPanel for safety. -->
+    <div
+      v-if="activeSubtab !== null"
+      v-for="tab in artifactSubtabs.filter((t) => t.id === activeSubtab)"
+      :key="`art-${tab.id}`"
+      class="artifact-subpane"
+    >
+      <iframe
+        :src="tab.url"
+        :title="tab.title || tab.id"
+        sandbox="allow-scripts allow-same-origin allow-forms"
+        class="artifact-iframe"
+        loading="lazy"
+      />
+    </div>
+
+    <div v-else class="detail-scroll">
       <div v-if="item.preview" class="detail-preview">{{ item.preview }}</div>
 
       <div v-if="(item.description_size ?? 0) > 0" class="detail-body-section">
@@ -815,6 +893,70 @@ function formatSnoozeUntil(ts?: number): string {
   display: flex;
   flex-direction: column;
   gap: 16px;
+}
+
+/* ---- Artifact subtab strip (per-inbox) ----------------------------------- */
+.subtab-strip {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  padding: 6px 8px 0 8px;
+  background: #181a21;
+  border-bottom: 1px solid #2a2e38;
+  overflow-x: auto;
+  flex-shrink: 0;
+}
+.subtab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-radius: 6px 6px 0 0;
+  color: var(--p-text-color-secondary);
+  font-size: 12.5px;
+  cursor: pointer;
+  white-space: nowrap;
+  max-width: 240px;
+  font: inherit;
+}
+.subtab:hover { background: #20232c; color: var(--p-text-color); }
+.subtab.active {
+  background: var(--p-content-background);
+  border-color: #2a2e38;
+  color: var(--p-text-color);
+  position: relative;
+  top: 1px;
+}
+.subtab-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 160px;
+}
+.subtab-close {
+  font-size: 10px;
+  padding: 2px;
+  margin-left: 2px;
+  border-radius: 3px;
+  opacity: 0.6;
+}
+.subtab-close:hover { opacity: 1; background: #2a2e38; }
+.subtab:focus-visible { outline: 2px solid var(--p-primary-color, #88c0d0); outline-offset: 1px; }
+
+/* ---- Artifact subpane (renders iframe inline when an artifact tab is active) */
+.artifact-subpane {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+.artifact-iframe {
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: var(--p-content-background);
 }
 
 .detail-preview { color: var(--p-text-color); font-size: 14px; font-style: italic; line-height: 1.5; }

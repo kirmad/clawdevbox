@@ -106,6 +106,17 @@ interface State {
     subscriberCount: number;
   };
   artifactTabs: OpenArtifactTab[];
+  /**
+   * Per-inbox artifact subtabs. Each inbox item has its own list of
+   * artifact subtabs that render inside the inbox detail panel (instead
+   * of opening top-level tabs that lose context). Keyed by inbox item id.
+   * `active` tracks which subtab is currently visible for that item;
+   * `null` = the inbox item content view, otherwise an artifact id.
+   */
+  inboxArtifactSubtabs: Record<string, {
+    tabs: OpenArtifactTab[];
+    active: string | null;  // null = "Item" content view; otherwise artifact id
+  }>;
   /** Pane id currently rendered fullscreen, e.g. `inbox-detail:<id>` or `artifact:<id>`. Null = none. */
   fullscreenPaneId: string | null;
   /**
@@ -157,6 +168,7 @@ export const useUiStore = defineStore('ui', {
       subscriberCount: 0,
     },
     artifactTabs: [],
+    inboxArtifactSubtabs: {},
     fullscreenPaneId: null,
     pendingMobileDetailRestore: null,
     activeTab: 'inbox',
@@ -239,6 +251,11 @@ export const useUiStore = defineStore('ui', {
      *
      * `from` records the parent context so the artifact tab gets a
      * "← back" button that returns to that view.
+     *
+     * **Use `openInboxAttachmentInline` instead** when the user is in
+     * the inbox detail panel and the artifact should appear as a subtab
+     * within that panel (in-context view). This top-level-tab variant is
+     * kept for non-inbox callers (recipe steps, etc).
      */
     openInboxAttachment(
       attachment: InboxAttachment,
@@ -254,6 +271,53 @@ export const useUiStore = defineStore('ui', {
         url: attachment.view_url,
         returnTo: from,
       });
+    },
+
+    /**
+     * Open an inbox attachment as a SUBTAB within the inbox detail panel.
+     * Adds the artifact to the per-inbox subtabs list and activates it.
+     * Re-opening the same attachment is idempotent (just activates the
+     * existing subtab). Persists across inbox-item navigation — clicking
+     * back to this item later restores the subtab state.
+     */
+    openInboxAttachmentInline(
+      attachment: InboxAttachment,
+      inboxId: string,
+    ): void {
+      if (!attachment.view_url) return;
+      const match = attachment.view_url.match(/^\/artifact\/([A-Za-z0-9._-]+)/);
+      if (!match) return;
+      const entry = this.inboxArtifactSubtabs[inboxId] ?? { tabs: [], active: null };
+      if (!entry.tabs.some((t) => t.id === attachment.artifact_id)) {
+        entry.tabs = [...entry.tabs, {
+          id: attachment.artifact_id,
+          title: attachment.title ?? attachment.artifact_id,
+          url: attachment.view_url,
+        }];
+      }
+      entry.active = attachment.artifact_id;
+      this.inboxArtifactSubtabs = { ...this.inboxArtifactSubtabs, [inboxId]: entry };
+    },
+
+    /** Close an inbox artifact subtab. If it was active, fall back to "Item". */
+    closeInboxArtifactSubtab(inboxId: string, artifactId: string): void {
+      const entry = this.inboxArtifactSubtabs[inboxId];
+      if (!entry) return;
+      const tabs = entry.tabs.filter((t) => t.id !== artifactId);
+      const active = entry.active === artifactId ? null : entry.active;
+      this.inboxArtifactSubtabs = {
+        ...this.inboxArtifactSubtabs,
+        [inboxId]: { tabs, active },
+      };
+    },
+
+    /** Switch the active subtab for an inbox item. `null` = "Item" content view. */
+    setActiveInboxSubtab(inboxId: string, active: string | null): void {
+      const entry = this.inboxArtifactSubtabs[inboxId] ?? { tabs: [], active: null };
+      this.inboxArtifactSubtabs = {
+        ...this.inboxArtifactSubtabs,
+        [inboxId]: { ...entry, active },
+      };
     },
 
     /**
