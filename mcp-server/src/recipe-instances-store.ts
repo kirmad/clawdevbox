@@ -50,8 +50,15 @@ export type RecipeStepStatus = 'pending' | 'running' | 'done' | 'failed' | 'awai
 export interface RecipeStep {
   /** Stable step id within the recipe (e.g. 'analyze-diffs', 'step-3'). */
   id: string;
-  /** Display title. */
+  /** Display title — the human-readable TL;DR for the UI. */
   title: string;
+  /**
+   * Full agent-facing prompt for this step. Optional — when omitted the
+   * step is purely informational / gate-only (no agent execution
+   * required). The UI renders this in a collapsible "Agent instructions"
+   * panel beneath the title.
+   */
+  ai_instructions?: string;
   status: RecipeStepStatus;
   started_at?: number;
   completed_at?: number;
@@ -256,9 +263,15 @@ function readStepsFromDb(db: Database, recipe_instance_id: string): RecipeStep[]
     const state = JSON.parse(r.state_json) as Record<string, unknown>;
     const step: RecipeStep = {
       id: r.step_id,
-      title: r.name ?? r.goal,
+      // `goal` is the human-readable TL;DR (the new shape). For back-compat
+      // with rows written before the rename, fall back to `name`. Either way
+      // the result is a ≤ 200-char short title suitable for the UI.
+      title: r.goal ?? r.name ?? '(no goal)',
       status: r.status,
     };
+    if (typeof state.ai_instructions === 'string' && state.ai_instructions.length > 0) {
+      step.ai_instructions = state.ai_instructions;
+    }
     if (r.started_at != null) step.started_at = r.started_at;
     if (r.completed_at != null) step.completed_at = r.completed_at;
     if (r.message) step.message = r.message;
@@ -434,6 +447,7 @@ function mirrorStepsToDb(
       stateObj.child_recipe_instance_id = s.child_recipe_instance_id;
     }
     if (s.artifact_id) stateObj.artifact_id = s.artifact_id;
+    if (s.ai_instructions) stateObj.ai_instructions = s.ai_instructions;
     const state_json = JSON.stringify(stateObj);
     const goal = s.title ?? '(no goal)';
     const name = s.title ?? null;

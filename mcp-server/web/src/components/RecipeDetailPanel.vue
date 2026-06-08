@@ -65,6 +65,17 @@ function stepClass(s: RecipeStep): string {
   return `step-row step-${s.status}`;
 }
 
+// Track which step's "Agent instructions" panel is expanded. Persisted only
+// for the lifetime of this component instance; collapsed by default to keep
+// the stepper scannable.
+const expandedAi = ref<Set<string>>(new Set());
+function toggleAiInstructions(stepId: string): void {
+  const next = new Set(expandedAi.value);
+  if (next.has(stepId)) next.delete(stepId);
+  else next.add(stepId);
+  expandedAi.value = next;
+}
+
 function formatDuration(s: RecipeStep): string {
   if (!s.started_at) return '';
   const end = s.completed_at ?? Date.now();
@@ -235,6 +246,27 @@ function openTerminal(): void {
                 <span v-if="formatDuration(s)" class="step-duration">{{ formatDuration(s) }}</span>
               </div>
               <div v-if="s.message" class="step-message">{{ s.message }}</div>
+              <div
+                v-if="s.ai_instructions"
+                class="step-ai-instructions"
+              >
+                <button
+                  type="button"
+                  class="step-ai-toggle"
+                  :aria-expanded="expandedAi.has(s.id)"
+                  @click="toggleAiInstructions(s.id)"
+                >
+                  <i
+                    class="pi"
+                    :class="expandedAi.has(s.id) ? 'pi-chevron-down' : 'pi-chevron-right'"
+                  />
+                  Agent instructions
+                </button>
+                <pre
+                  v-if="expandedAi.has(s.id)"
+                  class="step-ai-body"
+                >{{ s.ai_instructions }}</pre>
+              </div>
               <div
                 v-if="s.status === 'awaiting_user' && s.awaiting_user_prompt"
                 class="step-awaiting"
@@ -412,6 +444,44 @@ function openTerminal(): void {
 .step-title { font-weight: 500; font-size: 13.5px; }
 .step-duration { color: var(--p-text-color-secondary); font-size: 11px; }
 .step-message { color: var(--p-text-color-secondary); font-size: 12px; }
+
+/* ---- Collapsible "Agent instructions" panel beneath each step title ---- */
+.step-ai-instructions {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.step-ai-toggle {
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: transparent;
+  border: none;
+  padding: 2px 0;
+  color: var(--p-text-color-secondary);
+  font-size: 11.5px;
+  font: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.step-ai-toggle:hover { color: var(--p-text-color); }
+.step-ai-toggle i { font-size: 9px; }
+.step-ai-body {
+  margin: 4px 0 0 14px;
+  padding: 8px 10px;
+  background: rgba(255, 255, 255, 0.03);
+  border-left: 2px solid #2a2e38;
+  border-radius: 0 4px 4px 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--p-text-color);
+  white-space: pre-wrap;
+  font-family: ui-sans-serif, system-ui, sans-serif;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
 .step-awaiting {
   display: inline-flex;
   align-items: center;

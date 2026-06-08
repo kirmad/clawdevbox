@@ -251,6 +251,105 @@ test('step.artifacts.id pattern enforced', () => {
   if (!r.ok) assert.ok(r.errors.some((e) => e.path === 'steps[0].artifacts[0].id'));
 });
 
+// =========================================================================
+// ai_instructions field + auto-promotion of long-form `goal`
+// =========================================================================
+
+test('step.ai_instructions accepted alongside short goal', () => {
+  const r = withSteps([
+    { id: 'a', goal: 'Open PR', ai_instructions: 'Run `git push -u origin HEAD` then call ado.create_pr with target_ref=main.' },
+  ]);
+  const res = validateRecipeParsed(r);
+  assert.equal(res.ok, true, res.ok ? '' : JSON.stringify(res.errors));
+  assert.equal(r.steps[0].goal, 'Open PR');
+  assert.equal(
+    r.steps[0].ai_instructions,
+    'Run `git push -u origin HEAD` then call ado.create_pr with target_ref=main.',
+  );
+});
+
+test('step.ai_instructions empty string rejected', () => {
+  const r = withSteps([{ id: 'a', goal: 'g', ai_instructions: '' }]);
+  const res = validateRecipeParsed(r);
+  assert.equal(res.ok, false);
+  if (!res.ok) {
+    assert.ok(res.errors.some((e) => e.path === 'steps[0].ai_instructions' && e.code === 'INVALID_VALUE'));
+  }
+});
+
+test('step.ai_instructions >16000 chars rejected', () => {
+  const r = withSteps([{ id: 'a', goal: 'g', ai_instructions: 'x'.repeat(16001) }]);
+  const res = validateRecipeParsed(r);
+  assert.equal(res.ok, false);
+  if (!res.ok) {
+    assert.ok(res.errors.some((e) => e.path === 'steps[0].ai_instructions' && e.code === 'INVALID_VALUE'));
+  }
+});
+
+test('step.ai_instructions non-string rejected', () => {
+  const r = withSteps([{ id: 'a', goal: 'g', ai_instructions: 123 }]);
+  const res = validateRecipeParsed(r);
+  assert.equal(res.ok, false);
+  if (!res.ok) {
+    assert.ok(res.errors.some((e) => e.path === 'steps[0].ai_instructions' && e.code === 'TYPE'));
+  }
+});
+
+test('long goal (>200 chars) auto-promotes to ai_instructions + synthesizes short goal from first line', () => {
+  const firstLine = 'Phase 1 — Intake. Parse the work item URL and load relevant memory.';
+  const longGoal = `${firstLine}\nDetailed step a: do X.\nDetailed step b: do Y.\n` + 'z'.repeat(300);
+  const r = withSteps([{ id: 'a', goal: longGoal }]);
+  const res = validateRecipeParsed(r);
+  assert.equal(res.ok, true, res.ok ? '' : JSON.stringify(res.errors));
+  assert.equal(r.steps[0].goal, firstLine, 'short goal should be the first non-empty line');
+  assert.equal(r.steps[0].ai_instructions, longGoal, 'long goal should move into ai_instructions');
+});
+
+test('long goal — auto-promotion does NOT overwrite explicit ai_instructions', () => {
+  const longGoal = 'A'.repeat(250);
+  const explicit = 'My explicit instructions';
+  const r = withSteps([{ id: 'a', goal: longGoal, ai_instructions: explicit }]);
+  const res = validateRecipeParsed(r);
+  assert.equal(res.ok, true, res.ok ? '' : JSON.stringify(res.errors));
+  // Goal still gets shortened (it is > 200 chars).
+  assert.ok(r.steps[0].goal.length <= 200);
+  // But ai_instructions is preserved (not clobbered by the long goal).
+  assert.equal(r.steps[0].ai_instructions, explicit);
+});
+
+test('long goal — synthesizeShortGoal falls back to first sentence when first line is also long', () => {
+  const firstSentence = 'Run the deploy pipeline.';
+  // Make the FULL line > 200 chars so the first-line branch is skipped and
+  // we fall through to the sentence-split branch.
+  const tail = ' Then verify metrics in Grafana and post to Slack with the result, taking care to include the build id and the commit sha so the on-call can trace it back to the source and the relevant PR can be linked.';
+  const longGoal = firstSentence + tail;
+  assert.ok(longGoal.length > 200, `test fixture must be > 200 chars (got ${longGoal.length})`);
+  const r = withSteps([{ id: 'a', goal: longGoal }]);
+  const res = validateRecipeParsed(r);
+  assert.equal(res.ok, true, res.ok ? '' : JSON.stringify(res.errors));
+  assert.equal(r.steps[0].goal, firstSentence);
+  assert.equal(r.steps[0].ai_instructions, longGoal);
+});
+
+test('long goal — synthesizeShortGoal falls back to 197-char truncation + ellipsis', () => {
+  const longGoal = 'a'.repeat(500);
+  const r = withSteps([{ id: 'a', goal: longGoal }]);
+  const res = validateRecipeParsed(r);
+  assert.equal(res.ok, true, res.ok ? '' : JSON.stringify(res.errors));
+  assert.ok(r.steps[0].goal.length <= 200);
+  assert.ok(r.steps[0].goal.endsWith('…'));
+  assert.equal(r.steps[0].ai_instructions, longGoal);
+});
+
+test('step.goal missing still rejected (auto-promotion does not apply)', () => {
+  const r = withSteps([{ id: 'a', ai_instructions: 'do the thing' }]);
+  const res = validateRecipeParsed(r);
+  assert.equal(res.ok, false);
+  if (!res.ok) {
+    assert.ok(res.errors.some((e) => e.path === 'steps[0].goal' && e.code === 'REQUIRED'));
+  }
+});
+
 test('parseRecipeSource parses YAML', () => {
   const parsed = parseRecipeSource('id: foo\nname: Foo\n');
   assert.deepEqual(parsed, { id: 'foo', name: 'Foo' });

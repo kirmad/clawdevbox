@@ -263,7 +263,10 @@ export type RecipeStepStatus = 'pending' | 'running' | 'done' | 'failed' | 'awai
 
 export interface RecipeStep {
   id: string;
+  /** Short human-readable TL;DR for the UI (≤ 200 chars). */
   title: string;
+  /** Full agent-facing prompt; rendered in a collapsible panel. Optional. */
+  ai_instructions?: string;
   status: RecipeStepStatus;
   started_at?: number;
   completed_at?: number;

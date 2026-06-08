@@ -45,8 +45,18 @@ export interface ArtifactDecl {
 
 export interface Step {
   id: string;
+  /** Optional back-compat synonym for `goal`. New recipes use `goal` directly. */
   name?: string;
+  /** Human-readable TL;DR (≤ 200 chars). Shown as the step title in the UI. */
   goal: string;
+  /**
+   * Full agent-facing prompt for this step. Optional — omit when the step
+   * is purely informational (no agent execution required). Rendered as a
+   * collapsible "Agent instructions" panel in the SPA. Persisted in
+   * `state_json` rather than its own column so it survives schema
+   * migrations.
+   */
+  ai_instructions?: string;
   depends?: string[];
   params?: StepParamDecl[];
   triggers?: TriggerDecl[];
@@ -159,13 +169,16 @@ export function materializeSteps(
        id, recipe_instance_id, step_index, step_id, name, goal,
        depends_json, params_schema_json, triggers_decl_json, artifacts_decl_json,
        status, state_json
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', '{}')`,
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
   );
   const ids: string[] = [];
   const tx = db.transaction(() => {
     steps.forEach((s, idx) => {
       const id = mintStepId();
       ids.push(id);
+      // Stash ai_instructions in state_json (no schema migration needed).
+      const state: Record<string, unknown> = {};
+      if (s.ai_instructions) state.ai_instructions = s.ai_instructions;
       insertStmt.run(
         id,
         recipe_instance_id,
@@ -177,6 +190,7 @@ export function materializeSteps(
         JSON.stringify(s.params ?? []),
         JSON.stringify(s.triggers ?? []),
         JSON.stringify(s.artifacts ?? []),
+        JSON.stringify(state),
       );
     });
   });

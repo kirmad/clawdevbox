@@ -61,6 +61,28 @@ function isNonEmptyString(x: unknown): x is string {
   return typeof x === 'string' && x.length > 0;
 }
 
+/**
+ * Derive a short (≤ 200 char) human-readable TL;DR from a long-form step
+ * `goal` that pre-dates the new ai_instructions field. Tries (in order):
+ *   1. The first non-empty line.
+ *   2. The first sentence (split on `.`, `?`, `!`).
+ *   3. The first 200 chars + ellipsis.
+ *
+ * Stops trying at the first candidate that fits in 200 chars.
+ */
+function synthesizeShortGoal(longGoal: string): string {
+  const lines = longGoal.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  for (const line of lines) {
+    if (line.length <= 200) return line;
+    const sentences = line.split(/(?<=[.?!])\s+/);
+    for (const s of sentences) {
+      if (s.length > 0 && s.length <= 200) return s.trim();
+    }
+    return line.slice(0, 197).trim() + '…';
+  }
+  return longGoal.slice(0, 197).trim() + '…';
+}
+
 // ============================================================================
 // Recipe (TaskDock shape — spec §7.4)
 // ============================================================================
@@ -203,7 +225,9 @@ export function validateRecipeParsed(parsed: unknown): ValidationResult {
           seenIds.add(step.id);
         }
 
-        // name — optional, but when present must be a non-empty string ≤ 200 chars.
+        // name — optional. Kept as a back-compat synonym for `goal`; new
+        // recipes should set `goal` directly. When name is set, it must be a
+        // non-empty string ≤ 200 chars.
         if (step.name !== undefined) {
           if (typeof step.name !== 'string') {
             errors.push({ path: `${pathPrefix}.name`, code: 'TYPE', message: 'step.name must be a string.' });
@@ -214,8 +238,35 @@ export function validateRecipeParsed(parsed: unknown): ValidationResult {
           }
         }
 
+        // goal — required, human-readable TL;DR shown as the step title in
+        // the UI. Should be ≤ 200 chars. For back-compat with older recipes
+        // that put long agent instructions in `goal`: when goal > 200 chars,
+        // auto-promote the long form into `ai_instructions` (if unset) and
+        // synthesize a short goal from the first sentence/line. This keeps
+        // legacy recipes working without a hard break.
         if (!isNonEmptyString(step.goal)) {
-          errors.push({ path: `${pathPrefix}.goal`, code: 'REQUIRED', message: 'step.goal is required and must be a non-empty string.' });
+          errors.push({ path: `${pathPrefix}.goal`, code: 'REQUIRED', message: 'step.goal is required and must be a non-empty string (human-readable TL;DR ≤ 200 chars).' });
+        } else if ((step.goal as string).length > 200) {
+          // Auto-promote: long goal → ai_instructions + synthesize short goal.
+          const longGoal = step.goal as string;
+          if (typeof step.ai_instructions !== 'string' || step.ai_instructions.length === 0) {
+            step.ai_instructions = longGoal;
+          }
+          step.goal = synthesizeShortGoal(longGoal);
+        }
+
+        // ai_instructions — optional. The full agent-facing prompt for this
+        // step. Use when the step requires meaningful agent work; omit for
+        // purely-informational / gate steps that don't need agent execution.
+        // Max 16000 chars (room for detailed multi-paragraph instructions).
+        if (step.ai_instructions !== undefined) {
+          if (typeof step.ai_instructions !== 'string') {
+            errors.push({ path: `${pathPrefix}.ai_instructions`, code: 'TYPE', message: 'step.ai_instructions must be a string.' });
+          } else if (step.ai_instructions.length === 0) {
+            errors.push({ path: `${pathPrefix}.ai_instructions`, code: 'INVALID_VALUE', message: 'step.ai_instructions must not be empty (omit the field if no agent work is needed).' });
+          } else if (step.ai_instructions.length > 16000) {
+            errors.push({ path: `${pathPrefix}.ai_instructions`, code: 'INVALID_VALUE', message: 'step.ai_instructions must be ≤ 16000 characters.' });
+          }
         }
 
         // depends — accept array of strings or integers (integers coerced in place).
