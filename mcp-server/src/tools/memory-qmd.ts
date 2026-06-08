@@ -18,6 +18,7 @@ import { mkdirSync, readdirSync, existsSync, statSync } from 'node:fs';
 import type { VaultInfo } from '../vault-chain.ts';
 import type { MemoryConfig } from './memory-config.ts';
 import type { MemoryType } from './memory-paths.ts';
+import { vaultMemoryRoot } from './memory-paths.ts';
 
 let cachedStore: { store: QMDStore; dbPath: string } | null = null;
 
@@ -81,8 +82,12 @@ export async function registerVaultCollections(
   const existing = new Set((await store.listCollections()).map((c) => c.name));
   for (const vault of chain) {
     if (existing.has(vault.id)) continue;
+    // Ensure the memories subroot exists before qmd tries to scan it —
+    // qmd treats a missing collection root as an empty index but warns.
+    const root = vaultMemoryRoot(vault);
+    mkdirSync(root, { recursive: true });
     await store.addCollection(vault.id, {
-      path: vault.path,
+      path: root,
       pattern: '**/*.md',
       ignore: STANDARD_IGNORE,
     });
@@ -106,13 +111,14 @@ export async function registerProjectContexts(
   chain: VaultInfo[],
 ): Promise<void> {
   for (const vault of chain) {
-    if (!existsSync(vault.path)) continue;
-    const projects = readdirSync(vault.path, { withFileTypes: true })
+    const root = vaultMemoryRoot(vault);
+    if (!existsSync(root)) continue;
+    const projects = readdirSync(root, { withFileTypes: true })
       .filter((d) => d.isDirectory() && !d.name.startsWith('.'))
       .map((d) => d.name);
     for (const project of projects) {
       for (const [type, folder] of Object.entries(TYPE_FOLDERS) as Array<[MemoryType, string]>) {
-        const subtree = join(vault.path, project, folder);
+        const subtree = join(root, project, folder);
         if (!existsSync(subtree) || !statSync(subtree).isDirectory()) continue;
         const ctxPath = `/${project}/${folder}`;
         const description = contextDescription(vault.kind, project, type);

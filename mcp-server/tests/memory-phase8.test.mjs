@@ -108,17 +108,20 @@ function cleanupCtx(ctx) {
  * Set up a vault with a wiki-page conflict pending. After this returns:
  *  - the vault is mid-rebase-conflict
  *  - returns the syncOutcome (with base_sha / our_sha / their_sha / conflict_paths)
- *  - 'p/wiki/architecture/overview.md' is in conflict
+ *  - 'memories/p/wiki/architecture/overview.md' is in conflict
+ *
+ * NOTE: all wiki/memory artifacts live under the top-level `memories/`
+ * subdirectory in each vault (per memory-paths.ts MEMORY_ROOT_DIR).
  */
 function setupWikiConflict(vaultPath, remotePath, ourContent, theirContent) {
-  const wikiSubdir = join(vaultPath, 'p', 'wiki', 'architecture');
+  const wikiSubdir = join(vaultPath, 'memories', 'p', 'wiki', 'architecture');
   // First create the file on remote so both sides start from a common base
   const seedDir = mkdtempSync(join(tmpdir(), 'seed-conflict-'));
   try {
     git(['clone', '-q', remotePath, seedDir], '.');
     git(['config', 'user.email', 'seed@team.com'], seedDir);
     git(['config', 'user.name', 'Seed'], seedDir);
-    const seedSubdir = join(seedDir, 'p', 'wiki', 'architecture');
+    const seedSubdir = join(seedDir, 'memories', 'p', 'wiki', 'architecture');
     require_mkdir(seedSubdir);
     writeFileSync(join(seedSubdir, 'overview.md'), '# base\n\nshared starting content\n');
     git(['add', '.'], seedDir);
@@ -143,7 +146,7 @@ function setupWikiConflict(vaultPath, remotePath, ourContent, theirContent) {
     git(['clone', '-q', remotePath, otherDir], '.');
     git(['config', 'user.email', 'bob@team.com'], otherDir);
     git(['config', 'user.name', 'Bob'], otherDir);
-    const otherSubdir = join(otherDir, 'p', 'wiki', 'architecture');
+    const otherSubdir = join(otherDir, 'memories', 'p', 'wiki', 'architecture');
     writeFileSync(join(otherSubdir, 'overview.md'), theirContent);
     git(['add', '.'], otherDir);
     git(['commit', '-q', '-m', 'bob: edit wiki overview'], otherDir);

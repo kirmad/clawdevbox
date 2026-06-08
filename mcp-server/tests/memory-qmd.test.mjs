@@ -57,14 +57,14 @@ test('registerVaultCollections + searchAcrossCollections finds a memory by keywo
   const vaultDir = mkdtempSync(join(tmpdir(), 'qmd-vault-'));
   const dbDir   = mkdtempSync(join(tmpdir(), 'qmd-db-'));
   try {
-    mkdirSync(join(vaultDir, 'clawdevbox', 'memories'), { recursive: true });
+    mkdirSync(join(vaultDir, 'memories', 'clawdevbox', 'memories'), { recursive: true });
     writeFileSync(
-      join(vaultDir, 'clawdevbox', 'memories', '2026-06-07-jwt.md'),
+      join(vaultDir, 'memories', 'clawdevbox', 'memories', '2026-06-07-jwt.md'),
       '---\ntitle: JWT validation\nproject: clawdevbox\ntype: memory\n---\n\n# JWT validation\n\nAlways check the exp claim before iat.\n',
     );
-    mkdirSync(join(vaultDir, 'clawdevbox', 'wiki'), { recursive: true });
+    mkdirSync(join(vaultDir, 'memories', 'clawdevbox', 'wiki'), { recursive: true });
     writeFileSync(
-      join(vaultDir, 'clawdevbox', 'wiki', 'overview.md'),
+      join(vaultDir, 'memories', 'clawdevbox', 'wiki', 'overview.md'),
       '---\ntitle: Overview\nproject: clawdevbox\ntype: wiki\n---\n\n# Overview\n\nCaching strategy uses redis.\n',
     );
 
@@ -118,8 +118,8 @@ test('registerProjectContexts adds contexts for existing project/type subtrees',
   const vaultDir = mkdtempSync(join(tmpdir(), 'qmd-ctx-'));
   const dbDir   = mkdtempSync(join(tmpdir(), 'qmd-db-'));
   try {
-    mkdirSync(join(vaultDir, 'clawdevbox', 'memories'), { recursive: true });
-    mkdirSync(join(vaultDir, 'clawdevbox', 'wiki'), { recursive: true });
+    mkdirSync(join(vaultDir, 'memories', 'clawdevbox', 'memories'), { recursive: true });
+    mkdirSync(join(vaultDir, 'memories', 'clawdevbox', 'wiki'), { recursive: true });
     // No lessons / sessions folders — they should be skipped.
 
     _resetStoreCache();
@@ -149,8 +149,8 @@ test('scheduleReindex + flushReindex picks up newly written files', async () => 
   const vaultDir = mkdtempSync(join(tmpdir(), 'qmd-reindex-'));
   const dbDir   = mkdtempSync(join(tmpdir(), 'qmd-db-'));
   try {
-    mkdirSync(join(vaultDir, 'p', 'memories'), { recursive: true });
-    writeFileSync(join(vaultDir, 'p', 'memories', 'a.md'), '# alpha\n\nbeta.\n');
+    mkdirSync(join(vaultDir, 'memories', 'p', 'memories'), { recursive: true });
+    writeFileSync(join(vaultDir, 'memories', 'p', 'memories', 'a.md'), '# alpha\n\nbeta.\n');
 
     _resetStoreCache();
     const cfg = { ...DEFAULT_MEMORY_CONFIG, qmd_db_path: join(dbDir, 'i.sqlite') };
@@ -159,7 +159,7 @@ test('scheduleReindex + flushReindex picks up newly written files', async () => 
     await store.update();
 
     // Write a new file, schedule reindex, then flush to pick it up.
-    writeFileSync(join(vaultDir, 'p', 'memories', 'b.md'), '# gamma\n\ndelta.\n');
+    writeFileSync(join(vaultDir, 'memories', 'p', 'memories', 'b.md'), '# gamma\n\ndelta.\n');
     scheduleReindex(store, 'v', cfg);
     await flushReindex(store, cfg);
 

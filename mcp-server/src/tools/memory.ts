@@ -40,7 +40,7 @@ import {
   DEFAULT_MEMORY_CONFIG,
 } from './memory-config.ts';
 import {
-  buildFilename, resolveVault, vaultPathFor, eventsPathFor,
+  buildFilename, resolveVault, vaultPathFor, eventsPathFor, vaultMemoryRoot, MEMORY_ROOT_DIR,
   withCollisionSuffix, type MemoryType, type Scope, typeFolder,
 } from './memory-paths.ts';
 import { withVaultLock } from './memory-vault-lock.ts';
@@ -252,7 +252,9 @@ export async function handleAddLesson(
   if (dup) {
     return withVaultLock(vault.id, async () => {
       // Append a `reinforced` event to the existing lesson.
-      const segments = dup.vaultRelPath.split('/').filter(Boolean);
+      // dup.vaultRelPath is vault-relative ("memories/<project>/lessons/<file>.md");
+      // strip the memories/ prefix before extracting the rest-after-type.
+      const segments = stripMemoryRootPrefix(dup.vaultRelPath).split('/').filter(Boolean);
       const restAfterType = segments.slice(2).join('/');
       const eventsPath = eventsPathFor(vault, args.project, 'lesson', restAfterType);
       appendEvent(eventsPath, {
@@ -423,12 +425,14 @@ export async function handleGetMemory(
 
   const relPath = args.path.endsWith('.md') ? args.path : `${args.path}.md`;
   let found: { vault: VaultInfo; abs: string } | null = null;
+  // Accept either vault-relative ("memories/<project>/<type>/<rest>")
+  // or memory-root-relative ("<project>/<type>/<rest>") — try both
+  // in each vault before moving on.
   for (const v of candidates) {
-    const abs = join(v.path, relPath);
-    if (existsSync(abs)) {
-      found = { vault: v, abs };
-      break;
-    }
+    const direct = join(v.path, relPath);
+    if (existsSync(direct)) { found = { vault: v, abs: direct }; break; }
+    const underRoot = join(vaultMemoryRoot(v), relPath);
+    if (existsSync(underRoot)) { found = { vault: v, abs: underRoot }; break; }
   }
   if (!found) {
     const tried = candidates.map((v) => v.id).join(', ');
@@ -439,10 +443,11 @@ export async function handleGetMemory(
   const { frontmatter, body } = splitFrontmatterAndBody(raw);
   const type = frontmatter.type;
 
-  // Map frontmatter type to its sidecar file
-  const segments = relPath.split('/').filter(Boolean);
-  // Expected layout: <project>/<typeFolder>/<rest>.md
-  // Build events path from same logic as eventsPathFor by reusing it.
+  // Map frontmatter type to its sidecar file.
+  // relPath can be either:
+  //   - vault-relative: "memories/<project>/<typeFolder>/<rest>.md" (what add_* returns)
+  //   - memory-root-relative: "<project>/<typeFolder>/<rest>.md" (legacy/short form)
+  const segments = stripMemoryRootPrefix(relPath).split('/').filter(Boolean);
   const project = segments[0];
   const eventsPath = eventsPathFor(found.vault, project, type, segments.slice(2).join('/'));
   const events = readEvents(eventsPath);
@@ -686,14 +691,16 @@ export async function handleMemoryInit(
     );
   }
 
-  // Scaffold the _general/<type>/ folders in each vault. Existing
-  // folders are left alone; this is purely idempotent mkdirSync.
+  // Scaffold the _general/<type>/ folders in each vault, INSIDE the
+  // memories/ subroot so the vault root stays clean for other content.
   for (const vault of ctx.chain) {
     if (!existsSync(vault.path)) {
       throw new Error(`vault ${vault.id} path does not exist on disk: ${vault.path}`);
     }
+    const root = vaultMemoryRoot(vault);
+    mkdirSync(root, { recursive: true });
     for (const type of TYPE_FOLDERS_LIST) {
-      mkdirSync(join(vault.path, '_general', typeFolder(type)), { recursive: true });
+      mkdirSync(join(root, '_general', typeFolder(type)), { recursive: true });
     }
   }
 
@@ -806,8 +813,10 @@ export async function handleSearchMemory(
     if (!types.includes(decomposed.type)) continue;
     if (args.project && decomposed.project !== args.project) continue;
 
-    // Load events + frontmatter for ranking & last_modified
-    const absMd = join(vault.path, hit.displayPath);
+    // Load events + frontmatter for ranking & last_modified.
+    // displayPath is collection-relative; the collection is rooted at
+    // <vault>/memories so absolute path lives under vaultMemoryRoot().
+    const absMd = join(vaultMemoryRoot(vault), hit.displayPath);
     let folded;
     let lastModified = '';
     try {
@@ -944,12 +953,14 @@ export async function handleGetWikiIndex(
   let truncated = false;
 
   for (const vault of vaults) {
+    const root = vaultMemoryRoot(vault);
+    if (!existsSync(root)) continue;
     const projects = args.project
       ? [args.project]
-      : safeReaddir(vault.path).filter((d) => !d.startsWith('.') && !d.startsWith('_'));
+      : safeReaddir(root).filter((d) => !d.startsWith('.') && !d.startsWith('_'));
 
     for (const project of projects) {
-      const wikiRoot = join(vault.path, project, 'wiki');
+      const wikiRoot = join(root, project, 'wiki');
       if (!existsSync(wikiRoot)) continue;
       const subroot = args.root ? join(wikiRoot, args.root.replace(/^\/+/, '')) : wikiRoot;
       if (!existsSync(subroot)) continue;
@@ -1153,8 +1164,19 @@ function normalizeContent(s: string): string {
   return s.toLowerCase().replace(/\s+/g, ' ').trim();
 }
 
+/**
+ * Strip a leading "memories/" prefix from a path so the remainder is
+ * memory-root-relative (<project>/<typeFolder>/<rest>). Used by handlers
+ * that accept both vault-relative paths (returned by add_*) and shorter
+ * memory-root-relative paths in their `path` arguments.
+ */
+function stripMemoryRootPrefix(p: string): string {
+  const prefix = `${MEMORY_ROOT_DIR}/`;
+  return p.startsWith(prefix) ? p.slice(prefix.length) : p;
+}
+
 interface DedupHit {
-  vaultRelPath: string;     // <project>/lessons/<slug>.md
+  vaultRelPath: string;     // memories/<project>/lessons/<slug>.md (vault-relative)
   similarity: number;       // 0-1
 }
 
@@ -1185,7 +1207,7 @@ async function findDuplicateLesson(
       const { body } = splitFrontmatterAndBody(raw);
       if (normalizeContent(body) === normalizedNew) {
         return {
-          vaultRelPath: `${project}/lessons/${filename}`,
+          vaultRelPath: `${MEMORY_ROOT_DIR}/${project}/lessons/${filename}`,
           similarity: 1.0,
         };
       }
@@ -1207,7 +1229,7 @@ async function findDuplicateLesson(
       if (!dec || dec.project !== project || dec.type !== 'lesson') continue;
       const score = typeof (r as any).score === 'number' ? (r as any).score : 0;
       if (score >= ctx.config.duplicate_threshold) {
-        return { vaultRelPath: stripped, similarity: score };
+        return { vaultRelPath: `${MEMORY_ROOT_DIR}/${stripped}`, similarity: score };
       }
     }
   } catch { /* qmd unavailable; treat as no-dup */ }
@@ -1254,12 +1276,12 @@ async function handleVote(
     throw new Error('no vaults match the requested scope/vault_id');
   }
   let target: { vault: VaultInfo; abs: string } | null = null;
+  // Accept either vault-relative or memory-root-relative paths — try both.
   for (const v of candidates) {
-    const abs = join(v.path, relPath);
-    if (existsSync(abs)) {
-      target = { vault: v, abs };
-      break;
-    }
+    const direct = join(v.path, relPath);
+    if (existsSync(direct)) { target = { vault: v, abs: direct }; break; }
+    const underRoot = join(vaultMemoryRoot(v), relPath);
+    if (existsSync(underRoot)) { target = { vault: v, abs: underRoot }; break; }
   }
   if (!target) {
     throw new Error(`vote target not found: ${relPath} (searched ${candidates.map((v) => v.id).join(', ')})`);
@@ -1277,7 +1299,9 @@ async function handleVote(
   const project = args.project ?? frontmatter.project;
 
   return withVaultLock(target.vault.id, async () => {
-    const segments = relPath.split('/').filter(Boolean);
+    // relPath may be vault-relative ("memories/<project>/<type>/<rest>")
+    // or memory-root-relative ("<project>/<type>/<rest>"); normalize.
+    const segments = stripMemoryRootPrefix(relPath).split('/').filter(Boolean);
     const restAfterType = segments.slice(2).join('/');
     const eventsPath = eventsPathFor(target.vault, project, expectedType, restAfterType);
     const ts = ctx.now().toISOString();
@@ -1361,14 +1385,18 @@ export async function handleUpdateWiki(
   args: UpdateWikiArgs,
 ): Promise<UpdateWikiResult> {
   const vault = resolveVault(ctx.chain, args.scope, args.vault_id);
-  // Accept either a wiki-relative path ("architecture/data-flow") or a
-  // full vault-relative path ("p/wiki/architecture/data-flow.md"). The
-  // latter is what get_memory and search_memory return, so it's
-  // natural to round-trip.
+  // Accept any of these path shapes:
+  //   - "architecture/data-flow.md"               (wiki-relative)
+  //   - "<project>/wiki/architecture/data-flow.md" (project-relative shortcut)
+  //   - "memories/<project>/wiki/architecture/data-flow.md" (vault-relative;
+  //      returned by add_wiki_page.path / search_memory)
   let wikiRelPath = args.path.endsWith('.md') ? args.path : `${args.path}.md`;
-  const projectWikiPrefix = `${args.project}/wiki/`;
-  if (wikiRelPath.startsWith(projectWikiPrefix)) {
-    wikiRelPath = wikiRelPath.slice(projectWikiPrefix.length);
+  const fullPrefix = `${MEMORY_ROOT_DIR}/${args.project}/wiki/`;
+  const shortPrefix = `${args.project}/wiki/`;
+  if (wikiRelPath.startsWith(fullPrefix)) {
+    wikiRelPath = wikiRelPath.slice(fullPrefix.length);
+  } else if (wikiRelPath.startsWith(shortPrefix)) {
+    wikiRelPath = wikiRelPath.slice(shortPrefix.length);
   }
   const abs = vaultPathFor(vault, args.project, 'wiki', wikiRelPath);
   if (!existsSync(abs)) {

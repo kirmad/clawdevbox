@@ -11,6 +11,23 @@ import type { VaultInfo } from '../vault-chain.ts';
 export type MemoryType = 'memory' | 'lesson' | 'session' | 'wiki';
 export type Scope = 'personal' | 'team';
 
+/**
+ * Top-level subdirectory under each vault that holds all clawdevbox
+ * memory artifacts. Keeps memory data isolated so the vault can host
+ * other kinds of content (Obsidian notes, skills, agents) at the root
+ * without colliding with the per-project memory layout.
+ */
+export const MEMORY_ROOT_DIR = 'memories';
+
+/**
+ * Absolute path to the memory subsystem's root within a vault:
+ *   <vault.path>/memories
+ * All other path builders compose on top of this.
+ */
+export function vaultMemoryRoot(vault: VaultInfo): string {
+  return join(vault.path, MEMORY_ROOT_DIR);
+}
+
 const TYPE_TO_FOLDER: Record<MemoryType, string> = {
   memory: 'memories',
   lesson: 'lessons',
@@ -91,7 +108,7 @@ export function vaultPathFor(
   filename: string,
 ): string {
   assertProjectSafe(project);
-  return join(vault.path, project, typeFolder(type), filename);
+  return join(vaultMemoryRoot(vault), project, typeFolder(type), filename);
 }
 
 export function eventsPathFor(
@@ -105,8 +122,8 @@ export function eventsPathFor(
   const dir = dirname(stem);
   const base = basename(stem);
   const eventsDir = dir === '.'
-    ? join(vault.path, project, typeFolder(type), '.events')
-    : join(vault.path, project, typeFolder(type), '.events', dir);
+    ? join(vaultMemoryRoot(vault), project, typeFolder(type), '.events')
+    : join(vaultMemoryRoot(vault), project, typeFolder(type), '.events', dir);
   return join(eventsDir, `${base}.jsonl`);
 }
 

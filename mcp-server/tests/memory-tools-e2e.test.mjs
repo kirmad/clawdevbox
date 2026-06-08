@@ -90,7 +90,7 @@ test('handleAddMemory writes file, sidecar event, and commits', async () => {
     assert.match(result.slug, /^2026-06-07-always-validate-jwt-exp-before-iat\.md$/);
 
     const teamRoot = chain[1].path;
-    const filePath = join(teamRoot, 'clawdevbox', 'memories', result.slug);
+    const filePath = join(teamRoot, 'memories', 'clawdevbox', 'memories', result.slug);
     assert.ok(existsSync(filePath), `expected ${filePath} to exist`);
     const md = readFileSync(filePath, 'utf8');
     assert.match(md, /scope: team/);
@@ -101,7 +101,7 @@ test('handleAddMemory writes file, sidecar event, and commits', async () => {
     assert.match(md, /reason:/);
     assert.match(md, /Always validate JWT exp before iat/);
 
-    const eventsFile = join(teamRoot, 'clawdevbox', 'memories', '.events',
+    const eventsFile = join(teamRoot, 'memories', 'clawdevbox', 'memories', '.events',
       result.slug.replace(/\.md$/, '') + '.jsonl');
     assert.ok(existsSync(eventsFile), `expected ${eventsFile} to exist`);
     const ev = JSON.parse(readFileSync(eventsFile, 'utf8').trim());
@@ -175,7 +175,7 @@ test('handleAddLesson writes to lessons/ with initial_confidence', async () => {
       project: '_general',
       confidence: 0.7,
     });
-    const filePath = join(chain[0].path, '_general', 'lessons', result.slug);
+    const filePath = join(chain[0].path, 'memories', '_general', 'lessons', result.slug);
     assert.ok(existsSync(filePath));
     const md = readFileSync(filePath, 'utf8');
     assert.match(md, /type: lesson/);
@@ -210,7 +210,7 @@ test('handleAddSessionSummary uses minute granularity in filename', async () => 
       files: ['mcp-server/src/tools/memory.ts'],
     });
     assert.match(result.slug, /^2026-06-07T09-38-design-memory-tools\.md$/);
-    const md = readFileSync(join(chain[0].path, 'clawdevbox', 'sessions', result.slug), 'utf8');
+    const md = readFileSync(join(chain[0].path, 'memories', 'clawdevbox', 'sessions', result.slug), 'utf8');
     assert.match(md, /sidecar over frontmatter/);
     assert.match(md, /decisions:/);
     assert.match(md, /## Decisions/);
@@ -236,7 +236,7 @@ test('handleAddWikiPage creates nested path with wikilink-friendly body', async 
       project: 'clawdevbox',
     });
     assert.equal(result.slug, 'architecture/data-flow.md');
-    const filePath = join(chain[1].path, 'clawdevbox', 'wiki', 'architecture', 'data-flow.md');
+    const filePath = join(chain[1].path, 'memories', 'clawdevbox', 'wiki', 'architecture', 'data-flow.md');
     assert.ok(existsSync(filePath));
     const md = readFileSync(filePath, 'utf8');
     assert.match(md, /type: wiki/);
@@ -331,11 +331,11 @@ test('handleMemoryInit scaffolds folders and registers qmd collections idempoten
     const result1 = await handleMemoryInit(ctx, {});
     assert.equal(result1.vaults.length, 2);
     assert.equal(result1.qmd_status.collections, 2);
-    assert.ok(existsSync(join(chain[0].path, '_general', 'memories')));
-    assert.ok(existsSync(join(chain[0].path, '_general', 'lessons')));
-    assert.ok(existsSync(join(chain[0].path, '_general', 'sessions')));
-    assert.ok(existsSync(join(chain[0].path, '_general', 'wiki')));
-    assert.ok(existsSync(join(chain[1].path, '_general', 'memories')));
+    assert.ok(existsSync(join(chain[0].path, 'memories', '_general', 'memories')));
+    assert.ok(existsSync(join(chain[0].path, 'memories', '_general', 'lessons')));
+    assert.ok(existsSync(join(chain[0].path, 'memories', '_general', 'sessions')));
+    assert.ok(existsSync(join(chain[0].path, 'memories', '_general', 'wiki')));
+    assert.ok(existsSync(join(chain[1].path, 'memories', '_general', 'memories')));
 
     // Idempotent
     const result2 = await handleMemoryInit(ctx, {});

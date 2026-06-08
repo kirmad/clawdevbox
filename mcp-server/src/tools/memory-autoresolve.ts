@@ -243,9 +243,11 @@ async function safeInbox(opts: AutoResolveOptions, entry: InboxEntry): Promise<v
 }
 
 function isWikiPath(path: string): boolean {
-  // Vault-relative: <project>/wiki/<rest>.md
+  // Vault-relative paths from git status now look like:
+  //   memories/<project>/wiki/<rest>.md
+  // (memory subsystem files live under the top-level memories/ dir).
   const parts = path.replace(/\\/g, '/').split('/').filter(Boolean);
-  return parts.length >= 3 && parts[1] === 'wiki';
+  return parts.length >= 4 && parts[0] === 'memories' && parts[2] === 'wiki';
 }
 
 function countDiffLines(conflict: ConflictContext): number {

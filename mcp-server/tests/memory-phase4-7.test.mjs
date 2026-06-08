@@ -94,7 +94,7 @@ test('vote_memory appends event, commits, returns vote tally', async () => {
 
     // Commit should be visible in git log.
     const log = execFileSync('git', ['log', '--oneline'], { cwd: chain[1].path, encoding: 'utf8' });
-    assert.match(log, /vote: up p\/memories/);
+    assert.match(log, /vote: up memories\/p\/memories/);
   } finally {
     await cleanup();
     cleanupCtx(ctx);

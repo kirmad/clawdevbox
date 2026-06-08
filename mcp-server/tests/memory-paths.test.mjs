@@ -59,11 +59,11 @@ test('resolveVault throws when no vault matches', () => {
   assert.throws(() => resolveVault(chain, 'personal', 'nonexistent'), /vault_id "nonexistent" not found/i);
 });
 
-test('vaultPathFor builds the correct file path', () => {
+test('vaultPathFor builds the correct file path under the memories/ subroot', () => {
   const vault = { id: 'x', path: '/v', kind: 'personal', remote: null };
   assert.equal(
     vaultPathFor(vault, 'clawdevbox', 'memory', '2026-06-07-jwt.md').replace(/\\/g, '/'),
-    '/v/clawdevbox/memories/2026-06-07-jwt.md',
+    '/v/memories/clawdevbox/memories/2026-06-07-jwt.md',
   );
 });
 
@@ -77,7 +77,7 @@ test('eventsPathFor maps to sibling .events folder for flat types', () => {
   const vault = { id: 'x', path: '/v', kind: 'personal', remote: null };
   assert.equal(
     eventsPathFor(vault, 'clawdevbox', 'memory', '2026-06-07-jwt.md').replace(/\\/g, '/'),
-    '/v/clawdevbox/memories/.events/2026-06-07-jwt.jsonl',
+    '/v/memories/clawdevbox/memories/.events/2026-06-07-jwt.jsonl',
   );
 });
 
@@ -85,7 +85,7 @@ test('eventsPathFor handles nested wiki paths', () => {
   const vault = { id: 'x', path: '/v', kind: 'personal', remote: null };
   assert.equal(
     eventsPathFor(vault, 'clawdevbox', 'wiki', 'architecture/data-flow.md').replace(/\\/g, '/'),
-    '/v/clawdevbox/wiki/.events/architecture/data-flow.jsonl',
+    '/v/memories/clawdevbox/wiki/.events/architecture/data-flow.jsonl',
   );
 });
 
