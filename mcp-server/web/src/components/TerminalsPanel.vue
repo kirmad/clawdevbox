@@ -48,6 +48,7 @@ const olderArchived = computed(() => {
 // ---------------------------------------------------------------------------
 const LS_TAB_WIDTH = 'clawdevbox.terminals.tabListWidth';
 const LS_SIDE_WIDTH = 'clawdevbox.terminals.sidePanelWidth';
+const LS_SIDE_COLLAPSED = 'clawdevbox.terminals.sideCollapsed';
 
 function loadWidth(key: string, def: number, min: number, max: number): number {
   try {
@@ -56,11 +57,32 @@ function loadWidth(key: string, def: number, min: number, max: number): number {
   } catch { /* ignore */ }
   return def;
 }
+function loadBool(key: string, def: boolean): boolean {
+  try {
+    const v = localStorage.getItem(key);
+    if (v === '1' || v === 'true') return true;
+    if (v === '0' || v === 'false') return false;
+  } catch { /* ignore */ }
+  return def;
+}
 const tabListWidth = ref<number>(loadWidth(LS_TAB_WIDTH, 280, 180, 600));
 const sidePanelWidth = ref<number>(loadWidth(LS_SIDE_WIDTH, 360, 240, 900));
-const sideCollapsed = ref<boolean>(false);
+// Start COLLAPSED by default — the side panel covers ≈360px of horizontal
+// space and the terminal needs every column it can get for clean rendering
+// of wide TUI output (copilot's box drawing, multi-column lists, etc.).
+// User's toggle is persisted to localStorage so subsequent sessions remember
+// their preference.
+const sideCollapsed = ref<boolean>(loadBool(LS_SIDE_COLLAPSED, true));
 watch(tabListWidth, (v) => { try { localStorage.setItem(LS_TAB_WIDTH, String(v)); } catch { /* ignore */ } });
 watch(sidePanelWidth, (v) => { try { localStorage.setItem(LS_SIDE_WIDTH, String(v)); } catch { /* ignore */ } });
+watch(sideCollapsed, (v) => {
+  try { localStorage.setItem(LS_SIDE_COLLAPSED, v ? '1' : '0'); } catch { /* ignore */ }
+  // Resize the xterm + underlying pty when the side panel toggles. Debounced
+  // (200ms) so a flurry of mid-animation layout ticks coalesces into ONE
+  // resize message — that's what avoids the tmux re-flow garble we saw
+  // when ResizeObserver fired ~20 times per drag.
+  scheduleRefit();
+});
 
 
 function relTime(ts: number): string {
@@ -146,70 +168,116 @@ function tabLine3(s: Session): string {
 }
 
 /**
- * Refit the xterm to its container and inform the server-side pty of
- * the new cols/rows. Wrapped in requestAnimationFrame so layout has a
- * chance to settle before measurement (FitAddon reads computed CSS
- * dimensions; reading too early returns stale 0×0). No-ops if any
- * piece isn't ready yet.
+ * Refit the xterm to its container and tell the server pty about the new
+ * cols/rows. Three rules learned the hard way:
  *
- * IMPORTANT: skip when the host has zero dimensions. PrimeVue eagerly
- * mounts every TabPanel (even inactive ones), so this component runs
- * `attach()` while `.xterm-host` is still hidden (clientWidth/Height === 0).
- * In that state `fit.fit()` no-ops but `term.cols` / `term.rows` still
- * hold xterm's 80×24 defaults — sending those over the WS would resize
- * (shrink!) the live pty. ResizeObserver re-fires this function when
- * the host becomes visible, at which point fit can actually measure.
+ *   1. SKIP when the host has zero dimensions. PrimeVue eagerly mounts every
+ *      TabPanel (even inactive ones), so this fires while `.xterm-host` is
+ *      still hidden. fit.fit() on a 0×0 host shrinks the live pty to xterm's
+ *      80×24 default.
+ *   2. DEDUPE + min-delta. Only send a resize when cols/rows changed by at
+ *      least 2 cells. tmux re-flows scrollback on every SIGWINCH, and on
+ *      psmux/Windows that re-flow can visibly garble in-progress agent
+ *      output. We pay the reflow cost only for real layout changes, not
+ *      sub-pixel measurement jitter from font load or scrollbar mount.
+ *   3. DEBOUNCE — wait for layout to settle before measuring/sending.
+ *      Callers invoke `scheduleRefit()` rather than `refit()` directly.
  */
+let lastSentCols = 0;
+let lastSentRows = 0;
+let refitTimer: ReturnType<typeof setTimeout> | null = null;
+const MIN_RESIZE_DELTA = 2;
+
 function refit(): void {
-  if (!term || !fit) return;
-  requestAnimationFrame(() => {
-    const host = termHost.value;
-    if (!host || host.clientWidth === 0 || host.clientHeight === 0) return;
-    try {
-      fit!.fit();
-      if (ws && ws.readyState === WebSocket.OPEN && term) {
-        ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
-      }
-    } catch { /* host not measurable yet — next observer tick will retry */ }
-  });
+  if (!term || !fit || !termHost.value) return;
+  const host = termHost.value;
+  if (host.clientWidth === 0 || host.clientHeight === 0) return;
+  try { fit.fit(); } catch { return; }
+  const c = term.cols;
+  const r = term.rows;
+  if (c < 20 || r < 5 || c === 80) return;
+  if (Math.abs(c - lastSentCols) < MIN_RESIZE_DELTA && Math.abs(r - lastSentRows) < MIN_RESIZE_DELTA) return;
+  lastSentCols = c;
+  lastSentRows = r;
+  if (ws && ws.readyState === 1) {
+    try { ws.send(JSON.stringify({ type: 'resize', cols: c, rows: r })); } catch { /* ignore */ }
+  }
+}
+
+function scheduleRefit(): void {
+  if (refitTimer) clearTimeout(refitTimer);
+  refitTimer = setTimeout(() => {
+    refitTimer = null;
+    refit();
+  }, 200);
 }
 
 async function teardown(): Promise<void> {
+  if (refitTimer) { clearTimeout(refitTimer); refitTimer = null; }
   if (resizeObs) { try { resizeObs.disconnect(); } catch {} resizeObs = null; }
   if (onWindowResize) { window.removeEventListener('resize', onWindowResize); onWindowResize = null; }
   if (ws) { try { ws.close(); } catch {} ws = null; }
   if (term) { try { term.dispose(); } catch {} term = null; }
   fit = null;
+  lastSentCols = 0;
+  lastSentRows = 0;
 }
 
 async function attach(): Promise<void> {
   if (!termHost.value || !selectedId.value) return;
   await teardown();
   const isMobile = window.matchMedia('(max-width: 720px)').matches;
+  // Font family matches the standalone /terminal/<id> page (Consolas first)
+  // for consistent cell-width metrics. Cascadia Code's slightly-non-uniform
+  // glyphs caused intermittent header-overlay artifacts on copilot's TUI
+  // status line; Consolas is rock-solid for monospace alignment on Windows.
   term = new Terminal({
     cursorBlink: true,
-    fontFamily: 'Cascadia Code, ui-monospace, Menlo, monospace',
+    fontFamily: 'Consolas, "Liberation Mono", Cascadia Code, ui-monospace, Menlo, monospace',
     fontSize: isMobile ? 12 : 13,
     scrollback: 2000,
     theme: { background: '#15171d', foreground: '#d8dee9' },
-    allowProposedApi: true,
   });
   fit = new FitAddon();
   term.loadAddon(fit);
   term.open(termHost.value);
   await nextTick();
-  refit();
+
+  // Wait for xterm's renderer to actually measure the host's font.
+  // term.open() schedules font measurement asynchronously; calling fit.fit()
+  // in the same tick returns the 80×24 default. We rAF-poll up to ~6 frames
+  // (~100ms at 60fps) until FitAddon produces a reasonable result.
+  // The dims we resolve here are FINAL — once the WS opens, we never resize
+  // again (locked-at-attach pattern; see refit() comment below).
+  let initCols = 120;
+  let initRows = 30;
+  for (let i = 0; i < 8; i++) {
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    const host = termHost.value;
+    if (!host || host.clientWidth === 0 || host.clientHeight === 0) continue;
+    if (!term || !fit) break;
+    try { fit.fit(); } catch { continue; }
+    if (term.cols >= 20 && term.rows >= 5 && term.cols !== 80) {
+      // 80 is xterm's hard-coded default before any measurement — keep
+      // polling until we get a measured result.
+      initCols = term.cols;
+      initRows = term.rows;
+      break;
+    }
+  }
 
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const id = encodeURIComponent(selectedId.value);
-  ws = new WebSocket(`${proto}//${location.host}/terminal/${id}/ws`);
+  ws = new WebSocket(
+    `${proto}//${location.host}/terminal/${id}/ws?cols=${initCols}&rows=${initRows}`,
+  );
   ws.onopen = () => {
-    // Immediately fit with current layout, then again after 100 ms so that
-    // any async CSS reflows (flex layout settling, scrollbar appearing) have
-    // completed.  The second call also covers the common race where xterm
-    // opens before the host element has reached its final rendered width.
-    refit();
-    setTimeout(() => refit(), 100);
+    // The IPty was already sized from the URL ?cols=&rows= query, so we
+    // don't fire an initial resize here. lastSentCols/Rows are seeded so
+    // that the refit() dedup correctly suppresses redundant resizes when
+    // ResizeObserver fires immediately after WS open (host hasn't moved).
+    lastSentCols = initCols;
+    lastSentRows = initRows;
   };
   ws.onmessage = (ev) => {
     let msg: { type?: string; content?: string; chunk?: string };
@@ -223,14 +291,13 @@ async function attach(): Promise<void> {
     });
   }
 
-  // Auto-refit on container size changes (window resize, sidebar drawer
-  // toggle, tab switches) AND on window resize as a fallback for any
-  // change the ResizeObserver misses.
-  if (termHost.value && typeof ResizeObserver !== 'undefined') {
-    resizeObs = new ResizeObserver(() => refit());
-    resizeObs.observe(termHost.value);
-  }
-  onWindowResize = () => refit();
+  // Live resize. Both ResizeObserver (layout-driven: side panel toggle,
+  // tab-list drag, font load) and window-resize (browser viewport) feed
+  // the same debounced refit() — so a flurry of mid-animation ticks turns
+  // into ONE resize message after layout settles.
+  resizeObs = new ResizeObserver(() => scheduleRefit());
+  if (termHost.value) resizeObs.observe(termHost.value);
+  onWindowResize = () => scheduleRefit();
   window.addEventListener('resize', onWindowResize);
 }
 
@@ -665,8 +732,18 @@ watch(selectedId, () => { attach(); });
  * scrollbar absolutely inside the host. */
 .xterm-host { flex: 1 1 auto; min-width: 0; min-height: 0; background: #15171d; position: relative; padding: 4px; box-sizing: border-box; overflow: hidden; }
 .xterm-host :deep(.xterm) { width: 100%; height: 100%; }
-.xterm-host :deep(.xterm-viewport) { width: 100% !important; }
-.xterm-host :deep(.xterm-screen) { width: 100% !important; }
+/*
+ * IMPORTANT: do NOT force `width: 100%` on .xterm-viewport or .xterm-screen.
+ * xterm.js sizes these to EXACTLY `cols × cellWidth` px so that ANSI cursor
+ * positioning, background-color highlights, and selection rectangles land
+ * on the same pixels as the rendered glyphs. Forcing them wider with
+ * `!important` decouples the layers — text renders at one position while
+ * highlights render at another, producing the "GE pill drifting into
+ * Pull-requests" artifact in copilot's TUI status bar.
+ *
+ * We rely on the IPty being born at the host's exact dims (via the WS
+ * `?cols=&rows=` query) so xterm's natural size already fills the host.
+ */
 
 /* Spawn dialog */
 .spawn-form { display: flex; flex-direction: column; gap: 14px; padding: 4px 0; }

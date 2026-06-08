@@ -42,11 +42,27 @@ const activeTab = ref<Tab>(loadActiveTab());
 const artifactsNonce = ref(0);
 const recipeNonce = ref(0);
 
+/**
+ * Default: COLLAPSED. The side panel covers ≈360px of horizontal space and
+ * the terminal needs every column it can get for clean rendering of wide
+ * TUI output. Once the user explicitly toggles, the choice is persisted to
+ * `clawdevbox.terminals.sidePanelCollapsed` (stored as '1' for collapsed,
+ * '0' for expanded) and respected on subsequent loads. An absent key
+ * (first-time visitor) returns true.
+ *
+ * NOTE: TerminalsPanel.vue also tracks its own `sideCollapsed` ref (stored
+ * under `clawdevbox.terminals.sideCollapsed`) — both must default the same
+ * way for the initial render to be consistent (otherwise the parent
+ * reserves 28px of flex-basis while this component renders the expanded
+ * layout inside it, producing a broken sliver). The two refs stay in sync
+ * after first toggle via the @update:collapsed event.
+ */
 function loadCollapsed(): boolean {
   try {
     const v = localStorage.getItem(LS_COLLAPSED);
-    return v === '1';
-  } catch { return false; }
+    if (v === '0') return false; // user explicitly expanded
+    return true; // '1' or null (first visit) → collapsed
+  } catch { return true; }
 }
 function loadActiveTab(): Tab {
   try {

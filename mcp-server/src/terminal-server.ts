@@ -127,47 +127,17 @@ function resolveTmuxBin(): string {
 }
 
 /**
- * Force a tmux pane + window to the given dimensions. Required on psmux
- * (Windows) because `aggressive-resize` does not propagate SIGWINCH from an
- * `attach-session` client back to the tmux server — so the pane stays at its
- * creation size (120×30) even after the browser sends a resize message.
- *
- * We run both `resize-window` and `resize-pane` because psmux sometimes needs
- * both: resize-window sets the window geometry; resize-pane adjusts the
- * individual pane within it.  Both are fire-and-forget via spawnSync with a
- * short timeout so they don't block the Node event loop.
+ * Clamp a possibly-NaN / out-of-range pty dimension to a sane integer.
+ * Used when parsing the optional ?cols=&rows= query string on /terminal/<id>/ws.
+ * Range chosen to cover real desktop viewports (240 cols ≈ 4K @ 13px) without
+ * letting a buggy / hostile client request something silly.
  */
-function tmuxResizePane(
-  tmuxBin: string,
-  tmuxSocket: string | null,
-  sessionName: string,
-  cols: number,
-  rows: number,
-): void {
-  const socketArgs = tmuxSocket ? ['-L', tmuxSocket] : [];
-  // eslint-disable-next-line no-console
-  console.log('[tmux-resize]', JSON.stringify({ session: sessionName, cols, rows }));
-  // psmux (Windows) reserves 1 row internally even with `status off`, so the
-  // visible pane height is window_height - 1.  The caller already compensated
-  // in ipty.resize (passing rows+1); here we pass the original rows so that
-  // resize-window + ipty together converge on the correct pane height.
-  // resize-pane with only -x keeps pane width in sync; omitting -y avoids the
-  // double-subtract that would give rows-2.
-  for (const subcmd of [
-    ['resize-window', '-t', sessionName, '-x', String(cols), '-y', String(rows)],
-    ['resize-pane', '-t', sessionName, '-x', String(cols)],
-    ['refresh-client', '-t', sessionName],
-  ]) {
-    try {
-      spawnSync(tmuxBin, [...socketArgs, ...subcmd], {
-        timeout: 2000,
-        stdio: 'ignore',
-        // tmuxResizePane fires 3× per browser resize message; without
-        // windowsHide each one pops a brief console window on Windows.
-        windowsHide: true,
-      });
-    } catch { /* ignore — psmux may return non-zero for unsupported commands */ }
-  }
+function clampDim(v: number, fallback: number): number {
+  if (!Number.isFinite(v)) return fallback;
+  const n = Math.floor(v);
+  if (n < 20) return fallback; // < 20 ⇒ measurement against a hidden host; refuse
+  if (n > 500) return 500;
+  return n;
 }
 
 /**
@@ -260,8 +230,19 @@ export async function startTerminalServer(opts: {
       return;
     }
     const instanceId = wsMatch[1];
+    // Parse optional ?cols=&rows= so the FIRST tmux-attach IPty is born at
+    // the viewer's actual viewport size. On psmux (Windows) the pane's conpty
+    // dimensions are locked at attach-client creation time — `resize-window`
+    // and SIGWINCH-via-ipty.resize() are both no-ops. The only reliable way
+    // to update the underlying CLI's terminal size is to spawn a NEW
+    // `tmux attach-session` IPty at the new dims, which is what the WS
+    // 'resize' handler now does (see attachWebsocketViaTmux). Passing dims
+    // up-front avoids a flicker where the initial paint happens at the
+    // default 120×30 and then re-flows when the first resize message lands.
+    const cols = clampDim(Number(url.searchParams.get('cols')), 120);
+    const rows = clampDim(Number(url.searchParams.get('rows')), 30);
     wsServer!.handleUpgrade(req, socket, head, (ws) => {
-      void attachWebsocket(ws, instanceId);
+      void attachWebsocket(ws, instanceId, { cols, rows });
     });
   });
 
@@ -790,26 +771,30 @@ function renderTerminalHtml(instanceId: string, meta: TerminalHeaderMeta): strin
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.open(document.getElementById('term'));
+    // Fit BEFORE opening the WS so the server's tmux-attach IPty is born at
+    // the viewer's real dims. See terminal-server.ts attachWebsocketViaTmux
+    // for the rationale — on Windows psmux the pane's underlying CLI is
+    // locked to the size at attach-creation, and a resize mid-render causes
+    // tmux to re-flow the existing scrollback (visible as garbled text).
     fit.fit();
+    const initCols = (term.cols && term.cols >= 20) ? term.cols : 120;
+    const initRows = (term.rows && term.rows >= 5) ? term.rows : 30;
 
     const statusEl = document.getElementById('status');
     const killBtn = document.getElementById('killBtn');
 
     const wsUrl = new URL(\`/terminal/\${instanceId}/ws\`, location.href);
     wsUrl.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    wsUrl.searchParams.set('cols', String(initCols));
+    wsUrl.searchParams.set('rows', String(initRows));
     const ws = new WebSocket(wsUrl.toString());
 
     ws.onopen = () => {
       statusEl.textContent = 'attached';
-      // Fit ONCE to the actual rendered xterm size, then lock. We don't
-      // re-fit on window resize because the pty's scrollback (and any
-      // currently-on-screen TUI like a CLI's command palette) was painted
-      // using ANSI column positioning at the old cols. Re-fitting reflows
-      // those columns onto a different viewport width and the boxes /
-      // multi-column layouts misalign. Lock-after-attach gives a stable,
-      // predictable view; the browser viewport can grow or shrink freely
-      // (overflow handles the rest) without poisoning the visible buffer.
-      fit.fit();
+      // Belt-and-suspenders: send the (still-current) cols/rows once more.
+      // The server dedupes identical resizes so this is free when nothing
+      // changed; it covers the rare case where layout settled between
+      // fit.fit() and ws.onopen.
       ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
     };
     ws.onclose = () => {
@@ -860,14 +845,18 @@ function renderTerminalHtml(instanceId: string, meta: TerminalHeaderMeta): strin
 // WS handler
 // ============================================================================
 
-async function attachWebsocket(ws: WebSocket, instanceId: string): Promise<void> {
+async function attachWebsocket(
+  ws: WebSocket,
+  instanceId: string,
+  initialDims: { cols: number; rows: number } = { cols: 120, rows: 30 },
+): Promise<void> {
   // T19: tmux-attach path. If the instance is a tmux-backed agent in our
   // registry, spawn a per-viewer `tmux attach` IPty. xterm.js capability
   // replies go INTO tmux (a TUI client) and never reach the agent — this is
   // the structural fix for the viewer-input race.
   const tmuxSession = tmuxSessionRegistry.get(instanceId);
   if (tmuxSession) {
-    attachWebsocketViaTmux(ws, instanceId, tmuxSession.name);
+    attachWebsocketViaTmux(ws, instanceId, tmuxSession.name, initialDims);
     return;
   }
 
@@ -877,7 +866,7 @@ async function attachWebsocket(ws: WebSocket, instanceId: string): Promise<void>
   // exact instance_id name exists, attach to it. Uses the cached tmux list
   // (1s TTL) so back-to-back WS attaches don't fork a child each.
   if (!hasSession(instanceId) && await tmuxSessionExists(instanceId)) {
-    attachWebsocketViaTmux(ws, instanceId, instanceId);
+    attachWebsocketViaTmux(ws, instanceId, instanceId, initialDims);
     return;
   }
 
@@ -957,11 +946,28 @@ export function viewerCountForInstance(instanceId: string): number {
  * to the WebSocket. Each viewer gets its own attach process; closing the WS
  * kills only that viewer's attach without affecting other viewers OR the
  * agent (which keeps running in tmux).
+ *
+ * RESIZE — on Windows psmux (3.3.2 port of tmux):
+ *   • `tmux resize-window` / `resize-pane` are SILENT NO-OPS — they accept
+ *     the request and return success but the pane's conpty never changes
+ *     size.
+ *   • `ipty.resize(cols, rows)` on the attach IPty DOES work — node-pty
+ *     calls ResizePseudoConsole on the attach client's local conpty, the
+ *     tmux-attach process detects SIGWINCH (well, the Win32 equivalent),
+ *     and psmux applies the new size to the pane (because aggressive-resize
+ *     is on per the bundled cdb.tmux.conf).
+ *   • The pane's INITIAL size is locked at attach-client creation time. If
+ *     we spawn the attach IPty at 120×30 then resize to 136×52, copilot's
+ *     existing scrollback was rendered at 120 cols and tmux's re-flow of
+ *     mixed-width content looks garbled. To avoid this, the WS upgrade
+ *     handler parses `?cols=&rows=` and we pass them as the initial IPty
+ *     dims — so the very first paint is already at the viewer's real size.
  */
 function attachWebsocketViaTmux(
   ws: WebSocket,
   instanceId: string,
   tmuxSessionName: string,
+  initialDims: { cols: number; rows: number } = { cols: 120, rows: 30 },
 ): void {
   const tmuxBin = resolveTmuxBin();
   const cfg = resolveConfig({
@@ -979,14 +985,16 @@ function attachWebsocketViaTmux(
   args.push('attach-session', '-t', tmuxSessionName);
 
   // eslint-disable-next-line no-console
-  console.log('[tmux-attach]', JSON.stringify({ bin: tmuxBin, args, cwd: process.cwd() }));
+  console.log('[tmux-attach]', JSON.stringify({
+    bin: tmuxBin, args, cols: initialDims.cols, rows: initialDims.rows,
+  }));
 
   let ipty: ReturnType<typeof ptySpawn>;
   try {
     ipty = ptySpawn(tmuxBin, args, {
       name: 'xterm-256color',
-      cols: 120,
-      rows: 30,
+      cols: initialDims.cols,
+      rows: initialDims.rows,
       cwd: process.cwd(),
       env: process.env as Record<string, string>,
     });
@@ -995,7 +1003,7 @@ function attachWebsocketViaTmux(
       ws.send(JSON.stringify({
         type: 'snapshot',
         content: `[clawdevbox] failed to attach tmux viewer: ${(err as Error).message}\r\n`,
-        cols: 120, rows: 30, exited: true, exitCode: 1,
+        cols: initialDims.cols, rows: initialDims.rows, exited: true, exitCode: 1,
       }));
       ws.send(JSON.stringify({ type: 'exit', exitCode: 1 }));
       ws.close(1011, 'tmux attach failed');
@@ -1022,6 +1030,11 @@ function attachWebsocketViaTmux(
     try { ws.close(1000, 'tmux attach exited'); } catch {}
   });
 
+  // Track the last applied dims so we can ignore no-op resize messages
+  // (ResizeObserver fires many times during a viewport drag).
+  let currentCols = initialDims.cols;
+  let currentRows = initialDims.rows;
+
   ws.on('message', (raw) => {
     if (closed) return;
     let msg: unknown;
@@ -1035,16 +1048,15 @@ function attachWebsocketViaTmux(
       typeof m.cols === 'number' &&
       typeof m.rows === 'number'
     ) {
-      const cols = m.cols as number;
-      const rows = m.rows as number;
-      // psmux on Windows: the SIGWINCH path through `ipty.resize` tells tmux
-      // attach that the viewport is cols×rows, but aggressive-resize subtracts
-      // 1 row from the reported size when it propagates to the pane.  Pass
-      // rows+1 to ipty so the pane ends up at the rows the browser expects.
+      const cols = clampDim(m.cols, currentCols);
+      const rows = clampDim(m.rows, currentRows);
+      if (cols === currentCols && rows === currentRows) return;
+      currentCols = cols;
+      currentRows = rows;
+      // psmux on Windows: aggressive-resize subtracts 1 row when it propagates
+      // the IPty's SIGWINCH-equivalent to the pane. Pass rows+1 to ipty so
+      // the pane ends up at the rows the browser expects.
       try { ipty.resize(cols, rows + 1); } catch { /* attach dead */ }
-      // Explicit resize-window / resize-pane as belt-and-suspenders for psmux
-      // (aggressive-resize alone doesn't update the pane on Windows).
-      tmuxResizePane(tmuxBin, tmuxSocket, tmuxSessionName, cols, rows);
     }
     // 'kill' on a tmux-attach viewer just detaches (kill the attach IPty),
     // not the agent. Use DELETE /api/sessions/<id> for full agent kill.
