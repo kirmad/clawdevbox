@@ -1502,6 +1502,168 @@ function replaceMarkdownSection(body: string, sectionHeader: string, replacement
 }
 
 // ---------------------------------------------------------------------------
+// get_lessons — top lessons by combined score (decay × vote boost)
+//
+// This is the "session-start preload" tool. Unlike search_memory which is
+// query-driven, get_lessons walks the lesson files on disk for the active
+// project (+ _general), folds events for each, scores by
+//   combined = decay_adjusted_confidence × (1 + log1p(max(0, up - down)))
+// and returns the top N per scope (personal + team).
+//
+// Auto-resolves project from the current workspace's parent directory name
+// if not passed. Skips lessons not in <project> or _general so callers
+// don't get noise from unrelated repos.
+// ---------------------------------------------------------------------------
+
+const getLessonsSchema = z.object({
+  project: z.string().min(1).optional(),
+  limit_personal: z.number().int().positive().max(50).optional(),
+  limit_team: z.number().int().positive().max(50).optional(),
+}).strict();
+
+export type GetLessonsArgs = z.infer<typeof getLessonsSchema>;
+
+export interface RankedLesson {
+  vault_id: string;
+  scope: 'personal' | 'team';
+  project: string;
+  path: string;            // vault-relative (memories/<project>/lessons/<file>.md)
+  title: string;
+  content: string;         // full body
+  confidence: number;      // decay-adjusted
+  votes: { up: number; down: number };
+  reinforcement_count: number;
+  last_reinforced: string;
+  combined_score: number;
+}
+
+export interface GetLessonsResult {
+  personal: RankedLesson[];
+  team: RankedLesson[];
+  context: {
+    project: string;
+    projects_searched: string[];
+    vaults_searched: Array<{ id: string; kind: 'personal' | 'team' }>;
+    total_candidates: number;
+  };
+}
+
+export async function handleGetLessons(
+  ctx: ToolCtx,
+  args: GetLessonsArgs,
+): Promise<GetLessonsResult> {
+  const limitPersonal = args.limit_personal ?? 10;
+  const limitTeam = args.limit_team ?? 10;
+  const project = args.project ?? deriveActiveProject(ctx);
+  const projectsToSearch = project === '_general' ? ['_general'] : [project, '_general'];
+
+  const candidates: RankedLesson[] = [];
+  const now = ctx.now().getTime();
+
+  for (const vault of ctx.chain) {
+    const root = vaultMemoryRoot(vault);
+    if (!existsSync(root)) continue;
+    for (const proj of projectsToSearch) {
+      const lessonsDir = join(root, proj, 'lessons');
+      if (!existsSync(lessonsDir)) continue;
+      let entries: string[];
+      try {
+        entries = readdirSync(lessonsDir).filter((f) => f.endsWith('.md'));
+      } catch {
+        continue;
+      }
+      for (const filename of entries) {
+        const abs = join(lessonsDir, filename);
+        let raw: string;
+        try {
+          raw = readFileSync(abs, 'utf8');
+        } catch {
+          continue;
+        }
+        const { frontmatter, body } = splitFrontmatterAndBody(raw);
+        if (frontmatter.type !== 'lesson') continue;
+        const eventsPath = eventsPathFor(vault, proj, 'lesson', filename);
+        const folded = foldEvents(readEvents(eventsPath), { isLesson: true });
+
+        const storedConfidence = typeof folded.confidence_stored === 'number'
+          ? folded.confidence_stored
+          : 0.5;
+        const lastReinforcedAt = folded.last_reinforced
+          ? new Date(folded.last_reinforced).getTime()
+          : new Date(folded.created.at || '').getTime() || now;
+        const confidence = decayConfidence({
+          confidence_stored: storedConfidence,
+          last_reinforced_at: lastReinforcedAt,
+          now,
+          floor: ctx.config.decay.floor,
+          half_life_days: ctx.config.decay.half_life_days,
+        });
+        const net = folded.votes.up - folded.votes.down;
+        const voteBoost = 1 + Math.log1p(Math.max(0, net));
+        const combined = confidence * voteBoost;
+
+        const title = typeof frontmatter.title === 'string' && frontmatter.title
+          ? frontmatter.title
+          : deriveTitle(body);
+
+        candidates.push({
+          vault_id: vault.id,
+          scope: vault.kind,
+          project: proj,
+          path: `${MEMORY_ROOT_DIR}/${proj}/lessons/${filename}`,
+          title,
+          content: body.trim(),
+          confidence,
+          votes: { up: folded.votes.up, down: folded.votes.down },
+          reinforcement_count: folded.reinforcement_count ?? 0,
+          last_reinforced: folded.last_reinforced ?? folded.created.at ?? '',
+          combined_score: combined,
+        });
+      }
+    }
+  }
+
+  const personal = candidates
+    .filter((c) => c.scope === 'personal')
+    .sort((a, b) => b.combined_score - a.combined_score)
+    .slice(0, limitPersonal);
+  const team = candidates
+    .filter((c) => c.scope === 'team')
+    .sort((a, b) => b.combined_score - a.combined_score)
+    .slice(0, limitTeam);
+
+  return {
+    personal,
+    team,
+    context: {
+      project,
+      projects_searched: projectsToSearch,
+      vaults_searched: ctx.chain.map((v) => ({ id: v.id, kind: v.kind })),
+      total_candidates: candidates.length,
+    },
+  };
+}
+
+/**
+ * Resolve the project slug for "what am I working on right now". Falls
+ * back to '_general' when we can't infer from the workspace. The vault
+ * chain's first non-_general project name in the personal vault is a
+ * good signal, but env-supplied PROJECT or the cwd basename is more
+ * reliable when the tool is called from a real session.
+ */
+function deriveActiveProject(ctx: ToolCtx): string {
+  // 1. Explicit env var wins (set by clawdevbox start when launching agents).
+  const env = process.env.CLAWDEVBOX_PROJECT ?? process.env.CLAWDEVBOX_PROJECT_SLUG;
+  if (env && env.trim()) return env.trim();
+  // 2. cwd basename — the parent directory of the .clawdevbox/ folder.
+  const cwd = process.cwd();
+  const base = cwd.split(/[\\/]/).pop() ?? '';
+  if (base && !base.startsWith('.')) return base;
+  // 3. Last resort.
+  return '_general';
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -1727,6 +1889,26 @@ export function registerMemoryEntries(
     handler: async (args) => asJson(await handleMemorySync(await buildCtx(), args as MemorySyncArgs)),
     source: 'builtin',
     sourceFile,
+  });
+
+  defineTool({
+    name: 'get_lessons',
+    description:
+      'Return the top-ranked lessons preloaded for session-start context. ' +
+      'Walks <vault>/memories/<project>/lessons/ for the active project (+ _general), ' +
+      'computes combined_score = decay_adjusted_confidence × (1 + log1p(votes_up - votes_down)) ' +
+      'per lesson, and returns the top N personal + top N team. CALL THIS AT SESSION START ' +
+      'before answering anything substantive — these are durable heuristics future-you ' +
+      'should weigh from the first turn. Auto-resolves project from the env var ' +
+      'CLAWDEVBOX_PROJECT or the cwd basename when not passed explicitly.',
+    parameters: getLessonsSchema,
+    handler: async (args) => asJson(await handleGetLessons(await buildCtx(), args as GetLessonsArgs)),
+    source: 'builtin',
+    sourceFile,
+    examples: [{
+      description: 'Preload top lessons for the clawdevbox project',
+      args: { project: 'clawdevbox' },
+    }],
   });
 }
 
