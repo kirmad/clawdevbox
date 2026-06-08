@@ -145,6 +145,8 @@ export interface InboxItem {
   questions?: InboxQuestion[];
   /** Item-level dispatch — used by the always-on freeform reply box. */
   dispatch?: InboxQuestionDispatch;
+  /** True when there is unseen agent activity. Cleared on view / mark-read. */
+  unread?: boolean;
   replies?: InboxReply[];
   /** Optional legacy URL for direct artifact open. */
   view_url?: string;
@@ -235,6 +237,24 @@ export async function postInboxReply(
     throw new Error(`POST /api/inbox/${id}/reply → HTTP ${res.status} ${detail}`);
   }
   return (await res.json()) as InboxReplyResponse;
+}
+
+/**
+ * Mark an inbox item as read (clear the unread flag). The SPA calls this
+ * when the user opens the detail panel (auto) or clicks the explicit
+ * "Mark as read" button. Idempotent — re-marking a read item is a no-op.
+ */
+export async function markInboxRead(id: string): Promise<{ item: InboxItem }> {
+  const res = await fetch(`/api/inbox/${encodeURIComponent(id)}/mark-read`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+  });
+  if (!res.ok) {
+    let detail = '';
+    try { detail = (await res.text()).slice(0, 500); } catch { /* ignore */ }
+    throw new Error(`POST /api/inbox/${id}/mark-read → HTTP ${res.status} ${detail}`);
+  }
+  return (await res.json()) as { item: InboxItem };
 }
 
 // -- Recipes -----------------------------------------------------------------

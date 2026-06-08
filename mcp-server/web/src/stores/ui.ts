@@ -28,6 +28,7 @@ import {
   postInboxState,
   postPushUnsubscribe,
   postRecipeResume,
+  markInboxRead,
   type Bootstrap,
   type InboxAttachment,
   type InboxItem,
@@ -394,6 +395,32 @@ export const useUiStore = defineStore('ui', {
       // Fire-and-forget refresh — keeps the list in sync with the server.
       void this.refreshInbox();
       return result;
+    },
+
+    /**
+     * Mark an inbox item as read (clear the unread flag). Idempotent.
+     * Called automatically when the user opens the detail panel + on
+     * explicit "Mark as read" button. Optimistically updates the local
+     * `unread` flag so the badge clears immediately.
+     */
+    async markInboxItemRead(id: string): Promise<void> {
+      const idx = this.inbox.findIndex((it) => it.id === id);
+      if (idx >= 0 && this.inbox[idx].unread !== true) return; // already read
+      // Optimistic clear.
+      if (idx >= 0) {
+        const updated = { ...this.inbox[idx], unread: false };
+        this.inbox = [...this.inbox.slice(0, idx), updated, ...this.inbox.slice(idx + 1)];
+      }
+      try {
+        await markInboxRead(id);
+      } catch (err) {
+        // Rollback on failure; surface as a transient note (don't block UX).
+        console.warn('markInboxRead failed; rolling back optimistic clear:', err);
+        if (idx >= 0) {
+          const reverted = { ...this.inbox[idx], unread: true };
+          this.inbox = [...this.inbox.slice(0, idx), reverted, ...this.inbox.slice(idx + 1)];
+        }
+      }
     },
 
     // --- recipes ----------------------------------------------------------

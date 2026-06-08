@@ -285,6 +285,16 @@ export interface InboxItem {
    */
   dispatch?: InboxQuestionDispatch;
   /**
+   * True when there is unseen agent activity on this item the user
+   * hasn't acknowledged yet. Set to `true` on creation and on every
+   * agent-side mutation (agent reply, new questions, body change, etc).
+   * Cleared (`false`) when the user opens the item in the SPA or
+   * explicitly marks it read via `inbox.mark_read` /
+   * `POST /api/inbox/<id>/mark-read`. Defaults to `true` for items that
+   * have never been read.
+   */
+  unread?: boolean;
+  /**
    * Legacy single-question field. Always undefined after read-time
    * migration. Typed as `unknown` so callers can't accidentally consume
    * the pre-migration shape — go through `questions[]`.
@@ -331,6 +341,8 @@ export interface InboxPatch {
   question?: unknown;
   questions?: InboxQuestion[];
   dispatch?: InboxQuestionDispatch | null;
+  /** Toggle unread flag (true on agent activity, false on mark-read). */
+  unread?: boolean;
   replies?: InboxReply[];
   agent_message?: string;
   agent_tone?: AgentTone;
@@ -514,12 +526,37 @@ export class InboxStore {
     if (opts.newState) {
       updated.state = opts.newState;
     }
+    // Agent replies mark the item unread (new content for the user); user
+    // replies do NOT (the user just generated the content themselves).
+    if (reply.author === 'agent') {
+      updated.unread = true;
+    }
     if (this.globalDir) {
       upsertInboxItem(this.globalDir, updated);
     } else {
       this.memory.set(id, updated);
     }
     return { item: updated, reply };
+  }
+
+  /**
+   * Clear the unread flag on an item. Called when the user opens the
+   * detail panel (auto) or explicitly hits "Mark as read". Idempotent —
+   * marking an already-read item is a no-op.
+   */
+  markRead(id: string): InboxItem | undefined {
+    const existing = this.globalDir
+      ? readInboxItemById(this.globalDir, id) ?? undefined
+      : this.memory.get(id);
+    if (!existing) return undefined;
+    if (existing.unread !== true) return existing; // already read
+    const updated: InboxItem = { ...existing, unread: false, updated_at: Date.now() };
+    if (this.globalDir) {
+      upsertInboxItem(this.globalDir, updated);
+    } else {
+      this.memory.set(id, updated);
+    }
+    return updated;
   }
 
   /** Patch an existing reply in place (e.g. fill in dispatch outcome). */

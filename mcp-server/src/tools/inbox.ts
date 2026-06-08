@@ -360,6 +360,12 @@ export function registerInboxEntries(ws: Workspace): void {
         ),
       agent_message: z.string().optional(),
       agent_tone: agentToneField.optional(),
+      unread: z
+        .boolean()
+        .optional()
+        .describe(
+          'Explicit unread override. Default: items are auto-marked unread on creation and on any content-changing update (replies/questions/body/preview/title/attachments). Pass `false` here to suppress unread badging for a refresh you don\'t want to interrupt the user with; pass `true` to force unread without changing content.',
+        ),
       notify: z
         .boolean()
         .optional()
@@ -512,7 +518,37 @@ export function registerInboxEntries(ws: Workspace): void {
         }
       }
 
+      // ---- Set unread flag ---------------------------------------------------
+      // Items are marked unread on creation and on any agent-side mutation
+      // that delivers NEW content for the user — replies, questions, body,
+      // preview, title, attachments. Metadata-only updates (dispatch, labels,
+      // recipe_instance, trigger_id) do NOT toggle unread.
+      const contentChanged =
+        args.replies !== undefined ||
+        args.questions !== undefined ||
+        args.question !== undefined ||
+        args.description !== undefined ||
+        args.preview !== undefined ||
+        args.title !== undefined ||
+        args.attachments !== undefined;
+      // Caller can pass `unread: false` to suppress (e.g. a no-op refresh
+      // that shouldn't badge the user). Default: true on create + content
+      // change; undefined (unchanged) otherwise.
+      const explicitUnread = (args as unknown as { unread?: boolean }).unread;
+      if (typeof explicitUnread === 'boolean') {
+        patch.unread = explicitUnread;
+      } else if (contentChanged) {
+        patch.unread = true;
+      }
+
       const { item, created } = inbox.upsert(args.id, args.kind, args.source, patch);
+      // Brand-new items default to unread regardless of whether content
+      // changed in the patch — first arrival counts as new content. But
+      // respect explicit `unread: false` from the caller (silent refresh).
+      if (created && item.unread !== true && explicitUnread !== false) {
+        const re = inbox.upsert(item.id, item.kind, item.source, { unread: true });
+        Object.assign(item, re.item);
+      }
 
       // Default: push only on the first arrival. Caller can override either
       // way with an explicit `notify` flag.
@@ -739,6 +775,24 @@ export function registerInboxEntries(ws: Workspace): void {
       threads;
       return {
         content: [{ type: 'text', text: `Archived ${item.id}.` }],
+        structuredContent: { item },
+      };
+    },
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
+
+  // -- inbox.mark_read ------------------------------------------------------
+  defineTool({
+    name: 'inbox.mark_read',
+    description:
+      'Clear the unread flag on an inbox item. Items are auto-marked unread on creation and on agent-side mutations (replies, new questions, body/preview/title changes). The SPA also auto-clears unread when the user opens the item — this MCP tool exists for explicit programmatic clears (e.g. after the agent has digested a user follow-up reply). Idempotent — marking an already-read item is a no-op.',
+    parameters: z.object({ id: z.string().min(1) }),
+    handler: async (args) => {
+      const item = inbox.markRead(args.id);
+      if (!item) return notFound('inbox_item', args.id);
+      return {
+        content: [{ type: 'text', text: `Marked ${item.id} as read.` }],
         structuredContent: { item },
       };
     },

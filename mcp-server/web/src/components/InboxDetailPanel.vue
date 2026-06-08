@@ -231,6 +231,26 @@ watch(
   resetForm,
 );
 
+// Auto-mark item read when the detail panel opens for an unread item.
+// Idempotent — only fires when unread, and the store helper short-circuits
+// if already read. Triggers on initial mount + on every props.itemId change
+// (user clicks a different inbox item).
+watch(
+  () => props.itemId,
+  (id) => {
+    if (!id) return;
+    // Item may not be loaded yet when itemId changes — re-check on next
+    // tick by reading the latest item.value.
+    queueMicrotask(() => {
+      const cur = store.inbox.find((it) => it.id === id);
+      if (cur?.unread === true) {
+        void store.markInboxItemRead(id);
+      }
+    });
+  },
+  { immediate: true },
+);
+
 function toggleOption(qid: string, optId: string): void {
   if (allClosed.value) return;
   const q = activeQuestions.value.find((x) => x.id === qid);
@@ -369,6 +389,11 @@ function popOut(): void {
   store.popOutInbox(item.value.id, item.value.title);
 }
 
+function onMarkRead(): void {
+  if (!item.value) return;
+  void store.markInboxItemRead(item.value.id);
+}
+
 function jumpToRecipe(): void { store.setActiveTab('recipes'); }
 function jumpToTrigger(): void { store.setActiveTab('triggers'); }
 
@@ -478,6 +503,17 @@ function formatSnoozeUntil(ts?: number): string {
 
         <span class="action-divider" />
 
+        <Button
+          v-if="item.unread === true"
+          icon="pi pi-eye"
+          text
+          rounded
+          size="small"
+          aria-label="Mark as read"
+          title="Mark as read"
+          class="head-btn"
+          @click="onMarkRead"
+        />
         <Button
           v-if="!hidePopOut"
           icon="pi pi-external-link"

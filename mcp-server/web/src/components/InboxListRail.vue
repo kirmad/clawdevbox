@@ -68,11 +68,17 @@ function formatTime(ts?: number): string {
       :key="it.id"
       type="button"
       class="card"
-      :class="{ active: selectedId === it.id }"
+      :class="{ active: selectedId === it.id, unread: it.unread === true }"
       :aria-pressed="selectedId === it.id"
       @click="emit('select', it.id)"
     >
       <div class="card-row title-row">
+        <span
+          v-if="it.unread === true"
+          class="unread-dot"
+          aria-label="Unread"
+          title="Unread"
+        />
         <span class="title-text">{{ it.title || it.id }}</span>
         <span class="time">{{ formatTime(it.updated_at) }}</span>
       </div>
@@ -139,10 +145,21 @@ function formatTime(ts?: number): string {
   background: #232733;
   border-left-color: var(--p-primary-color, #88c0d0);
 }
+.card.unread .title-text {
+  font-weight: 700;
+}
 .card:focus-visible { outline: 2px solid var(--p-primary-color, #88c0d0); outline-offset: 1px; }
 
 .card-row { display: flex; align-items: center; gap: 6px; }
 .title-row { justify-content: space-between; }
+.unread-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--p-primary-color, #88c0d0);
+  flex-shrink: 0;
+  display: inline-block;
+}
 .title-text {
   flex: 1;
   min-width: 0;

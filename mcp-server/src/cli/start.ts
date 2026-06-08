@@ -1037,6 +1037,24 @@ export async function runStart(flags: Flags): Promise<void> {
       }
     }
 
+    // POST /api/inbox/<id>/mark-read — clear the unread flag.
+    // The SPA hits this when the user opens an item OR clicks Mark as Read.
+    {
+      const m = url.pathname.match(/^\/api\/inbox\/([^/]+)\/mark-read\/?$/);
+      if (m && req.method === 'POST') {
+        const id = decodeURIComponent(m[1]);
+        const item = inbox.markRead(id);
+        if (!item) {
+          res.writeHead(404, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'inbox item not found', id }));
+          return;
+        }
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ item }));
+        return;
+      }
+    }
+
     // POST /api/recipes/<id>/resume — spawn a new agent CLI session with
     // `--resume <session_id>` and write a new recipe-instance row tied
     // back to the original via `resume_of`. Source instance must have
