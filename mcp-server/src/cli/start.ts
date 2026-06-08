@@ -1907,23 +1907,30 @@ async function handleInboxReply(
   }
 
   // ---- Dispatch to the agent ---------------------------------------------
+  // Routing precedence:
+  //   1. First question with `dispatch.session_id` set (per-question routing).
+  //   2. Item-level `dispatch` (the always-on freeform reply target —
+  //      also used as fallback when questions don't have their own dispatch,
+  //      which is the COMMON case for items created via the inbox.upsert
+  //      session_id shorthand or auto-injected from the request header).
   const router = pickDispatchRouter(questions);
+  const routerDispatch = router?.dispatch ?? itemDispatch;
   let dispatchOutcome: InboxReply['dispatch'] | undefined;
   const shouldDispatch =
     body.dispatch !== false &&
-    !!router?.dispatch?.session_id &&
+    !!routerDispatch?.session_id &&
     !!compiled.dispatch_prompt;
 
-  if (shouldDispatch && ctx && router?.dispatch) {
+  if (shouldDispatch && ctx && routerDispatch) {
     try {
       const { spawnDispatchOrResume } = await import('../session-helpers.ts');
       const sessionCtx = sessionHelperCtxFromCron(ctx);
       const result = await spawnDispatchOrResume(sessionCtx, {
         prompt: compiled.dispatch_prompt,
-        session_id: router.dispatch.session_id ?? null,
-        provider: router.dispatch.provider ?? null,
-        workspace_id: router.dispatch.workspace_id ?? null,
-        workspace_path: router.dispatch.workspace_path ?? null,
+        session_id: routerDispatch.session_id ?? null,
+        provider: routerDispatch.provider ?? null,
+        workspace_id: routerDispatch.workspace_id ?? null,
+        workspace_path: routerDispatch.workspace_path ?? null,
         default_workspace_path: null,
       });
       if (result.ok) {
