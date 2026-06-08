@@ -26,6 +26,21 @@ All clawdevbox tools are gated by three meta-tools:
 **Session-warm pattern** (do once near start): `list_tools` for any subsystem
 you expect to touch, then `learn_tool` with a batch of names you'll need.
 
+> **Exact call shapes** — these are easy to get wrong:
+> - `learn_tool({ "tools": ["name1", "name2"] })` — `tools` is a **required array**, never omit it.
+> - `run_tool({ "tool": "<name>", "args": { ... } })` — uses `args` (not `arguments`).
+> - When a `run_tool` call returns a validation error mentioning a missing
+>   field, re-read the schema via `learn_tool` before retrying.
+
+### When the user says "use recipe X"
+
+This means call `recipe.begin({ "id": "X", "args": { ... } })`. Do NOT
+`recipe.read` the YAML and execute the steps manually — that bypasses the
+step-machine, status tracking, suspend/resume hooks, and the
+`recipe.steps.update_status` advance points the recipe assumes. Only use
+`recipe.read` when you genuinely need to inspect a recipe's shape before
+deciding whether to run it.
+
 ---
 
 ## Hard reflexes — do these every session, no exceptions
