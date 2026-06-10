@@ -1020,12 +1020,30 @@ function attachWebsocketViaTmux(
     else tmuxViewerCounts.set(instanceId, cur - 1);
   };
 
-  ipty.onData((chunk) => {
+  // Coalesce tmux's tight redraw bursts into ≤120fps WS messages. Without
+  // this, a full-screen tmux repaint flushes 100+ tiny chunks per second,
+  // each becoming its own JSON.stringify + ws.send + onmessage + term.write
+  // round-trip on the browser. Batching 8ms of chunks into one message
+  // cuts xterm.js's writebuffer pressure dramatically and lets the WebGL
+  // renderer draw entire repaints in a single frame.
+  let pendingChunks: string[] = [];
+  let flushTimer: ReturnType<typeof setImmediate> | null = null;
+  const flush = (): void => {
+    flushTimer = null;
+    if (pendingChunks.length === 0) return;
+    const merged = pendingChunks.length === 1 ? pendingChunks[0] : pendingChunks.join('');
+    pendingChunks = [];
     if (closed || ws.readyState !== ws.OPEN) return;
-    try { ws.send(JSON.stringify({ type: 'data', chunk })); } catch { /* viewer drop */ }
+    try { ws.send(JSON.stringify({ type: 'data', chunk: merged })); } catch { /* viewer drop */ }
+  };
+  ipty.onData((chunk) => {
+    if (closed) return;
+    pendingChunks.push(chunk);
+    if (!flushTimer) flushTimer = setImmediate(flush);
   });
   ipty.onExit(({ exitCode }) => {
     if (closed) return;
+    flush();
     try { ws.send(JSON.stringify({ type: 'exit', exitCode: exitCode ?? 0 })); } catch {}
     try { ws.close(1000, 'tmux attach exited'); } catch {}
   });
@@ -1070,6 +1088,8 @@ function attachWebsocketViaTmux(
   const cleanup = (): void => {
     if (closed) return;
     closed = true;
+    if (flushTimer) { clearImmediate(flushTimer); flushTimer = null; }
+    pendingChunks = [];
     killViewerIpty(ipty);
     decrementViewerCount();
   };

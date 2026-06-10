@@ -15,6 +15,8 @@ import type { Session } from '../api';
 import { fetchAgentClis, type AgentCliInfo } from '../api';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
+import { WebglAddon } from '@xterm/addon-webgl';
+import { CanvasAddon } from '@xterm/addon-canvas';
 import '@xterm/xterm/css/xterm.css';
 import ResizeHandle from './ResizeHandle.vue';
 import SessionSidePanel from './SessionSidePanel.vue';
@@ -26,6 +28,11 @@ let fit: FitAddon | null = null;
 let ws: WebSocket | null = null;
 let resizeObs: ResizeObserver | null = null;
 let onWindowResize: (() => void) | null = null;
+// Monotonic token to detect concurrent attach() calls. If another attach()
+// bumps this between awaits, the older call bails out instead of clobbering
+// module-level refs. A previous race here registered TWO term.onData handlers
+// on the same Terminal, producing the "every keystroke shows up twice" bug.
+let attachGen = 0;
 
 const selectedId = computed(() => store.terminals.selectedInstanceId);
 const activeSessions = computed(() => store.terminals.items.filter((s) => s.live));
@@ -168,137 +175,172 @@ function tabLine3(s: Session): string {
 }
 
 /**
- * Refit the xterm to its container and tell the server pty about the new
- * cols/rows. Three rules learned the hard way:
- *
- *   1. SKIP when the host has zero dimensions. PrimeVue eagerly mounts every
- *      TabPanel (even inactive ones), so this fires while `.xterm-host` is
- *      still hidden. fit.fit() on a 0×0 host shrinks the live pty to xterm's
- *      80×24 default.
- *   2. DEDUPE + min-delta. Only send a resize when cols/rows changed by at
- *      least 2 cells. tmux re-flows scrollback on every SIGWINCH, and on
- *      psmux/Windows that re-flow can visibly garble in-progress agent
- *      output. We pay the reflow cost only for real layout changes, not
- *      sub-pixel measurement jitter from font load or scrollbar mount.
- *   3. DEBOUNCE — wait for layout to settle before measuring/sending.
- *      Callers invoke `scheduleRefit()` rather than `refit()` directly.
+ * Try to load a GPU-accelerated renderer. Preference: WebGL -> Canvas -> DOM
+ * (default xterm fallback). xterm.js's WebGL addon handles tmux's aggressive
+ * redraws far better than the DOM renderer (which mounts/unmounts thousands
+ * of nodes per frame). On WebGL context-loss (driver crash, tab suspend),
+ * we dispose the addon and xterm transparently falls back to DOM.
  */
-let lastSentCols = 0;
-let lastSentRows = 0;
+function loadAcceleratedRenderer(t: Terminal): 'webgl' | 'canvas' | 'dom' {
+  try {
+    const addon = new WebglAddon();
+    addon.onContextLoss(() => { try { addon.dispose(); } catch { /* */ } });
+    t.loadAddon(addon);
+    return 'webgl';
+  } catch { /* WebGL2 unavailable */ }
+  try {
+    const addon = new CanvasAddon();
+    t.loadAddon(addon);
+    return 'canvas';
+  } catch { /* fall through to DOM */ }
+  return 'dom';
+}
+
+/**
+ * Refit xterm to its host's current pixel size. fit.fit() updates
+ * term.cols/term.rows; if those change, the `term.onResize` listener
+ * registered in attach() automatically sends a {type:'resize'} WS message
+ * which reaches ipty.resize() on the backend. Skip when host is hidden so
+ * we don't shrink the live pty to xterm's 80x24 default.
+ */
 let refitTimer: ReturnType<typeof setTimeout> | null = null;
-const MIN_RESIZE_DELTA = 2;
 
 function refit(): void {
   if (!term || !fit || !termHost.value) return;
   const host = termHost.value;
   if (host.clientWidth === 0 || host.clientHeight === 0) return;
-  try { fit.fit(); } catch { return; }
-  const c = term.cols;
-  const r = term.rows;
-  if (c < 20 || r < 5 || c === 80) return;
-  if (Math.abs(c - lastSentCols) < MIN_RESIZE_DELTA && Math.abs(r - lastSentRows) < MIN_RESIZE_DELTA) return;
-  lastSentCols = c;
-  lastSentRows = r;
-  if (ws && ws.readyState === 1) {
-    try { ws.send(JSON.stringify({ type: 'resize', cols: c, rows: r })); } catch { /* ignore */ }
-  }
+  try { fit.fit(); } catch { /* layout not stable yet */ }
 }
 
 function scheduleRefit(): void {
   if (refitTimer) clearTimeout(refitTimer);
-  refitTimer = setTimeout(() => {
-    refitTimer = null;
-    refit();
-  }, 200);
+  refitTimer = setTimeout(() => { refitTimer = null; refit(); }, 150);
 }
 
 async function teardown(): Promise<void> {
   if (refitTimer) { clearTimeout(refitTimer); refitTimer = null; }
   if (resizeObs) { try { resizeObs.disconnect(); } catch {} resizeObs = null; }
   if (onWindowResize) { window.removeEventListener('resize', onWindowResize); onWindowResize = null; }
-  if (ws) { try { ws.close(); } catch {} ws = null; }
+  if (ws) {
+    try { ws.onmessage = null; ws.onopen = null; ws.onclose = null; ws.onerror = null; } catch {}
+    try { ws.close(); } catch {}
+    ws = null;
+  }
   if (term) { try { term.dispose(); } catch {} term = null; }
   fit = null;
-  lastSentCols = 0;
-  lastSentRows = 0;
 }
 
+/**
+ * Connect xterm to the selected session's pty via WebSocket.
+ *
+ * RACE-SAFE: attach() may be invoked twice in quick succession (onMounted's
+ * `await attach()` plus a `watch(selectedId)` firing once
+ * store.refreshTerminals resolves). Each call captures `attachGen` at
+ * entry into `myGen`; after every await we check `attachGen !== myGen`
+ * and bail. All resources stay in LOCAL vars (localTerm/localFit/localWs)
+ * and only get committed to module-level refs at the very end. Before
+ * this, two concurrent attaches would both call `term.onData(...)` on
+ * the survivor's Terminal, doubling every keystroke.
+ *
+ * RESIZE: localTerm.onResize fires when fit.fit() changes the grid, and
+ * sends the {type:'resize'} WS message. ResizeObserver/window-resize only
+ * TRIGGER fit; if fit produces identical dims xterm doesn't fire onResize
+ * and no message is sent (natural dedupe). This is the pattern xterm.js
+ * docs recommend for tmux/node-pty backends.
+ */
 async function attach(): Promise<void> {
   if (!termHost.value || !selectedId.value) return;
+  const myGen = ++attachGen;
+  const targetId = selectedId.value;
   await teardown();
+  if (attachGen !== myGen) return;
+
   const isMobile = window.matchMedia('(max-width: 720px)').matches;
-  // Font family matches the standalone /terminal/<id> page (Consolas first)
-  // for consistent cell-width metrics. Cascadia Code's slightly-non-uniform
-  // glyphs caused intermittent header-overlay artifacts on copilot's TUI
-  // status line; Consolas is rock-solid for monospace alignment on Windows.
-  term = new Terminal({
+  const localTerm = new Terminal({
     cursorBlink: true,
     fontFamily: 'Consolas, "Liberation Mono", Cascadia Code, ui-monospace, Menlo, monospace',
     fontSize: isMobile ? 12 : 13,
     scrollback: 2000,
     theme: { background: '#15171d', foreground: '#d8dee9' },
   });
-  fit = new FitAddon();
-  term.loadAddon(fit);
-  term.open(termHost.value);
-  await nextTick();
+  const localFit = new FitAddon();
+  localTerm.loadAddon(localFit);
+  if (!termHost.value) { localTerm.dispose(); return; }
+  localTerm.open(termHost.value);
+  const renderer = loadAcceleratedRenderer(localTerm);
+  // eslint-disable-next-line no-console
+  console.log('[terminals-panel] renderer:', renderer);
 
-  // Wait for xterm's renderer to actually measure the host's font.
-  // term.open() schedules font measurement asynchronously; calling fit.fit()
-  // in the same tick returns the 80×24 default. We rAF-poll up to ~6 frames
-  // (~100ms at 60fps) until FitAddon produces a reasonable result.
-  // The dims we resolve here are FINAL — once the WS opens, we never resize
-  // again (locked-at-attach pattern; see refit() comment below).
+  await nextTick();
+  if (attachGen !== myGen) { localTerm.dispose(); return; }
+
+  // rAF-poll until fit produces a real (non-default 80x24) measurement.
   let initCols = 120;
   let initRows = 30;
   for (let i = 0; i < 8; i++) {
     await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    if (attachGen !== myGen) { localTerm.dispose(); return; }
     const host = termHost.value;
     if (!host || host.clientWidth === 0 || host.clientHeight === 0) continue;
-    if (!term || !fit) break;
-    try { fit.fit(); } catch { continue; }
-    if (term.cols >= 20 && term.rows >= 5 && term.cols !== 80) {
-      // 80 is xterm's hard-coded default before any measurement — keep
-      // polling until we get a measured result.
-      initCols = term.cols;
-      initRows = term.rows;
+    try { localFit.fit(); } catch { continue; }
+    if (localTerm.cols >= 20 && localTerm.rows >= 5 && localTerm.cols != 80) {
+      initCols = localTerm.cols;
+      initRows = localTerm.rows;
       break;
     }
   }
 
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const id = encodeURIComponent(selectedId.value);
-  ws = new WebSocket(
+  const id = encodeURIComponent(targetId);
+  const localWs = new WebSocket(
     `${proto}//${location.host}/terminal/${id}/ws?cols=${initCols}&rows=${initRows}`,
   );
-  ws.onopen = () => {
-    // The IPty was already sized from the URL ?cols=&rows= query, so we
-    // don't fire an initial resize here. lastSentCols/Rows are seeded so
-    // that the refit() dedup correctly suppresses redundant resizes when
-    // ResizeObserver fires immediately after WS open (host hasn't moved).
-    lastSentCols = initCols;
-    lastSentRows = initRows;
-  };
-  ws.onmessage = (ev) => {
+
+  // term.onResize -> backend pty.resize. Fires whenever fit changes the
+  // grid; xterm dedupes identical sizes natively so a no-op fit doesn't
+  // produce a spurious message.
+  localTerm.onResize(({ cols, rows }) => {
+    if (localWs.readyState === 1) {
+      try { localWs.send(JSON.stringify({ type: 'resize', cols, rows })); } catch { /* */ }
+    }
+  });
+
+  localWs.onmessage = (ev) => {
     let msg: { type?: string; content?: string; chunk?: string };
     try { msg = JSON.parse(ev.data); } catch { return; }
-    if (msg.type === 'snapshot' && msg.content && term) term.write(msg.content);
-    if (msg.type === 'data' && msg.chunk && term) term.write(msg.chunk);
+    if (msg.type === 'snapshot' && msg.content) localTerm.write(msg.content);
+    if (msg.type === 'data' && msg.chunk) localTerm.write(msg.chunk);
   };
-  if (term) {
-    term.onData((d) => {
-      if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'input', data: d }));
-    });
+
+  // user keystroke -> backend pty. Single onData handler per Terminal.
+  localTerm.onData((d) => {
+    if (localWs.readyState === 1) {
+      try { localWs.send(JSON.stringify({ type: 'input', data: d })); } catch { /* */ }
+    }
+  });
+
+  // Final race check before committing to module-level refs. If a newer
+  // attach() bumped attachGen during the rAF poll, tear down what we built
+  // and let the newer call own the state.
+  if (attachGen !== myGen) {
+    try { localWs.close(); } catch {}
+    try { localTerm.dispose(); } catch {}
+    return;
   }
 
-  // Live resize. Both ResizeObserver (layout-driven: side panel toggle,
-  // tab-list drag, font load) and window-resize (browser viewport) feed
-  // the same debounced refit() — so a flurry of mid-animation ticks turns
-  // into ONE resize message after layout settles.
-  resizeObs = new ResizeObserver(() => scheduleRefit());
-  if (termHost.value) resizeObs.observe(termHost.value);
-  onWindowResize = () => scheduleRefit();
-  window.addEventListener('resize', onWindowResize);
+  // Commit. Module-level refs now point at the just-built Terminal/Fit/WS.
+  term = localTerm;
+  fit = localFit;
+  ws = localWs;
+
+  // Live resize: ResizeObserver + window-resize both feed scheduleRefit().
+  // Debounced fit -> if dims changed, term.onResize sends the WS message.
+  const localResizeObs = new ResizeObserver(() => scheduleRefit());
+  if (termHost.value) localResizeObs.observe(termHost.value);
+  resizeObs = localResizeObs;
+  const localOnWindowResize = (): void => scheduleRefit();
+  window.addEventListener('resize', localOnWindowResize);
+  onWindowResize = localOnWindowResize;
 }
 
 function select(s: Session): void {
@@ -725,25 +767,23 @@ watch(selectedId, () => { attach(); });
 .load-more { display: block; margin: 6px auto; padding: 4px 10px; font-size: 11px; background: transparent; color: #7c8290; border: 1px solid #3a3f4a; border-radius: 3px; cursor: pointer; }
 
 /* xterm-host fills the remaining width and full panel height. The two
- * min-* zeros are required for flex children that contain content
- * larger than the parent (xterm's canvas) — without them the host
- * grows to the canvas's natural size and the flex 1 doesn't take effect.
- * `position: relative` is needed because xterm.js positions its
- * scrollbar absolutely inside the host. */
-.xterm-host { flex: 1 1 auto; min-width: 0; min-height: 0; background: #15171d; position: relative; padding: 4px; box-sizing: border-box; overflow: hidden; }
-.xterm-host :deep(.xterm) { width: 100%; height: 100%; }
-/*
- * IMPORTANT: do NOT force `width: 100%` on .xterm-viewport or .xterm-screen.
- * xterm.js sizes these to EXACTLY `cols × cellWidth` px so that ANSI cursor
- * positioning, background-color highlights, and selection rectangles land
- * on the same pixels as the rendered glyphs. Forcing them wider with
- * `!important` decouples the layers — text renders at one position while
- * highlights render at another, producing the "GE pill drifting into
- * Pull-requests" artifact in copilot's TUI status bar.
+ * min-* zeros are required for flex children that contain content larger
+ * than the parent (xterm's canvas) — without them the host grows to the
+ * canvas's natural size and the flex 1 doesn't take effect.
+ * `position: relative` is needed because xterm.js positions its scrollbar
+ * absolutely inside the host.
  *
- * We rely on the IPty being born at the host's exact dims (via the WS
- * `?cols=&rows=` query) so xterm's natural size already fills the host.
+ * We deliberately DO NOT force `width:100%` / `height:100%` on the xterm
+ * internals (.xterm, .xterm-viewport, .xterm-screen). xterm.js — and the
+ * WebGL/Canvas renderers especially — size their layers to exactly
+ * `cols × cellWidth` / `rows × cellHeight` px. Overriding with !important
+ * decouples the glyph layer from the cursor/background-color layer, which
+ * is what produced the "GE pill drifting into Pull-requests" overlay on
+ * copilot's TUI status bar. The IPty is born at the host's exact dims
+ * (via the WS `?cols=&rows=` query) so xterm's natural size already
+ * fills the host.
  */
+.xterm-host { flex: 1 1 auto; min-width: 0; min-height: 0; background: #15171d; position: relative; padding: 4px; box-sizing: border-box; overflow: hidden; }
 
 /* Spawn dialog */
 .spawn-form { display: flex; flex-direction: column; gap: 14px; padding: 4px 0; }
