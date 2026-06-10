@@ -241,6 +241,41 @@ function resetForm() {
   perQuestionOptionIds.value = {};
   perQuestionText.value = {};
   submitError.value = null;
+  currentQuestionIdx.value = 0;
+}
+
+// Wizard navigation: show one question at a time.
+const currentQuestionIdx = ref(0);
+const currentQuestion = computed<InboxQuestion | null>(
+  () => activeQuestions.value[currentQuestionIdx.value] ?? null,
+);
+const totalQuestions = computed(() => activeQuestions.value.length);
+const isLastQuestion = computed(
+  () => currentQuestionIdx.value >= totalQuestions.value - 1,
+);
+const isFirstQuestion = computed(() => currentQuestionIdx.value <= 0);
+const currentQuestionIsAnswered = computed(() =>
+  currentQuestion.value ? questionAnswered(currentQuestion.value) : false,
+);
+const wizardProgressPct = computed(() => {
+  if (totalQuestions.value === 0) return 0;
+  // After the last answer, fill all the way.
+  return Math.round(((currentQuestionIdx.value + 1) / totalQuestions.value) * 100);
+});
+function goNextQuestion(): void {
+  if (isLastQuestion.value) return;
+  currentQuestionIdx.value = Math.min(
+    currentQuestionIdx.value + 1,
+    totalQuestions.value - 1,
+  );
+}
+function goPrevQuestion(): void {
+  if (isFirstQuestion.value) return;
+  currentQuestionIdx.value = Math.max(currentQuestionIdx.value - 1, 0);
+}
+function jumpToQuestion(idx: number): void {
+  if (idx < 0 || idx >= totalQuestions.value) return;
+  currentQuestionIdx.value = idx;
 }
 
 watch(() => props.itemId, resetForm);
@@ -362,8 +397,19 @@ const canSubmit = computed(() => {
 });
 
 const unansweredCount = computed(() =>
-  activeQuestions.value.filter((q) => !questionAnswered(q)).length,
+  activeQuestions.value.filter((q) => q.closed !== true && !questionAnswered(q)).length,
 );
+
+// Render a question prompt as inline-only markdown (bold, italic, code,
+// links). We strip block-level structure so a prompt can never produce
+// h1/h2 or unexpected paragraphs that would break the wizard header layout.
+function renderPrompt(text: string): string {
+  if (!text) return '';
+  const html = renderInboxBody(text, 'markdown');
+  // Strip wrapping <p>…</p> from a single paragraph so the prompt stays
+  // inline; multi-paragraph prompts keep their breaks.
+  return html.replace(/^\s*<p>/, '').replace(/<\/p>\s*$/, '');
+}
 
 async function onSubmitReply(): Promise<void> {
   if (!canSubmit.value || !item.value) return;
@@ -666,70 +712,142 @@ function formatSnoozeUntil(ts?: number): string {
         </div>
       </div>
 
-      <!-- Active question batch (item-level or latest agent-reply) -->
-      <div v-if="activeQuestions.length > 0" class="question-section">
-        <div v-for="q in activeQuestions" :key="q.id" class="question-block">
-          <div v-if="q.title" class="question-title">{{ q.title }}</div>
-          <div class="question-prompt">{{ q.prompt }}</div>
-          <div v-if="!allClosed" class="question-form">
-            <div
-              v-if="(q.options?.length ?? 0) > 0"
-              class="question-options"
-              :class="{ 'options-single': modeFor(q) === 'single', 'options-multi': modeFor(q) === 'multi' }"
-              role="group"
-              :aria-label="modeFor(q) === 'single' ? 'Pick one option' : 'Pick one or more options'"
-            >
-              <Button
-                v-for="opt in (q.options ?? [])"
-                :key="opt.id"
-                class="question-opt-btn"
-                size="small"
-                :severity="isOptionSelected(q.id, opt.id) ? 'info' : 'secondary'"
-                :outlined="!isOptionSelected(q.id, opt.id)"
-                :aria-pressed="isOptionSelected(q.id, opt.id)"
-                @click="toggleOption(q.id, opt.id)"
-              >
-                <i v-if="isOptionSelected(q.id, opt.id)" class="pi pi-check" />
-                <span>{{ opt.label }}</span>
-              </Button>
+      <!-- Active question batch (item-level or latest agent-reply) — wizard UI -->
+      <!-- All-closed batches collapse to a single muted "answered" pill;
+           we don't show the full wizard chrome when nothing is actionable. -->
+      <div v-if="activeQuestions.length > 0 && allClosed" class="qz-closed-summary muted small">
+        <i class="pi pi-check-circle" />
+        {{ activeQuestions.length === 1
+          ? 'Question answered.'
+          : `All ${activeQuestions.length} questions answered.` }}
+      </div>
+      <div v-else-if="activeQuestions.length > 0" class="question-section">
+        <!-- Header: progress + step counter + jump dots -->
+        <div class="qz-header">
+          <div class="qz-progress-row">
+            <div class="qz-step-label">
+                <span class="qz-step-counter">
+                  Question {{ currentQuestionIdx + 1 }}
+                  <span class="qz-step-of">of {{ totalQuestions }}</span>
+                </span>
+                <span v-if="unansweredCount > 0" class="qz-step-remaining muted small">
+                  · {{ unansweredCount }} unanswered
+                </span>
             </div>
-            <Textarea
-              v-if="allowFreeformFor(q)"
-              :model-value="perQuestionText[q.id] ?? ''"
-              class="question-text"
-              :placeholder="q.placeholder ?? 'Add a message…'"
-              :rows="2"
-              autoResize
-              :disabled="submitting"
-              @update:model-value="setText(q.id, $event)"
-            />
+            <div v-if="totalQuestions > 1" class="qz-dots">
+                <button
+                  v-for="(q, idx) in activeQuestions"
+                  :key="q.id"
+                  type="button"
+                  class="qz-dot"
+                  :class="{
+                    'qz-dot-current': idx === currentQuestionIdx,
+                    'qz-dot-done': questionAnswered(q),
+                  }"
+                  :title="`Question ${idx + 1}${questionAnswered(q) ? ' (answered)' : ''}`"
+                  :aria-label="`Jump to question ${idx + 1}`"
+                  @click="jumpToQuestion(idx)"
+                />
+            </div>
+          </div>
+          <div class="qz-progress-bar" role="progressbar" :aria-valuenow="wizardProgressPct" aria-valuemin="0" aria-valuemax="100">
+            <div class="qz-progress-fill" :style="{ width: wizardProgressPct + '%' }" />
           </div>
         </div>
 
-        <div v-if="!allClosed" class="question-form question-form-actions">
-          <div v-if="submitError" class="question-error">
-            <i class="pi pi-exclamation-triangle" /> {{ submitError }}
-          </div>
-          <div class="question-actions">
-            <span class="muted small">
-              {{ activeQuestions.length === 1 ? 'Answer the question' : `Answer all ${activeQuestions.length} questions` }},
-              then Send.
-              <span v-if="unansweredCount > 0">({{ unansweredCount }} unanswered)</span>
-            </span>
-            <Button
-              icon="pi pi-send"
-              label="Send"
-              size="small"
-              severity="info"
-              :loading="submitting"
-              :disabled="!canSubmit"
-              @click="onSubmitReply"
-            />
+        <!-- Body: ONE question, options stacked vertically -->
+        <div v-if="currentQuestion" class="qz-body">
+          <div v-if="currentQuestion.title" class="qz-title">{{ currentQuestion.title }}</div>
+          <div class="qz-prompt" v-html="renderPrompt(currentQuestion.prompt)" />
+
+          <div v-if="!allClosed" class="qz-form">
+            <div
+                v-if="(currentQuestion.options?.length ?? 0) > 0"
+                class="qz-options"
+                role="group"
+                :aria-label="modeFor(currentQuestion) === 'single' ? 'Pick one option' : 'Pick one or more options'"
+            >
+                <button
+                  v-for="opt in (currentQuestion.options ?? [])"
+                  :key="opt.id"
+                  type="button"
+                  class="qz-option-row"
+                  :class="{ 'qz-option-selected': isOptionSelected(currentQuestion.id, opt.id) }"
+                  :aria-pressed="isOptionSelected(currentQuestion.id, opt.id)"
+                  :disabled="submitting"
+                  @click="toggleOption(currentQuestion.id, opt.id)"
+                >
+                  <span
+                    class="qz-option-indicator"
+                    :class="{
+                      'qz-indicator-radio': modeFor(currentQuestion) === 'single',
+                      'qz-indicator-checkbox': modeFor(currentQuestion) === 'multi',
+                    }"
+                    aria-hidden="true"
+                  >
+                    <i
+                      v-if="isOptionSelected(currentQuestion.id, opt.id)"
+                      :class="modeFor(currentQuestion) === 'single' ? 'pi pi-circle-fill' : 'pi pi-check'"
+                    />
+                  </span>
+                  <span class="qz-option-label">{{ opt.label }}</span>
+                </button>
+            </div>
+
+            <div v-if="allowFreeformFor(currentQuestion)" class="qz-freeform-wrap">
+                <label class="qz-freeform-label muted small">
+                  {{ (currentQuestion.options?.length ?? 0) > 0 ? 'Or type a custom answer:' : 'Your answer:' }}
+                </label>
+                <Textarea
+                  :model-value="perQuestionText[currentQuestion.id] ?? ''"
+                  class="qz-freeform-input"
+                  :placeholder="currentQuestion.placeholder ?? 'Type your answer…'"
+                  :rows="3"
+                  autoResize
+                  :disabled="submitting"
+                  @update:model-value="setText(currentQuestion.id, $event)"
+                />
+            </div>
           </div>
         </div>
-        <div v-else class="question-closed muted small">
-          <i class="pi pi-check-circle" />
-          {{ activeQuestions.length === 1 ? 'Question closed.' : `All ${activeQuestions.length} questions closed.` }}
+
+        <!-- Sticky footer: Back / Next or Send -->
+        <div v-if="!allClosed" class="qz-footer">
+          <div v-if="submitError" class="question-error qz-error">
+            <i class="pi pi-exclamation-triangle" /> {{ submitError }}
+          </div>
+          <div class="qz-footer-row">
+            <Button
+                icon="pi pi-arrow-left"
+                label="Back"
+                size="small"
+                severity="secondary"
+                text
+                :disabled="isFirstQuestion || submitting"
+                @click="goPrevQuestion"
+            />
+            <div class="qz-footer-spacer" />
+            <Button
+                v-if="!isLastQuestion"
+                icon="pi pi-arrow-right"
+                iconPos="right"
+                label="Next"
+                size="small"
+                severity="secondary"
+                :disabled="!currentQuestionIsAnswered || submitting"
+                @click="goNextQuestion"
+            />
+            <Button
+                v-else
+                icon="pi pi-send"
+                label="Send all answers"
+                size="small"
+                severity="info"
+                :loading="submitting"
+                :disabled="!canSubmit"
+                @click="onSubmitReply"
+            />
+          </div>
         </div>
       </div>
 
@@ -743,7 +861,7 @@ function formatSnoozeUntil(ts?: number): string {
           v-model="freeformReplyText"
           class="freeform-text"
           placeholder="Type your message…"
-          :rows="2"
+          :rows="4"
           autoResize
           :disabled="freeformSubmitting"
           @keydown.enter.exact.prevent="onSubmitFreeform"
@@ -751,13 +869,13 @@ function formatSnoozeUntil(ts?: number): string {
         <div v-if="freeformError" class="question-error">
           <i class="pi pi-exclamation-triangle" /> {{ freeformError }}
         </div>
-        <div class="question-actions">
+        <div class="question-actions freeform-actions">
           <span class="muted small">Press Enter or click Send. The agent will receive it as a new prompt.</span>
           <Button
             icon="pi pi-send"
             label="Send"
             size="small"
-            severity="secondary"
+            severity="info"
             :loading="freeformSubmitting"
             :disabled="!canSendFreeform"
             @click="onSubmitFreeform"
@@ -887,13 +1005,27 @@ function formatSnoozeUntil(ts?: number): string {
 
 .detail-scroll {
   flex: 1;
+  min-width: 0;
   min-height: 0;
   overflow-y: auto;
-  padding: 16px;
+  overflow-x: hidden;
+  padding: 14px 16px;
   display: flex;
   flex-direction: column;
   gap: 16px;
 }
+/* Reorder children so the question wizard + freeform composer appear
+ * directly under the preview, BEFORE the long markdown description.
+ * The action should be visible without scrolling; the description is
+ * reference material that can live below the fold. */
+.detail-scroll > .detail-preview     { order: 1; }
+.detail-scroll > .question-section   { order: 2; }
+.detail-scroll > .qz-closed-summary  { order: 2; }
+.detail-scroll > .freeform-reply     { order: 3; }
+.detail-scroll > .detail-body-section { order: 4; }
+.detail-scroll > .no-body            { order: 4; }
+.detail-scroll > .reply-chain        { order: 5; }
+.detail-scroll > .detail-section     { order: 6; }
 
 /* ---- Artifact subtab strip (per-inbox) ----------------------------------- */
 .subtab-strip {
@@ -993,6 +1125,8 @@ function formatSnoozeUntil(ts?: number): string {
 .empty-text { font-size: 13px; }
 
 /* Markdown styling — scoped under the detail body. */
+.markdown-body { min-width: 0; overflow-wrap: anywhere; word-break: break-word; }
+.markdown-body :deep(*) { max-width: 100%; }
 .markdown-body :deep(h1), .markdown-body :deep(h2), .markdown-body :deep(h3) {
   color: #fff; border-bottom: 1px solid #3e3e42; padding-bottom: 4px; margin-top: 1.2em;
 }
@@ -1000,36 +1134,329 @@ function formatSnoozeUntil(ts?: number): string {
 .markdown-body :deep(h2) { font-size: 1.25em; }
 .markdown-body :deep(h3) { font-size: 1.05em; border-bottom: 0; }
 .markdown-body :deep(p) { margin: 0.6em 0; }
-.markdown-body :deep(a) { color: #4daafc; }
+.markdown-body :deep(a) { color: #4daafc; word-break: break-all; overflow-wrap: anywhere; }
 .markdown-body :deep(code) { background: #0f1115; padding: 1px 5px; border-radius: 3px; font-size: 0.9em; }
-.markdown-body :deep(pre) { background: #0f1115; padding: 10px 12px; border-radius: 4px; overflow-x: auto; }
-.markdown-body :deep(pre code) { background: transparent; padding: 0; }
+.markdown-body :deep(pre) {
+  background: #0f1115; padding: 10px 12px; border-radius: 4px;
+  max-width: 100%; overflow-x: auto;
+  white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word;
+}
+.markdown-body :deep(pre code) { background: transparent; padding: 0; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; }
+.markdown-body :deep(code) { word-break: break-word; }
 .markdown-body :deep(blockquote) { border-left: 3px solid #3e3e42; padding-left: 12px; color: var(--p-text-color-secondary); margin: 0.6em 0; }
-.markdown-body :deep(ul), .markdown-body :deep(ol) { padding-left: 1.4em; margin: 0.6em 0; }
-.markdown-body :deep(table) { border-collapse: collapse; margin: 0.6em 0; }
+.markdown-body :deep(ul), .markdown-body :deep(ol) { padding-left: 1.2em; margin: 0.5em 0; }
+.markdown-body :deep(li) { margin: 0.15em 0; }
+.markdown-body :deep(table) { border-collapse: collapse; margin: 0.6em 0; display: block; max-width: 100%; overflow-x: auto; }
 .markdown-body :deep(th), .markdown-body :deep(td) { border: 1px solid #3e3e42; padding: 5px 9px; }
-.markdown-body :deep(img) { max-width: 100%; }
+.markdown-body :deep(img) { max-width: 100%; height: auto; }
 .markdown-body :deep(.inbox-body-pre) {
   background: #0f1115; padding: 10px 12px; border-radius: 4px;
   overflow-x: auto; white-space: pre-wrap;
 }
 
 /* ─── Question + reply chain ──────────────────────────────────────────── */
+/* ============================================================ */
+/* Wizard-style question UI: one question at a time, vertical    */
+/* option rows with radio/checkbox affordance, sticky footer.    */
+/* ============================================================ */
 .question-section {
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  padding: 12px;
+  gap: 0;
+  padding: 0;
   border: 1px solid var(--p-content-border-color, #2a2e38);
-  border-radius: 6px;
+  border-radius: 10px;
   background: rgba(74, 138, 232, 0.04);
+  overflow: hidden;
+  /* As a flex item in .detail-scroll (column flex), prevent shrinking
+   * below the wizard's own content height — otherwise the section
+   * collapses to its border (~2px) and the children overflow. */
+  flex-shrink: 0;
 }
-.question-prompt {
-  font-size: 14px;
-  font-weight: 500;
+
+.qz-header {
+  padding: 14px 18px 12px;
+  background: rgba(74, 138, 232, 0.06);
+  border-bottom: 1px solid var(--p-content-border-color, #2a2e38);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.qz-progress-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.qz-step-label {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+.qz-step-counter {
+  font-size: 13px;
+  font-weight: 600;
   color: var(--p-text-color);
-  line-height: 1.5;
+}
+.qz-step-of {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--p-text-color-secondary);
+  margin-left: 2px;
+}
+.qz-step-remaining { font-size: 11px; }
+
+.qz-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.qz-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 1px solid var(--p-content-border-color, #2a2e38);
+  background: transparent;
+  padding: 0;
+  cursor: pointer;
+  transition: transform 120ms ease, background 120ms ease, border-color 120ms ease;
+}
+.qz-dot:hover { transform: scale(1.2); border-color: #4a8ae8; }
+.qz-dot-done {
+  background: #4ade80;
+  border-color: #4ade80;
+}
+.qz-dot-current {
+  background: #4a8ae8;
+  border-color: #4a8ae8;
+  transform: scale(1.3);
+  box-shadow: 0 0 0 2px rgba(74, 138, 232, 0.25);
+}
+
+.qz-progress-bar {
+  height: 3px;
+  width: 100%;
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.qz-progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #4a8ae8 0%, #4ade80 100%);
+  transition: width 240ms ease;
+}
+
+.qz-body {
+  padding: 18px 18px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.qz-title {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--p-text-color-secondary);
+  opacity: 0.85;
+}
+.qz-prompt {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--p-text-color);
+  line-height: 1.4;
   white-space: pre-wrap;
+}
+.qz-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin-top: 4px;
+}
+
+.qz-options {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.qz-option-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 12px 14px;
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--p-content-border-color, #2a2e38);
+  border-radius: 8px;
+  color: var(--p-text-color);
+  font-family: inherit;
+  font-size: 14px;
+  text-align: left;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease, transform 80ms ease;
+}
+.qz-option-row:hover:not(:disabled) {
+  background: rgba(74, 138, 232, 0.08);
+  border-color: rgba(74, 138, 232, 0.45);
+}
+.qz-option-row:active:not(:disabled) {
+  transform: scale(0.995);
+}
+.qz-option-row:focus-visible {
+  outline: 2px solid #4a8ae8;
+  outline-offset: 2px;
+}
+.qz-option-row:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.qz-option-selected {
+  background: rgba(74, 138, 232, 0.14) !important;
+  border-color: #4a8ae8 !important;
+  box-shadow: inset 0 0 0 1px rgba(74, 138, 232, 0.5);
+}
+.qz-option-indicator {
+  flex-shrink: 0;
+  width: 20px;
+  height: 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1.5px solid var(--p-text-color-secondary);
+  background: transparent;
+  color: #fff;
+}
+.qz-indicator-radio { border-radius: 50%; }
+.qz-indicator-checkbox { border-radius: 4px; }
+.qz-option-selected .qz-option-indicator {
+  border-color: #4a8ae8;
+  background: #4a8ae8;
+}
+.qz-option-indicator i {
+  font-size: 10px;
+  line-height: 1;
+}
+.qz-indicator-radio i.pi-circle-fill { font-size: 8px; }
+.qz-option-label {
+  flex: 1;
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+.qz-freeform-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 4px;
+}
+.qz-freeform-label {
+  font-size: 12px;
+  color: var(--p-text-color-secondary);
+}
+.qz-freeform-input {
+  width: 100%;
+  font-family: inherit;
+  font-size: 14px;
+  min-height: 80px;
+}
+
+.qz-footer {
+  padding: 12px 18px 14px;
+  background: rgba(74, 138, 232, 0.06);
+  border-top: 1px solid var(--p-content-border-color, #2a2e38);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.qz-footer-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.qz-footer-spacer { flex: 1; }
+.qz-footer .p-button { min-width: 90px; }
+.qz-error {
+  font-size: 12px;
+}
+.qz-closed {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 12px 18px;
+}
+.qz-closed i { color: #4ade80; }
+
+.qz-closed-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border: 1px dashed var(--p-content-border-color, #2a2e38);
+  border-radius: 8px;
+  background: rgba(74, 222, 128, 0.04);
+  align-self: flex-start;
+  flex-shrink: 0;
+}
+.qz-closed-summary i {
+  color: #4ade80;
+  font-size: 14px;
+}
+
+/* Legacy classes (kept for question.error usage in freeform-reply) */
+.question-error {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: #f59e9e;
+  font-size: 12px;
+}
+.question-error i { font-size: 12px; }
+
+/* ============================================================ */
+/* Freeform reply composer (the "Send a message to the agent")   */
+/* ============================================================ */
+.freeform-reply {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 16px 18px 14px;
+  margin-top: 12px;
+  border: 1px solid var(--p-content-border-color, #2a2e38);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.02);
+  flex-shrink: 0;
+}
+.freeform-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--p-text-color);
+}
+.freeform-label i {
+  color: var(--p-text-color-secondary);
+  font-size: 15px;
+}
+.freeform-text {
+  width: 100%;
+  font-family: inherit;
+  font-size: 14px;
+  min-height: 100px;
+}
+.freeform-reply .question-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 2px;
+}
+.freeform-reply .question-actions .small { font-size: 12px; }
+.freeform-reply .question-actions .p-button {
+  min-width: 110px;
 }
 
 .reply-chain {
@@ -1079,50 +1506,4 @@ function formatSnoozeUntil(ts?: number): string {
   margin-top: 4px;
 }
 .reply-att-btn { font-size: 11px; }
-
-.question-form {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  margin-top: 4px;
-}
-.question-options {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-.question-opt-btn { font-size: 12px; }
-.question-opt-btn i { margin-right: 4px; font-size: 10px; }
-
-.question-text {
-  width: 100%;
-  font-family: inherit;
-  font-size: 13px;
-}
-
-.question-error {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  color: #f59e9e;
-  font-size: 12px;
-}
-.question-error i { font-size: 12px; }
-
-.question-actions {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  flex-wrap: wrap;
-}
-.question-actions .small { font-size: 11px; }
-
-.question-closed {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 4px 0;
-}
-.question-closed i { color: #4ade80; }
 </style>
