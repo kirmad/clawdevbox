@@ -784,6 +784,11 @@ watch(selectedId, () => { attach(); });
  * fills the host.
  */
 .xterm-host { flex: 1 1 auto; min-width: 0; min-height: 0; background: #15171d; position: relative; padding: 4px; box-sizing: border-box; overflow: hidden; }
+/* Hide xterm's viewport scrollbar — mouse-wheel still scrolls. The scrollbar
+ * is a vestigial column of grey pixels that looks like the panel edge has a
+ * stray sliver next to the side-panel chevrons. */
+.xterm-host :deep(.xterm-viewport) { scrollbar-width: none; -ms-overflow-style: none; }
+.xterm-host :deep(.xterm-viewport)::-webkit-scrollbar { width: 0; height: 0; display: none; }
 
 /* Spawn dialog */
 .spawn-form { display: flex; flex-direction: column; gap: 14px; padding: 4px 0; }
