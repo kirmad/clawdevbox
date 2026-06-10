@@ -6,7 +6,7 @@
  * parent decides whether to load it into a master-detail right pane
  * (desktop) or push a detail view (mobile).
  */
-import { computed } from 'vue';
+import { computed, ref, watch } from 'vue';
 import { useUiStore } from '../stores/ui';
 import type { InboxItem } from '../api';
 
@@ -17,7 +17,20 @@ const props = defineProps<{
 const emit = defineEmits<{ (e: 'select', id: string): void }>();
 
 const store = useUiStore();
-const items = computed(() => store.inbox);
+const LS_UNREAD_ONLY = 'clawdevbox.inbox.unreadOnly';
+const showUnreadOnly = ref<boolean>((() => {
+  try { return localStorage.getItem(LS_UNREAD_ONLY) === '1'; } catch { return false; }
+})());
+watch(showUnreadOnly, (v) => {
+  try { localStorage.setItem(LS_UNREAD_ONLY, v ? '1' : '0'); } catch { /* ignore */ }
+});
+
+const unreadCount = computed(() => store.inbox.filter((it) => it.unread === true).length);
+const items = computed(() =>
+  showUnreadOnly.value
+    ? store.inbox.filter((it) => it.unread === true)
+    : store.inbox,
+);
 // `props` is consumed in the template (selectedId), the binding is
 // kept so TS-aware linters don't drop the import.
 void props;
@@ -55,12 +68,33 @@ function formatTime(ts?: number): string {
 
 <template>
   <div class="list-rail">
+    <div class="rail-toolbar">
+      <button
+        type="button"
+        class="filter-btn"
+        :class="{ active: showUnreadOnly }"
+        :aria-pressed="showUnreadOnly"
+        :title="showUnreadOnly ? 'Showing unread only — click to show all' : 'Show unread only'"
+        @click="showUnreadOnly = !showUnreadOnly"
+      >
+        <i class="pi pi-circle-fill filter-dot" />
+        <span>Unread</span>
+        <span class="filter-count">{{ unreadCount }}</span>
+      </button>
+    </div>
+
     <Message v-if="store.inboxError" severity="error" :closable="false">
       Failed to load: {{ store.inboxError }}
     </Message>
 
     <div v-if="items.length === 0 && !store.inboxLoading" class="empty">
-      No items. Anything pushed via <code>inbox.upsert</code> lands here.
+      <template v-if="showUnreadOnly">
+        No unread items.
+        <button type="button" class="link-btn" @click="showUnreadOnly = false">Show all</button>
+      </template>
+      <template v-else>
+        No items. Anything pushed via <code>inbox.upsert</code> lands here.
+      </template>
     </div>
 
     <button
@@ -124,7 +158,56 @@ function formatTime(ts?: number): string {
   flex-direction: column;
   gap: 8px;
 }
+.rail-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 2px;
+}
+.filter-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  font: inherit;
+  font-size: 11.5px;
+  background: transparent;
+  color: var(--p-text-color-secondary);
+  border: 1px solid var(--p-content-border-color, #2a2e38);
+  border-radius: 12px;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+.filter-btn:hover { background: rgba(255,255,255,0.04); color: var(--p-text-color); }
+.filter-btn.active {
+  background: rgba(136, 192, 208, 0.12);
+  color: var(--p-primary-color, #88c0d0);
+  border-color: var(--p-primary-color, #88c0d0);
+}
+.filter-btn .filter-dot { font-size: 7px; opacity: 0.5; }
+.filter-btn.active .filter-dot { opacity: 1; }
+.filter-btn .filter-count {
+  font-size: 10.5px;
+  padding: 0 5px;
+  border-radius: 8px;
+  background: rgba(255,255,255,0.08);
+  min-width: 14px;
+  text-align: center;
+}
+.filter-btn.active .filter-count {
+  background: var(--p-primary-color, #88c0d0);
+  color: #0e1117;
+}
 .empty { color: var(--p-text-color-secondary); padding: 8px; }
+.link-btn {
+  background: none;
+  border: none;
+  color: var(--p-primary-color, #88c0d0);
+  cursor: pointer;
+  padding: 0 0 0 4px;
+  font: inherit;
+  text-decoration: underline;
+}
 
 .card {
   text-align: left;
