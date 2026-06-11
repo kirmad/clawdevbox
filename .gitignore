@@ -58,3 +58,4 @@ plugins/*/node_modules
 # Playwright screenshots from ad-hoc validation
 /files/
 
+samples/triggers/teams-listener.mjs
