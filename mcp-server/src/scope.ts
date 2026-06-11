@@ -76,13 +76,14 @@ export function validationError(errors: Array<{ path: string; code: string; mess
 // Scope guards
 // ============================================================================
 
-/** Reject `plugin:<id>` writes and return the structured error if so. */
+/** Reject `plugin:<id>` writes and return the structured error if so. Vault scopes pass. */
 export function ensureWritableScope(scope: string): CallToolResult | null {
   if (isWritableScope(scope)) return null;
+  if (scope.startsWith('vault:')) return null;
   if (scope.startsWith('plugin:')) return pluginScopeReadonly(scope);
   return structuredError(
     'INVALID_SCOPE',
-    `Unknown scope: ${scope}. Expected 'project' or 'global'.`,
+    `Unknown scope: ${scope}. Expected 'project', 'global', or 'vault:<id>'.`,
     { scope },
   );
 }

@@ -718,6 +718,24 @@ export class Dispatcher {
 
     const payload = fire.payload_json ? JSON.parse(fire.payload_json) : null;
 
+    // Per-trigger persistent scratch dir. Materialize lazily so legacy scripts
+    // that read env.trigger_data_dir always get a writable path.
+    const triggerDataDir = join(wsRow.path, '.clawdevbox', 'triggers', trigger.id, 'data');
+    try { mkdirSync(triggerDataDir, { recursive: true }); } catch { /* best effort */ }
+
+    // Back-compat alias for older scripts (env.callback_url). Prefer the
+    // live dispatch_url (Mode B "wake the subscriber thread") when the
+    // subscriber pty is up; fall back to spawn_url so the script always
+    // has a destination to POST to.
+    const callbackUrl = (dispatchTargetInstanceId ? dispatchUrl : undefined) ?? spawnUrl;
+
+    // fires.source is wider than the script-facing enum; normalize.
+    // Treat 'webhook' and 'event' as 'external' inbound events.
+    const firedBy: 'cron' | 'manual' | 'external' =
+      fire.source === 'cron' ? 'cron'
+        : fire.source === 'manual' ? 'manual'
+          : 'external';
+
     const result = await runTriggerScript({
       scriptPath: typeManifest.file_abs,
       runtime,
@@ -728,6 +746,9 @@ export class Dispatcher {
         output_dir: outDir,
         dispatch_url: dispatchTargetInstanceId ? dispatchUrl : undefined,
         spawn_url: spawnUrl,
+        callback_url: callbackUrl,
+        fired_by: firedBy,
+        trigger_data_dir: triggerDataDir,
         state,
         payload,
       },

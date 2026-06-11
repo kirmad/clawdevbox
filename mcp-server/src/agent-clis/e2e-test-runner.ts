@@ -153,7 +153,7 @@ async function rpc(url, headers, sessionId, method, params, id) {
       await rpc(cfg.url, cfg.headers, mcpSessionId, 'tools/call', {
         name: 'run_tool',
         arguments: {
-          tool: 'recipe.update_steps',
+          tool: 'recipe.instance.update_steps',
           args: { add: [{ id: 'e2e-check', goal: 'verify e2e' }] },
         },
       }, 3);

@@ -339,6 +339,14 @@ export async function runRecipe(opts: RunRecipeOptions): Promise<RunRecipeResult
       : `http://${opts.cfg.http.host}:${opts.cfg.http.port}/mcp`;
   let pid: number | undefined;
   let spawnError: unknown = null;
+  // The seed prompt is baked into the CLI's argv by the provider
+  // (copilot uses `-i <prompt>`, claude uses a trailing positional).
+  // Apply the session-id prefix so the agent learns its own
+  // cli_session_id + update_status field semantics on first read.
+  const promptForSpawn: string | undefined =
+    spawnMode === 'interactive' && opts.prompt
+      ? buildSessionIdPromptPrefix(sessionId) + opts.prompt
+      : opts.prompt;
   try {
     const handle = await provider.spawnSession(providerCtx, {
       mode: spawnMode,
@@ -346,7 +354,7 @@ export async function runRecipe(opts: RunRecipeOptions): Promise<RunRecipeResult
         ? { kind: 'resume', session_id: sessionId }
         : { kind: 'new', session_id: sessionId },
       role: 'recipe-instance',
-      prompt: opts.prompt,
+      prompt: promptForSpawn,
       agent: opts.agent,
       model: opts.model,
       workspaceInfo: opts.workspaceInfo,
@@ -514,36 +522,11 @@ export async function runRecipe(opts: RunRecipeOptions): Promise<RunRecipeResult
     }
   }
 
-  // 6. Initial prompt delivery for tmux-migrated interactive providers.
-  //    The provider no longer auto-delivers the seed prompt (the
-  //    deliverInitialPromptWhenReady byte-stream helper was removed in T15-T17).
-  //    Instead, we fire-and-forget a snapshot-poll readiness wait + dispatch
-  //    via the dispatcher's standard pending-dispatch path. This lets the
-  //    initial prompt benefit from update_status done-detection just like any
-  //    follow-up dispatch.
-  //
-  //    Skipped when:
-  //      - no opts.prompt (interactive shell without a seed)
-  //      - spawnMode !== 'interactive' (headless already passed -p to the CLI)
-  //      - the provider hasn't been tmux-migrated (handle.session missing —
-  //        legacy IPty providers ignore opts.prompt now, but no caller relies
-  //        on initial prompt for headless e2e-test-runner)
-  if (spawnMode === 'interactive' && opts.prompt) {
-    const { tmuxSessionRegistry } = await import('./cli-sessions/tmux-session-runtime.ts');
-    const session = tmuxSessionRegistry.get(instanceId);
-    if (session) {
-      // Prepend a clawdevbox session-id hint so the agent always knows its
-      // own cli_session_id and can pass it back as the explicit `session_id`
-      // arg to update_status (belt + suspenders correlation: header AND arg).
-      // The header path also works, but in shared-workspace / subagent
-      // scenarios the .mcp.json file on disk may be overwritten by a newer
-      // spawn, and the agent that reads it stale would send the wrong id.
-      const prefixedPrompt = buildSessionIdPromptPrefix(sessionId) + opts.prompt;
-      void deliverInitialPromptAfterReady(instanceId, session, prefixedPrompt, {
-        agentCli, sessionId, ws: opts.ws,
-      });
-    }
-  }
+  // 6. Seed-prompt delivery is the provider's job — it bakes opts.prompt
+  //    into the CLI's argv (copilot uses `-i <prompt>`, claude uses a
+  //    trailing positional). The CLI consumes its own argv before
+  //    drawing the input box, so we have nothing to dispatch and
+  //    nothing to race with.
 
   return {
     recipe_instance_id: instanceId,
@@ -596,80 +579,3 @@ function buildSessionIdPromptPrefix(sessionId: string): string {
   );
 }
 
-/**
- * Fire-and-forget: wait for the agent's TUI to draw the prompt-ready glyph
- * (and the model-line indicator for copilot), then dispatch the initial
- * prompt via the standard dispatcher path. Errors are logged but never
- * raised — the caller has already returned to its caller.
- */
-async function deliverInitialPromptAfterReady(
-  instanceId: string,
-  session: CliSession,
-  prompt: string,
-  ctx: { agentCli: string; sessionId: string; ws: Workspace },
-): Promise<void> {
-  try {
-    const { waitForReady } = await import('./cli-sessions/wait-for-ready.ts');
-    await waitForReady(session, {
-      // Copilot/Agency: `❯` glyph, status bar `context (N%)`. Claude: `❯`
-      // followed by NBSP or space; no context line. We test for both and
-      // accept either fully-rendered indicator.
-      promptReadyRegex: /❯/,
-      fullyRenderedRegex: /context\s*\(\d+%\)|Model:|Conversation/i,
-      pollIntervalMs: 500,
-      stableMs: 2500,
-      timeoutMs: 90_000,
-    });
-  } catch (err) {
-    logger.warn(
-      { instanceId, err: err instanceof Error ? err.message : String(err) },
-      'recipe-runner: waitForReady failed; dispatching initial prompt anyway',
-    );
-  }
-
-  // Belt-and-suspenders: if the provider opts into the copilot-events
-  // idle signal, also wait for assistant.turn_end / first-idle in the
-  // structured event stream before sending. This catches the case where
-  // the glyph is on-screen but the readline buffer isn't accepting input
-  // yet (Copilot's initial render races vs MCP server connect).
-  try {
-    const provider = ctx.ws.agentCliProviders?.get(ctx.agentCli);
-    if (provider?.capabilities?.idleSignal === 'copilot-events') {
-      const { waitForCopilotIdle } = await import('./agent-clis/copilot-events.ts');
-      const r = await waitForCopilotIdle(ctx.sessionId, { timeoutMs: 15_000 });
-      if (!r.ready) {
-        logger.info(
-          { instanceId, sessionId: ctx.sessionId, reason: r.reason, lastEvent: r.lastEvent, waitedMs: r.waitedMs },
-          'recipe-runner: copilot-events idle wait fell through; sending initial prompt anyway',
-        );
-      } else {
-        logger.debug(
-          { instanceId, sessionId: ctx.sessionId, lastEvent: r.lastEvent, waitedMs: r.waitedMs },
-          'recipe-runner: copilot-events confirmed idle before initial prompt',
-        );
-      }
-    }
-  } catch (err) {
-    logger.warn(
-      { instanceId, err: err instanceof Error ? err.message : String(err) },
-      'recipe-runner: copilot-events wait threw (continuing to send prompt)',
-    );
-  }
-
-  try {
-    // Send Escape + text + Enter via the session API. We don't go through
-    // dispatcher.dispatchToInstance here to avoid a circular dep — and the
-    // initial prompt doesn't need pending-dispatch queueing (it's the FIRST
-    // bytes the agent sees).
-    await session.sendKey('Escape');
-    await new Promise((r) => setTimeout(r, 200));
-    await session.sendText(prompt);
-    await new Promise((r) => setTimeout(r, 250));
-    await session.sendKey('Enter');
-  } catch (err) {
-    logger.warn(
-      { instanceId, err: err instanceof Error ? err.message : String(err) },
-      'recipe-runner: initial prompt dispatch failed',
-    );
-  }
-}

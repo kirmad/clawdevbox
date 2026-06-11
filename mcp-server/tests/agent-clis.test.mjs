@@ -92,6 +92,9 @@ function baseOpts({ ws, mode, kind, sessionId, prompt }) {
 const MATRIX = [
   { mode: 'interactive', kind: 'new',    sessionId: 'sess-new-i',  prompt: undefined },
   { mode: 'interactive', kind: 'resume', sessionId: 'sess-res-i',  prompt: undefined },
+  // Interactive WITH seed prompt — providers must bake it into argv.
+  { mode: 'interactive', kind: 'new',    sessionId: 'sess-new-ip', prompt: 'seed for new' },
+  { mode: 'interactive', kind: 'resume', sessionId: 'sess-res-ip', prompt: 'seed for resume' },
   { mode: 'headless',    kind: 'new',    sessionId: 'sess-new-h',  prompt: 'hello world' },
   { mode: 'headless',    kind: 'resume', sessionId: 'sess-res-h',  prompt: 'resume me' },
 ];
@@ -130,8 +133,16 @@ for (const row of MATRIX) {
       const pIdx = c.args.indexOf('-p');
       assert.ok(pIdx >= 0, 'headless missing -p');
       assert.equal(c.args[pIdx + 1], row.prompt);
+      assert.ok(!c.args.includes('-i'), 'headless must not include -i');
+    } else if (row.prompt) {
+      // Interactive WITH seed prompt: must use `-i <prompt>`.
+      const iIdx = c.args.indexOf('-i');
+      assert.ok(iIdx >= 0, `interactive+prompt missing -i; argv: ${c.args.join(' ')}`);
+      assert.equal(c.args[iIdx + 1], row.prompt);
+      assert.ok(!c.args.includes('-p'), 'interactive must not include -p');
     } else {
       assert.ok(!c.args.includes('-p'), 'interactive must not include -p');
+      assert.ok(!c.args.includes('-i'), 'interactive without prompt must not include -i');
     }
 
     assert.equal(handle.sessionId, row.sessionId);
@@ -180,6 +191,12 @@ for (const row of MATRIX) {
         const pIdx = c.args.indexOf('-p');
         assert.ok(pIdx >= 0, 'headless missing -p');
         assert.equal(c.args[pIdx + 1], row.prompt);
+      } else if (row.prompt) {
+        // Interactive WITH seed prompt: claude takes a trailing positional
+        // arg. It must be the LAST element of argv (no flag after).
+        assert.ok(!c.args.includes('-p'), 'interactive must not include -p');
+        assert.equal(c.args[c.args.length - 1], row.prompt,
+          `interactive+prompt: prompt must be trailing positional; argv: ${c.args.join(' ')}`);
       } else {
         assert.ok(!c.args.includes('-p'), 'interactive must not include -p');
       }

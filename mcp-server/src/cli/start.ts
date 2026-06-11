@@ -19,7 +19,7 @@
 import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
@@ -86,6 +86,7 @@ import { closeDatabase, getDatabase, openDatabase } from '../db/index.ts';
 import { scanLegacyFiles } from '../db/legacy-files.ts';
 import { readTriggersFile } from '../triggers-store.ts';
 import { loadWorkspaceFromEnv, triggersJsonPath, WorkspaceConfigError } from '../workspace.ts';
+import { findTemplate, loadOneOffTemplate } from '../template-store.ts';
 import { Dispatcher } from '../dispatcher.ts';
 import { Scheduler } from '../scheduler.ts';
 import { DaemonSupervisor } from '../daemon-supervisor.ts';
@@ -457,26 +458,26 @@ export async function runStart(flags: Flags): Promise<void> {
     }
     initTmuxSessionRuntime(tmuxClient);
 
-    // Sweep orphan `cdb_*` tmux sessions before anything else uses tmux.
-    // When clawdevbox dies hard (OOM, kill /F, power loss) the tmux servers
-    // it spawned become orphans and the agency/copilot processes inside
-    // keep running indefinitely, leaking ~5-10 processes per orphan. We
-    // tag each session at creation with CDB_CREATOR_PID; this sweep kills
-    // any cdb_* session whose creator PID is dead (or untagged, which
-    // implies pre-fix legacy). Concurrent clawdevbox instances are safe:
-    // their sessions stay because their PIDs are alive.
+    // Re-tag orphan `cdb_*` tmux sessions BEFORE reconcileOnStartup runs.
+    // When clawdevbox dies (clean restart, OOM, hard kill, power loss), the
+    // tmux servers it spawned stay alive and the agency/copilot/claude
+    // processes inside keep running. We KEEP those sessions across
+    // restarts — the user's in-flight work continues uninterrupted —
+    // and rebind them to the new clawdevbox process via reconcileOnStartup
+    // below. Sessions belonging to a CONCURRENT live clawdevbox instance
+    // are left untouched (their PID is alive, not ours).
     try {
       const sweep = await sweepStaleTmuxSessions(tmuxClient);
-      if (sweep.killed > 0 || sweep.kept > 0) {
+      if (sweep.retagged > 0 || sweep.kept > 0) {
         logger.info(
-          { killed: sweep.killed, kept: sweep.kept },
-          'tmux: swept orphan cdb_* sessions',
+          { retagged: sweep.retagged, kept: sweep.kept },
+          'tmux: re-tagged orphan cdb_* sessions for adoption',
         );
       }
     } catch (err) {
       logger.warn(
         { err: err instanceof Error ? err.message : String(err) },
-        'tmux orphan sweep failed (non-fatal)',
+        'tmux orphan re-tag failed (non-fatal)',
       );
     }
 
@@ -714,10 +715,11 @@ export async function runStart(flags: Flags): Promise<void> {
     }
   });
 
-  /** Pre-compute and store the inbox list cache entry. */
+  /** Pre-compute and store the inbox list cache entry. Excludes archived items. */
   const warmInboxCache = () => {
     try {
-      const items = inbox.list({ limit: 200 });
+      const items = inbox.list({ limit: 200 })
+        .filter((it) => it.state !== 'archived');
       const enriched = enrichInboxItemsForList(items);
       inboxCache.json = JSON.stringify({ items: enriched });
       inboxCache.ts = Date.now();
@@ -965,6 +967,22 @@ export async function runStart(flags: Flags): Promise<void> {
     }
 
     if (url.pathname === '/api/inbox' && req.method === 'GET') {
+      // Default: hide archived items. ?include_archived=true to opt in (e.g.
+      // for an "Archive" view in the SPA). Bypasses the cache so the result
+      // is always fresh — the cache is the hot path for the default view.
+      const includeArchived = url.searchParams.get('include_archived') === 'true';
+      if (includeArchived) {
+        try {
+          const items = inbox.list({ limit: 200 });
+          const enriched = enrichInboxItemsForList(items);
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ items: enriched }));
+        } catch {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ items: [] }));
+        }
+        return;
+      }
       const now = Date.now();
       if (inboxCache.json && now - inboxCache.ts < API_CACHE_TTL_MS) {
         res.writeHead(200, { 'content-type': 'application/json' });
@@ -1139,6 +1157,195 @@ export async function runStart(flags: Flags): Promise<void> {
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ items }));
       return;
+    }
+
+    // GET /api/triggers/<id>/script — return the script source + runtime
+    // + on-disk path for a registered trigger. Resolves via the same chain
+    // used by trigger.test / trigger.fire (plugin TYPE → one-off template).
+    {
+      const m = url.pathname.match(/^\/api\/triggers\/([^/]+)\/script\/?$/);
+      if (m && req.method === 'GET') {
+        const id = decodeURIComponent(m[1]);
+        const file = readTriggersFile(triggersJsonPath(ws));
+        const row = file.registered.find((r) => r.id === id);
+        if (!row) {
+          res.writeHead(404, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: { code: 'NOT_FOUND', message: `trigger ${id} not registered` } }));
+          return;
+        }
+        const type = ws.triggerTypes.get(row.type);
+        const oneoff = type ? null : loadOneOffTemplate(ws, row.type);
+        const tpl = !type && !oneoff ? findTemplate(ws, row.type) : null;
+        const scriptAbs = type?.file_abs ?? oneoff?.scriptAbs ?? tpl?.scriptAbs ?? null;
+        const runtime =
+          (type as unknown as { runtime?: string } | undefined)?.runtime
+          ?? oneoff?.manifest.runtime
+          ?? tpl?.manifest.runtime
+          ?? 'tsx';
+        if (!scriptAbs) {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({
+            id, type: row.type, runtime,
+            path: null, path_rel: null, source: null, found: false,
+            error: { code: 'SCRIPT_NOT_FOUND', message: `no script resolved for type ${row.type}` },
+          }));
+          return;
+        }
+        let source: string | null = null;
+        let errCode: string | null = null;
+        let errMessage: string | null = null;
+        try {
+          source = readFileSync(scriptAbs, 'utf8');
+          if (source.length > 256 * 1024) {
+            // Don't ship megabyte trigger scripts over the wire; trim.
+            source = source.slice(0, 256 * 1024) + '\n\n…(truncated at 256 KiB)…';
+          }
+        } catch (err) {
+          errCode = 'READ_FAILED';
+          errMessage = (err as Error).message;
+        }
+        const path_rel = (() => {
+          try { return relative(ws.projectDir, scriptAbs); } catch { return scriptAbs; }
+        })();
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          id, type: row.type, runtime,
+          path: scriptAbs, path_rel,
+          source, found: source !== null,
+          error: errCode ? { code: errCode, message: errMessage } : null,
+        }));
+        return;
+      }
+    }
+
+    // POST /api/triggers/<id>/fire — force-run a trigger right now.
+    // Thin HTTP wrapper around the `trigger.fire` MCP tool — enqueues a
+    // real fire row, the dispatcher picks it up identically to a cron tick.
+    {
+      const m = url.pathname.match(/^\/api\/triggers\/([^/]+)\/fire\/?$/);
+      if (m && req.method === 'POST') {
+        const id = decodeURIComponent(m[1]);
+        let body: { payload?: unknown } = {};
+        try {
+          const chunks: Buffer[] = [];
+          let total = 0;
+          for await (const c of req) {
+            const buf = c instanceof Buffer ? c : Buffer.from(c);
+            total += buf.length;
+            if (total > 64 * 1024) break;
+            chunks.push(buf);
+          }
+          const text = Buffer.concat(chunks).toString('utf8');
+          if (text.length > 0) body = JSON.parse(text) as { payload?: unknown };
+        } catch {
+          // empty/invalid body is fine — payload is optional.
+        }
+        const tool = getRegistry().get('trigger.instance.fire');
+        if (!tool) {
+          res.writeHead(500, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: { code: 'TOOL_NOT_REGISTERED', message: 'trigger.fire is not in the registry' } }));
+          return;
+        }
+        try {
+          const result = (await tool.handler(
+            { id, payload: body.payload ?? null },
+            { source: 'http-api' },
+          )) as { isError?: boolean; structuredContent?: unknown; content?: unknown };
+          const status = result.isError ? 422 : 200;
+          res.writeHead(status, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({
+            ok: !result.isError,
+            structuredContent: result.structuredContent ?? null,
+            content: result.content ?? null,
+          }));
+        } catch (err) {
+          res.writeHead(500, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: { code: 'TOOL_THREW', message: (err as Error).message } }));
+        }
+        return;
+      }
+    }
+
+    // GET /api/triggers/<id>/runs — list recent fires (default last 10) +
+    // include the latest fire's stdout/stderr inline so the UI doesn't need
+    // a second round-trip to render the most useful slice.
+    {
+      const m = url.pathname.match(/^\/api\/triggers\/([^/]+)\/runs\/?$/);
+      if (m && req.method === 'GET') {
+        const id = decodeURIComponent(m[1]);
+        const limit = Math.max(1, Math.min(50, parseInt(url.searchParams.get('limit') ?? '10', 10) || 10));
+        let db;
+        try { db = getDatabase(); } catch (err) {
+          res.writeHead(500, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: { code: 'DB_UNAVAILABLE', message: (err as Error).message } }));
+          return;
+        }
+        const rows = db.prepare(
+          `SELECT fire_id, source, status, attempt, scheduled_at, started_at, finished_at,
+                  exit_code, duration_ms, output_dir, error
+             FROM fires WHERE trigger_id = ?
+             ORDER BY scheduled_at DESC LIMIT ?`,
+        ).all(id, limit) as Array<{
+          fire_id: string;
+          source: string;
+          status: string;
+          attempt: number;
+          scheduled_at: number;
+          started_at: number | null;
+          finished_at: number | null;
+          exit_code: number | null;
+          duration_ms: number | null;
+          output_dir: string | null;
+          error: string | null;
+        }>;
+
+        function readOutputFile(dir: string | null, attempt: number, name: string, cap = 256 * 1024): string | null {
+          if (!dir) return null;
+          // output_dir is the PARENT (`<ws>/.clawdevbox/fires/<fire_id>`),
+          // but the dispatcher writes stdout/stderr inside `attempt-<N>/`.
+          // Try the attempt subdir first, fall back to the parent (older rows).
+          const candidates = [
+            join(dir, `attempt-${attempt}`, name),
+            join(dir, name),
+          ];
+          for (const p of candidates) {
+            try {
+              let txt = readFileSync(p, 'utf8');
+              if (txt.length > cap) txt = txt.slice(0, cap) + '\n\n…(truncated at 256 KiB)…';
+              return txt;
+            } catch { /* try next */ }
+          }
+          return null;
+        }
+
+        const items = rows.map((r) => ({ ...r, has_output_dir: !!r.output_dir }));
+        // Inline stdout/stderr for the most recent fire that ACTUALLY ran
+        // (i.e. skip `running` rows whose files don't exist yet, and
+        // `skipped` rows that never produced any output). Keeps the
+        // "Last run" UI useful even when cron is mid-tick.
+        let latest: {
+          fire_id: string;
+          stdout: string | null;
+          stderr: string | null;
+          stdout_parsed: unknown | null;
+        } | null = null;
+        const latestFinished = rows.find(
+          (r) => r.output_dir && r.status !== 'running' && r.status !== 'skipped',
+        );
+        if (latestFinished) {
+          const stdout = readOutputFile(latestFinished.output_dir, latestFinished.attempt, 'stdout.txt');
+          const stderr = readOutputFile(latestFinished.output_dir, latestFinished.attempt, 'stderr.txt');
+          let stdoutParsed: unknown = null;
+          if (stdout) {
+            try { stdoutParsed = JSON.parse(stdout); } catch { /* not JSON, leave null */ }
+          }
+          latest = { fire_id: latestFinished.fire_id, stdout, stderr, stdout_parsed: stdoutParsed };
+        }
+
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ items, latest }));
+        return;
+      }
     }
 
     // Pending approvals (for the "needs your input" badge).

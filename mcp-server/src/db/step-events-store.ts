@@ -54,6 +54,19 @@ export function appendEvent(
   const id = mintEventId();
   const created_at = Date.now();
   const payload_json = opts.payload === undefined ? '{}' : JSON.stringify(opts.payload);
+  // FK-safe agent_session_id: the column has a hard FK on agent_sessions(id).
+  // If the caller passes a stale id (session archived, never written, or
+  // an env-var holdover from a prior run), the INSERT fails with
+  // "FOREIGN KEY constraint failed". Validate existence and null it if
+  // not found — the column is `ON DELETE SET NULL` anyway, so null is
+  // semantically equivalent to "the session linkage was lost".
+  let safeSessionId: string | null = opts.agent_session_id ?? null;
+  if (safeSessionId !== null) {
+    const exists = db
+      .prepare('SELECT 1 FROM agent_sessions WHERE id = ?')
+      .get(safeSessionId) as { 1: number } | undefined;
+    if (!exists) safeSessionId = null;
+  }
   db.prepare(
     `INSERT INTO step_events (
        id, recipe_step_id, recipe_instance_id, agent_session_id, type, message, payload_json, created_at
@@ -62,7 +75,7 @@ export function appendEvent(
     id,
     opts.recipe_step_id,
     opts.recipe_instance_id,
-    opts.agent_session_id ?? null,
+    safeSessionId,
     opts.type,
     opts.message ?? null,
     payload_json,
@@ -72,7 +85,7 @@ export function appendEvent(
     id,
     recipe_step_id: opts.recipe_step_id,
     recipe_instance_id: opts.recipe_instance_id,
-    agent_session_id: opts.agent_session_id ?? null,
+    agent_session_id: safeSessionId,
     type: opts.type,
     message: opts.message ?? null,
     payload_json,

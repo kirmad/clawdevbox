@@ -205,6 +205,13 @@ export function updateStepsImpl(
   db: Database,
   opts: UpdateStepsOpts,
 ): UpdateStepsResult {
+  // FK-safe agent_session_id — see updateStatusImpl for the rationale.
+  if (opts.agent_session_id) {
+    const exists = db
+      .prepare('SELECT 1 FROM agent_sessions WHERE id = ?')
+      .get(opts.agent_session_id) as { 1: number } | undefined;
+    if (!exists) opts = { ...opts, agent_session_id: null };
+  }
   const inst = lookupInstanceWorkspace(db, opts.recipe_instance_id);
   if (!inst) {
     throw new ToolErrorBox({
@@ -414,6 +421,18 @@ export function updateStatusImpl(
       code: 'MUTUALLY_EXCLUSIVE_STATE_FIELDS',
       message: 'state and state_replace are mutually exclusive.',
     });
+  }
+  // FK-safe agent_session_id: every downstream INSERT (step_events,
+  // inbox_items) has a hard FK on agent_sessions(id). If the caller's
+  // session id is stale (env-var holdover, never written, archived) the
+  // whole update_status crashes with "FOREIGN KEY constraint failed".
+  // Validate once up front and null it if not found — semantically the
+  // same as the schema's `ON DELETE SET NULL` behavior.
+  if (opts.agent_session_id) {
+    const exists = db
+      .prepare('SELECT 1 FROM agent_sessions WHERE id = ?')
+      .get(opts.agent_session_id) as { 1: number } | undefined;
+    if (!exists) opts = { ...opts, agent_session_id: null };
   }
   const inst = lookupInstanceWorkspace(db, opts.recipe_instance_id);
   if (!inst) {

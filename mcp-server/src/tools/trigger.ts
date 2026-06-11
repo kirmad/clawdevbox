@@ -37,7 +37,7 @@ import { tmpdir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
-import { defineTool } from './registry.ts';
+import { aliasTool, defineTool, getRegistry } from './registry.ts';
 import { runTriggerScript } from '../trigger-runner.ts';
 import type { TriggerTypeParameter } from '../workspace.ts';
 import { logger } from '../logger.ts';
@@ -63,15 +63,26 @@ import { ensureWorkspace } from '../db/workspaces-store.ts';
 import {
   deleteOneOffTemplate,
   deleteTemplate,
+  deleteVaultTemplate,
   findTemplate,
+  listVaultTemplates,
   loadOneOffTemplate,
+  loadVaultTemplate,
   mintOneOffId,
   templateExists,
   toRegisteredType,
   writeOneOffTemplate,
   writeTemplate,
+  writeVaultTemplate,
+  type LoadedTemplate,
   type TemplateManifest,
+  type TemplateScope,
 } from '../template-store.ts';
+import {
+  loadVaultChainForWorkspace,
+  resolveVaultById,
+} from '../vault-paths.ts';
+import type { VaultInfo } from '../vault-chain.ts';
 import {
   reloadTypeRegistries,
   triggersJsonPath,
@@ -169,11 +180,36 @@ function projectType(t: RegisteredTriggerType): Record<string, unknown> {
 // Registration
 // ============================================================================
 
+/**
+ * Dispatch a template write to the right backend based on its scope string.
+ * 'project'/'global' → `<scope>/trigger-types/`. 'vault:<id>' → vault path.
+ * Throws if the vault id doesn't match a configured vault.
+ */
+function writeTemplateAnyScope(
+  ws: Workspace, scope: TemplateScope,
+  opts: { manifest: TemplateManifest; scriptContent: string },
+): { dir: string; scriptAbs: string } {
+  if (typeof scope === 'string' && scope.startsWith('vault:')) {
+    const v = resolveVaultById(loadVaultChainForWorkspace(ws), scope.slice('vault:'.length));
+    return writeVaultTemplate(v, opts);
+  }
+  return writeTemplate(ws, scope as 'project' | 'global', opts);
+}
+
+/** Dispatch a template delete to the right backend based on scope. */
+function deleteTemplateAnyScope(ws: Workspace, scope: TemplateScope, id: string): boolean {
+  if (typeof scope === 'string' && scope.startsWith('vault:')) {
+    const v = resolveVaultById(loadVaultChainForWorkspace(ws), scope.slice('vault:'.length));
+    return deleteVaultTemplate(v, id);
+  }
+  return deleteTemplate(ws, scope as 'project' | 'global', id);
+}
+
 export function registerTriggerEntries(ws: Workspace): void {
   // -- trigger.list_types ---------------------------------------------------
   defineTool({
-    name: 'trigger.list_types',
-    description: 'List trigger TYPES (capabilities) discovered from enabled plugins (spec §8.2 / §10.4). Each entry carries the parameter schema, default cron, callback binding, and source plugin. Use trigger.register to create a concrete instance from one.',
+    name: 'trigger.type.list',
+    description: 'TYPE CATALOG: List trigger TYPES (capabilities) discovered from enabled plugins AND agent-authored templates (spec §8.2 / §10.4). Read-only view of everything that could be `trigger.instance.register`-ed. Each entry carries the parameter schema, default cron, callback binding, and source plugin. Use trigger.instance.register to create a concrete instance from one.',
     parameters: z.object({
         scope: z
           .string()
@@ -221,7 +257,7 @@ export function registerTriggerEntries(ws: Workspace): void {
 
   // -- trigger.list_registered ----------------------------------------------
   defineTool({
-    name: 'trigger.list_registered',
+    name: 'trigger.instance.list',
     description: 'List REGISTERED trigger instances from `.clawdevbox/triggers.json` (spec §8.3). Each entry shows the bound params, cron resolution (inherited/overridden/disabled), and last-run status. Use trigger.list_types to see available capabilities.',
     parameters: z.object({
         enabled: z.boolean().optional(),
@@ -255,8 +291,8 @@ export function registerTriggerEntries(ws: Workspace): void {
 
   // -- trigger.register -----------------------------------------------------
   defineTool({
-    name: 'trigger.register',
-    description: 'Register a trigger instance. Three mutually-exclusive sources: (a) `type_id` for a saved TYPE; (b) `script` for an inline one-off; (c) `script_file` for a file under `.clawdevbox/`. One-off paths default to `once: true`, `cron: false` (manual/webhook only). Validates params against the type schema (where one exists), mints `<type_id>#<key>` (or auto-template id for one-offs), and writes to `triggers.json`.',
+    name: 'trigger.instance.register',
+    description: '⚠️ PREREQUISITE (only when supplying `script`): read the `authoring-triggers` skill FIRST via `skill.read({ id: "authoring-triggers" })`. Inline scripts hit the same envelope/state/cursor/auth contract as plugin TYPES — skipping the skill yields subtle silent bugs. (Not needed when registering a saved type_id.) INSTANCE: Register a trigger INSTANCE. Three mutually-exclusive sources: (a) `type_id` for a saved TYPE (plugin or agent-authored); (b) `script` for an inline one-off; (c) `script_file` for a file under `.clawdevbox/`. One-off paths default to `once: true`, `cron: false` (manual/webhook only). Validates params against the type schema (where one exists), mints `<type_id>#<key>` (or auto-template id for one-offs), and writes to `triggers.json`.',
     parameters: z.object({
         type_id: z.string().min(1).optional(),
         script: z.string().optional(),
@@ -402,8 +438,8 @@ export function registerTriggerEntries(ws: Workspace): void {
 
   // -- trigger.unregister ---------------------------------------------------
   defineTool({
-    name: 'trigger.unregister',
-    description: 'Remove a registered trigger instance by id. For one-off registrations, also drops the auto-template directory under `_oneoff/`. The underlying TYPE stays available for non-oneoff types.',
+    name: 'trigger.instance.unregister',
+    description: 'INSTANCE: Remove a registered trigger instance by id. For one-off registrations, also drops the auto-template directory under `_oneoff/`. The underlying TYPE stays available for non-oneoff types.',
     parameters: z.object({ id: z.string().min(1) }),
     handler: async (args) => {
       const path = triggersJsonPath(ws);
@@ -430,8 +466,8 @@ export function registerTriggerEntries(ws: Workspace): void {
 
   // -- trigger.update_params ------------------------------------------------
   defineTool({
-    name: 'trigger.update_params',
-    description: 'Modify the params and/or cron of a registered trigger without unregister/re-register (spec §8.3). Re-validates params against the type schema. The registered id is stable — even when an identity param changes, the id is NOT remitted (use unregister + register if you want a new id).',
+    name: 'trigger.instance.update_params',
+    description: 'INSTANCE: Modify the params and/or cron of a registered trigger without unregister/re-register (spec §8.3). Re-validates params against the type schema. The registered id is stable — even when an identity param changes, the id is NOT remitted (use trigger.instance.unregister + trigger.instance.register if you want a new id).',
     parameters: z.object({
         id: z.string().min(1),
         params: z
@@ -533,8 +569,8 @@ export function registerTriggerEntries(ws: Workspace): void {
 
   // -- trigger.enable / trigger.disable -------------------------------------
   defineTool({
-    name: 'trigger.enable',
-    description: "Enable a registered trigger by flipping its 'enabled' flag (spec §8.3). The registration row stays on disk; disabled triggers are skipped by the cron daemon but can still be fired manually via trigger.fire.",
+    name: 'trigger.instance.enable',
+    description: "INSTANCE: Enable a registered trigger by flipping its 'enabled' flag (spec §8.3). The registration row stays on disk; disabled triggers are skipped by the cron daemon but can still be fired manually via trigger.instance.fire.",
     parameters: z.object({ id: z.string().min(1) }),
     handler: async (args) => {
       const path = triggersJsonPath(ws);
@@ -556,8 +592,8 @@ export function registerTriggerEntries(ws: Workspace): void {
   });
 
   defineTool({
-    name: 'trigger.disable',
-    description: "Disable a registered trigger by flipping its 'enabled' flag (spec §8.3). The registration row stays on disk; disabled triggers are skipped by the cron daemon but can still be fired manually via trigger.fire.",
+    name: 'trigger.instance.disable',
+    description: "INSTANCE: Disable a registered trigger by flipping its 'enabled' flag (spec §8.3). The registration row stays on disk; disabled triggers are skipped by the cron daemon but can still be fired manually via trigger.instance.fire.",
     parameters: z.object({ id: z.string().min(1) }),
     handler: async (args) => {
       const path = triggersJsonPath(ws);
@@ -580,8 +616,8 @@ export function registerTriggerEntries(ws: Workspace): void {
 
   // -- trigger.fire ---------------------------------------------------------
   defineTool({
-    name: 'trigger.fire',
-    description: 'Manually fire a registered trigger by id. Returns a queued run_id and logs the fire intent. A future in-process cron daemon (or external scheduler) handles the actual webhook POST to `/hooks/<id>`. Works regardless of cron state — manual fires always succeed.',
+    name: 'trigger.instance.fire',
+    description: 'INSTANCE: Manually fire a registered trigger by id. Returns a queued run_id and logs the fire intent. A future in-process cron daemon (or external scheduler) handles the actual webhook POST to `/hooks/<id>`. Works regardless of cron state — manual fires always succeed.',
     parameters: z.object({
         id: z.string().min(1),
         payload: z.unknown().optional(),
@@ -622,11 +658,17 @@ export function registerTriggerEntries(ws: Workspace): void {
 
   // -- trigger.create_template ---------------------------------------------
   defineTool({
-    name: 'trigger.create_template',
-    description: 'Create a new agent-authored trigger TYPE on disk. Persisted as `<scope>/trigger-types/<id>/template.yaml + trigger.<ext>`. Reloads `ws.triggerTypes` so `trigger.register` can immediately consume it. Id must start with `local.`.',
+    name: 'trigger.template.create',
+    description: '⚠️ PREREQUISITE: read the `authoring-triggers` skill FIRST via `skill.read({ id: "authoring-triggers" })`. It codifies the envelope contract, state shape, cursor design, auth, spawn routing, bootstrap, and 12 other footguns — skipping it produces subtle silent bugs (events never fire, state never advances, auth never resolves). TEMPLATE: Create a new agent-authored trigger TYPE on disk. Persisted as `<scope>/trigger-types/<id>/template.yaml + trigger.<ext>`. Scope can be `project`, `global`, or `vault:<vault_id>` (saves to a team/personal vault — syncs via git). Reloads `ws.triggerTypes` so `trigger.instance.register` can immediately consume it. Id must start with `local.`.',
     parameters: z.object({
         id: z.string().min(1).describe("Type id; must match /^local\\.[a-z][a-z0-9-]*(\\.[a-z][a-z0-9-]*)*$/."),
-        scope: z.enum(['project', 'global']).optional().describe("Default 'project'."),
+        scope: z
+          .union([
+            z.enum(['project', 'global']),
+            z.string().regex(/^vault:[a-z][a-z0-9_-]*$/, 'vault:<vault_id>'),
+          ])
+          .optional()
+          .describe("Default 'project'. Use 'vault:<id>' to save into a configured vault (syncs via git)."),
         description: z.string().min(1),
         runtime: z.enum(['node', 'tsx', 'python', 'bash']),
         script: z.string().optional().describe('Inline script source. XOR with script_file.'),
@@ -637,7 +679,8 @@ export function registerTriggerEntries(ws: Workspace): void {
         parameters: z.array(z.record(z.string(), z.unknown())).optional(),
       }),
     handler: async (args) => {
-      const scope = args.scope ?? 'project';
+      const scope = (args.scope ?? 'project') as TemplateScope;
+      const isVaultScope = typeof scope === 'string' && scope.startsWith('vault:');
       const hasScript = typeof args.script === 'string';
       const hasFile = typeof args.script_file === 'string';
       if (hasScript === hasFile) {
@@ -662,7 +705,22 @@ export function registerTriggerEntries(ws: Workspace): void {
         return validationError(validation.errors);
       }
 
-      if (templateExists(ws, scope, args.id)) {
+      // Existence check across both backends. For vault scope, look in that
+      // specific vault only; for project/global, the existing helper works.
+      if (isVaultScope) {
+        const vaultId = scope.slice('vault:'.length);
+        let vault: VaultInfo;
+        try {
+          vault = resolveVaultById(loadVaultChainForWorkspace(ws), vaultId);
+        } catch (err) {
+          return structuredError('VAULT_NOT_FOUND', (err as Error).message, { vault_id: vaultId });
+        }
+        if (loadVaultTemplate(vault, args.id)) {
+          return structuredError('TRIGGER_TEMPLATE_EXISTS',
+            `A template with id ${args.id} already exists in vault ${vaultId}.`,
+            { id: args.id, scope });
+        }
+      } else if (templateExists(ws, scope as 'project' | 'global', args.id)) {
         return structuredError('TRIGGER_TEMPLATE_EXISTS',
           `A template with id ${args.id} already exists in scope ${scope}.`,
           { id: args.id, scope });
@@ -677,7 +735,7 @@ export function registerTriggerEntries(ws: Workspace): void {
         scriptContent = readFileSync(fileGuard.path, 'utf8');
       }
 
-      const written = writeTemplate(ws, scope, { manifest, scriptContent });
+      const written = writeTemplateAnyScope(ws, scope, { manifest, scriptContent });
       await reloadTypeRegistries(ws);
 
       return {
@@ -694,16 +752,27 @@ export function registerTriggerEntries(ws: Workspace): void {
 
   // -- trigger.list_templates ----------------------------------------------
   defineTool({
-    name: 'trigger.list_templates',
-    description: 'List agent-authored trigger TYPES (project + global scopes). Equivalent to `trigger.list_types` filtered to scope in {project, global}.',
+    name: 'trigger.template.list',
+    description: 'TEMPLATE: List agent-authored trigger TYPES across project + global + every configured vault. Vault-stored templates surface with scope=`vault:<id>`.',
     parameters: z.object({
-        scope: z.enum(['project', 'global']).optional(),
+        scope: z
+          .union([
+            z.enum(['project', 'global', 'all']),
+            z.string().regex(/^vault:[a-z][a-z0-9_-]*$/, 'vault:<vault_id>'),
+          ])
+          .optional()
+          .describe("Default 'all' (project + global + vaults). Pass 'vault:<id>' for a single vault."),
         search: z.string().min(1).optional(),
       }),
     handler: async (args) => {
+      const filter = args.scope ?? 'all';
       const all = [...ws.triggerTypes.values()].sort((a, b) => a.id.localeCompare(b.id));
-      let filtered = all.filter((t) => t.scope === 'project' || t.scope === 'global');
-      if (args.scope) filtered = filtered.filter((t) => t.scope === args.scope);
+      let filtered = all.filter((t) =>
+        t.scope === 'project' ||
+        t.scope === 'global' ||
+        (typeof t.scope === 'string' && t.scope.startsWith('vault:')),
+      );
+      if (filter !== 'all') filtered = filtered.filter((t) => t.scope === filter);
       if (args.search) {
         const q = args.search.toLowerCase();
         filtered = filtered.filter((t) =>
@@ -722,8 +791,8 @@ export function registerTriggerEntries(ws: Workspace): void {
 
   // -- trigger.update_template --------------------------------------------
   defineTool({
-    name: 'trigger.update_template',
-    description: 'Update an agent-authored trigger template in place (project or global). Manifest fields omitted from the call are preserved; script is replaced only when `script` or `script_file` is supplied. Reloads `ws.triggerTypes` on success.',
+    name: 'trigger.template.update',
+    description: '⚠️ PREREQUISITE (only when supplying `script` or `script_file`): read the `authoring-triggers` skill FIRST via `skill.read({ id: "authoring-triggers" })`. The skill\'s pre-deploy checklist (§15) catches the bugs that bite mid-edit (state casing, cursor logic, bootstrap flag, auth fallback). TEMPLATE: Update an agent-authored trigger template in place (project, global, or vault:<id>). Manifest fields omitted from the call are preserved; script is replaced only when `script` or `script_file` is supplied. Reloads `ws.triggerTypes` on success.',
     parameters: z.object({
         id: z.string().min(1),
         description: z.string().optional(),
@@ -789,7 +858,7 @@ export function registerTriggerEntries(ws: Workspace): void {
         try { rmSync(existing.scriptAbs, { force: true }); } catch { /* ignore */ }
       }
 
-      const written = writeTemplate(ws, existing.scope, { manifest: merged, scriptContent });
+      const written = writeTemplateAnyScope(ws, existing.scope, { manifest: merged, scriptContent });
       await reloadTypeRegistries(ws);
 
       return {
@@ -803,8 +872,8 @@ export function registerTriggerEntries(ws: Workspace): void {
 
   // -- trigger.delete_template -------------------------------------------
   defineTool({
-    name: 'trigger.delete_template',
-    description: 'Delete an agent-authored trigger template by id. Refuses to delete plugin-shipped TYPES (use plugin.uninstall) or templates referenced by registered instances (unregister first).',
+    name: 'trigger.template.delete',
+    description: 'TEMPLATE: Delete an agent-authored trigger template by id. Refuses to delete plugin-shipped TYPES (use plugin.uninstall) or templates referenced by registered instances (trigger.instance.unregister first).',
     parameters: z.object({ id: z.string().min(1) }),
     handler: async (args) => {
       const existing = findTemplate(ws, args.id);
@@ -825,7 +894,7 @@ export function registerTriggerEntries(ws: Workspace): void {
           `Template ${args.id} is referenced by ${refs.length} registered instance(s). Unregister them first.`,
           { id: args.id, registered_ids: refs });
       }
-      const removed = deleteTemplate(ws, existing.scope, args.id);
+      const removed = deleteTemplateAnyScope(ws, existing.scope, args.id);
       await reloadTypeRegistries(ws);
       return {
         content: [{ type: 'text', text: `Deleted template ${args.id} (scope=${existing.scope}).` }],
@@ -839,7 +908,7 @@ export function registerTriggerEntries(ws: Workspace): void {
   // -- trigger.test ---------------------------------------------------------
   defineTool({
     name: 'trigger.test',
-    description: 'Run a trigger script with a synthesized envelope and capture the result. NON-MUTATING — does not write to triggers.json or update state. Three input sources (XOR): `id` (registered instance), `template_id` (saved type, any scope), or `script` + `runtime` (inline). Captures stdout/stderr and any observation files the script wrote to envelope.output_dir. Hard timeout (default 30s).',
+    description: '⚠️ PREREQUISITE (only when supplying inline `script`): read the `authoring-triggers` skill FIRST via `skill.read({ id: "authoring-triggers" })`. The skill catches the silent-failure modes that `trigger.test` would otherwise mask (exit 0 + empty output = looks healthy but did nothing useful). Run a trigger script with a synthesized envelope and capture the result. NON-MUTATING — does not write to triggers.json or update state. Three input sources (XOR): `id` (registered instance), `template_id` (saved type, any scope), or `script` + `runtime` (inline). Captures stdout/stderr and any observation files the script wrote to envelope.output_dir. Hard timeout (default 30s).',
     parameters: z.object({
         id: z.string().min(1).optional(),
         template_id: z.string().min(1).optional(),

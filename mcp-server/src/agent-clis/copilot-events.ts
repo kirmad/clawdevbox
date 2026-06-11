@@ -4,35 +4,27 @@
  * Copilot CLI writes a structured JSONL event stream to
  * `<copilotDir>/session-state/<sessionId>/events.jsonl`. Each line is a
  * JSON object with `{ type, id, parentId, timestamp, data }`. We use
- * this stream as the authoritative "is the agent ready for input" signal,
- * complementing (not replacing) the existing TUI snapshot/glyph wait.
+ * this stream as the authoritative "is the agent ready for input" signal
+ * for FOLLOW-UP dispatches (the seed prompt is delivered via the CLI's
+ * own argv hook — `copilot -i <prompt>` / `claude <prompt>` — so it does
+ * not need an idle gate).
  *
  * Idle definition (verified against agent-watch state machine + live
  * inspection of ~/.copilot/session-state/<uuid>/events.jsonl):
  *
- *   The agent is IDLE when the last status-bearing event is one of:
+ *   IDLE when the last status-bearing event is one of:
  *     - assistant.turn_end       (normal "ready for next prompt")
  *     - session.task_complete    (explicit task completion)
  *
- *   The agent is BUSY when the last status-bearing event is one of:
- *     - user.message             (we just sent input; agent will respond)
- *     - assistant.turn_start     (turn opened, no output yet)
- *     - assistant.message        (mid-turn streaming or tool-request emission)
- *     - tool.execution_start     (tool running; may emit more after)
- *     - subagent.started         (subagent running)
+ *   BUSY when the last status-bearing event is one of:
+ *     - user.message, assistant.turn_start, assistant.message
+ *     - tool.execution_start, subagent.started, skill.invoked
+ *     - session.compaction_start
  *
- *   Neutral / non-status events (do NOT flip idle ↔ busy):
- *     - session.context_changed  (just a context update)
- *     - hook.start / hook.end    (hook events around tool runs)
- *     - session.start            (initial line — handled specially below)
+ *   TERMINAL: session.shutdown / abort / session.error  →  caller should NOT
+ *   send to a dead session.
  *
- *   Terminal-but-not-idle:
- *     - session.shutdown / abort / session.error  →  reason='terminal',
- *       caller should NOT send to a dead session.
- *
- * `tool.execution_complete` is NOT idle — the assistant typically emits
- * more content in the same turn after a tool finishes (final answer or
- * another tool call). Only `assistant.turn_end` is the safe idle signal.
+ * Everything else is NEUTRAL (does NOT flip the state).
  */
 
 import {
@@ -44,7 +36,6 @@ import { setTimeout as sleepP } from 'node:timers/promises';
 import { logger } from '../logger.ts';
 
 export type IdleReason = 'idle' | 'timeout' | 'terminal' | 'unknown-session';
-
 export interface WaitForIdleOpts {
   /** Override the copilot root dir (default $USERPROFILE/.copilot). */
   copilotDir?: string;

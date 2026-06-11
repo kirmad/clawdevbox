@@ -25,6 +25,18 @@ import {
   type WritableScope, type Workspace,
 } from './workspace.ts';
 import type { TriggerRuntime } from './validators.ts';
+import type { VaultInfo } from './vault-chain.ts';
+import {
+  loadVaultChainForWorkspace,
+  vaultTriggerTypesDir,
+  vaultTriggerTemplateDir,
+} from './vault-paths.ts';
+
+/**
+ * Where a template lives. A flat string union (parallel to `plugin:<id>`)
+ * so it round-trips through JSON and is easy to filter on.
+ */
+export type TemplateScope = 'project' | 'global' | `vault:${string}`;
 
 const RUNTIME_EXT: Record<TriggerRuntime, string> = {
   node: 'js', tsx: 'ts', python: 'py', bash: 'sh',
@@ -49,7 +61,7 @@ export interface LoadedTemplate {
   manifest: TemplateManifest;
   scriptAbs: string;
   dir: string;
-  scope: 'project' | 'global';
+  scope: TemplateScope;
 }
 
 function templateDirRoot(ws: Workspace, scope: WritableScope): string {
@@ -70,6 +82,12 @@ export function findTemplate(ws: Workspace, id: string): LoadedTemplate | null {
       const loaded = loadTemplate(ws, scope, id);
       if (loaded) return loaded;
     }
+  }
+  // Vault-stored templates rank AFTER project/global so a project override
+  // wins (parallel to plugin precedence). Scan every configured vault.
+  for (const vault of loadVaultChainForWorkspace(ws)) {
+    const loaded = loadVaultTemplate(vault, id);
+    if (loaded) return loaded;
   }
   return null;
 }
@@ -114,6 +132,13 @@ export function writeTemplate(
   const scriptAbs = join(dir, scriptName);
   writeFileAtomic(scriptAbs, opts.scriptContent);
   writeFileAtomic(join(dir, 'template.yaml'), yamlDump(manifestToWrite));
+  // For tsx/node runtimes, drop a sibling package.json with `type: module`
+  // so esbuild/tsx + Node treat the script as ESM (top-level await + ESM
+  // imports work). Without this, scripts get bundled as CJS and TLA fails.
+  // Harmless for python/bash; only relevant for node-family runtimes.
+  if (opts.manifest.runtime === 'tsx' || opts.manifest.runtime === 'node') {
+    writeFileAtomic(join(dir, 'package.json'), '{"type":"module"}\n');
+  }
   return { dir, scriptAbs };
 }
 
@@ -205,3 +230,71 @@ export function toRegisteredType(loaded: LoadedTemplate): RegisteredTriggerType 
     file_abs: loaded.scriptAbs,
   } as unknown as RegisteredTriggerType;
 }
+
+// ============================================================================
+// Vault-stored templates — same on-disk shape as project/global, but rooted
+// at <vault.path>/trigger-types/<id>/. Synced via the vault's git remote.
+// ============================================================================
+
+export function loadVaultTemplate(vault: VaultInfo, id: string): LoadedTemplate | null {
+  const dir = vaultTriggerTemplateDir(vault, id);
+  const manifestPath = join(dir, 'template.yaml');
+  if (!existsSync(manifestPath)) return null;
+  let manifest: TemplateManifest;
+  try {
+    manifest = yamlLoad(readFileSync(manifestPath, 'utf8')) as TemplateManifest;
+  } catch {
+    return null;
+  }
+  if (!manifest || typeof manifest !== 'object') return null;
+  const scriptAbs = resolveScriptAbs(dir, manifest.file);
+  if (!scriptAbs) return null;
+  return { manifest, scriptAbs, dir, scope: `vault:${vault.id}` };
+}
+
+export function writeVaultTemplate(
+  vault: VaultInfo, opts: WriteOptions,
+): { dir: string; scriptAbs: string } {
+  const dir = vaultTriggerTemplateDir(vault, opts.manifest.id);
+  mkdirSync(dir, { recursive: true });
+  const scriptName = `trigger.${RUNTIME_EXT[opts.manifest.runtime]}`;
+  const manifestToWrite: TemplateManifest = { ...opts.manifest, file: scriptName };
+  const scriptAbs = join(dir, scriptName);
+  writeFileAtomic(scriptAbs, opts.scriptContent);
+  writeFileAtomic(join(dir, 'template.yaml'), yamlDump(manifestToWrite));
+  // Same ESM-mode marker as writeTemplate — see comment there. Synced via
+  // git so teammates inherit the right node runtime contract.
+  if (opts.manifest.runtime === 'tsx' || opts.manifest.runtime === 'node') {
+    writeFileAtomic(join(dir, 'package.json'), '{"type":"module"}\n');
+  }
+  return { dir, scriptAbs };
+}
+
+export function deleteVaultTemplate(vault: VaultInfo, id: string): boolean {
+  const dir = vaultTriggerTemplateDir(vault, id);
+  if (!existsSync(dir)) return false;
+  const tomb = `${dir}.deleted-${Date.now()}`;
+  renameSync(dir, tomb);
+  try { rmSync(tomb, { recursive: true, force: true }); } catch { /* ignore */ }
+  return true;
+}
+
+export function listVaultTemplates(vault: VaultInfo): LoadedTemplate[] {
+  const root = vaultTriggerTypesDir(vault);
+  if (!existsSync(root)) return [];
+  let entries: string[];
+  try { entries = readdirSync(root); } catch { return []; }
+  const out: LoadedTemplate[] = [];
+  for (const entry of entries) {
+    if (entry.startsWith('.')) continue;
+    if (entry === '_oneoff') continue;
+    const dir = join(root, entry);
+    try {
+      if (!statSync(dir).isDirectory()) continue;
+    } catch { continue; }
+    const loaded = loadVaultTemplate(vault, entry);
+    if (loaded) out.push(loaded);
+  }
+  return out;
+}
+

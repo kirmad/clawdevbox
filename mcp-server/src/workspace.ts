@@ -24,7 +24,8 @@
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
-import { listAgentAuthoredTemplates, toRegisteredType } from './template-store.ts';
+import { listAgentAuthoredTemplates, listVaultTemplates, toRegisteredType } from './template-store.ts';
+import { loadVaultChainForWorkspace } from './vault-paths.ts';
 import { BUILTIN_RENDERER_TYPES } from './renderer-registry.ts';
 import type { AgentCliProvider, AgentCliProviderError } from './agent-clis/types.ts';
 import { registerBuiltinProviders } from './agent-clis/index.ts';
@@ -42,7 +43,7 @@ export type { ResolvedCapabilities } from './manifest/load-plugin.ts';
 // Types
 // ============================================================================
 
-export type Scope = 'project' | 'global' | `plugin:${string}` | 'all';
+export type Scope = 'project' | 'global' | `plugin:${string}` | `vault:${string}` | 'all';
 export type WritableScope = 'project' | 'global';
 
 export interface PluginProvideEntry {
@@ -626,6 +627,33 @@ export async function reloadTypeRegistries(ws: Workspace): Promise<void> {
       });
     }
     ws.triggerTypes.set(id, toRegisteredType(loaded));
+  }
+
+  // ---- Vault-stored templates (between global and plugin in precedence) ----
+  // Vaults are git-synced — when a teammate pushes a `vault:<id>` template,
+  // every other teammate picks it up on next sync. A project-scope template
+  // with the same id still wins (so a local edit overrides a team change),
+  // but vault templates DO override plugin-shipped TYPES so teams can
+  // tailor / replace plugin behavior centrally.
+  //
+  // Note: scoped only ABOVE plugins. Project + global templates already
+  // populated above will collide-shadow vault entries; we still register
+  // the vault entry and record an error for visibility.
+  for (const vault of loadVaultChainForWorkspace(ws)) {
+    for (const loaded of listVaultTemplates(vault)) {
+      const id = loaded.manifest.id;
+      const prior = ws.triggerTypes.get(id);
+      if (prior && (prior.scope === 'project' || prior.scope === 'global')) {
+        // Higher-precedence scope already wins; skip vault entry but record.
+        ws.triggerTypeErrors.push({
+          plugin_id: prior.source_plugin_id || `<${prior.scope}>`,
+          type_id: id,
+          error: `trigger_type id ${id} from vault:${vault.id} is shadowed by ${prior.scope}`,
+        });
+        continue;
+      }
+      ws.triggerTypes.set(id, toRegisteredType(loaded));
+    }
   }
 
   // ---- Plugin-provided AgentCliProviders (spec §4) ----

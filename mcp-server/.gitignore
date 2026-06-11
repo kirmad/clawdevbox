@@ -5,3 +5,4 @@ dist/
 .tmp-test-workspace/
 tests/.mcp-bootstrap.full.bak
 artifacts/
+tests/.tmp/

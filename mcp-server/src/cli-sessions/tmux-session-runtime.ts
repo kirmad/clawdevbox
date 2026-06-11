@@ -201,33 +201,47 @@ export async function reconcileOnStartup(
 }
 
 // ============================================================================
-// Orphan tmux sweep
+// Orphan tmux re-adoption on startup
 // ============================================================================
 
 /**
- * On Windows, when clawdevbox crashes (OOM, hard kill, `taskkill /F`),
- * its child tmux servers don't die — they become orphans, and the
- * agency/copilot processes inside keep running forever, spawning new
- * shell + MCP subprocesses on each agent turn. Across multiple crashes
- * this accumulates into hundreds of leaked processes.
+ * On Windows, when clawdevbox dies (clean restart, OOM, hard kill,
+ * `taskkill /F`), its child tmux servers don't die — they become orphans,
+ * and the agency/copilot/claude processes inside keep running. We want
+ * to KEEP those sessions alive across restarts so the user's in-flight
+ * agent work continues uninterrupted; the reconcileOnStartup pass below
+ * will rebind them to the new clawdevbox process.
  *
- * `createTmuxSession` tags every `cdb_*` tmux session with
- * `CDB_CREATOR_PID = <process.pid>` via `tmux set-environment`. This
- * sweep, called at clawdevbox startup BEFORE the main agent spawns,
- * walks the live tmux session list and kills any `cdb_*` session whose
- * recorded creator PID is no longer alive (or whose env tag is missing,
- * which only happens for pre-fix sessions — those are always orphans
- * by the time a new clawdevbox starts).
+ * What this sweep does on a fresh boot:
+ *   - Walks every `cdb_*` tmux session
+ *   - Re-tags it with the CURRENT process's PID via
+ *     `tmux set-environment CDB_CREATOR_PID`, so future sweeps from a
+ *     subsequent restart can still distinguish "owned by another live
+ *     clawdevbox instance" vs "orphan from a dead one"
+ *   - Returns the session names so the caller can pass them through to
+ *     reconcileOnStartup
  *
- * Sessions belonging to *another* running clawdevbox instance are
- * preserved because their CDB_CREATOR_PID is still alive.
+ * What it does NOT do anymore: kill orphan sessions. Killing them
+ * defeats the whole point of tmux persistence (the user's work
+ * disappears on every restart). True abandonment (no viewer, no agent
+ * activity) is handled by the idle-reaper, not by the boot sweep.
  *
- * Returns { killed, kept } counts so the caller can log a summary line.
+ * Sessions belonging to *another* running clawdevbox instance — i.e.
+ * whose CDB_CREATOR_PID is currently alive AND not this process — are
+ * left untouched (we don't re-tag them; the other instance still owns
+ * them).
+ *
+ * Returns counts + per-session diagnostics so the caller can log a
+ * summary line.
  */
 export interface SweepResult {
-  killed: number;
+  retagged: number;
   kept: number;
-  details: Array<{ name: string; creatorPid: number | null; alive: boolean; killed: boolean }>;
+  details: Array<{
+    name: string;
+    creatorPid: number | null;
+    action: 'retagged' | 'kept' | 'failed';
+  }>;
 }
 
 function isPidAlive(pid: number): boolean {
@@ -243,7 +257,7 @@ function isPidAlive(pid: number): boolean {
 
 export async function sweepStaleTmuxSessions(client: TmuxClientOpts): Promise<SweepResult> {
   const list = await tmuxRunAsync(client, ['list-sessions', '-F', '#{session_name}']);
-  const result: SweepResult = { killed: 0, kept: 0, details: [] };
+  const result: SweepResult = { retagged: 0, kept: 0, details: [] };
   if (list.exitCode !== 0) return result;
 
   const sessionNames = list.stdout
@@ -251,10 +265,8 @@ export async function sweepStaleTmuxSessions(client: TmuxClientOpts): Promise<Sw
     .map((l) => l.trim().split(/[:(\s]/)[0])
     .filter((n) => n && n.startsWith('cdb_'));
 
+  const myPid = process.pid;
   for (const name of sessionNames) {
-    // Query the tag we set in createTmuxSession. show-environment writes
-    // `NAME=VALUE` on stdout when the var is set; "-NAME" when explicitly
-    // unset; non-zero exit when the session is gone (race).
     const env = tmuxRun(client, ['show-environment', '-t', name, 'CDB_CREATOR_PID']);
     let creatorPid: number | null = null;
     if (env.exitCode === 0) {
@@ -262,20 +274,26 @@ export async function sweepStaleTmuxSessions(client: TmuxClientOpts): Promise<Sw
       if (m) creatorPid = Number(m[1]);
     }
 
-    const alive = creatorPid != null && isPidAlive(creatorPid);
-    if (alive) {
-      // Owned by a live clawdevbox (this one or another concurrent run) — keep.
+    // Owned by ANOTHER live clawdevbox instance — leave it alone.
+    if (creatorPid != null && creatorPid !== myPid && isPidAlive(creatorPid)) {
       result.kept++;
-      result.details.push({ name, creatorPid, alive: true, killed: false });
+      result.details.push({ name, creatorPid, action: 'kept' });
       continue;
     }
 
-    // Either no creator tag (pre-fix session, always orphan since the original
-    // clawdevbox that made it is gone) or creator PID is dead. Kill it.
-    const kill = tmuxRun(client, ['kill-session', '-t', name]);
-    const killed = kill.exitCode === 0;
-    if (killed) result.killed++;
-    result.details.push({ name, creatorPid, alive: false, killed });
+    // Either no tag, tag points to a dead PID, or tag is already ours
+    // (idempotent re-tag on multiple sweeps within one boot). Adopt by
+    // re-tagging with our PID. The reconcileOnStartup pass that runs
+    // immediately after this sweep will rebind the session to its DB row.
+    const retag = tmuxRun(client, [
+      'set-environment', '-t', name, 'CDB_CREATOR_PID', String(myPid),
+    ]);
+    if (retag.exitCode === 0) {
+      result.retagged++;
+      result.details.push({ name, creatorPid, action: 'retagged' });
+    } else {
+      result.details.push({ name, creatorPid, action: 'failed' });
+    }
   }
   return result;
 }

@@ -33,6 +33,7 @@ import {
   mintInboxReplyId,
   threads,
   type InboxItem,
+  type InboxQuestion,
   type InboxReply,
   type InboxState,
 } from '../store.ts';
@@ -90,8 +91,28 @@ const optionIdSchema = z
   .max(80, 'option.id must be ≤80 chars')
   .regex(/^[A-Za-z0-9._\-:]+$/, 'option.id may contain letters, digits, ._-:');
 
+/**
+ * Slugify a label into a stable, schema-valid option id. Used as the
+ * fallback when an agent passes `{ label, value }` without an explicit
+ * `id` (the most common shape — agents intuit "label + value" but not
+ * "id is also required"). Falls back to `opt-<index>` if the label
+ * collapses to nothing valid.
+ */
+function deriveOptionId(label: string, index: number): string {
+  const slug = label
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 60);
+  return slug.length > 0 ? slug : `opt-${index + 1}`;
+}
+
 const questionOptionSchema = z.object({
-  id: optionIdSchema,
+  id: optionIdSchema.optional().describe(
+    'Stable id used to identify the answered option in the reply. ' +
+    'Optional — when omitted, derived from `label` (slugified) so agents ' +
+    'can pass just `{ label, value }` without thinking about ids.',
+  ),
   label: z.string().trim().min(1).max(200),
   value: z.string().max(2_000).optional(),
 });
@@ -160,7 +181,8 @@ export function mintReplyId(): string {
 function normalizeReply(input: z.infer<typeof replySchema>): InboxReply {
   // Auto-id any questions on agent replies, mirroring the item-level
   // upsert logic. Reply-level question ids are unique per-reply, not
-  // per-item, so q1, q2, ... is fine.
+  // per-item, so q1, q2, ... is fine. Same option-id auto-derivation
+  // applied so agents can pass `{label, value}` without an `id`.
   let normalizedQuestions: InboxReply['questions'];
   if (Array.isArray(input.questions) && input.questions.length > 0) {
     const seen = new Set<string>();
@@ -170,12 +192,26 @@ function normalizeReply(input: z.infer<typeof replySchema>): InboxReply {
         throw new Error(`reply.questions[${idx}]: duplicate id "${id}"`);
       }
       seen.add(id);
+      let normalizedOptions = q.options;
+      if (Array.isArray(q.options) && q.options.length > 0) {
+        const seenOptIds = new Set<string>();
+        normalizedOptions = q.options.map((o, oi) => {
+          let oid: string = o.id ?? deriveOptionId(o.label, oi);
+          let suffix = 2;
+          while (seenOptIds.has(oid)) {
+            oid = `${o.id ?? deriveOptionId(o.label, oi)}-${suffix++}`;
+          }
+          seenOptIds.add(oid);
+          return { ...o, id: oid };
+        });
+      }
       return {
         ...q,
         id,
+        options: normalizedOptions,
         mode: q.mode ?? (q.options && q.options.length > 0 ? 'single' : 'text'),
         close_on_answer: q.close_on_answer ?? true,
-      };
+      } as unknown as InboxQuestion;
     });
   }
   return {
@@ -279,7 +315,11 @@ export function registerInboxEntries(ws: Workspace): void {
     parameters: z.object({
       id: z.string().min(1),
       kind: z.string().min(1),
-      source: z.string().min(1),
+      source: z
+        .string()
+        .min(1)
+        .optional()
+        .describe("Who created the item — 'agent' (default), 'user', 'system', or a plugin id. Defaults to 'agent' when omitted."),
       title: z.string().max(500).optional(),
       preview: z
         .string()
@@ -469,6 +509,8 @@ export function registerInboxEntries(ws: Workspace): void {
           // Each question MUST have a unique id. Auto-generate "q<N>" for
           // entries where the caller omitted it, but warn if any duplicates
           // result. Defensive: callers are encouraged to set ids explicitly.
+          // Same treatment for each option.id — agents intuit `{label, value}`
+          // but rarely set `id`; derive from label so the call doesn't fail.
           const seenIds = new Set<string>();
           const normalized = args.questions.map((q: z.infer<typeof questionSchema>, idx: number) => {
             const id = q.id ?? `q${idx + 1}`;
@@ -476,12 +518,34 @@ export function registerInboxEntries(ws: Workspace): void {
               throw new Error(`questions[${idx}]: duplicate id "${id}" — every question must have a unique id`);
             }
             seenIds.add(id);
-            return {
+            // Auto-derive option ids from label when omitted.
+            // Type the result as InboxQuestionOption[] (id required) so the
+            // outer `normalized` array satisfies InboxQuestion.options.
+            type StrictOption = z.infer<typeof questionOptionSchema> & { id: string };
+            let normalizedOptions: StrictOption[] | undefined;
+            if (Array.isArray(q.options) && q.options.length > 0) {
+              const seenOptIds = new Set<string>();
+              normalizedOptions = q.options.map((o, oi): StrictOption => {
+                let oid: string = o.id ?? deriveOptionId(o.label, oi);
+                let suffix = 2;
+                while (seenOptIds.has(oid)) {
+                  oid = `${o.id ?? deriveOptionId(o.label, oi)}-${suffix++}`;
+                }
+                seenOptIds.add(oid);
+                return { ...o, id: oid };
+              });
+            }
+            // Spread {...q} first then override with `options` so TS infers
+            // the wider q.options first. Cast the final object — the runtime
+            // shape matches InboxQuestion (id derivation happens above).
+            const norm = {
               ...q,
               id,
+              options: normalizedOptions,
               mode: q.mode ?? (q.options && q.options.length > 0 ? 'single' : 'text'),
               close_on_answer: q.close_on_answer ?? true,
-            };
+            } as unknown as InboxQuestion;
+            return norm;
           });
           patch.questions = normalized;
           patch.question = undefined;          // questions[] wins over legacy
@@ -541,7 +605,7 @@ export function registerInboxEntries(ws: Workspace): void {
         patch.unread = true;
       }
 
-      const { item, created } = inbox.upsert(args.id, args.kind, args.source, patch);
+      const { item, created } = inbox.upsert(args.id, args.kind, args.source ?? 'agent', patch);
       // Brand-new items default to unread regardless of whether content
       // changed in the patch — first arrival counts as new content. But
       // respect explicit `unread: false` from the caller (silent refresh).

@@ -374,6 +374,75 @@ export function fetchTriggerTypes(): Promise<{ items: TriggerType[]; errors: unk
   return fetchJson('/api/triggers/types');
 }
 
+export interface TriggerScript {
+  id: string;
+  type: string;
+  runtime: 'node' | 'tsx' | 'python' | 'bash' | string;
+  path: string | null;
+  path_rel: string | null;
+  source: string | null;
+  found: boolean;
+  error: { code: string; message: string } | null;
+}
+
+export function fetchTriggerScript(id: string): Promise<TriggerScript> {
+  return fetchJson(`/api/triggers/${encodeURIComponent(id)}/script`);
+}
+
+export interface FireTriggerResult {
+  ok: boolean;
+  structuredContent: { fire_id?: string; status?: string; trigger_id?: string } | null;
+  content: unknown;
+}
+
+export async function fireTrigger(id: string, payload?: unknown): Promise<FireTriggerResult> {
+  const res = await fetch(`/api/triggers/${encodeURIComponent(id)}/fire`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(payload === undefined ? {} : { payload }),
+  });
+  const text = await res.text();
+  let parsed: unknown = null;
+  try { parsed = text.length > 0 ? JSON.parse(text) : null; } catch { /* ignore */ }
+  if (!res.ok) {
+    const msg =
+      (parsed && typeof parsed === 'object' && 'error' in parsed)
+        ? JSON.stringify((parsed as { error: unknown }).error)
+        : text || `HTTP ${res.status}`;
+    throw new Error(`fireTrigger failed: ${msg}`);
+  }
+  return parsed as FireTriggerResult;
+}
+
+export interface TriggerFireRow {
+  fire_id: string;
+  source: string;
+  status: string;
+  attempt: number;
+  scheduled_at: number;
+  started_at: number | null;
+  finished_at: number | null;
+  exit_code: number | null;
+  duration_ms: number | null;
+  output_dir: string | null;
+  error: string | null;
+  has_output_dir: boolean;
+}
+
+export interface TriggerRunsResponse {
+  items: TriggerFireRow[];
+  latest: {
+    fire_id: string;
+    stdout: string | null;
+    stderr: string | null;
+    stdout_parsed: unknown | null;
+  } | null;
+}
+
+export function fetchTriggerRuns(id: string, limit = 10): Promise<TriggerRunsResponse> {
+  return fetchJson(`/api/triggers/${encodeURIComponent(id)}/runs?limit=${limit}`);
+}
+
 // -- Approvals ---------------------------------------------------------------
 
 export interface PendingApproval {

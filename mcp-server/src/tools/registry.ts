@@ -43,6 +43,27 @@ export function defineTool(entry: ToolEntry): void {
   toolRegistry.set(entry.name, entry);
 }
 
+/**
+ * Register an existing tool under an additional name (a deprecation alias).
+ * Reuses the same handler / parameters / examples, but prepends a deprecation
+ * note to the description so `list_tools` / `learn_tool` surface the rename.
+ *
+ * @param newAliasName - the name to register the alias under (typically the OLD name, kept for back-compat)
+ * @param target       - the canonical tool entry the alias delegates to
+ * @param canonicalName - the new canonical name to point users at
+ */
+export function aliasTool(
+  newAliasName: string,
+  target: ToolEntry,
+  canonicalName: string,
+): void {
+  toolRegistry.set(newAliasName, {
+    ...target,
+    name: newAliasName,
+    description: `⚠️ DEPRECATED — use \`${canonicalName}\` instead. ${target.description}`,
+  });
+}
+
 /** Get the full registry (read-only view). */
 export function getRegistry(): ReadonlyMap<string, ToolEntry> {
   return toolRegistry;

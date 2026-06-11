@@ -247,7 +247,25 @@ export async function handleTestHook(
       sendJson(res, 400, { error: { code: 'INVALID_REQUEST', message: '`id` is required' } });
       return true;
     }
-    await invokeTool('trigger.fire', body, res);
+    await invokeTool('trigger.instance.fire', body, res);
+    return true;
+  }
+
+  // ── POST /api/test/inbox-upsert ───────────────────────────────────────
+  // Test-only shortcut: forwards directly to the `inbox.upsert` MCP tool
+  // (same handler the agent CLIs hit over MCP HTTP). Lets Playwright /
+  // integration tests seed items — including the new `question` payload —
+  // without doing the StreamableHTTP session handshake.
+  if (path === '/api/test/inbox-upsert' && req.method === 'POST') {
+    const body = (await readJsonBody<Record<string, unknown>>(req, res)) ?? null;
+    if (body == null) return true;
+    if (!body.id || !body.kind || !body.source) {
+      sendJson(res, 400, {
+        error: { code: 'INVALID_REQUEST', message: '`id`, `kind`, `source` are required' },
+      });
+      return true;
+    }
+    await invokeTool('inbox.upsert', body, res);
     return true;
   }
 
@@ -276,7 +294,7 @@ export async function handleTestHook(
       payload?: unknown;
     };
 
-    const registerOutcome = await callTool('trigger.register', {
+    const registerOutcome = await callTool('trigger.instance.register', {
       script: INLINE_TRIGGER_SCRIPT,
       runtime: 'node',
     });
@@ -290,7 +308,7 @@ export async function handleTestHook(
         content:
           registerOutcome.kind === 'ok' ? registerOutcome.result.content ?? null : null,
         message:
-          registerOutcome.kind === 'threw' ? registerOutcome.message : 'trigger.register failed',
+          registerOutcome.kind === 'threw' ? registerOutcome.message : 'trigger.instance.register failed',
       });
       return true;
     }
@@ -300,13 +318,13 @@ export async function handleTestHook(
       sendJson(res, 500, {
         ok: false,
         stage: 'register',
-        message: 'trigger.register did not return structuredContent.id',
+        message: 'trigger.instance.register did not return structuredContent.id',
         structuredContent: registerOutcome.result.structuredContent ?? null,
       });
       return true;
     }
 
-    const fireOutcome = await callTool('trigger.fire', {
+    const fireOutcome = await callTool('trigger.instance.fire', {
       id: triggerId,
       payload: body.payload ?? { witness: 'TRIGGER_E2E_MARKER' },
     });
@@ -319,7 +337,7 @@ export async function handleTestHook(
         structuredContent:
           fireOutcome.kind === 'ok' ? fireOutcome.result.structuredContent ?? null : null,
         content: fireOutcome.kind === 'ok' ? fireOutcome.result.content ?? null : null,
-        message: fireOutcome.kind === 'threw' ? fireOutcome.message : 'trigger.fire failed',
+        message: fireOutcome.kind === 'threw' ? fireOutcome.message : 'trigger.instance.fire failed',
       });
       return true;
     }

@@ -1,7 +1,7 @@
 /**
  * tools/recipe.ts
  *
- * Implements recipe.list / read / upsert / delete.
+ * Implements recipe.template.list / get / upsert / delete + recipe.instance.* (begin / get / view_url / kill / list_running / update_steps) + recipe.steps.update_status.
  * - File-backed: reads/writes `.clawdevbox/recipes/<id>.yaml` (project),
  *   `~/.clawdevbox/recipes/<id>.yaml` (global), and looks up plugin recipes
  *   through the manifest's `provides.recipes` list.
@@ -10,12 +10,20 @@
  * - Shape validation per spec §7.4 happens server-side before disk writes.
  */
 
-import { existsSync, readFileSync, unlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
-import { defineTool } from './registry.ts';
+import { aliasTool, defineTool, getRegistry } from './registry.ts';
+import {
+  loadVaultChainForWorkspace,
+  resolveVaultById,
+  vaultRecipePath,
+  vaultRecipesDir,
+  listAllVaultRecipes,
+} from '../vault-paths.ts';
+import type { VaultInfo } from '../vault-chain.ts';
 import { dump as yamlDump } from 'js-yaml';
 import {
   hasSession as ptyHasSession,
@@ -69,19 +77,21 @@ import type { RecipeStepStatus, Step } from '../db/recipe-steps-store.ts';
 const scopeFilter = z
   .enum(['project', 'global', 'all'])
   .or(z.string().regex(/^plugin:[a-z][a-z0-9-]*$/, 'plugin:<id>'))
+  .or(z.string().regex(/^vault:[a-z][a-z0-9_-]*$/, 'vault:<vault_id>'))
   .optional()
-  .describe("'project' | 'plugin:<id>' | 'global' | 'all' (default 'all').");
+  .describe("'project' | 'plugin:<id>' | 'global' | 'vault:<vault_id>' | 'all' (default 'all').");
 
 const writableScope = z
   .enum(['project', 'global'])
   .or(z.string().regex(/^plugin:[a-z][a-z0-9-]*$/, 'plugin:<id> (will be rejected)'))
-  .describe("Write target. Plugin scope is rejected with PLUGIN_SCOPE_READONLY.");
+  .or(z.string().regex(/^vault:[a-z][a-z0-9_-]*$/, 'vault:<vault_id>'))
+  .describe("Write target. 'project' | 'global' | 'vault:<vault_id>'. Plugin scope is rejected with PLUGIN_SCOPE_READONLY.");
 
 export function registerRecipeEntries(ws: Workspace): void {
-  // -- recipe.list ----------------------------------------------------------
+  // -- recipe.template.list --------------------------------------------------
   defineTool({
-    name: 'recipe.list',
-    description: 'List recipes across scopes (spec §6.1 + §10.4). Project shadows plugin shadows global on id collision in `all` mode; the listing reports every (id, scope) pair so customizations are visible.',
+    name: 'recipe.template.list',
+    description: 'TEMPLATE: List recipe TEMPLATES across all scopes — project + plugin + global + every configured vault. Vault entries appear with scope `vault:<id>` (synced via git). Project shadows plugin shadows global on id collision in `all` mode.',
     parameters: z.object({
         scope: scopeFilter,
         search: z
@@ -91,25 +101,29 @@ export function registerRecipeEntries(ws: Workspace): void {
           .describe('Substring filter against id, name, or description.'),
       }),
     handler: async (args) => {
-      const scope = (args.scope ?? 'all') as 'project' | 'global' | 'all' | `plugin:${string}`;
-      const entries = listAllInScope(ws, scope, 'recipe', recipePath);
-      const recipes = entries.map((e) => {
-        const source = safeRead(e.path);
-        const parsed = source ? safeParse(source) : null;
-        return {
-          id: e.id,
-          scope: e.scope,
-          name: pickString(parsed, 'name') ?? e.id,
-          description: pickString(parsed, 'description') ?? '',
-          kind: pickString(parsed, 'kind'),
-          mcp_servers: Array.isArray((parsed as Record<string, unknown> | null)?.mcp_servers)
-            ? ((parsed as Record<string, unknown>).mcp_servers as string[])
-            : undefined,
-          step_count: Array.isArray((parsed as Record<string, unknown> | null)?.steps)
-            ? ((parsed as Record<string, unknown>).steps as unknown[]).length
-            : 0,
-        };
-      });
+      const scope = (args.scope ?? 'all') as
+        | 'project' | 'global' | 'all' | `plugin:${string}` | `vault:${string}`;
+      // Project + plugin + global come from the existing scope-walker.
+      const scopeEntries = (typeof scope === 'string' && scope.startsWith('vault:'))
+        ? []
+        : listAllInScope(ws, scope as 'project' | 'global' | 'all' | `plugin:${string}`, 'recipe', recipePath);
+      const fromScopes = scopeEntries.map((e) => buildListEntry(e.id, e.path, e.scope));
+      // Vault entries — included for 'all' or 'vault:<id>'.
+      let fromVaults: Array<ReturnType<typeof buildListEntry>> = [];
+      if (scope === 'all' || (typeof scope === 'string' && scope.startsWith('vault:'))) {
+        const chain = loadVaultChainForWorkspace(ws);
+        const filteredChain = (typeof scope === 'string' && scope.startsWith('vault:'))
+          ? chain.filter((v) => v.id === scope.slice('vault:'.length))
+          : chain;
+        for (const vault of filteredChain) {
+          const root = vaultRecipesDir(vault);
+          if (!existsSync(root)) continue;
+          for (const { id, path } of (listAllVaultRecipes([vault])[0]?.files ?? [])) {
+            fromVaults.push(buildListEntry(id, path, `vault:${vault.id}`));
+          }
+        }
+      }
+      const recipes = [...fromScopes, ...fromVaults];
       const filtered = args.search
         ? recipes.filter((r) => {
             const q = args.search!.toLowerCase();
@@ -130,10 +144,10 @@ export function registerRecipeEntries(ws: Workspace): void {
     sourceFile: fileURLToPath(import.meta.url),
   });
 
-  // -- recipe.read ----------------------------------------------------------
+  // -- recipe.template.get ---------------------------------------------------
   defineTool({
-    name: 'recipe.read',
-    description: 'Read a recipe by id, with scope precedence project → plugin → global (spec §10.4). Returns raw YAML + parsed object + the scope it resolved from.',
+    name: 'recipe.template.get',
+    description: "TEMPLATE: Read a recipe template by id. Scope precedence in 'all' mode: project → plugin → global → vaults (in chain order — personal vaults first). Returns raw YAML + parsed object + the resolved scope (e.g. 'vault:my-team').",
     parameters: z.object({
         id: z.string().min(1).describe('Recipe id ([a-z][a-z0-9-]*).'),
         scope: scopeFilter,
@@ -141,29 +155,52 @@ export function registerRecipeEntries(ws: Workspace): void {
     handler: async (args) => {
       const idCheck = validateId(args.id);
       if (!idCheck.ok) return structuredError('INVALID_ID', idCheck.message!);
-      const scope = (args.scope ?? 'all') as 'project' | 'global' | 'all' | `plugin:${string}`;
-      const hit = resolveRead(ws, scope, 'recipe', args.id, recipePath);
-      if (!hit) return notFound('recipe', args.id);
-      const parsed = safeParse(hit.source);
-      return {
-        content: [{ type: 'text', text: `recipe ${args.id} [scope=${hit.scope}]` }],
-        structuredContent: {
-          id: args.id,
-          scope: hit.scope,
-          source: hit.source,
-          parsed,
-        },
-      };
+      const scope = (args.scope ?? 'all') as
+        | 'project' | 'global' | 'all' | `plugin:${string}` | `vault:${string}`;
+
+      // Try non-vault scopes first via the existing resolver.
+      if (!(typeof scope === 'string' && scope.startsWith('vault:'))) {
+        const hit = resolveRead(ws, scope as 'project' | 'global' | 'all' | `plugin:${string}`, 'recipe', args.id, recipePath);
+        if (hit) {
+          const parsed = safeParse(hit.source);
+          return {
+            content: [{ type: 'text', text: `recipe ${args.id} [scope=${hit.scope}]` }],
+            structuredContent: { id: args.id, scope: hit.scope, source: hit.source, parsed },
+          };
+        }
+        if (scope !== 'all') return notFound('recipe', args.id);
+      }
+
+      // Vault lookup — single vault if scope=vault:<id>, otherwise scan all.
+      const chain = loadVaultChainForWorkspace(ws);
+      const candidates = (typeof scope === 'string' && scope.startsWith('vault:'))
+        ? chain.filter((v) => v.id === scope.slice('vault:'.length))
+        : chain;
+      for (const vault of candidates) {
+        for (const ext of ['yaml', 'yml', 'json'] as const) {
+          const p = vaultRecipePath(vault, args.id, ext);
+          if (!existsSync(p)) continue;
+          const source = safeRead(p);
+          if (!source) continue;
+          const parsed = safeParse(source);
+          const scopeLabel = `vault:${vault.id}` as const;
+          return {
+            content: [{ type: 'text', text: `recipe ${args.id} [scope=${scopeLabel}]` }],
+            structuredContent: { id: args.id, scope: scopeLabel, source, parsed },
+          };
+        }
+      }
+      return notFound('recipe', args.id);
     },
     source: 'builtin',
     sourceFile: fileURLToPath(import.meta.url),
   });
 
-  // -- recipe.upsert --------------------------------------------------------
+  // -- recipe.template.upsert ------------------------------------------------
   defineTool({
-    name: 'recipe.upsert',
+    name: 'recipe.template.upsert',
     description: [
-      'Create or update a recipe template (TaskDock-shape, spec §6.2 + §7.4). Recipes are reusable multi-step pipelines that agents execute via `recipe.begin`; each step has a stable id, a human-readable goal, and (optionally) full agent instructions.',
+      'TEMPLATE: Create or update a recipe TEMPLATE (TaskDock-shape, spec §6.2 + §7.4). Recipes are reusable multi-step pipelines that agents execute via `recipe.instance.begin`; each step has a stable id, a human-readable goal, and (optionally) full agent instructions.',
       '',
       'Plugin scope is read-only — copy to project to customize.',
       '',
@@ -280,7 +317,25 @@ export function registerRecipeEntries(ws: Workspace): void {
       }
 
       const format = (args.format ?? 'yaml') as 'yaml' | 'json';
-      const dir = dirname(recipePath(ws, args.scope as 'project' | 'global', args.id));
+      // Dispatch by scope: 'vault:<id>' writes under the vault's recipes/
+      // directory (synced via git); 'project'/'global' use the existing
+      // workspace paths.
+      let dir: string;
+      let scopeLabel: string = args.scope;
+      if (typeof args.scope === 'string' && args.scope.startsWith('vault:')) {
+        const vaultId = args.scope.slice('vault:'.length);
+        let vault: VaultInfo;
+        try {
+          vault = resolveVaultById(loadVaultChainForWorkspace(ws), vaultId);
+        } catch (err) {
+          return structuredError('VAULT_NOT_FOUND', (err as Error).message, { vault_id: vaultId });
+        }
+        dir = vaultRecipesDir(vault);
+        mkdirSync(dir, { recursive: true });
+        scopeLabel = `vault:${vault.id}`;
+      } else {
+        dir = dirname(recipePath(ws, args.scope as 'project' | 'global', args.id));
+      }
       const target = join(dir, `${args.id}.${format}`);
       const body =
         format === 'json'
@@ -341,10 +396,10 @@ export function registerRecipeEntries(ws: Workspace): void {
       }
 
       return {
-        content: [{ type: 'text', text: `Wrote recipe ${args.id} to ${args.scope} scope (${format}).` }],
+        content: [{ type: 'text', text: `Wrote recipe ${args.id} to ${scopeLabel} scope (${format}).` }],
         structuredContent: {
           id: args.id,
-          scope: args.scope,
+          scope: scopeLabel,
           path: target,
           format,
           removed_siblings: removedPaths,
@@ -356,10 +411,10 @@ export function registerRecipeEntries(ws: Workspace): void {
     sourceFile: fileURLToPath(import.meta.url),
   });
 
-  // -- recipe.delete --------------------------------------------------------
+  // -- recipe.template.delete ------------------------------------------------
   defineTool({
-    name: 'recipe.delete',
-    description: 'Delete a recipe from project or global scope. Plugin scope is read-only.',
+    name: 'recipe.template.delete',
+    description: "TEMPLATE: Delete a recipe template from 'project', 'global', or 'vault:<id>' scope. Plugin scope is read-only.",
     parameters: z.object({
         id: z.string().min(1),
         scope: writableScope,
@@ -367,8 +422,23 @@ export function registerRecipeEntries(ws: Workspace): void {
     handler: async (args) => {
       const guard = ensureWritableScope(args.scope);
       if (guard) return guard;
-      const target = recipePath(ws, args.scope as 'project' | 'global', args.id);
-      const dir = dirname(target);
+      // Resolve the directory based on scope: vault:<id> → vault recipes dir.
+      let dir: string;
+      let scopeLabel: string = args.scope;
+      if (typeof args.scope === 'string' && args.scope.startsWith('vault:')) {
+        const vaultId = args.scope.slice('vault:'.length);
+        let vault: VaultInfo;
+        try {
+          vault = resolveVaultById(loadVaultChainForWorkspace(ws), vaultId);
+        } catch (err) {
+          return structuredError('VAULT_NOT_FOUND', (err as Error).message, { vault_id: vaultId });
+        }
+        dir = vaultRecipesDir(vault);
+        scopeLabel = `vault:${vault.id}`;
+      } else {
+        dir = dirname(recipePath(ws, args.scope as 'project' | 'global', args.id));
+      }
+      const target = join(dir, `${args.id}.yaml`);
       const candidates = [target, join(dir, `${args.id}.yml`), join(dir, `${args.id}.json`)];
       const removed: string[] = [];
       for (const p of candidates) {
@@ -383,15 +453,15 @@ export function registerRecipeEntries(ws: Workspace): void {
       }
       if (removed.length === 0) return notFound('recipe', args.id);
       return {
-        content: [{ type: 'text', text: `Deleted recipe ${args.id} from ${args.scope} scope.` }],
-        structuredContent: { id: args.id, scope: args.scope, path: target, removed },
+        content: [{ type: 'text', text: `Deleted recipe ${args.id} from ${scopeLabel} scope.` }],
+        structuredContent: { id: args.id, scope: scopeLabel, path: target, removed },
       };
     },
     source: 'builtin',
     sourceFile: fileURLToPath(import.meta.url),
   });
 
-  // -- recipe.begin ---------------------------------------------------------
+  // -- recipe.instance.begin -------------------------------------------------
   // Agent-executes-recipe model (new in 2026-06):
   //
   // The CALLING agent — not a child — executes the recipe. recipe.begin
@@ -415,8 +485,8 @@ export function registerRecipeEntries(ws: Workspace): void {
   // tried to propagate identity via HTTP headers (fragile when wrappers
   // like agency redeclared the MCP server entry).
   defineTool({
-    name: 'recipe.begin',
-    description: 'Start executing a recipe IN THE CALLING AGENT\'S SESSION. Creates a recipe-instance row, materializes the declared steps into the DB, and returns the recipe_instance_id plus the initial step list. The calling agent then iterates the steps itself using recipe.steps.update_status (status: running → done/failed/skipped) with the returned recipe_instance_id. For multi-agent collaboration, hand the returned recipe_instance_id to other agents (via prompts, dispatch, inbox) — they call update_status with the same id. First-writer-wins via the monotonic step machine. Specify the recipe by either `template_id` (load saved recipe via scope chain) or inline `source` YAML.',
+    name: 'recipe.instance.begin',
+    description: 'INSTANCE: Start executing a recipe IN THE CALLING AGENT\'S SESSION. Creates a recipe-instance row, materializes the declared steps into the DB, and returns the recipe_instance_id plus the initial step list. The calling agent then iterates the steps itself using recipe.steps.update_status (status: running → done/failed/skipped) with the returned recipe_instance_id. For multi-agent collaboration, hand the returned recipe_instance_id to other agents (via prompts, dispatch, inbox) — they call update_status with the same id. First-writer-wins via the monotonic step machine. Specify the recipe by either `template_id` (load saved template via scope chain) or inline `source` YAML.',
     parameters: z.object({
       template_id: z
         .string()
@@ -473,7 +543,21 @@ export function registerRecipeEntries(ws: Workspace): void {
       if (hasId) {
         const idCheck = validateId(args.template_id!);
         if (!idCheck.ok) return structuredError('INVALID_ID', idCheck.message!);
-        const hit = resolveRead(ws, 'all', 'recipe', args.template_id!, recipePath);
+        let hit = resolveRead(ws, 'all', 'recipe', args.template_id!, recipePath);
+        if (!hit) {
+          // Fall back to vaults — same scope chain as recipe.template.get.
+          for (const vault of loadVaultChainForWorkspace(ws)) {
+            for (const ext of ['yaml', 'yml', 'json'] as const) {
+              const p = vaultRecipePath(vault, args.template_id!, ext);
+              if (!existsSync(p)) continue;
+              const source = safeRead(p);
+              if (!source) continue;
+              hit = { scope: `vault:${vault.id}`, path: p, source };
+              break;
+            }
+            if (hit) break;
+          }
+        }
         if (!hit) return notFound('recipe', args.template_id!);
         recipeId = args.template_id!;
         recipeSnapshot = hit.source;
@@ -621,10 +705,10 @@ export function registerRecipeEntries(ws: Workspace): void {
   });
 
 
-  // -- recipe.instance_info -------------------------------------------------
+  // -- recipe.instance.get ---------------------------------------------------
   defineTool({
-    name: 'recipe.instance_info',
-    description: 'Read a recipe-run instance by id, or — when no id is passed — by reading CLAWDEVBOX_RECIPE_INSTANCE_ID + CLAWDEVBOX_WORKSPACE_ID env vars inside a spawned session. Returns the full instance row.',
+    name: 'recipe.instance.get',
+    description: '⚠️ PREREQUISITE: a recipe instance must already exist — call `recipe.instance.begin` first to mint one. INSTANCE: Read a recipe-run INSTANCE by id, or — when no id is passed — by reading CLAWDEVBOX_RECIPE_INSTANCE_ID + CLAWDEVBOX_WORKSPACE_ID env vars inside a spawned session. Returns the full instance row.',
     parameters: z.object({
         id: z
           .string()
@@ -678,14 +762,14 @@ export function registerRecipeEntries(ws: Workspace): void {
     sourceFile: fileURLToPath(import.meta.url),
   });
 
-  // -- recipe.view_url ------------------------------------------------------
+  // -- recipe.instance.view_url ----------------------------------------------
   // Returns the browser URL that hooks an xterm.js view into the hidden pty
   // session for a running recipe instance. Mirrors the pattern from
   // taskdock's chat-terminal:watch — many viewers can attach to the same
   // session, and each gets a scrollback snapshot followed by live data.
   defineTool({
-    name: 'recipe.view_url',
-    description: 'Return a browser URL that opens an xterm.js viewer attached to the hidden pty running the given recipe instance. Viewers receive a scrollback snapshot, then live data, and can send keystrokes / resize / kill back. Multiple clients may attach simultaneously. Errors if the instance is unknown or already cleaned up.',
+    name: 'recipe.instance.view_url',
+    description: '⚠️ PREREQUISITE: a recipe instance must already exist — call `recipe.instance.begin` first to mint one. INSTANCE: Return a browser URL that opens an xterm.js viewer attached to the hidden pty running the given recipe instance. Viewers receive a scrollback snapshot, then live data, and can send keystrokes / resize / kill back. Multiple clients may attach simultaneously. Errors if the instance is unknown or already cleaned up.',
     parameters: z.object({
         id: z
           .string()
@@ -731,12 +815,12 @@ export function registerRecipeEntries(ws: Workspace): void {
     sourceFile: fileURLToPath(import.meta.url),
   });
 
-  // -- recipe.kill ----------------------------------------------------------
+  // -- recipe.instance.kill --------------------------------------------------
   // Forcibly terminate a running pty session. Marks the instance as cancelled
   // so subsequent recipe.instance_info reads reflect the truth.
   defineTool({
-    name: 'recipe.kill',
-    description: 'Terminate a running recipe pty. Sends a signal to the underlying agent process, marks the recipe instance as cancelled, and disconnects all attached viewers via the regular exit event.',
+    name: 'recipe.instance.kill',
+    description: '⚠️ PREREQUISITE: a recipe instance must already exist — call `recipe.instance.begin` first to mint one. INSTANCE: Terminate a running recipe pty. Sends a signal to the underlying agent process, marks the recipe instance as cancelled, and disconnects all attached viewers via the regular exit event.',
     parameters: z.object({
         id: z
           .string()
@@ -797,12 +881,12 @@ export function registerRecipeEntries(ws: Workspace): void {
     sourceFile: fileURLToPath(import.meta.url),
   });
 
-  // -- recipe.list_running ---------------------------------------------------
+  // -- recipe.instance.list_running ------------------------------------------
   // Convenience listing of every pty session currently registered. Useful for
   // dashboards and Playwright tests.
   defineTool({
-    name: 'recipe.list_running',
-    description: 'List every recipe-instance currently holding a live pty session in this MCP server. Returns view_url per entry when the terminal server is running.',
+    name: 'recipe.instance.list_running',
+    description: 'INSTANCE: List every recipe-instance currently holding a live pty session in this MCP server. Returns view_url per entry when the terminal server is running.',
     parameters: z.object({}),
     handler: async () => {
       const handle = getTerminalServer();
@@ -820,13 +904,13 @@ export function registerRecipeEntries(ws: Workspace): void {
     source: 'builtin',
     sourceFile: fileURLToPath(import.meta.url),
   });
-  // -- recipe.update_steps --------------------------------------------------
+  // -- recipe.instance.update_steps ------------------------------------------
   defineTool({
-    name: 'recipe.update_steps',
+    name: 'recipe.instance.update_steps',
     description: [
-      'Mutate the step plan of a running recipe instance (spec §10.5). Supports three operations in one call: `add` new steps, `remove` pending steps by step_id, and `update_meta` to patch existing step declarations. All mutations run inside a single DB transaction; any failure rolls everything back. Added triggers on running steps register immediately; removed triggers disable matching auto-declared rows. Defaults `recipe_instance_id` from $CLAWDEVBOX_RECIPE_INSTANCE_ID when omitted.',
+      'INSTANCE: Mutate the step plan of a running recipe instance (spec §10.5). ⚠️ PREREQUISITE: a recipe instance must already exist — call `recipe.instance.begin` first to mint one (or be running inside a spawned session that inherited CLAWDEVBOX_RECIPE_INSTANCE_ID). Supports three operations in one call: `add` new steps, `remove` pending steps by step_id, and `update_meta` to patch existing step declarations. All mutations run inside a single DB transaction; any failure rolls everything back. Added triggers on running steps register immediately; removed triggers disable matching auto-declared rows. Defaults `recipe_instance_id` from $CLAWDEVBOX_RECIPE_INSTANCE_ID when omitted.',
       '',
-      'Step shape for `add[]` / `update_meta[]` is the same as recipe.upsert:',
+      'Step shape for `add[]` / `update_meta[]` is the same as recipe.template.upsert:',
       '  id:              kebab-case unique step id',
       '  goal:            ≤200 char human-readable TL;DR (shown as title in SPA)',
       '  ai_instructions: full agent-facing prompt (optional, ≤16000 chars,',
@@ -894,7 +978,7 @@ export function registerRecipeEntries(ws: Workspace): void {
   // -- recipe.steps.update_status -------------------------------------------
   defineTool({
     name: 'recipe.steps.update_status',
-    description: 'Update the status, state, or attachments of a single step in a recipe instance (spec §10.5). Enforces the monotonic transition rule. Entry hook: transitioning into `running` registers the step\'s declared triggers. Exit hook: transitioning into a terminal state (`done`/`failed`/`skipped`) disables auto-declared triggers and cascades the instance to terminal when all siblings are terminal. `request_user_input` atomically transitions to `awaiting_user` and creates a linked inbox item. `state` merges; `state_replace` overwrites (mutually exclusive). Defaults `recipe_instance_id` from $CLAWDEVBOX_RECIPE_INSTANCE_ID when omitted.',
+    description: '⚠️ PREREQUISITE: a recipe instance must already exist — call `recipe.instance.begin` first to mint one (or be running inside a spawned session that inherited CLAWDEVBOX_RECIPE_INSTANCE_ID). Update the status, state, or attachments of a single step in a recipe instance (spec §10.5). Enforces the monotonic transition rule. Entry hook: transitioning into `running` registers the step\'s declared triggers. Exit hook: transitioning into a terminal state (`done`/`failed`/`skipped`) disables auto-declared triggers and cascades the instance to terminal when all siblings are terminal. `request_user_input` atomically transitions to `awaiting_user` and creates a linked inbox item. `state` merges; `state_replace` overwrites (mutually exclusive). Defaults `recipe_instance_id` from $CLAWDEVBOX_RECIPE_INSTANCE_ID when omitted.',
     parameters: z.object({
         recipe_instance_id: z.string().min(1).optional(),
         step_id: z.string().min(1),
@@ -990,10 +1074,6 @@ export function registerRecipeEntries(ws: Workspace): void {
   });
 }
 
-// ----------------------------------------------------------------------------
-// Helpers
-// ----------------------------------------------------------------------------
-
 function successResponse(inst: RecipeInstance): CallToolResult {
   return {
     content: [{ type: 'text' as const, text: `recipe instance ${inst.id} (status=${inst.status})` }],
@@ -1037,4 +1117,31 @@ function pickString(obj: unknown, field: string): string | undefined {
     if (typeof v === 'string') return v;
   }
   return undefined;
+}
+
+/** Projection used by recipe.template.list — same shape across scopes + vaults. */
+function buildListEntry(id: string, path: string, scope: string): {
+  id: string;
+  scope: string;
+  name: string;
+  description: string;
+  kind: string | undefined;
+  mcp_servers: string[] | undefined;
+  step_count: number;
+} {
+  const source = safeRead(path);
+  const parsed = source ? safeParse(source) : null;
+  return {
+    id,
+    scope,
+    name: pickString(parsed, 'name') ?? id,
+    description: pickString(parsed, 'description') ?? '',
+    kind: pickString(parsed, 'kind'),
+    mcp_servers: Array.isArray((parsed as Record<string, unknown> | null)?.mcp_servers)
+      ? ((parsed as Record<string, unknown>).mcp_servers as string[])
+      : undefined,
+    step_count: Array.isArray((parsed as Record<string, unknown> | null)?.steps)
+      ? ((parsed as Record<string, unknown>).steps as unknown[]).length
+      : 0,
+  };
 }

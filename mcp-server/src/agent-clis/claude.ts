@@ -84,6 +84,11 @@ export const claudeProvider: AgentCliProvider = {
     if (opts.mode === 'headless') {
       if (!opts.prompt) throw new Error('claude: headless mode requires opts.prompt');
       argv.push('-p', opts.prompt);
+    } else if (opts.prompt) {
+      // Interactive WITH seed prompt: `claude [options] [prompt]` —
+      // the trailing positional prompt is auto-executed on startup.
+      // Must come AFTER all options.
+      argv.push(opts.prompt);
     }
 
     const env = { ...process.env, ...opts.ambientEnv } as Record<string, string>;

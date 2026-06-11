@@ -45,8 +45,9 @@ const copilotCapabilities: ProviderCapabilities = {
   // Copilot writes a structured event stream to
   // ~/.copilot/session-state/<sessionId>/events.jsonl which is more
   // reliable than glyph-on-tail for "is the agent ready for input".
-  // The dispatcher uses this to gate the next prompt on
+  // The dispatcher uses this to gate the next FOLLOW-UP prompt on
   // assistant.turn_end (idle) instead of pushing into a busy TUI.
+  // (Seed prompt is delivered via `copilot -i <prompt>`.)
   idleSignal: 'copilot-events',
 };
 
@@ -111,6 +112,15 @@ export const copilotProvider: AgentCliProvider = {
     if (opts.mode === 'headless') {
       if (!opts.prompt) throw new Error('copilot: headless mode requires opts.prompt');
       argv.push('-p', opts.prompt);
+    } else if (opts.prompt) {
+      // Interactive WITH seed prompt: `copilot -i <prompt>` starts the
+      // interactive REPL AND auto-executes the prompt on startup. This
+      // is preferred over post-spawn keystroke dispatch — the CLI
+      // consumes its own argv before drawing the input box, so we
+      // sidestep the entire "is stdin ready yet?" race that plagued
+      // the old tmux send-keys path (especially when MCP servers were
+      // slow/failing to connect).
+      argv.push('-i', opts.prompt);
     }
 
     const env = { ...process.env, ...opts.ambientEnv } as Record<string, string>;
