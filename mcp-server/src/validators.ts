@@ -1441,6 +1441,67 @@ function validateClawdevboxExtensions(value: unknown, errors: ValidationError[])
       }
     }
   });
+
+  const daemonSeen = new Set<string>();
+  if (c.daemons !== undefined) {
+    if (!Array.isArray(c.daemons)) {
+      errors.push({
+        path: 'clawdevbox.daemons',
+        code: 'TYPE',
+        message: 'clawdevbox.daemons must be an array of daemon entries.',
+      });
+    } else {
+      c.daemons.forEach((entry, i) => {
+        const p = `clawdevbox.daemons[${i}]`;
+        if (!isPlainObject(entry)) {
+          errors.push({ path: p, code: 'TYPE', message: 'daemon entry must be an object.' });
+          return;
+        }
+        const e = entry as Record<string, unknown>;
+        if (!isNonEmptyString(e.id)) {
+          errors.push({ path: `${p}.id`, code: 'REQUIRED', message: 'daemon.id is required.' });
+        } else if (!ID_PATTERN.test(e.id as string)) {
+          errors.push({
+            path: `${p}.id`, code: 'PATTERN',
+            message: `daemon.id "${e.id}" must match ${ID_PATTERN}.`,
+          });
+        } else if (daemonSeen.has(e.id as string)) {
+          errors.push({
+            path: `${p}.id`, code: 'DUPLICATE',
+            message: `daemon id ${e.id} duplicated within plugin.`,
+          });
+        } else {
+          daemonSeen.add(e.id as string);
+        }
+        if (!isNonEmptyString(e.name)) {
+          errors.push({ path: `${p}.name`, code: 'REQUIRED', message: 'daemon.name is required.' });
+        }
+        if (!isNonEmptyString(e.file)) {
+          errors.push({ path: `${p}.file`, code: 'REQUIRED', message: 'daemon.file is required.' });
+        } else if (isUnsafeRelPath(e.file as string)) {
+          errors.push({
+            path: `${p}.file`, code: 'PATH_ESCAPE',
+            message: 'daemon.file must be a relative path with no ".." segments.',
+          });
+        }
+        if (e.runtime !== undefined) {
+          const VALID = ['node', 'tsx', 'python', 'bash', 'pwsh', 'direct'];
+          if (typeof e.runtime !== 'string' || !VALID.includes(e.runtime)) {
+            errors.push({
+              path: `${p}.runtime`, code: 'ENUM',
+              message: `daemon.runtime must be one of: ${VALID.join(', ')}.`,
+            });
+          }
+        }
+        if (e.env !== undefined && !isPlainObject(e.env)) {
+          errors.push({
+            path: `${p}.env`, code: 'TYPE',
+            message: 'daemon.env must be an object of string→string.',
+          });
+        }
+      });
+    }
+  }
 }
 
 function validateMcpServersField(value: unknown, errors: ValidationError[]): void {

@@ -673,6 +673,7 @@ function emptyCapabilities(): ResolvedCapabilities {
     triggerTypes: [],
     agentClis: [],
     renderers: [],
+    daemons: [],
   };
 }
 

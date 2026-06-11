@@ -72,6 +72,51 @@ async function fireClientSync(
   }
 }
 
+/**
+ * After every plugin reload, re-sync plugin-declared daemons against
+ * the daemons table. New daemons get upserted; daemons whose plugin
+ * was uninstalled get deleted; daemons whose plugin was disabled get
+ * marked enabled=0. Daemons whose spec materially changed are
+ * force-restarted via the supervisor so the live process picks up
+ * the new command immediately (otherwise it would keep running the
+ * old spec until it exited on its own).
+ *
+ * Best-effort: this MUST NOT abort the calling tool — if reconcile
+ * throws (e.g. transient DB lock, supervisor not yet initialized),
+ * the next plugin reload OR the next clawdevbox boot will pick up
+ * the drift.
+ */
+async function reconcileDaemonsBestEffort(ws: Workspace): Promise<void> {
+  try {
+    const { getDatabase } = await import('../db/index.ts');
+    const { reconcilePluginDaemons } = await import('../plugin-daemons.ts');
+    const db = getDatabase();
+    if (!db) return;
+    const result = reconcilePluginDaemons(db, ws);
+
+    // Force-restart any daemon whose spec changed (or that's brand new).
+    // The supervisor is reachable via the global ctx — same handle used
+    // by the daemon.* MCP tools. If the global isn't initialized yet
+    // (e.g. running under tests, or boot-time reconcile), the supervisor's
+    // next tick will spawn changed daemons anyway since they're newly
+    // upserted.
+    const ctx = (globalThis as Record<string, unknown>).__clawdevboxDaemonToolCtx as
+      | { supervisor?: { restart: (id: string) => Promise<void> } }
+      | undefined;
+    if (ctx?.supervisor && result.changed.length > 0) {
+      for (const daemonId of result.changed) {
+        try {
+          await ctx.supervisor.restart(daemonId);
+        } catch {
+          // swallow — supervisor's own backoff will catch up
+        }
+      }
+    }
+  } catch {
+    // swallow — see doc comment
+  }
+}
+
 interface StateFile {
   plugins?: Record<string, { enabled?: boolean }>;
 }
@@ -379,6 +424,7 @@ export function registerPluginEntries(ws: Workspace): void {
         return structuredError('MANIFEST_MISSING', `.claude-plugin/plugin.json not found at ${manifestPath} after update`);
       }
       await reloadPluginRegistry(ws);
+      await reconcileDaemonsBestEffort(ws);
       return {
         content: [{ type: 'text', text: `Updated plugin ${args.id} (reset to ${resetTarget}).` }],
         structuredContent: { id: args.id, reset_to: resetTarget, output: reset.stdout?.trim() ?? '' },
@@ -431,6 +477,7 @@ export function registerPluginEntries(ws: Workspace): void {
       }
       removeInstallRecord(ws, args.id);
       await reloadPluginRegistry(ws);
+      await reconcileDaemonsBestEffort(ws);
       await fireClientSync(ws, 'plugin-uninstall');
       return {
         content: [{ type: 'text', text: `Uninstalled plugin ${args.id}.` }],
@@ -455,6 +502,7 @@ export function registerPluginEntries(ws: Workspace): void {
         state.plugins[args.id] = { enabled: action === 'enable' };
         writeStateFile(ws, state);
         await reloadPluginRegistry(ws);
+        await reconcileDaemonsBestEffort(ws);
         return {
           content: [
             { type: 'text', text: `${action === 'enable' ? 'Enabled' : 'Disabled'} plugin ${args.id}.` },
@@ -570,6 +618,7 @@ async function installFromGit(ws: Workspace, from: string, ref: string | null): 
     writeInstallRecord(ws, manifest.name, record);
 
     await reloadPluginRegistry(ws);
+    await reconcileDaemonsBestEffort(ws);
     await fireClientSync(ws, 'plugin-install');
     return {
       content: [{ type: 'text', text: `Installed plugin ${manifest.name} from ${from}.` }],
@@ -672,6 +721,7 @@ async function installFromLocalFolder(ws: Workspace, sourcePath: string): Promis
   }
 
   await reloadPluginRegistry(ws);
+  await reconcileDaemonsBestEffort(ws);
   await fireClientSync(ws, 'plugin-install');
   const messages = [`Installed plugin ${manifest.name} as a local-folder link → ${absoluteSource}.`];
   if (nodeModulesHint) messages.push(nodeModulesHint);

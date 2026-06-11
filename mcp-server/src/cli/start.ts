@@ -1524,6 +1524,28 @@ export async function runStart(flags: Flags): Promise<void> {
       return row?.path ?? null;
     },
   });
+
+  // Sync plugin-declared daemons into the desired-state table BEFORE the
+  // supervisor starts ticking. The supervisor only reads from this table;
+  // any daemon declared in a plugin's `clawdevbox.daemons[]` becomes a
+  // managed row, and any plugin-sourced row whose plugin no longer
+  // declares it gets deleted (the supervisor tears down the live run).
+  try {
+    const { reconcilePluginDaemons } = await import('../plugin-daemons.ts');
+    const recon = reconcilePluginDaemons(opened.db, ws);
+    if (recon.upserted > 0 || recon.disabled > 0 || recon.deleted > 0) {
+      logger.info(
+        recon,
+        'plugin-daemons: reconciled plugin-declared daemons',
+      );
+    }
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'plugin-daemons: initial reconcile failed (non-fatal)',
+    );
+  }
+
   daemonSupervisor.start();
   (globalThis as Record<string, unknown>).__clawdevboxDaemonToolCtx = {
     db: opened.db,

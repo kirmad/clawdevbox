@@ -36,6 +36,7 @@ import type {
   PluginStatus,
   PluginProvideEntry,
   ClawdevboxToolEntry,
+  ClawdevboxDaemonEntry,
   PluginRendererEntry,
 } from './types.ts';
 import type { PluginTriggerType, PluginAgentCliEntry } from '../workspace.ts';
@@ -76,6 +77,26 @@ export interface ResolvedTool {
   runtime?: string;
 }
 
+/**
+ * Resolved `clawdevbox.daemons[]` entry — paths resolved to absolute,
+ * passed through to the daemon supervisor's upsert path during plugin
+ * reload (see `reconcilePluginDaemons` in the workspace loader).
+ */
+export interface ResolvedDaemon {
+  id: string;
+  name: string;
+  file: string;
+  absoluteFile: string;
+  runtime: 'node' | 'tsx' | 'python' | 'bash' | 'pwsh' | 'direct';
+  env: Record<string, string>;
+  restart_policy?: {
+    backoff_ms?: number[];
+    stable_after_ms?: number;
+    max_restarts?: number;
+  };
+  description?: string;
+}
+
 export interface ResolvedRenderer {
   type: string;
   module: string;
@@ -94,6 +115,7 @@ export interface ResolvedCapabilities {
   triggerTypes: PluginTriggerType[];
   agentClis: PluginAgentCliEntry[];
   renderers: ResolvedRenderer[];
+  daemons: ResolvedDaemon[];
   status?: PluginStatus;
 }
 
@@ -109,7 +131,8 @@ export type LoadErrorScope =
   | 'tools'
   | 'trigger_types'
   | 'agent_clis'
-  | 'renderers';
+  | 'renderers'
+  | 'daemons';
 
 export interface LoadError {
   scope: LoadErrorScope;
@@ -237,6 +260,7 @@ export async function loadPluginFromDir(pluginDir: string): Promise<LoadedPlugin
   const triggerTypes = await discoverTriggerTypes(pluginDir, cdb?.trigger_types, pluginName, loadErrors);
   const agentClis = await discoverAgentClis(pluginDir, cdb?.agent_clis, loadErrors);
   const renderers = await discoverRenderers(pluginDir, cdb?.renderers, loadErrors);
+  const daemons = resolveDaemons(pluginDir, cdb?.daemons, loadErrors);
 
   const capabilities: ResolvedCapabilities = {
     skills,
@@ -249,6 +273,7 @@ export async function loadPluginFromDir(pluginDir: string): Promise<LoadedPlugin
     triggerTypes,
     agentClis,
     renderers,
+    daemons,
     status: manifest.status,
   };
 
@@ -989,4 +1014,90 @@ async function discoverRenderers(
     fileToEntry,
     fromExplicit: (e) => fromExplicit(e as unknown as PluginRendererEntry[]),
   });
+}
+
+// ---------------------------------------------------------------------------
+// 6. Daemons — long-running background processes (no auto-discovery)
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve `clawdevbox.daemons[]` into `ResolvedDaemon[]`. Path-escape
+ * validation: `file` must resolve INSIDE pluginDir (defense in depth
+ * against ../../etc/passwd-style entries). Unknown runtime values are
+ * rejected with a structured load error.
+ *
+ * No auto-discovery — daemons must be enumerated explicitly. Running
+ * background processes is the most invasive thing a plugin can do, so
+ * we want every daemon explicitly opted-in by the manifest author.
+ */
+function resolveDaemons(
+  pluginDir: string,
+  manifestValue: ClawdevboxDaemonEntry[] | undefined,
+  errors: LoadError[],
+): ResolvedDaemon[] {
+  if (manifestValue === undefined) return [];
+  if (!Array.isArray(manifestValue)) {
+    // Validator should have caught this already; defensive.
+    errors.push({
+      scope: 'daemons',
+      path: 'clawdevbox.daemons',
+      message: 'clawdevbox.daemons must be an array of daemon entries.',
+    });
+    return [];
+  }
+  const out: ResolvedDaemon[] = [];
+  const seen = new Set<string>();
+  for (let i = 0; i < manifestValue.length; i += 1) {
+    const e = manifestValue[i]!;
+    const p = `clawdevbox.daemons[${i}]`;
+    if (typeof e?.id !== 'string' || e.id.length === 0) {
+      errors.push({ scope: 'daemons', path: p, message: 'daemon.id is required.' });
+      continue;
+    }
+    if (seen.has(e.id)) {
+      errors.push({
+        scope: 'daemons', path: `${p}.id`,
+        message: `daemon id '${e.id}' duplicated within plugin.`,
+      });
+      continue;
+    }
+    if (typeof e.name !== 'string' || e.name.length === 0) {
+      errors.push({ scope: 'daemons', path: `${p}.name`, message: 'daemon.name is required.' });
+      continue;
+    }
+    if (typeof e.file !== 'string' || e.file.length === 0) {
+      errors.push({ scope: 'daemons', path: `${p}.file`, message: 'daemon.file is required.' });
+      continue;
+    }
+    const absoluteFile = resolve(pluginDir, e.file);
+    // Path-escape guard.
+    if (!absoluteFile.startsWith(pluginDir)) {
+      errors.push({
+        scope: 'daemons', path: `${p}.file`,
+        message: `daemon.file escapes plugin directory: ${e.file}`,
+      });
+      continue;
+    }
+    const runtime = e.runtime ?? 'direct';
+    const VALID_RUNTIMES = ['node', 'tsx', 'python', 'bash', 'pwsh', 'direct'] as const;
+    if (!VALID_RUNTIMES.includes(runtime as typeof VALID_RUNTIMES[number])) {
+      errors.push({
+        scope: 'daemons', path: `${p}.runtime`,
+        message: `unknown runtime '${runtime}'. Allowed: ${VALID_RUNTIMES.join(', ')}.`,
+      });
+      continue;
+    }
+    seen.add(e.id);
+    out.push({
+      id: e.id,
+      name: e.name,
+      file: e.file,
+      absoluteFile,
+      runtime: runtime as ResolvedDaemon['runtime'],
+      env: e.env ?? {},
+      restart_policy: e.restart_policy,
+      description: e.description,
+    });
+  }
+  return out;
 }

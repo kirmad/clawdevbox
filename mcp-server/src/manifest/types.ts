@@ -51,6 +51,45 @@ export interface ClawdevboxToolEntry {
 }
 
 /**
+ * `clawdevbox.daemons[]` entry: a long-running background process the
+ * plugin wants the clawdevbox supervisor to keep alive.
+ *
+ * The daemon is upserted into the `daemons` table whenever the plugin
+ * is loaded (status='enabled'); disabled when the plugin is disabled;
+ * deleted when the plugin is uninstalled. The supervisor reads
+ * desired-state from the same table, so this is the bridge from
+ * "plugin declares X should run" to "process X is alive".
+ *
+ * Fields map directly to DaemonsStore.UpsertDaemonInput:
+ *   - `id`               — stable id (e.g. "dmn-teams-listener"). Used
+ *                          as the upsert key, so renaming = recreate.
+ *   - `name`             — human-readable name in the dashboard.
+ *   - `file`             — path to the script, relative to the plugin
+ *                          directory. Resolved + passed as command[1].
+ *   - `runtime`          — defaults to 'direct' (Node executes the script
+ *                          via process.execPath). Use 'tsx' for .ts.
+ *   - `env`              — base env vars; the loader merges in
+ *                          per-runtime/process additions before upserting.
+ *   - `restart_policy`   — optional partial overrides for the supervisor's
+ *                          default policy. See RestartPolicy in
+ *                          db/daemons-store.ts.
+ *   - `description`      — surfaced in tooling listings.
+ */
+export interface ClawdevboxDaemonEntry {
+  id: string;
+  name: string;
+  file: string;
+  runtime?: 'node' | 'tsx' | 'python' | 'bash' | 'pwsh' | 'direct';
+  env?: Record<string, string>;
+  restart_policy?: {
+    backoff_ms?: number[];
+    stable_after_ms?: number;
+    max_restarts?: number;
+  };
+  description?: string;
+}
+
+/**
  * `clawdevbox.renderers[]` entry: a `.mjs` artifact renderer module shipped
  * by a plugin. `type` matches the `artifact.type` field at resolution time.
  */
@@ -80,6 +119,13 @@ export interface ClawdevboxExtensions {
   trigger_types?: string | string[] | PluginTriggerType[];
   agent_clis?: string | string[] | PluginAgentCliEntry[];
   renderers?: string | string[] | PluginRendererEntry[];
+  /**
+   * Long-running background processes the supervisor should keep alive
+   * while the plugin is enabled. Auto-discovery is NOT supported (a
+   * plugin's daemons must be enumerated explicitly to keep the
+   * "what's running on my machine?" surface deliberate).
+   */
+  daemons?: ClawdevboxDaemonEntry[];
 }
 
 /**
