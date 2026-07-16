@@ -1,0 +1,103 @@
+# Clawdevbox recipe template (TaskDock-shape). See spec §6.1 and §5.
+#
+# Router recipe invoked by the ado.new-work-item-watcher trigger. Owns
+# Phase 0 repo-set resolution (free-form markdown memory at
+# .clawdevbox/repo-registry.md), then dispatches to implement-feature or
+# fix-bug. Steps are prose; the agent adapts as the work demands.
+#
+# Confidence-gated: silent dispatch when memory + WI signals line up,
+# inbox approval card only when not confident or when later phases
+# contradict the choice.
+
+id: triage-work-item
+name: "Triage an ADO work item"
+description: >
+  Read an inbound ADO work item, resolve which repo(s) it touches via
+  the free-form .clawdevbox/repo-registry.md memory, ensure those
+  repos are cloned, then dispatch to implement-feature or fix-bug.
+kind: work_item
+default_client: copilot
+mcp_servers:
+  - ado
+  - clawdevbox
+timeout_minutes: 0
+
+steps:
+  - id: 1
+    goal: >
+      Read the WI via `ado.get_work_item({ id, include_relations: true })`.
+      Extract WorkItemType, State, AreaPath, Tags, Title, Description, and
+      any linked PRs / commits / parent WIs from `relations`. Emit
+      `view.emit({ view_id: 'wi_summary', payload: { id, type, state,
+      area, tags, title } })`. Update the inbox card's `agent_message`
+      to a one-line summary truncated to ~80 chars.
+
+  - id: 2
+    goal: >
+      Phase 0.a — Read `.clawdevbox/repo-registry.md` from the project
+      dir. If the file is missing, treat as empty and plan to author it
+      as you learn. Reason from the registry's prose plus the WI
+      signals (AreaPath, Tags, Title, Description, linked
+      PRs / commits) to nominate a candidate repo set. Multiple repos
+      are valid — a single WI may touch several services.
+    depends: [1]
+
+  - id: 3
+    goal: >
+      Phase 0.b — Self-rate confidence in the repo set. Confident when
+      EITHER (a) the registry contains a matching entry AND every WI
+      signal lines up AND no signal contradicts the choice, OR (b)
+      linked PRs / commits on the WI directly name the repo(s).
+      Confident → proceed silently; `thread.append_message` naming the
+      chosen repos and the memory cues that justified them. Not
+      confident → `inbox.create` with candidates + per-repo reasoning,
+      `approval.request` with a freeform field, and wait. On approved
+      list, record the user's choice in memory at step 7.
+    depends: [2]
+
+  - id: 4
+    goal: >
+      Phase 0.c — For each chosen repo, ensure a clone exists under
+      `<workspaces_root>/<workspace-id>/repos/<repo>`. If absent, clone
+      from the registry's `Clone:` URL (or look it up from the ADO repo
+      list when the registry lacks one). Initialize and update
+      submodules. Surface any auth / network errors as a blocking
+      inbox card.
+    depends: [3]
+
+  - id: 5
+    goal: >
+      Branch on `System.WorkItemType`:
+
+      - **Bug** → `recipe.run('fix-bug', { wi_id, repos })`.
+      - **User Story | Feature | Task** →
+        `recipe.run('implement-feature', { wi_id, repos })`.
+      - Other (Epic, Spike, Enabling Specification, etc.) →
+        `inbox.update` with "Unsupported WI type for automated flow:
+        <type>" and `recipe.done({ status: 'failure' })`.
+
+      Pass `repos` as the resolved repo-set objects (name, clone url,
+      worktree path slot). The child recipe owns worktree setup, not
+      this router.
+    depends: [4]
+
+  - id: 6
+    goal: >
+      If at any later phase the child recipe reports back (via
+      `thread.append_message` from its design / analysis step) that the
+      repo set is wrong, re-enter Phase 0 — STOP, post an inbox
+      approval naming the discovered contradiction, and update the
+      repo set per the user's choice. Then resume the child recipe
+      with the corrected set.
+    depends: [5]
+
+  - id: 7
+    goal: >
+      Update `.clawdevbox/repo-registry.md` with anything learned this
+      run — new repo aliases, new co-change patterns, new area-path
+      signals, new tag conventions. Free-form: the agent decides what's
+      worth recording. Commit the memory file to its own git history
+      if the project tracks it; otherwise just save in place.
+      `recipe.done({ status: 'success', message: 'dispatched <recipe>
+      for WI <id> across <repos>' })`.
+    depends: [6]

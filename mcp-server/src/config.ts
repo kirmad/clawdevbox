@@ -1,0 +1,915 @@
+/**
+ * config.ts
+ *
+ * `.clawdevbox/config.json` schema + resolver.
+ *
+ * Two on-disk layers:
+ *   1. Global config at `<globalDir>/config.json`. Account-wide settings
+ *      (HTTP port, token, tunnel, notifications) that apply to every
+ *      project the MCP server is run against. Written by
+ *      `clawdevbox init` when the user picks the "global" install scope.
+ *   2. Project config at `<projectDir>/.clawdevbox/config.json`. Overrides
+ *      the global layer for a specific project. Written by the legacy
+ *      "project-specific" install scope.
+ *
+ * Precedence (highest first):
+ *   1. Explicit options passed to resolveConfig() (CLI flags)
+ *   2. Environment variables (CLAWDEVBOX_PROJECT_DIR, CLAWDEVBOX_PORT, ...)
+ *   3. Project config (`<projectDir>/.clawdevbox/config.json`)
+ *   4. Global config (`<globalDir>/config.json`)
+ *   5. Built-in defaults
+ *
+ * The resolver returns absolute paths and a complete `http` block so callers
+ * don't have to re-derive anything. It does NOT mutate process.env — the CLI
+ * does that explicitly before booting subprocesses.
+ */
+
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
+
+export const CONFIG_DIRNAME = '.clawdevbox';
+export const CONFIG_FILENAME = 'config.json';
+/** Name of the global config file under `<globalDir>/`. */
+export const GLOBAL_CONFIG_FILENAME = 'config.json';
+export const DEFAULT_HTTP_PORT = 5201;
+export const DEFAULT_HTTP_HOST = '127.0.0.1';
+export const CONFIG_VERSION = 1 as const;
+
+export interface ClawdevboxHttpConfig {
+  port?: number;
+  host?: string;
+  /** Bearer token required on /mcp. Treat as a secret. */
+  token?: string;
+}
+
+export type TunnelKind = 'none' | 'devtunnel';
+
+export interface ClawdevboxTunnelConfig {
+  kind: TunnelKind;
+  /**
+   * Stable tunnel name. Becomes the devtunnel tunnel-id; the public URL is
+   * deterministic from this name + the registered port (e.g.
+   * `https://<name>-5201.usw2.devtunnels.ms`). Lowercase alnum + hyphens.
+   */
+  name?: string;
+  /**
+   * When true, the tunnel is created with `--allow-anonymous` so external
+   * clients can reach `/mcp` without a devtunnel access token. The HTTP
+   * server's bearer-token auth on `/mcp` is still in effect, so this is the
+   * normal/safe default.
+   */
+  allow_anonymous?: boolean;
+  /**
+   * When true (default), `clawdevbox start` brings the tunnel up automatically.
+   */
+  auto_start?: boolean;
+}
+
+export interface ClawdevboxVapidKeys {
+  /** Base64url-encoded uncompressed P-256 public key. Safe to ship to the browser. */
+  publicKey: string;
+  /** Base64url-encoded P-256 private key. SECRET — only used server-side by web-push. */
+  privateKey: string;
+  /** mailto: or http(s):// — push services require an identity for VAPID. */
+  subject: string;
+}
+
+export interface ClawdevboxNotificationsConfig {
+  /** Master switch — when false, /api/push/* still respond but no setup is performed. */
+  enabled?: boolean;
+  /** VAPID keypair. Generated once by `clawdevbox init` and reused forever. */
+  vapid?: ClawdevboxVapidKeys;
+}
+
+export interface ClawdevboxCronConfig {
+  /** Max concurrent in-flight fires in the dispatcher (default 4). */
+  max_concurrent?: number;
+  /** Graceful-shutdown drain window in ms (default 15000). */
+  dispatcher_drain_ms?: number;
+}
+
+export interface ClawdevboxClientSyncConfig {
+  /** auto = both directions eager. manual = via `clawdevbox plugin sync` only.
+   *  discover-only = pull side only (no writes to CLI). off = no sync. */
+  mode?: 'auto' | 'manual' | 'discover-only' | 'off';
+  /** When true (default), plugins removed from clawdevbox are also
+   *  uninstalled from the CLI (only those that came from a clawdevbox-managed
+   *  marketplace). */
+  bidirectional_uninstall?: boolean;
+  /** Persisted from `clawdevbox init` opt-in. Each entry is a (provider, name)
+   *  tuple of a CLI-installed plugin clawdevbox should register. */
+  discovered_plugins?: Array<{ provider: string; name: string }>;
+}
+
+export interface ClawdevboxShareTunnelConfig {
+  /** 'none' disables the share devtunnel even when share.enabled=true. */
+  kind?: 'none' | 'devtunnel';
+  /**
+   * Devtunnel name. Default at resolve time: `<cfg.tunnel.name>-share` (or
+   * `cdb-share` when the main tunnel has no name). Must satisfy
+   * `[a-z][a-z0-9-]*` (devtunnel's own naming rule).
+   */
+  name?: string | null;
+  /**
+   * When true, the share tunnel is created with --allow-anonymous so
+   * anyone with the URL can reach it. Mutually exclusive with `tenants`.
+   */
+  allow_anonymous?: boolean;
+  /**
+   * Microsoft Entra tenant ids that are granted access via
+   * `devtunnel access create --tenant <id>`. Use this for "share with
+   * colleagues in my tenant" mode. Mutually exclusive with
+   * `allow_anonymous`.
+   */
+  tenants?: string[] | null;
+}
+
+export interface ClawdevboxShareConfig {
+  /** Master switch. When false the share HTTP listener never binds. */
+  enabled?: boolean;
+  /** Bind port. Default at resolve time: `cfg.http.port + 100`. */
+  port?: number;
+  /** Bind host. Default: `cfg.http.host`. */
+  host?: string;
+  /** Devtunnel config for the share port. */
+  tunnel?: ClawdevboxShareTunnelConfig;
+  /**
+   * Permit `POST /dispatch` on the share endpoint so colleagues' Send
+   * actions can route their comments back to the agent. Default: true.
+   * Set to false to make the share endpoint strictly read-comment-only.
+   */
+  allow_dispatch?: boolean;
+}
+
+export interface VaultEntry {
+  id: string;
+  path: string;
+  kind: 'personal' | 'team';
+  remote: string | null;
+  /** Git branch to checkout after clone. Defaults to the repo's default branch. */
+  branch?: string;
+  /** If true, the vault is read-only — no writes (memory, recipes, etc.) allowed. */
+  readonly?: boolean;
+  /** If true (default), the vault participates in memory storage and indexing. */
+  memory?: boolean;
+}
+
+export interface ClawdevboxConfig {
+  version: typeof CONFIG_VERSION;
+  /**
+   * Project the config was authored against. Required for project-scope
+   * configs (`<projectDir>/.clawdevbox/config.json`); omitted for global
+   * configs (`<globalDir>/config.json`) where the project is the cwd at
+   * server-launch time.
+   */
+  project_dir?: string;
+  global_dir?: string;
+  workspaces_root?: string;
+  http?: ClawdevboxHttpConfig;
+  tunnel?: ClawdevboxTunnelConfig;
+  notifications?: ClawdevboxNotificationsConfig;
+  cron?: ClawdevboxCronConfig;
+  /**
+   * Default agent-CLI provider id used by the main agent and by
+   * `recipe.run` when no `agent_cli` arg is supplied. The runtime fallback
+   * (`'copilot'`) is applied at the call edge, not in the resolver — this
+   * field is `null` when neither config layer sets it.
+   */
+  default_agent_cli?: string;
+  /** Bidirectional plugin sync settings (spec §9). */
+  client_sync?: ClawdevboxClientSyncConfig;
+  /** Registered vaults (personal + team). */
+  vaults?: VaultEntry[];
+  /** Share-endpoint config (second HTTP listener + tenant-capable tunnel). */
+  share?: ClawdevboxShareConfig;
+}
+
+export interface ResolvedConfig {
+  projectDir: string;
+  globalDir: string;
+  workspacesRoot: string;
+  http: {
+    port: number;
+    host: string;
+    token: string | null;
+  };
+  tunnel: {
+    kind: TunnelKind;
+    name: string | null;
+    allow_anonymous: boolean;
+    auto_start: boolean;
+  };
+  notifications: {
+    enabled: boolean;
+    vapid: ClawdevboxVapidKeys | null;
+  };
+  cron: {
+    max_concurrent: number;
+    dispatcher_drain_ms: number;
+  };
+  /** Path to the config file that produced this (null if defaults-only). */
+  configPath: string | null;
+  /**
+   * Default agent-CLI provider id for the main agent (and `recipe.run` when
+   * unspecified). Resolved with project > global precedence; `null` when
+   * neither layer sets it. Callers apply the `'copilot'` fallback at the
+   * call edge.
+   */
+  defaultAgentCli: string | null;
+  /** Bidirectional plugin sync (project > global, defaults applied). */
+  clientSync: {
+    mode: 'auto' | 'manual' | 'discover-only' | 'off';
+    bidirectionalUninstall: boolean;
+    discoveredPlugins: Array<{ provider: string; name: string }>;
+  };
+  /** Registered vaults. Empty array when none configured. */
+  vaults: VaultEntry[];
+  /** Share-endpoint settings (always present; `enabled: false` when not configured). */
+  share: {
+    enabled: boolean;
+    port: number;
+    host: string;
+    tunnel: {
+      kind: 'none' | 'devtunnel';
+      name: string | null;
+      allow_anonymous: boolean;
+      tenants: string[];
+    };
+    allow_dispatch: boolean;
+  };
+  /** tmux client config (optional). socket=null shares default socket. */
+  tmux?: { socket: string | null };
+}
+
+export class ConfigError extends Error {
+  readonly code = 'CONFIG_ERROR';
+  constructor(message: string) {
+    super(message);
+    this.name = 'ConfigError';
+  }
+}
+
+export function configPath(projectDir: string): string {
+  return join(projectDir, CONFIG_DIRNAME, CONFIG_FILENAME);
+}
+
+/** Path to the account-wide config under the global dir. */
+export function globalConfigPath(globalDir: string): string {
+  return join(globalDir, GLOBAL_CONFIG_FILENAME);
+}
+
+export function readConfig(projectDir: string): ClawdevboxConfig | null {
+  return readConfigAt(configPath(projectDir));
+}
+
+/** Read the global config at `<globalDir>/config.json`, if present. */
+export function readGlobalConfig(globalDir: string): ClawdevboxConfig | null {
+  return readConfigAt(globalConfigPath(globalDir));
+}
+
+function readConfigAt(p: string): ClawdevboxConfig | null {
+  if (!existsSync(p)) return null;
+  let raw: string;
+  try {
+    raw = readFileSync(p, 'utf8');
+  } catch (err) {
+    throw new ConfigError(
+      `failed to read ${p}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    throw new ConfigError(
+      `${p} is not valid JSON: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  return validateConfig(parsed, p);
+}
+
+export function writeConfig(projectDir: string, cfg: ClawdevboxConfig): string {
+  const p = configPath(projectDir);
+  mkdirSync(dirname(p), { recursive: true });
+  writeFileSync(p, JSON.stringify(cfg, null, 2) + '\n', 'utf8');
+  return p;
+}
+
+/** Write a global config to `<globalDir>/config.json`. */
+export function writeGlobalConfig(globalDir: string, cfg: ClawdevboxConfig): string {
+  const p = globalConfigPath(globalDir);
+  mkdirSync(dirname(p), { recursive: true });
+  writeFileSync(p, JSON.stringify(cfg, null, 2) + '\n', 'utf8');
+  return p;
+}
+
+/**
+ * Merge the project + global config layers and return the consolidated
+ * `notifications` block. MCP tools (which only have `Workspace` —
+ * `projectDir` + `globalDir` — and not a ResolvedConfig) call this to see
+ * the same `notifications.enabled` + VAPID keys the HTTP server uses.
+ *
+ * Precedence matches resolveConfig: project layer wins over global layer.
+ * Returns `{ enabled: false, vapid: null }` if neither layer enables push.
+ */
+export function loadNotificationsConfig(args: {
+  projectDir: string;
+  globalDir: string;
+}): { enabled: boolean; vapid: ClawdevboxVapidKeys | null } {
+  let projectCfg: ClawdevboxConfig | null = null;
+  let globalCfg: ClawdevboxConfig | null = null;
+  try { projectCfg = readConfig(args.projectDir); } catch { /* ignore — fall through */ }
+  try { globalCfg = readGlobalConfig(args.globalDir); } catch { /* ignore */ }
+
+  // Project layer wins. A layer "wins" only if its `notifications` block
+  // is actually present; otherwise fall through to the next layer.
+  const fromProject = projectCfg?.notifications;
+  const fromGlobal = globalCfg?.notifications;
+  const enabled =
+    fromProject?.enabled !== undefined
+      ? !!fromProject.enabled
+      : !!fromGlobal?.enabled;
+  const vapid =
+    fromProject?.vapid ?? fromGlobal?.vapid ?? null;
+  return { enabled: enabled && !!vapid, vapid };
+}
+
+function validateConfig(parsed: unknown, source: string): ClawdevboxConfig {
+  if (!parsed || typeof parsed !== 'object') {
+    throw new ConfigError(`${source}: root must be a JSON object`);
+  }
+  const obj = parsed as Record<string, unknown>;
+  if (obj.version !== CONFIG_VERSION) {
+    throw new ConfigError(
+      `${source}: unsupported config version ${obj.version} (expected ${CONFIG_VERSION})`,
+    );
+  }
+  if (obj.project_dir !== undefined && (typeof obj.project_dir !== 'string' || obj.project_dir.length === 0)) {
+    throw new ConfigError(`${source}: project_dir, when present, must be a non-empty string`);
+  }
+  if (obj.global_dir !== undefined && typeof obj.global_dir !== 'string') {
+    throw new ConfigError(`${source}: global_dir must be a string`);
+  }
+  if (obj.workspaces_root !== undefined && typeof obj.workspaces_root !== 'string') {
+    throw new ConfigError(`${source}: workspaces_root must be a string`);
+  }
+  let tunnel: ClawdevboxTunnelConfig | undefined;
+  if (obj.tunnel !== undefined) {
+    if (!obj.tunnel || typeof obj.tunnel !== 'object') {
+      throw new ConfigError(`${source}: tunnel must be an object`);
+    }
+    const t = obj.tunnel as Record<string, unknown>;
+    if (t.kind !== 'none' && t.kind !== 'devtunnel') {
+      throw new ConfigError(`${source}: tunnel.kind must be 'none' or 'devtunnel'`);
+    }
+    tunnel = { kind: t.kind };
+    if (t.name !== undefined) {
+      if (typeof t.name !== 'string' || !/^[a-z][a-z0-9-]*$/.test(t.name)) {
+        throw new ConfigError(
+          `${source}: tunnel.name must match [a-z][a-z0-9-]* (devtunnel naming rule)`,
+        );
+      }
+      tunnel.name = t.name;
+    }
+    if (t.allow_anonymous !== undefined) {
+      if (typeof t.allow_anonymous !== 'boolean') {
+        throw new ConfigError(`${source}: tunnel.allow_anonymous must be a boolean`);
+      }
+      tunnel.allow_anonymous = t.allow_anonymous;
+    }
+    if (t.auto_start !== undefined) {
+      if (typeof t.auto_start !== 'boolean') {
+        throw new ConfigError(`${source}: tunnel.auto_start must be a boolean`);
+      }
+      tunnel.auto_start = t.auto_start;
+    }
+  }
+
+  let notifications: ClawdevboxNotificationsConfig | undefined;
+  if (obj.notifications !== undefined) {
+    if (!obj.notifications || typeof obj.notifications !== 'object') {
+      throw new ConfigError(`${source}: notifications must be an object`);
+    }
+    const n = obj.notifications as Record<string, unknown>;
+    notifications = {};
+    if (n.enabled !== undefined) {
+      if (typeof n.enabled !== 'boolean') {
+        throw new ConfigError(`${source}: notifications.enabled must be a boolean`);
+      }
+      notifications.enabled = n.enabled;
+    }
+    if (n.vapid !== undefined) {
+      if (!n.vapid || typeof n.vapid !== 'object') {
+        throw new ConfigError(`${source}: notifications.vapid must be an object`);
+      }
+      const v = n.vapid as Record<string, unknown>;
+      if (typeof v.publicKey !== 'string' || v.publicKey.length === 0) {
+        throw new ConfigError(`${source}: notifications.vapid.publicKey is required`);
+      }
+      if (typeof v.privateKey !== 'string' || v.privateKey.length === 0) {
+        throw new ConfigError(`${source}: notifications.vapid.privateKey is required`);
+      }
+      if (typeof v.subject !== 'string' || v.subject.length === 0) {
+        throw new ConfigError(`${source}: notifications.vapid.subject is required`);
+      }
+      notifications.vapid = {
+        publicKey: v.publicKey,
+        privateKey: v.privateKey,
+        subject: v.subject,
+      };
+    }
+  }
+
+  let cron: ClawdevboxCronConfig | undefined;
+  if (obj.cron !== undefined) {
+    if (!obj.cron || typeof obj.cron !== 'object') {
+      throw new ConfigError(`${source}: cron must be an object`);
+    }
+    const c = obj.cron as Record<string, unknown>;
+    cron = {};
+    if (c.max_concurrent !== undefined) {
+      if (
+        typeof c.max_concurrent !== 'number' ||
+        !Number.isInteger(c.max_concurrent) ||
+        c.max_concurrent < 1
+      ) {
+        throw new ConfigError(`${source}: cron.max_concurrent must be a positive integer`);
+      }
+      cron.max_concurrent = c.max_concurrent;
+    }
+    if (c.dispatcher_drain_ms !== undefined) {
+      if (
+        typeof c.dispatcher_drain_ms !== 'number' ||
+        !Number.isInteger(c.dispatcher_drain_ms) ||
+        c.dispatcher_drain_ms < 0
+      ) {
+        throw new ConfigError(
+          `${source}: cron.dispatcher_drain_ms must be a non-negative integer`,
+        );
+      }
+      cron.dispatcher_drain_ms = c.dispatcher_drain_ms;
+    }
+  }
+
+  let default_agent_cli: string | undefined;
+  if (obj.default_agent_cli !== undefined) {
+    if (
+      typeof obj.default_agent_cli !== 'string' ||
+      obj.default_agent_cli.length === 0 ||
+      !/^[a-z0-9][a-z0-9._-]*$/i.test(obj.default_agent_cli)
+    ) {
+      throw new ConfigError(
+        `${source}: default_agent_cli must be a non-empty provider id matching [a-z0-9][a-z0-9._-]* (got ${JSON.stringify(obj.default_agent_cli)})`,
+      );
+    }
+    default_agent_cli = obj.default_agent_cli;
+  }
+
+  let http: ClawdevboxHttpConfig | undefined;
+  if (obj.http !== undefined) {
+    if (!obj.http || typeof obj.http !== 'object') {
+      throw new ConfigError(`${source}: http must be an object`);
+    }
+    const h = obj.http as Record<string, unknown>;
+    http = {};
+    if (h.port !== undefined) {
+      if (typeof h.port !== 'number' || !Number.isInteger(h.port) || h.port <= 0 || h.port > 65535) {
+        throw new ConfigError(`${source}: http.port must be an integer in 1..65535`);
+      }
+      http.port = h.port;
+    }
+    if (h.host !== undefined) {
+      if (typeof h.host !== 'string' || h.host.length === 0) {
+        throw new ConfigError(`${source}: http.host must be a non-empty string`);
+      }
+      http.host = h.host;
+    }
+    if (h.token !== undefined) {
+      if (typeof h.token !== 'string') {
+        throw new ConfigError(`${source}: http.token must be a string`);
+      }
+      http.token = h.token;
+    }
+  }
+  let client_sync: ClawdevboxClientSyncConfig | undefined;
+  if (obj.client_sync !== undefined) {
+    if (!obj.client_sync || typeof obj.client_sync !== 'object') {
+      throw new ConfigError(`${source}: client_sync must be an object`);
+    }
+    const cs = obj.client_sync as Record<string, unknown>;
+    client_sync = {};
+    if (cs.mode !== undefined) {
+      if (
+        typeof cs.mode !== 'string' ||
+        (cs.mode !== 'auto' && cs.mode !== 'manual' && cs.mode !== 'discover-only' && cs.mode !== 'off')
+      ) {
+        throw new ConfigError(
+          `${source}: client_sync.mode must be one of 'auto' | 'manual' | 'discover-only' | 'off'`,
+        );
+      }
+      client_sync.mode = cs.mode;
+    }
+    if (cs.bidirectional_uninstall !== undefined) {
+      if (typeof cs.bidirectional_uninstall !== 'boolean') {
+        throw new ConfigError(`${source}: client_sync.bidirectional_uninstall must be a boolean`);
+      }
+      client_sync.bidirectional_uninstall = cs.bidirectional_uninstall;
+    }
+    if (cs.discovered_plugins !== undefined) {
+      if (!Array.isArray(cs.discovered_plugins)) {
+        throw new ConfigError(`${source}: client_sync.discovered_plugins must be an array`);
+      }
+      const out: Array<{ provider: string; name: string }> = [];
+      for (const e of cs.discovered_plugins) {
+        if (!e || typeof e !== 'object') {
+          throw new ConfigError(`${source}: client_sync.discovered_plugins[] entries must be objects`);
+        }
+        const en = e as Record<string, unknown>;
+        if (typeof en.provider !== 'string' || en.provider.length === 0) {
+          throw new ConfigError(
+            `${source}: client_sync.discovered_plugins[].provider must be a non-empty string`,
+          );
+        }
+        if (typeof en.name !== 'string' || en.name.length === 0) {
+          throw new ConfigError(
+            `${source}: client_sync.discovered_plugins[].name must be a non-empty string`,
+          );
+        }
+        out.push({ provider: en.provider, name: en.name });
+      }
+      client_sync.discovered_plugins = out;
+    }
+  }
+
+  let vaults: VaultEntry[] | undefined;
+  if (obj.vaults !== undefined) {
+    if (!Array.isArray(obj.vaults)) {
+      throw new ConfigError(`${source}: vaults must be an array`);
+    }
+    vaults = [];
+    for (let i = 0; i < obj.vaults.length; i++) {
+      const v = obj.vaults[i];
+      if (!v || typeof v !== 'object') {
+        throw new ConfigError(`${source}: vaults[${i}] must be an object`);
+      }
+      const ve = v as Record<string, unknown>;
+      if (typeof ve.id !== 'string' || ve.id.length === 0) {
+        throw new ConfigError(`${source}: vaults[${i}].id must be a non-empty string`);
+      }
+      if (typeof ve.path !== 'string' || ve.path.length === 0) {
+        throw new ConfigError(`${source}: vaults[${i}].path must be a non-empty string`);
+      }
+      if (ve.kind !== 'personal' && ve.kind !== 'team') {
+        throw new ConfigError(`${source}: vaults[${i}].kind must be 'personal' or 'team'`);
+      }
+      if (ve.remote !== null && typeof ve.remote !== 'string') {
+        throw new ConfigError(`${source}: vaults[${i}].remote must be a string or null`);
+      }
+      vaults.push({
+        id: ve.id,
+        path: ve.path,
+        kind: ve.kind,
+        remote: (ve.remote as string) ?? null,
+        ...(ve.branch != null ? { branch: ve.branch as string } : {}),
+        ...(ve.readonly != null ? { readonly: Boolean(ve.readonly) } : {}),
+        ...(ve.memory != null ? { memory: Boolean(ve.memory) } : {}),
+      });
+    }
+  }
+
+  let share: ClawdevboxShareConfig | undefined;
+  if (obj.share !== undefined) {
+    if (!obj.share || typeof obj.share !== 'object') {
+      throw new ConfigError(`${source}: share must be an object`);
+    }
+    const s = obj.share as Record<string, unknown>;
+    share = {};
+    if (s.enabled !== undefined) {
+      if (typeof s.enabled !== 'boolean') {
+        throw new ConfigError(`${source}: share.enabled must be a boolean`);
+      }
+      share.enabled = s.enabled;
+    }
+    if (s.port !== undefined) {
+      if (
+        typeof s.port !== 'number' ||
+        !Number.isInteger(s.port) ||
+        s.port <= 0 ||
+        s.port > 65535
+      ) {
+        throw new ConfigError(`${source}: share.port must be an integer in 1..65535`);
+      }
+      share.port = s.port;
+    }
+    if (s.host !== undefined) {
+      if (typeof s.host !== 'string' || s.host.length === 0) {
+        throw new ConfigError(`${source}: share.host must be a non-empty string`);
+      }
+      share.host = s.host;
+    }
+    if (s.allow_dispatch !== undefined) {
+      if (typeof s.allow_dispatch !== 'boolean') {
+        throw new ConfigError(`${source}: share.allow_dispatch must be a boolean`);
+      }
+      share.allow_dispatch = s.allow_dispatch;
+    }
+    if (s.tunnel !== undefined) {
+      if (!s.tunnel || typeof s.tunnel !== 'object') {
+        throw new ConfigError(`${source}: share.tunnel must be an object`);
+      }
+      const t = s.tunnel as Record<string, unknown>;
+      const tunnelOut: ClawdevboxShareTunnelConfig = {};
+      if (t.kind !== undefined) {
+        if (t.kind !== 'none' && t.kind !== 'devtunnel') {
+          throw new ConfigError(`${source}: share.tunnel.kind must be 'none' or 'devtunnel'`);
+        }
+        tunnelOut.kind = t.kind;
+      }
+      if (t.name !== undefined && t.name !== null) {
+        if (typeof t.name !== 'string' || !/^[a-z][a-z0-9-]*$/.test(t.name)) {
+          throw new ConfigError(
+            `${source}: share.tunnel.name must match [a-z][a-z0-9-]* (devtunnel naming rule)`,
+          );
+        }
+        tunnelOut.name = t.name;
+      } else if (t.name === null) {
+        tunnelOut.name = null;
+      }
+      if (t.allow_anonymous !== undefined) {
+        if (typeof t.allow_anonymous !== 'boolean') {
+          throw new ConfigError(`${source}: share.tunnel.allow_anonymous must be a boolean`);
+        }
+        tunnelOut.allow_anonymous = t.allow_anonymous;
+      }
+      if (t.tenants !== undefined && t.tenants !== null) {
+        if (!Array.isArray(t.tenants)) {
+          throw new ConfigError(`${source}: share.tunnel.tenants must be an array of strings or null`);
+        }
+        const tenantsArr: string[] = [];
+        for (let i = 0; i < t.tenants.length; i++) {
+          const v = t.tenants[i];
+          if (typeof v !== 'string' || v.length === 0) {
+            throw new ConfigError(
+              `${source}: share.tunnel.tenants[${i}] must be a non-empty string (Entra tenant id)`,
+            );
+          }
+          tenantsArr.push(v);
+        }
+        tunnelOut.tenants = tenantsArr;
+      } else if (t.tenants === null) {
+        tunnelOut.tenants = null;
+      }
+      if (tunnelOut.allow_anonymous && tunnelOut.tenants && tunnelOut.tenants.length > 0) {
+        throw new ConfigError(
+          `${source}: share.tunnel.allow_anonymous and share.tunnel.tenants are mutually exclusive`,
+        );
+      }
+      share.tunnel = tunnelOut;
+    }
+  }
+
+  return {
+    version: CONFIG_VERSION,
+    project_dir: obj.project_dir,
+    global_dir: obj.global_dir as string | undefined,
+    workspaces_root: obj.workspaces_root as string | undefined,
+    http,
+    tunnel,
+    notifications,
+    cron,
+    default_agent_cli,
+    client_sync,
+    vaults,
+    share,
+  };
+}
+
+export interface ResolveOptions {
+  /** CLI --project flag, or undefined to read env / cwd. */
+  projectDir?: string;
+  /** CLI --global flag. */
+  globalDir?: string;
+  /** CLI --workspaces-root flag. */
+  workspacesRoot?: string;
+  /** CLI --port flag. */
+  port?: number;
+  /** CLI --host flag. */
+  host?: string;
+  /** CLI --token flag (rarely used; usually comes from config). */
+  token?: string;
+  /** Environment object (defaults to process.env). */
+  env?: NodeJS.ProcessEnv;
+  /** Override cwd (for testing). */
+  cwd?: string;
+}
+
+/**
+ * Resolve the runtime config from (in order): CLI flags, env vars, project
+ * config (`<projectDir>/.clawdevbox/config.json`), global config
+ * (`<globalDir>/config.json`), defaults. Both file layers are optional.
+ *
+ * The project dir is the anchor for the project layer; it defaults to cwd
+ * when no flag / env var is provided. The global dir defaults to
+ * `~/.clawdevbox` (or whatever either config layer explicitly sets) and is
+ * where the account-wide layer lives.
+ *
+ * Resolution does NOT require either config to exist — defaults cover
+ * everything except the bearer token. If the caller needs a token
+ * (e.g. `start` subcommand) they should check `resolved.http.token` and
+ * fail or generate as appropriate.
+ */
+export function resolveConfig(opts: ResolveOptions = {}): ResolvedConfig {
+  const env = opts.env ?? process.env;
+  const cwd = opts.cwd ?? process.cwd();
+
+  const projectDirRaw =
+    opts.projectDir ?? env.CLAWDEVBOX_PROJECT_DIR ?? cwd;
+  const projectDir = isAbsolute(projectDirRaw)
+    ? resolve(projectDirRaw)
+    : resolve(cwd, projectDirRaw);
+
+  if (!existsSync(projectDir)) {
+    throw new ConfigError(`project directory does not exist: ${projectDir}`);
+  }
+
+  // Read the project-scope config first — it (optionally) tells us where
+  // the global dir lives. If absent, we fall through to env / default.
+  const projectCfg = readConfig(projectDir);
+
+  const globalDirRaw =
+    opts.globalDir ??
+    env.CLAWDEVBOX_GLOBAL_DIR ??
+    projectCfg?.global_dir ??
+    join(homedir(), '.clawdevbox');
+  const globalDir = isAbsolute(globalDirRaw)
+    ? resolve(globalDirRaw)
+    : resolve(projectDir, globalDirRaw);
+
+  // Read the global config layer. Per project > global precedence, project
+  // values win when both are set.
+  const globalCfg = readGlobalConfig(globalDir);
+
+  /** Layered lookup: project field, falling back to global field. */
+  const layered = <T>(pick: (c: ClawdevboxConfig) => T | undefined): T | undefined => {
+    const fromProject = projectCfg ? pick(projectCfg) : undefined;
+    if (fromProject !== undefined) return fromProject;
+    const fromGlobal = globalCfg ? pick(globalCfg) : undefined;
+    return fromGlobal;
+  };
+
+  const workspacesRootRaw =
+    opts.workspacesRoot ??
+    env.CLAWDEVBOX_WORKSPACES_ROOT ??
+    layered((c) => c.workspaces_root) ??
+    join(globalDir, 'workspaces');
+  const workspacesRoot = isAbsolute(workspacesRootRaw)
+    ? resolve(workspacesRootRaw)
+    : resolve(globalDir, workspacesRootRaw);
+
+  const portRaw =
+    opts.port ??
+    parsePortEnv(env.CLAWDEVBOX_PORT) ??
+    layered((c) => c.http?.port) ??
+    DEFAULT_HTTP_PORT;
+  const host =
+    opts.host ?? env.CLAWDEVBOX_HOST ?? layered((c) => c.http?.host) ?? DEFAULT_HTTP_HOST;
+  const token =
+    opts.token ?? env.CLAWDEVBOX_TOKEN ?? layered((c) => c.http?.token) ?? null;
+
+  const tunnelKind: TunnelKind =
+    (env.CLAWDEVBOX_TUNNEL_KIND as TunnelKind | undefined) ??
+    layered((c) => c.tunnel?.kind) ??
+    'none';
+  const tunnelName =
+    env.CLAWDEVBOX_TUNNEL_NAME ?? layered((c) => c.tunnel?.name) ?? null;
+  const tunnelAllowAnon = layered((c) => c.tunnel?.allow_anonymous) ?? false;
+  const tunnelAutoStart = layered((c) => c.tunnel?.auto_start) ?? true;
+
+  const notificationsEnabled = !!layered((c) => c.notifications?.enabled);
+  const notificationsVapid = layered((c) => c.notifications?.vapid) ?? null;
+
+  const cronMaxConcurrent =
+    parseIntEnv(env.CLAWDEVBOX_CRON_MAX_CONCURRENT) ??
+    layered((c) => c.cron?.max_concurrent) ??
+    4;
+  const cronDrainMs =
+    parseIntEnv(env.CLAWDEVBOX_CRON_DRAIN_MS) ??
+    layered((c) => c.cron?.dispatcher_drain_ms) ??
+    15_000;
+
+  const defaultAgentCli = layered((c) => c.default_agent_cli) ?? null;
+
+  const clientSyncMode =
+    layered((c) => c.client_sync?.mode) ?? 'auto';
+  const clientSyncBidirectionalUninstall =
+    layered((c) => c.client_sync?.bidirectional_uninstall) ?? true;
+  const clientSyncDiscoveredPlugins =
+    layered((c) => c.client_sync?.discovered_plugins) ?? [];
+
+  const vaults: VaultEntry[] = layered((c) => c.vaults) ?? [];
+
+  // -------- share-endpoint resolution -----------------------------------
+  // Defaults derived AFTER http/tunnel so we can copy host + suffix names.
+  const shareEnabled = !!layered((c) => c.share?.enabled);
+  const sharePort =
+    parsePortEnv(env.CLAWDEVBOX_SHARE_PORT) ??
+    layered((c) => c.share?.port) ??
+    portRaw + 100;
+  const shareHost = layered((c) => c.share?.host) ?? host;
+  const shareTunnelKind: 'none' | 'devtunnel' =
+    layered((c) => c.share?.tunnel?.kind) ?? 'none';
+  const shareTunnelNameExplicit = layered((c) => c.share?.tunnel?.name);
+  const shareTunnelName: string | null =
+    shareTunnelNameExplicit !== undefined
+      ? (shareTunnelNameExplicit ?? null)
+      : tunnelName
+        ? `${tunnelName}-share`
+        : null;
+  const shareTunnelAllowAnonymous =
+    layered((c) => c.share?.tunnel?.allow_anonymous) ?? false;
+  const shareTunnelTenantsRaw = layered((c) => c.share?.tunnel?.tenants);
+  const shareTunnelTenants: string[] =
+    Array.isArray(shareTunnelTenantsRaw) ? [...shareTunnelTenantsRaw] : [];
+  const shareAllowDispatch = layered((c) => c.share?.allow_dispatch) ?? true;
+
+  // Pick a representative configPath: prefer project layer when present,
+  // otherwise the global layer, otherwise null.
+  const configPathUsed = projectCfg
+    ? configPath(projectDir)
+    : globalCfg
+      ? globalConfigPath(globalDir)
+      : null;
+
+  return {
+    projectDir,
+    globalDir,
+    workspacesRoot,
+    http: { port: portRaw, host, token },
+    tunnel: {
+      kind: tunnelKind,
+      name: tunnelName,
+      allow_anonymous: tunnelAllowAnon,
+      auto_start: tunnelAutoStart,
+    },
+    notifications: {
+      enabled: notificationsEnabled,
+      vapid: notificationsVapid,
+    },
+    cron: {
+      max_concurrent: cronMaxConcurrent,
+      dispatcher_drain_ms: cronDrainMs,
+    },
+    configPath: configPathUsed,
+    defaultAgentCli,
+    clientSync: {
+      mode: clientSyncMode,
+      bidirectionalUninstall: clientSyncBidirectionalUninstall,
+      discoveredPlugins: clientSyncDiscoveredPlugins,
+    },
+    vaults,
+    share: {
+      enabled: shareEnabled,
+      port: sharePort,
+      host: shareHost,
+      tunnel: {
+        kind: shareTunnelKind,
+        name: shareTunnelName,
+        allow_anonymous: shareTunnelAllowAnonymous,
+        tenants: shareTunnelTenants,
+      },
+      allow_dispatch: shareAllowDispatch,
+    },
+  };
+}
+
+function parseIntEnv(v: string | undefined): number | undefined {
+  if (!v) return undefined;
+  const n = Number.parseInt(v, 10);
+  if (!Number.isInteger(n) || n < 0) return undefined;
+  return n;
+}
+
+function parsePortEnv(v: string | undefined): number | undefined {
+  if (!v) return undefined;
+  const n = Number.parseInt(v, 10);
+  if (!Number.isInteger(n) || n <= 0 || n > 65535) {
+    throw new ConfigError(`CLAWDEVBOX_PORT must be an integer in 1..65535 (got ${v})`);
+  }
+  return n;
+}
+
+/**
+ * Apply a resolved config to the environment of the current process so
+ * existing modules (workspace.ts, terminal-server.ts, etc.) that read
+ * env vars pick them up. Idempotent — only fills keys that aren't already
+ * set so explicit env wins.
+ */
+export function applyConfigToEnv(cfg: ResolvedConfig, env: NodeJS.ProcessEnv = process.env): void {
+  if (!env.CLAWDEVBOX_PROJECT_DIR) env.CLAWDEVBOX_PROJECT_DIR = cfg.projectDir;
+  if (!env.CLAWDEVBOX_GLOBAL_DIR) env.CLAWDEVBOX_GLOBAL_DIR = cfg.globalDir;
+  if (!env.CLAWDEVBOX_WORKSPACES_ROOT) env.CLAWDEVBOX_WORKSPACES_ROOT = cfg.workspacesRoot;
+  if (!env.CLAWDEVBOX_PORT) env.CLAWDEVBOX_PORT = String(cfg.http.port);
+  if (!env.CLAWDEVBOX_HOST) env.CLAWDEVBOX_HOST = cfg.http.host;
+  if (cfg.http.token && !env.CLAWDEVBOX_TOKEN) env.CLAWDEVBOX_TOKEN = cfg.http.token;
+}

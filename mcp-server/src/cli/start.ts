@@ -1,0 +1,4080 @@
+/**
+ * cli/start.ts
+ *
+ * `clawdevbox start` — Streamable HTTP MCP transport on a long-lived web
+ * server. One http.Server hosts:
+ *
+ *   POST/GET/DELETE /mcp[/...]   → StreamableHTTPServerTransport
+ *                                   (Authorization: Bearer <token> required)
+ *   GET   /terminal/:id          → xterm.js viewer (delegated)
+ *   GET   /artifact/:id[/...]    → artifact viewer (delegated)
+ *   GET   /__renderer/:type.mjs  → renderer chain (delegated)
+ *   WS    /terminal/:id/ws       → pty bridge (delegated)
+ *   GET   /healthz               → "ok"
+ *
+ * The bearer token is read from `.clawdevbox/config.json` (or the
+ * `CLAWDEVBOX_TOKEN` env override). Run `clawdevbox init` to mint one.
+ */
+
+import { randomUUID } from 'node:crypto';
+import { existsSync, readFileSync } from 'node:fs';
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { dirname, join, relative, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
+import { applyConfigToEnv, ConfigError, resolveConfig, type ResolvedConfig } from '../config.ts';
+import { handleTestHook } from '../api-test-hooks.ts';
+import { emitChange, onChange } from '../event-bus.ts';
+import { renderHomePage, resolveSpaAsset } from '../home-page.ts';
+import { logger } from '../logger.ts';
+import { startHeapMonitor, type HeapMonitorHandle } from '../heap-monitor.ts';
+import { startIdleReaper } from '../idle-reaper.ts';
+import { startValidationWorker, defaultValidationWorkerDeps } from '../recipe-validation-worker.ts';
+import { startLaneDispatchWorker, defaultLaneDispatchWorkerDeps } from '../lane-dispatch-worker.ts';
+import { startArtifactOutboxWorker, type ArtifactOutboxWorkerHandle } from '../artifact-outbox-worker.ts';
+import { cleanCopilotStaleLocks } from '../stale-locks.ts';
+import { startMainAgent, getMainAgentStatus, restartMainAgent } from '../main-agent.ts';
+import { buildProviderCtx } from '../agent-clis/shared.ts';
+import type { Workspace } from '../workspace.ts';
+import { getRegistry } from '../tools/registry.ts';
+import {
+  addSubscription,
+  listSubscriptions,
+  removeSubscription,
+  sendNotification,
+  type PushSubscriptionRecord,
+} from '../notifications.ts';
+import {
+  iconMaskableSvg,
+  iconSvg,
+  manifestJson,
+  serviceWorkerJs,
+} from '../pwa-assets.ts';
+import {
+  appleTouch180Png,
+  icon192Png,
+  icon512Png,
+  iconMaskable512Png,
+} from '../pwa-icons.ts';
+import {
+  listAllRecipeInstancesFromDb,
+  type RecipeInstance,
+} from '../recipe-instances-store.ts';
+import { readInboxBody } from '../inbox-persistence.ts';
+import { cronLabel, nextRunAfter } from '../cron-utils.ts';
+import {
+  readRecipeInstance,
+  writeRecipeInstance,
+  mintRecipeInstanceId,
+  type RecipeInstance as RecipeInstanceRow,
+} from '../recipe-instances-store.ts';
+import { registerPty, killAllSessions, listSessions as listPtySessions, getSessionMeta as getPtySessionMeta } from '../pty-registry.ts';
+import { tmuxSessionRegistry } from '../cli-sessions/tmux-session-runtime.ts';
+import { buildServer, createSessionServer } from '../server.ts';
+import {
+  fetchTunnelStatus,
+  installAutoStart,
+  isProcessAlive,
+  probeHealth,
+  readServiceState,
+  spawnDetached,
+  writeServiceState,
+  type ServiceState,
+} from '../service.ts';
+import { approvals, inbox, mintInboxReplyId, type InboxItem, type InboxQuestion, type InboxReply, type InboxState } from '../store.ts';
+import { dispatchTerminalRequest, startTerminalServer } from '../terminal-server.ts';
+import {
+  startShareServer,
+  stopShareServer,
+  type ShareServerHandle,
+} from '../share-server.ts';
+import {
+  startShareTunnel,
+  stopShareTunnel,
+  getShareTunnelStatus,
+  type ShareTunnelStatus,
+} from '../share-tunnel.ts';
+import {
+  deriveTunnelName,
+  getTunnelStatus,
+  startTunnel,
+  stopTunnel,
+  type TunnelStatus,
+} from '../tunnel.ts';
+import { closeDatabase, getDatabase, openDatabase } from '../db/index.ts';
+import { scanLegacyFiles } from '../db/legacy-files.ts';
+import { readTriggersFile } from '../triggers-store.ts';
+import { loadWorkspaceFromEnv, triggersJsonPath, WorkspaceConfigError } from '../workspace.ts';
+import { findTemplate, loadOneOffTemplate } from '../template-store.ts';
+import { Dispatcher } from '../dispatcher.ts';
+import { reclaimOrphanFires } from '../db/fires-store.ts';
+import { Scheduler } from '../scheduler.ts';
+import { DaemonSupervisor } from '../daemon-supervisor.ts';
+import {
+  listDaemons,
+  getDaemon,
+  getLiveRun,
+  listRecentRuns,
+  upsertDaemon,
+  setEnabled as setDaemonEnabled,
+  type DaemonRow,
+  type DaemonRunRow,
+} from '../db/daemons-store.ts';
+import { readDaemonLog } from '../daemon-process-runner.ts';
+import type { Database as BetterSqlite3Database } from 'better-sqlite3';
+import { handleCronApi, type CronApiContext } from './cron-api.ts';
+import { handleAgentCliApi } from './agent-clis-api.ts';
+import { handleLibraryApi } from './library-api.ts';
+import { handleLlmApi, type LlmApiContext } from './llm-api.ts';
+import type { Flags } from './index.ts';
+import {
+  initTmuxSessionRuntime,
+  reconcileOnStartup,
+  bundledTmuxConfPath,
+  sweepStaleTmuxSessions,
+} from '../cli-sessions/tmux-session-runtime.ts';
+import { tmuxRunAsync } from '../cli-sessions/tmux-client.ts';
+
+function str(flags: Flags, key: string): string | undefined {
+  const v = flags[key];
+  return typeof v === 'string' ? v : undefined;
+}
+
+function num(flags: Flags, key: string): number | undefined {
+  const v = flags[key];
+  if (typeof v !== 'string') return undefined;
+  const n = Number.parseInt(v, 10);
+  if (!Number.isInteger(n) || n <= 0 || n > 65535) {
+    throw new ConfigError(`--${key} must be an integer in 1..65535 (got ${v})`);
+  }
+  return n;
+}
+
+function constantTimeEquals(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let r = 0;
+  for (let i = 0; i < a.length; i++) {
+    r |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return r === 0;
+}
+
+function isMcpPath(pathname: string): boolean {
+  return pathname === '/mcp' || pathname.startsWith('/mcp/') || pathname.startsWith('/mcp?');
+}
+
+/**
+ * Allow-list of SPA top-level route prefixes (Vue Router HTML5 history
+ * mode). When any of these match on a GET, the server returns the
+ * SPA's `index.html` so reload-on-deep-link works.
+ *
+ * Allow-list (rather than a generic "is HTML" fallback) ensures we
+ * never accidentally swallow a misspelled `/api/...` or other server
+ * route by returning HTML on an unrelated 404.
+ *
+ * Note: `/artifact/<id>` (singular) is SERVER-RENDERED by
+ * terminal-server.ts. The SPA exposes artifacts at `/artifacts/<id>`
+ * (plural) so the two never collide.
+ */
+const SPA_ROUTE_PREFIXES = [
+  '/main-agent',
+  '/inbox',
+  '/recipes',
+  '/triggers',
+  '/daemons',
+  '/library',
+  '/terminals',
+  '/artifacts',
+];
+function isSpaRoute(pathname: string): boolean {
+  return SPA_ROUTE_PREFIXES.some(
+    (p) => pathname === p || pathname.startsWith(`${p}/`),
+  );
+}
+
+function bearerToken(req: IncomingMessage): string | null {
+  const h = req.headers.authorization;
+  if (typeof h !== 'string') return null;
+  const m = h.match(/^Bearer\s+(.+)$/i);
+  return m ? m[1]!.trim() : null;
+}
+
+function rejectUnauthorized(res: ServerResponse, message: string): void {
+  // NOTE: we intentionally do NOT emit a `WWW-Authenticate: Bearer` header.
+  // The MCP SDK in Copilot CLI treats that header as "OAuth required" and
+  // attempts protected-resource discovery, which fails for our static
+  // bearer setup. A plain 401 lets clients surface the error directly.
+  res.writeHead(401, { 'content-type': 'application/json' });
+  res.end(JSON.stringify({ error: { code: 'UNAUTHORIZED', message } }));
+}
+
+function getSessionIdHeader(req: IncomingMessage): string | undefined {
+  const h = req.headers['mcp-session-id'];
+  if (typeof h === 'string' && h.length > 0) return h;
+  if (Array.isArray(h) && h.length > 0 && typeof h[0] === 'string') return h[0];
+  return undefined;
+}
+
+async function readJsonRpcBody(req: IncomingMessage): Promise<unknown | undefined> {
+  const MAX = 8 * 1024 * 1024; // 8MB — plenty for tool args; ~64KB is typical.
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const c of req) {
+    const buf = c instanceof Buffer ? c : Buffer.from(c as ArrayBufferLike);
+    total += buf.length;
+    if (total > MAX) return undefined;
+    chunks.push(buf);
+  }
+  if (total === 0) return undefined;
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Route an `/mcp` request to the correct per-session transport, creating a
+ * new (server, transport) pair when the client sends a fresh `initialize`
+ * request. Implements the MCP Streamable HTTP spec's session model:
+ *
+ *   - Client `initialize` (POST, no `mcp-session-id` header) → mint a new
+ *     session ID, attach to a fresh `McpServer`, route the initialize body.
+ *   - Subsequent calls (POST / GET SSE / DELETE) carry the issued session
+ *     ID in `mcp-session-id` and are dispatched to the same transport.
+ *   - Unknown session ID → 404 (don't silently mint a new one — that would
+ *     mask client bugs).
+ *
+ * Session lifetime is owned by the SDK transport's lifecycle hooks: when
+ * the client sends DELETE or the transport finalises, we drop the entry
+ * from `transports` so the map doesn't leak.
+ */
+async function handleMcpRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  ws: Workspace,
+  transports: Map<string, StreamableHTTPServerTransport>,
+  recordAgentSessionId?: (mcpSessionId: string, agentSessionId: string | null) => void,
+): Promise<void> {
+  const method = req.method ?? 'GET';
+  const sessionId = getSessionIdHeader(req);
+
+  // Capture the agent session id from the request header so the idle
+  // sweep can keep transports for alive sessions. The header is the
+  // X-Clawdevbox-Session-Id value the per-session .mcp.json injects.
+  if (sessionId && recordAgentSessionId) {
+    const hdr = req.headers['x-clawdevbox-session-id'];
+    const asid = Array.isArray(hdr) ? hdr[0] : hdr;
+    recordAgentSessionId(sessionId, asid ?? null);
+  }
+
+  // Existing session: dispatch to its transport. Any HTTP method is fine —
+  // POST = JSON-RPC call, GET = SSE notification stream, DELETE = terminate.
+  if (sessionId) {
+    const existing = transports.get(sessionId);
+    if (!existing) {
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          error: { code: -32001, message: 'Session not found' },
+          id: null,
+        }),
+      );
+      return;
+    }
+    try {
+      await existing.handleRequest(req, res);
+    } catch (err) {
+      logger.error(
+        { err: err instanceof Error ? err.message : String(err), sessionId },
+        'mcp handler threw',
+      );
+      if (!res.headersSent) {
+        res.writeHead(500, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: { code: 'INTERNAL', message: 'handler error' } }));
+      }
+    }
+    return;
+  }
+
+  // No session ID. The only legitimate request is POST with an `initialize`
+  // body — everything else is a client bug (forgot to include the session
+  // header after init, or terminated then kept calling).
+  if (method !== 'POST') {
+    res.writeHead(400, { 'content-type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        error: { code: -32000, message: 'Bad Request: missing mcp-session-id' },
+        id: null,
+      }),
+    );
+    return;
+  }
+
+  const body = await readJsonRpcBody(req);
+  if (body === undefined) {
+    res.writeHead(400, { 'content-type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        error: { code: -32700, message: 'Parse error: invalid JSON or body too large' },
+        id: null,
+      }),
+    );
+    return;
+  }
+
+  // JSON-RPC batches CANNOT initialize a session (initialize must be a
+  // standalone request per the MCP spec). Reject arrays here so we don't
+  // accidentally mint a session for a batch of regular calls.
+  if (!isInitializeRequest(body)) {
+    res.writeHead(400, { 'content-type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        error: {
+          code: -32000,
+          message: 'Bad Request: missing mcp-session-id and not an initialize request',
+        },
+        id: null,
+      }),
+    );
+    return;
+  }
+
+  const newTransport: StreamableHTTPServerTransport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: () => randomUUID(),
+    onsessioninitialized: (id) => {
+      transports.set(id, newTransport);
+      logger.info({ sessionId: id, sessions: transports.size }, 'mcp session opened');
+    },
+    onsessionclosed: (id) => {
+      transports.delete(id);
+      logger.info({ sessionId: id, sessions: transports.size }, 'mcp session closed (client DELETE)');
+    },
+  });
+
+  newTransport.onclose = () => {
+    if (newTransport.sessionId && transports.delete(newTransport.sessionId)) {
+      logger.info(
+        { sessionId: newTransport.sessionId, sessions: transports.size },
+        'mcp transport closed',
+      );
+    }
+  };
+
+  // Each session gets its own `McpServer`. Tool registration is cheap
+  // (sync attach of handler functions); the heavy hosted-tool discovery
+  // happened once at startup and populates the shared registry.
+  const sessionServer = createSessionServer(ws);
+  await sessionServer.connect(newTransport);
+
+  try {
+    await newTransport.handleRequest(req, res, body);
+  } catch (err) {
+    logger.error(
+      { err: err instanceof Error ? err.message : String(err) },
+      'mcp initialize handler threw',
+    );
+    if (!res.headersSent) {
+      res.writeHead(500, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { code: 'INTERNAL', message: 'handler error' } }));
+    }
+    // If the SDK threw before the session was registered, the new
+    // transport's `onclose` may not fire — best-effort cleanup.
+    if (newTransport.sessionId) transports.delete(newTransport.sessionId);
+  }
+}
+
+function bool(flags: Flags, key: string): boolean {
+  const v = flags[key];
+  return v === true || v === 'true' || v === '1';
+}
+
+export async function runStart(flags: Flags): Promise<void> {
+  // Global last-resort error handlers. clawdevbox is a long-running daemon
+  // and MUST not die from a Promise that nobody caught. node-pty's
+  // conpty_console_list_agent.ts in particular crashes on Windows whenever
+  // it tries to AttachConsole() to a console that's already torn down,
+  // and the resulting unhandledRejection on the parent's _getConsoleProcessList
+  // Promise has been observed to take the process down. Log + survive.
+  //
+  // CAUTION: do not also exit here. The whole point is that the process
+  // KEEPS RUNNING. If a handler itself throws, default behavior re-applies
+  // (process exit + crash dump), which is the right escape hatch.
+  process.on('uncaughtException', (err, origin) => {
+    try {
+      logger.error(
+        {
+          err: err instanceof Error ? { message: err.message, stack: err.stack, name: err.name } : String(err),
+          origin,
+        },
+        'uncaughtException — surviving (daemon)',
+      );
+    } catch { /* logging itself broken; nothing we can do */ }
+  });
+  process.on('unhandledRejection', (reason, _promise) => {
+    try {
+      logger.error(
+        {
+          reason: reason instanceof Error
+            ? { message: reason.message, stack: reason.stack, name: reason.name }
+            : String(reason),
+        },
+        'unhandledRejection — surviving (daemon)',
+      );
+    } catch { /* logging itself broken; nothing we can do */ }
+  });
+
+  let cfg: ResolvedConfig;
+  try {
+    cfg = resolveConfig({
+      projectDir: str(flags, 'project'),
+      globalDir: str(flags, 'global'),
+      workspacesRoot: str(flags, 'workspaces-root'),
+      port: num(flags, 'port'),
+      host: str(flags, 'host'),
+      token: str(flags, 'token'),
+    });
+  } catch (err) {
+    if (err instanceof ConfigError) {
+      logger.error({ err: err.message }, 'config error');
+      process.exit(2);
+    }
+    throw err;
+  }
+  applyConfigToEnv(cfg);
+
+  // Bearer auth is opt-in: an empty/missing `http.token` disables /mcp and
+  // /api/* auth entirely. This is intentional for local-only setups where
+  // 127.0.0.1 binding + OS-level isolation is sufficient. Refuse the unsafe
+  // combination of "anonymous tunnel + no bearer" — that would expose the
+  // server to the public internet with zero auth.
+  if (!cfg.http.token && cfg.tunnel.kind !== 'none' && cfg.tunnel.allow_anonymous) {
+    logger.error(
+      { projectDir: cfg.projectDir, tunnel: cfg.tunnel.kind },
+      'refusing to start: tunnel.allow_anonymous=true requires a bearer token (set http.token or disable tunnel.allow_anonymous)',
+    );
+    process.exit(2);
+  }
+  if (!cfg.http.token) {
+    logger.warn(
+      { projectDir: cfg.projectDir },
+      'no bearer token configured — /mcp and /api/* are UNAUTHENTICATED (loopback-only protection); set http.token to enable auth',
+    );
+  }
+
+  // Service install path: spawn a detached child + register OS auto-start
+  // + write <globalDir>/service.json. No HTTP server runs in this process.
+  if (bool(flags, 'service')) {
+    await installAsService(cfg, flags);
+    return;
+  }
+
+  // EARLY already-running guard. Run BEFORE workspace load, DB open, plugin
+  // sync, tmux reconcile, and share-tunnel devtunnel probes — all of which
+  // are wasted work (and, in the share-tunnel case, ACTIVELY HARMFUL because
+  // they hammer the MSAL/DPAPI broker every restart) when another clawdevbox
+  // already owns the configured port.
+  //
+  // Failure mode this prevents: when a supervisor (Task Scheduler "Clawdevbox
+  // Supervisor" on Windows) repeatedly respawns a child while the original
+  // instance still holds the port, each child used to:
+  //   1. take ~120s spinning up the DB / plugin sync / tmux reconcile,
+  //   2. call `devtunnel user show` + `devtunnel show <name>` (poking MSAL),
+  //   3. finally try to bind the port, see EADDRINUSE → exit-with-code-0.
+  // Result was a ~2-min crash loop burning CPU and rate-limiting devtunnel.
+  //
+  // The probe is the same payload `listenOrConfirmExisting` looks for, so
+  // false positives are bounded: a non-clawdevbox listener on the same port
+  // won't be confused for ours (and the later EADDRINUSE check still fires).
+  try {
+    const headers: Record<string, string> = {};
+    if (cfg.http.token) headers.authorization = `Bearer ${cfg.http.token}`;
+    const probe = await fetch(
+      `http://${cfg.http.host}:${cfg.http.port}/api/cron/status`,
+      { headers, signal: AbortSignal.timeout(1500) },
+    );
+    if (probe.ok) {
+      const body = (await probe.json().catch(() => null)) as
+        | { db?: unknown; scheduler?: unknown; dispatcher?: unknown }
+        | null;
+      if (body && body.db && body.scheduler && body.dispatcher) {
+        logger.info(
+          { port: cfg.http.port, host: cfg.http.host },
+          'clawdevbox HTTP service already running — exiting cleanly (early)',
+        );
+        process.exit(0);
+      }
+    }
+  } catch {
+    // Connection refused / timeout / abort — port is (probably) free, proceed.
+  }
+
+  let ws;
+  try {
+    ws = await loadWorkspaceFromEnv();
+  } catch (err) {
+    if (err instanceof WorkspaceConfigError) {
+      logger.error({ err: err.message }, 'workspace config error');
+      process.exit(2);
+    }
+    throw err;
+  }
+
+  // Dev-mode self-heal: when running from a git checkout, ensure
+  // `<host_node_modules>/clawdevbox` resolves to this repo so plugins
+  // like agency-provider can `import 'clawdevbox/agent-clis'`. No-op
+  // in published-npm installs. See locateHostNodeModules() rationale.
+  try {
+    const { locateHostNodeModules } = await import('../tools/plugin.ts');
+    locateHostNodeModules();
+  } catch {
+    // best-effort; loader will retry on every plugin.install too
+  }
+
+  // Open the kernel DB. Runs migrations on every boot. Done before the HTTP
+  // server binds so a migration failure surfaces before any request lands.
+  const opened = openDatabase(cfg.globalDir);
+  logger.info(
+    { path: opened.path, schema_version: opened.schemaVersion },
+    'db opened',
+  );
+  scanLegacyFiles(cfg, opened.db);
+
+  // Initialize tmux session runtime: required for tmux-migrated providers
+  // (copilot, claude, agency, echo-stub). Probes the tmux binary first;
+  // fatal-exit if missing.
+  //
+  // Hoisted to function scope so downstream subsystems (e.g. idle-reaper)
+  // can issue their own tmux queries with the same socket/config.
+  let tmuxClient: { socket: string | null; configPath: string | null };
+  {
+    // Default to the shared tmux server (no -L). psmux on Windows creates a
+    // SEPARATE server per `new-session -L <name>` invocation rather than
+    // multiplexing one server per socket name (real-tmux behavior), which
+    // breaks `tmux attach` from secondary clients. Using the default socket
+    // forces psmux to multiplex on one process, which works correctly. Set
+    // `cfg.tmux.socket` to a non-null string only if you NEED isolation
+    // (e.g., multiple clawdevbox instances on the same machine).
+    const tmuxSocket = cfg.tmux?.socket ?? null;
+    const tmuxConfPath = bundledTmuxConfPath();
+    tmuxClient = { socket: tmuxSocket, configPath: tmuxConfPath };
+
+    const probe = await tmuxRunAsync({ socket: null, configPath: null }, ['-V']);
+    if (probe.exitCode !== 0) {
+      // Auto-install psmux on Windows if tmux is missing
+      if (process.platform === 'win32') {
+        process.stderr.write(
+          'tmux not found — installing psmux (Windows tmux port) via winget...\n',
+        );
+        const { spawnSync } = await import('node:child_process');
+        const install = spawnSync('winget', ['install', 'marlocarlo.psmux', '--accept-source-agreements', '--accept-package-agreements'], {
+          stdio: 'inherit',
+          timeout: 120_000,
+          windowsHide: true,
+        });
+        if (install.status === 0) {
+          // winget adds aliases to %LOCALAPPDATA%\Microsoft\WinGet\Links
+          // but the current process PATH doesn't include it yet.
+          const wingetLinks = join(process.env.LOCALAPPDATA ?? '', 'Microsoft', 'WinGet', 'Links');
+          if (existsSync(wingetLinks) && !process.env.PATH?.includes(wingetLinks)) {
+            process.env.PATH = `${wingetLinks};${process.env.PATH}`;
+          }
+          const recheck = await tmuxRunAsync({ socket: null, configPath: null }, ['-V']);
+          if (recheck.exitCode === 0) {
+            process.stderr.write(`psmux installed: ${recheck.stdout.trim()}\n`);
+          } else {
+            process.stderr.write(
+              'psmux installed but tmux still not on PATH. Close and reopen your terminal, then run clawdevbox start again.\n',
+            );
+            process.exit(2);
+          }
+        } else {
+          process.stderr.write(
+            'psmux auto-install failed. Install manually: winget install marlocarlo.psmux\n',
+          );
+          process.exit(2);
+        }
+      } else {
+        process.stderr.write(
+          `FATAL: tmux binary not found on PATH. Install tmux (https://github.com/tmux/tmux).\n`,
+        );
+        process.exit(2);
+      }
+    }
+    initTmuxSessionRuntime(tmuxClient);
+
+    // Re-tag orphan `cdb_*` tmux sessions BEFORE reconcileOnStartup runs.
+    // When clawdevbox dies (clean restart, OOM, hard kill, power loss), the
+    // tmux servers it spawned stay alive and the agency/copilot/claude
+    // processes inside keep running. We KEEP those sessions across
+    // restarts — the user's in-flight work continues uninterrupted —
+    // and rebind them to the new clawdevbox process via reconcileOnStartup
+    // below. Sessions belonging to a CONCURRENT live clawdevbox instance
+    // are left untouched (their PID is alive, not ours).
+    try {
+      const sweep = await sweepStaleTmuxSessions(tmuxClient);
+      if (sweep.retagged > 0 || sweep.kept > 0) {
+        logger.info(
+          { retagged: sweep.retagged, kept: sweep.kept },
+          'tmux: re-tagged orphan cdb_* sessions for adoption',
+        );
+      }
+    } catch (err) {
+      logger.warn(
+        { err: err instanceof Error ? err.message : String(err) },
+        'tmux orphan re-tag failed (non-fatal)',
+      );
+    }
+
+    // Fire-and-forget: reconcile orphan sessions in background so a slow
+    // attach loop (464 stale rows on dev machines) doesn't block boot. The
+    // reconcile only matters for adopting truly-still-alive tmux sessions
+    // from a prior kernel run; HTTP server starts immediately.
+    void reconcileOnStartup(opened.db).then((recon) => {
+      if (recon.adopted > 0 || recon.orphaned > 0) {
+        logger.info(
+          { adopted: recon.adopted, orphaned: recon.orphaned },
+          'tmux: reconciled sessions on startup',
+        );
+      }
+    }).catch((err) => {
+      logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'tmux reconcile failed');
+    });
+  }
+
+  // Bidirectional plugin sync (spec §6). Eager when cfg.clientSync.mode='auto'
+  // or 'discover-only'; otherwise a no-op. Failures degrade to WARN.
+  // Skip if provider binary isn't available (avoids auth toast on first boot).
+  try {
+    const providerId = cfg.defaultAgentCli ?? 'copilot';
+    const provider = ws.agentCliProviders.get(providerId);
+    const shouldSync = provider?.detect
+      ? (await provider.detect(buildProviderCtx(ws, cfg))).available
+      : true;
+    if (shouldSync) {
+      const { maybeRunClientSync } = await import('../agent-clis/lifecycle.ts');
+      await maybeRunClientSync(ws, cfg, 'boot');
+    }
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'boot-time client plugin sync failed',
+    );
+  }
+
+  // Auto-register memory-sync trigger type + default instance
+  try {
+    const { ensureMemorySyncTriggerType, ensureMemorySyncInstance } = await import('../memory-sync-register.ts');
+    ensureMemorySyncTriggerType(ws.globalDir);
+    ensureMemorySyncInstance(getDatabase());
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'memory-sync auto-register failed (non-fatal)');
+  }
+
+
+  // Discover hosted tools + register the initial server. The registry
+  // persists for per-session servers; the server returned here is discarded
+  // (each MCP HTTP session gets its own fresh server + transport pair).
+  const { hostedErrors } = await buildServer(ws);
+
+  // Per-session MCP transports. The MCP Streamable HTTP spec is stateful:
+  // the SDK's `Server.connect(transport)` binds 1:1, so each client session
+  // needs its own (server, transport) pair. Sessions are keyed by the
+  // `mcp-session-id` response header issued on initialize, then echoed in
+  // every subsequent request header. We tear entries down via three
+  // overlapping hooks (one is enough; the others are safety nets):
+  //   - `onsessionclosed`: client sent DELETE /mcp (explicit termination)
+  //   - `onclose`: underlying transport finalized (covers HTTP close paths)
+  //   - request-handler `.catch` logs but does NOT delete (the transport
+  //     itself decides whether the session is still usable).
+  //
+  // **Idle sweep**: the MCP Streamable HTTP transport has NO server-side
+  // way to detect that a client (agent process) has died — each request
+  // opens a fresh HTTP connection keyed by mcp-session-id, so there's no
+  // persistent socket whose closure would trigger `onclose`. Without a
+  // sweep, every crashed/killed agent leaks one transport entry plus
+  // whatever it references (recently-pushed messages, response buffers,
+  // etc.). Observed in production: ~+30 MB RSS per leaked transport;
+  // after ~100 spawns (one busy day) the heap OOMs.
+  //
+  // Sweep policy:
+  //   1. Each transport entry tracks `lastActivity` (bumped on every
+  //      request) and `lastAgentSessionId` (captured from
+  //      X-Clawdevbox-Session-Id header when present).
+  //   2. Periodically (every CLAWDEVBOX_MCP_SWEEP_MS, default 60s), walk
+  //      the transport map. For each entry:
+  //        - If the bound agent session is still alive (in
+  //          tmuxSessionRegistry OR pty-registry OR the main agent),
+  //          KEEP regardless of idle. Identified agents — like
+  //          recipe-spawned children whose per-session .mcp.json has
+  //          a session-id header that survives — get pinned to liveness.
+  //        - Else if idle > CLAWDEVBOX_MCP_IDLE_MS, REAP. Default is
+  //          24 hours — long enough that the main agent waiting for
+  //          human input is never surprised by a 404, short enough that
+  //          crashed / abandoned spawned agents don't accumulate
+  //          indefinitely. (The main agent's session id is invisible
+  //          to us when the spawn goes through a wrapper like agency
+  //          that re-emits the `clawdevbox` MCP server entry without
+  //          our headers — so isAgentSessionAlive can't pin it. Until
+  //          we have a header-independent identification path (URL
+  //          tokens etc.), the long idle timeout is the pragmatic
+  //          correctness/cleanup trade-off.)
+  //   3. Reaping calls transport.close() so the SDK releases sockets
+  //      and message buffers, then drops the map entry.
+  const MCP_IDLE_MS = Number(process.env.CLAWDEVBOX_MCP_IDLE_MS) || 24 * 60 * 60 * 1000;
+  const MCP_SWEEP_MS = Number(process.env.CLAWDEVBOX_MCP_SWEEP_MS) || 60 * 1000;
+  interface TransportEntry {
+    transport: StreamableHTTPServerTransport;
+    lastActivity: number;
+    lastAgentSessionId: string | null;
+  }
+  const mcpTransportEntries = new Map<string, TransportEntry>();
+
+  // Helper: is the agent session that this transport claims still alive?
+  // "Alive" means we know about it through one of the runtime registries.
+  // Returns true if we know it's alive; false if we know it's dead OR if
+  // we have no agent-session binding (those fall back to idle-based sweep).
+  // The main agent is included automatically: it registers in pty-registry
+  // with sessionId=handle.sessionId (see main-agent.ts), so the
+  // pty-registry walk below catches it as long as the main agent process
+  // is still running.
+  const isAgentSessionAlive = (asid: string | null | undefined): boolean => {
+    if (!asid) return false;
+    try {
+      for (const e of tmuxSessionRegistry.list()) {
+        if (e.instanceId === asid) return true;
+      }
+    } catch { /* registry not yet initialized */ }
+    try {
+      for (const s of listPtySessions()) {
+        const meta = getPtySessionMeta(s.instanceId);
+        if (meta?.sessionId === asid) return true;
+      }
+    } catch { /* registry not yet initialized */ }
+    return false;
+  };
+
+  // Backward-compat proxy: existing call sites (and the SDK) want a
+  // Map<string, transport>. We expose a get/set/delete proxy that keeps
+  // the entries map in sync.
+  const mcpTransports = new Proxy(new Map<string, StreamableHTTPServerTransport>(), {
+    get(_target, prop, _receiver) {
+      if (prop === 'get') {
+        return (key: string) => {
+          const entry = mcpTransportEntries.get(key);
+          if (entry) entry.lastActivity = Date.now();
+          return entry?.transport;
+        };
+      }
+      if (prop === 'set') {
+        return (key: string, value: StreamableHTTPServerTransport) => {
+          mcpTransportEntries.set(key, {
+            transport: value,
+            lastActivity: Date.now(),
+            lastAgentSessionId: null,
+          });
+          return mcpTransports;
+        };
+      }
+      if (prop === 'delete') {
+        return (key: string) => mcpTransportEntries.delete(key);
+      }
+      if (prop === 'has') {
+        return (key: string) => mcpTransportEntries.has(key);
+      }
+      if (prop === 'size') {
+        return mcpTransportEntries.size;
+      }
+      if (prop === Symbol.iterator || prop === 'entries') {
+        return () => {
+          const it = mcpTransportEntries.entries();
+          return {
+            [Symbol.iterator]() { return this; },
+            next() {
+              const r = it.next();
+              if (r.done) return { done: true, value: undefined } as IteratorResult<[string, StreamableHTTPServerTransport]>;
+              const [k, v] = r.value;
+              return { done: false, value: [k, v.transport] as [string, StreamableHTTPServerTransport] };
+            },
+          };
+        };
+      }
+      if (prop === 'forEach') {
+        return (cb: (v: StreamableHTTPServerTransport, k: string) => void) => {
+          for (const [k, entry] of mcpTransportEntries) cb(entry.transport, k);
+        };
+      }
+      return undefined;
+    },
+  }) as unknown as Map<string, StreamableHTTPServerTransport>;
+
+  // Track the agent session id per MCP request so the sweep can keep
+  // transports that belong to alive agents. Exported so handleMcpRequest
+  // can call it on every inbound HTTP request.
+  const recordAgentSessionIdForMcpRequest = (
+    mcpSessionId: string,
+    agentSessionId: string | null,
+  ): void => {
+    const entry = mcpTransportEntries.get(mcpSessionId);
+    if (entry && agentSessionId) entry.lastAgentSessionId = agentSessionId;
+  };
+
+  // Periodic idle sweep.
+  const mcpSweepTimer = setInterval(() => {
+    const now = Date.now();
+    let reaped = 0;
+    let kept = 0;
+    for (const [sid, entry] of mcpTransportEntries) {
+      if (isAgentSessionAlive(entry.lastAgentSessionId)) {
+        kept++;
+        continue;
+      }
+      if (now - entry.lastActivity <= MCP_IDLE_MS) {
+        kept++;
+        continue;
+      }
+      try { entry.transport.close?.(); } catch { /* ignore */ }
+      mcpTransportEntries.delete(sid);
+      reaped++;
+    }
+    if (reaped > 0) {
+      logger.info(
+        { reaped, kept, idleMs: MCP_IDLE_MS },
+        'mcp: reaped idle transports',
+      );
+    }
+  }, MCP_SWEEP_MS);
+  if (mcpSweepTimer.unref) mcpSweepTimer.unref();
+
+  const expectedToken = cfg.http.token;
+  const homePageHtml = renderHomePage({
+    mcpUrl: `http://${cfg.http.host}:${cfg.http.port}/mcp`,
+    projectDir: ws.projectDir,
+  });
+
+  // Cron API context — populated once the dispatcher/scheduler exist.
+  // The request handler closure reads `cronApiCtx` per-request, so by the
+  // time the listener is actually accepting requests it's been assigned.
+  let cronApiCtx: CronApiContext | null = null;
+  let testHookDispatcher: Dispatcher | null = null;
+  let testHookDaemonSupervisor: DaemonSupervisor | null = null;
+  let testHookArtifactOutboxWorker: ArtifactOutboxWorkerHandle | null = null;
+
+  // ── Fast response caches for list endpoints ─────────────────────────────
+  // /api/inbox and /api/recipes are now fully SQL-backed (V6+) and read in
+  // <30ms cold. The cache is a thin rate-limiter that coalesces rapid SPA
+  // polls (~every 2s) into a single SQL query. Invalidated on the relevant
+  // event-bus topics; the 2 s TTL provides a fallback in case an event is
+  // missed.
+  const API_CACHE_TTL_MS = 2_000;
+  const inboxCache: { json: string | null; ts: number } = { json: null, ts: 0 };
+  const recipeCache: { json: string | null; ts: number } = { json: null, ts: 0 };
+
+  onChange((topic) => {
+    if (topic === 'inbox' || topic === 'artifacts') {
+      inboxCache.json = null;
+    }
+    if (topic === 'recipes') {
+      recipeCache.json = null;
+    }
+  });
+
+  /** Pre-compute and store the inbox list cache entry. Excludes archived items. */
+  const warmInboxCache = () => {
+    try {
+      const items = inbox.list({ limit: 200 })
+        .filter((it) => it.state !== 'archived' && it.state !== 'snoozed');
+      const enriched = enrichInboxItemsForList(items);
+      inboxCache.json = JSON.stringify({ items: enriched });
+      inboxCache.ts = Date.now();
+    } catch { /* non-fatal; first request will recompute */ }
+  };
+
+  /** Wake snoozed items whose snoozed_until has passed. Marks them unread
+   * and transitions state to 'open' so they reappear in the inbox. */
+  const wakeExpiredSnoozes = () => {
+    try {
+      const now = Date.now();
+      const snoozed = inbox.list({ limit: 200 }).filter(
+        (it) => it.state === 'snoozed' && it.snoozed_until && it.snoozed_until <= now,
+      );
+      for (const it of snoozed) {
+        inbox.setState(it.id, 'open');
+        inbox.markUnread(it.id);
+      }
+      if (snoozed.length > 0) {
+        inboxCache.json = null; // invalidate cache
+        emitChange('inbox');
+        logger.info({ count: snoozed.length }, 'inbox: woke expired snoozed items');
+      }
+    } catch (err) {
+      logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'wakeExpiredSnoozes failed');
+    }
+  };
+  // Check every 30 seconds
+  const snoozeWakeTimer = setInterval(wakeExpiredSnoozes, 30_000);
+  if (snoozeWakeTimer.unref) snoozeWakeTimer.unref();
+
+  /** Pre-compute and store the recipe list cache entry. */
+  const warmRecipeCache = () => {
+    try {
+      const items = listAllRecipeInstancesFromDb();
+      items.sort((a, b) => {
+        const ra = recipeSortRank(a.status);
+        const rb = recipeSortRank(b.status);
+        if (ra !== rb) return ra - rb;
+        return (b.started_at ?? 0) - (a.started_at ?? 0);
+      });
+      const byParent = new Map<string, RecipeInstance[]>();
+      for (const inst of items) {
+        const pid = inst.parent_recipe_instance_id;
+        if (typeof pid === 'string' && pid.length > 0) {
+          const arr = byParent.get(pid) ?? [];
+          arr.push(inst);
+          byParent.set(pid, arr);
+        }
+      }
+      const enriched = items.map((inst) => {
+        const children = byParent.get(inst.id) ?? [];
+        let awaiting_user_count = 0;
+        let total_steps = 0;
+        let completed_steps = 0;
+        if (Array.isArray(inst.steps)) {
+          total_steps = inst.steps.length;
+          for (const s of inst.steps) {
+            if (s.status === 'done' || s.status === 'skipped') completed_steps++;
+            if (s.status === 'awaiting_user') awaiting_user_count++;
+          }
+        }
+        return {
+          ...inst,
+          children: children.map((c) => ({ id: c.id, recipe_id: c.recipe_id, status: c.status })),
+          progress: total_steps > 0
+            ? { total_steps, completed_steps, awaiting_user_count }
+            : null,
+        };
+      });
+      recipeCache.json = JSON.stringify({ items: enriched });
+      recipeCache.ts = Date.now();
+    } catch { /* non-fatal */ }
+  };
+
+  const serviceStartedAt = Date.now();
+  const ownVersion = readOwnVersion();
+
+  // Long-running memory observability. Logs a heap-usage line every 60 s
+  // and writes an automatic .heapsnapshot under <globalDir>/heap-snapshots/
+  // when heap crosses 80% of the configured --max-old-space-size. We've
+  // had OOM crashes after ~30 min uptime with no visible cause; this gives
+  // the next leak an actionable artifact rather than a stack trace from
+  // V8's mark-compact thrash. /api/heap-snapshot triggers one on demand
+  // (loopback-only, no bearer). Started here (before createServer) so the
+  // request-handler closure captures a fully-initialized handle even if
+  // the very first request races the server.listen() callback.
+  const heapMonitor: HeapMonitorHandle = startHeapMonitor({
+    snapshotDir: join(ws.globalDir, 'heap-snapshots'),
+  });
+
+  const httpServer = createServer(async (req, res) => {
+    const url = new URL(req.url ?? '/', `http://${cfg.http.host}`);
+
+    if (url.pathname === '/healthz') {
+      res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+      res.end('ok');
+      return;
+    }
+
+    // Loopback-only memory diagnostics. GET returns the latest heap sample
+    // (rss, heapUsed, heapTotal, configured max-old-space-size); POST writes
+    // a `.heapsnapshot` under <globalDir>/heap-snapshots/ and returns the
+    // path. Use to capture state on demand when investigating a memory leak
+    // without restarting the server.
+    if (url.pathname === '/api/heap-status' || url.pathname === '/api/heap-snapshot') {
+      const remote = req.socket.remoteAddress ?? '';
+      const isLoopback = remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1';
+      if (!isLoopback) {
+        res.writeHead(403, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: { code: 'LOOPBACK_ONLY' } }));
+        return;
+      }
+      if (url.pathname === '/api/heap-status' && req.method === 'GET') {
+        // Enrich the heap sample with per-subsystem counters so the next
+        // climb is diagnosable from /api/heap-status alone (no need to
+        // walk a heap snapshot for the obvious suspects).
+        const { pendingDispatchStats } = await import('../pending-dispatch-registry.ts');
+        const ptyLive = listPtySessions();
+        const pendingStats = pendingDispatchStats();
+        const enriched = {
+          ...heapMonitor.lastSample(),
+          counters: {
+            mcpSessions: mcpTransports.size,
+            ptySessions: ptyLive.length,
+            ptyBufferBytesTotal: 0,  // pty buffers are bounded at 256 KB each
+            tmuxSessions: tmuxSessionRegistry.list().length,
+            pendingDispatch: pendingStats,
+            workspacesInDb: opened.db.prepare('SELECT COUNT(*) AS n FROM workspaces').get() as { n: number },
+            daemonRunsLive: opened.db.prepare(
+              "SELECT COUNT(*) AS n FROM daemon_runs WHERE status IN ('starting','running')"
+            ).get() as { n: number },
+          },
+        };
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(enriched));
+        return;
+      }
+      if (url.pathname === '/api/heap-snapshot' && req.method === 'POST') {
+        const file = heapMonitor.snapshotNow();
+        heapMonitor.armSnapshot();
+        res.writeHead(file ? 200 : 500, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(file ? { ok: true, file } : { ok: false, error: 'writeHeapSnapshot failed' }));
+        return;
+      }
+      res.writeHead(405, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { code: 'METHOD_NOT_ALLOWED' } }));
+      return;
+    }
+
+    // Loopback-only test hooks: /api/test/recipe-run, /api/test/trigger-fire,
+    // /api/test/run-e2e, /api/test/agent-clis. Handled before /mcp so they
+    // never see bearer auth.
+    if (url.pathname.startsWith('/api/test/')) {
+      const handled = await handleTestHook(url, req, res, { cfg, ws, db: opened.db, getDispatcher: () => testHookDispatcher });
+      if (handled) return;
+    }
+
+    if (isMcpPath(url.pathname)) {
+      // Auth is opt-in: when no token is configured, /mcp is open (loopback
+      // protection only). When a token IS set, we DO NOT send a
+      // `WWW-Authenticate: Bearer` header on 401 because Copilot CLI's MCP
+      // SDK interprets that as "OAuth required" and falls into a futile
+      // discovery loop. Plain 401 lets clients see the failure and reuse
+      // the configured static bearer.
+      if (expectedToken) {
+        const presented = bearerToken(req);
+        if (!presented) {
+          rejectUnauthorized(res, 'missing bearer token');
+          return;
+        }
+        if (!constantTimeEquals(presented, expectedToken)) {
+          rejectUnauthorized(res, 'invalid bearer token');
+          return;
+        }
+      }
+      await handleMcpRequest(req, res, ws, mcpTransports, recordAgentSessionIdForMcpRequest);
+      return;
+    }
+
+    // Home page UI (loopback only — bearer auth is on /mcp).
+    if (url.pathname === '/' || url.pathname === '/index.html') {
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end(homePageHtml);
+      return;
+    }
+
+    // Standalone test UI — single self-contained HTML page with embedded
+    // CSS + JS for hand-driving the /spawn + /dispatch + /api/sessions
+    // endpoints. Loaded from CDN: xterm.js + addon-fit. No build step.
+    // Accessible at http://127.0.0.1:5201/test-ui — loopback only.
+    if (url.pathname === '/test-ui' || url.pathname === '/test-ui/' || url.pathname === '/test-ui/index.html') {
+      const { renderTestUI } = await import('../test-ui.ts');
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+      res.end(renderTestUI());
+      return;
+    }
+
+    // Vite-built SPA assets — /assets/<name>-<hash>.{js,css,svg,…}.
+    // Long-cached because the filename is hashed; index.html itself is
+    // re-fetched per visit so deploys land immediately.
+    if (url.pathname.startsWith('/assets/') && req.method === 'GET') {
+      const filePath = resolveSpaAsset(url.pathname);
+      if (filePath) {
+        const ext = filePath.slice(filePath.lastIndexOf('.') + 1).toLowerCase();
+        const ctype =
+          ext === 'js'   ? 'application/javascript; charset=utf-8' :
+          ext === 'css'  ? 'text/css; charset=utf-8' :
+          ext === 'svg'  ? 'image/svg+xml; charset=utf-8' :
+          ext === 'json' ? 'application/json; charset=utf-8' :
+          ext === 'wasm' ? 'application/wasm' :
+          ext === 'png'  ? 'image/png' :
+          ext === 'webp' ? 'image/webp' :
+          ext === 'woff2'? 'font/woff2' :
+          ext === 'woff' ? 'font/woff' :
+          'application/octet-stream';
+        const buf = readFileSync(filePath);
+        res.writeHead(200, {
+          'content-type': ctype,
+          'cache-control': 'public, max-age=31536000, immutable',
+        });
+        res.end(buf);
+        return;
+      }
+      // Fall through to 404 below if not found.
+    }
+
+    // PWA assets — manifest, service worker, vector icon.
+    if (url.pathname === '/manifest.webmanifest' && req.method === 'GET') {
+      res.writeHead(200, {
+        'content-type': 'application/manifest+json',
+        'cache-control': 'public, max-age=300',
+      });
+      res.end(manifestJson());
+      return;
+    }
+    if (url.pathname === '/sw.js' && req.method === 'GET') {
+      // Service workers MUST be served with a JS MIME type, and shouldn't
+      // be cached aggressively — browsers refetch sw.js every 24h anyway,
+      // but `no-cache` ensures shell updates land on the next visit.
+      res.writeHead(200, {
+        'content-type': 'application/javascript; charset=utf-8',
+        'cache-control': 'no-cache',
+        'service-worker-allowed': '/',
+      });
+      res.end(serviceWorkerJs());
+      return;
+    }
+    if (url.pathname === '/icon.svg' && req.method === 'GET') {
+      res.writeHead(200, {
+        'content-type': 'image/svg+xml; charset=utf-8',
+        'cache-control': 'public, max-age=86400',
+      });
+      res.end(iconSvg());
+      return;
+    }
+    if (url.pathname === '/icon-maskable.svg' && req.method === 'GET') {
+      res.writeHead(200, {
+        'content-type': 'image/svg+xml; charset=utf-8',
+        'cache-control': 'public, max-age=86400',
+      });
+      res.end(iconMaskableSvg());
+      return;
+    }
+    // PNG icons (rasterized in pwa-icons.ts) — iOS `apple-touch-icon` +
+    // Android WebAPK need real PNGs for a proper standalone install.
+    {
+      const pngRoutes: Record<string, () => Buffer> = {
+        '/icon-192.png': icon192Png,
+        '/icon-512.png': icon512Png,
+        '/icon-maskable-512.png': iconMaskable512Png,
+        '/apple-touch-icon.png': appleTouch180Png,
+      };
+      const pngFn = pngRoutes[url.pathname];
+      if (pngFn && req.method === 'GET') {
+        res.writeHead(200, {
+          'content-type': 'image/png',
+          'cache-control': 'public, max-age=86400',
+        });
+        res.end(pngFn());
+        return;
+      }
+    }
+    if (url.pathname === '/favicon.ico' && req.method === 'GET') {
+      // 302 to the svg — saves shipping a separate .ico binary.
+      res.writeHead(302, { location: '/icon.svg', 'cache-control': 'public, max-age=86400' });
+      res.end();
+      return;
+    }
+
+    if (url.pathname === '/api/inbox' && req.method === 'GET') {
+      // Default: hide archived items. ?include_archived=true to opt in (e.g.
+      // for an "Archive" view in the SPA). Bypasses the cache so the result
+      // is always fresh — the cache is the hot path for the default view.
+      const includeArchived = url.searchParams.get('include_archived') === 'true';
+      if (includeArchived) {
+        try {
+          const items = inbox.list({ limit: 200 });
+          const enriched = enrichInboxItemsForList(items);
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ items: enriched }));
+        } catch {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ items: [] }));
+        }
+        return;
+      }
+      const now = Date.now();
+      if (inboxCache.json && now - inboxCache.ts < API_CACHE_TTL_MS) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(inboxCache.json);
+        return;
+      }
+      warmInboxCache();
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(inboxCache.json ?? JSON.stringify({ items: [] }));
+      return;
+    }
+
+    // GET /api/inbox/<id> — single item with body inlined (if any).
+    if (url.pathname.startsWith('/api/inbox/') && req.method === 'GET') {
+      const id = decodeURIComponent(url.pathname.slice('/api/inbox/'.length));
+      if (!id) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing id' }));
+        return;
+      }
+      const item = inbox.read(id);
+      if (!item) {
+        res.writeHead(404, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'inbox item not found', id }));
+        return;
+      }
+      const [enriched] = enrichInboxItemsForList(
+        [item],
+      );
+      let description: string | null = null;
+      if (
+        typeof item.description_size === 'number' &&
+        item.description_size > 0 &&
+        item.description_format
+      ) {
+        description = readInboxBody(cfg.globalDir, item.id, item.description_format);
+      } else if (item.body_path) {
+        // Fallback: body_path exists but description_size wasn't set (compose items)
+        try {
+          description = readFileSync(item.body_path as string, 'utf8');
+        } catch { /* file missing — leave null */ }
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ item: enriched, description }));
+      return;
+    }
+
+    // POST /api/inbox/<id>/<verb> — lifecycle mutations.
+    //   state    body { state: 'new'|'open'|'done'|'archived' }
+    //   snooze   body { until: <unix-ms in the future> }
+    //   archive  (no body — equivalent to state=archived)
+    //   done     (no body — equivalent to state=done)
+    {
+      const m = url.pathname.match(
+        /^\/api\/inbox\/([^/]+)\/(state|snooze|archive|done)\/?$/,
+      );
+      if (m && req.method === 'POST') {
+        const id = decodeURIComponent(m[1]);
+        const verb = m[2] as 'state' | 'snooze' | 'archive' | 'done';
+        await handleInboxAction(req, res, id, verb, cfg);
+        return;
+      }
+    }
+
+    // POST /api/inbox/<id>/reply — user-side reply to a question.
+    // Validates the selection against `question.options`, compiles a
+    // prompt, dispatches to `question.dispatch.session_id` via
+    // spawnDispatchOrResume, and persists the reply on the item.
+    {
+      const m = url.pathname.match(/^\/api\/inbox\/([^/]+)\/reply\/?$/);
+      if (m && req.method === 'POST') {
+        const id = decodeURIComponent(m[1]);
+        await handleInboxReply(req, res, id, cronApiCtx);
+        return;
+      }
+    }
+
+    // POST /api/inbox/<id>/mark-read — clear the unread flag.
+    // The SPA hits this when the user opens an item OR clicks Mark as Read.
+    {
+      const m = url.pathname.match(/^\/api\/inbox\/([^/]+)\/mark-read\/?$/);
+      if (m && req.method === 'POST') {
+        const id = decodeURIComponent(m[1]);
+        const item = inbox.markRead(id);
+        if (!item) {
+          res.writeHead(404, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'inbox item not found', id }));
+          return;
+        }
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ item }));
+        return;
+      }
+    }
+
+    // POST /api/inbox/<id>/mark-unread — set the unread flag.
+    {
+      const m = url.pathname.match(/^\/api\/inbox\/([^/]+)\/mark-unread\/?$/);
+      if (m && req.method === 'POST') {
+        const id = decodeURIComponent(m[1]);
+        const item = inbox.markUnread(id);
+        if (!item) {
+          res.writeHead(404, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'inbox item not found', id }));
+          return;
+        }
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ item }));
+        return;
+      }
+    }
+
+    // POST /api/inbox/compose — create an inbox item + spawn agent session.
+    // The agent receives the inbox_item_id so it can reply back.
+    {
+      const m = url.pathname.match(/^\/api\/inbox\/compose\/?$/);
+      if (m && req.method === 'POST') {
+        await handleInboxCompose(req, res, cronApiCtx);
+        return;
+      }
+    }
+
+    // POST /api/inbox/<id>/send-draft — send a previously saved draft.
+    {
+      const m = url.pathname.match(/^\/api\/inbox\/([^/]+)\/send-draft\/?$/);
+      if (m && req.method === 'POST') {
+        const id = decodeURIComponent(m[1]);
+        await handleSendDraft(req, res, id, cronApiCtx);
+        return;
+      }
+    }
+
+    // POST /api/recipes/<id>/resume — spawn a new agent CLI session with
+    // `--resume <session_id>` and write a new recipe-instance row tied
+    // back to the original via `resume_of`. Source instance must have
+    // session_id set.
+    {
+      const m = url.pathname.match(/^\/api\/recipes\/([^/]+)\/resume\/?$/);
+      if (m && req.method === 'POST') {
+        await handleRecipeResume(req, res, decodeURIComponent(m[1]), cfg, ws);
+        return;
+      }
+    }
+
+    if (url.pathname === '/api/recipes' && req.method === 'GET') {
+      const now = Date.now();
+      if (recipeCache.json && now - recipeCache.ts < API_CACHE_TTL_MS) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(recipeCache.json);
+        return;
+      }
+      warmRecipeCache();
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(recipeCache.json ?? JSON.stringify({ items: [] }));
+      return;
+    }
+
+    // Triggers — types catalog (read-only) + registered instances.
+    if (url.pathname === '/api/triggers/types' && req.method === 'GET') {
+      const items = [...ws.triggerTypes.values()].map((t) => ({
+        id: t.id,
+        source_plugin_id: t.source_plugin_id,
+        scope: t.scope,
+        description: t.description,
+        default_cron: t.default_cron,
+        accepts_webhook: t.accepts_webhook,
+        identity_param: t.identity_param,
+        parameters: t.parameters,
+      }));
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ items, errors: ws.triggerTypeErrors }));
+      return;
+    }
+    if (url.pathname === '/api/triggers' && req.method === 'GET') {
+      const file = readTriggersFile(triggersJsonPath(ws));
+      const now = Date.now();
+      // Project the rows so we don't leak full state.* (might contain
+      // plugin-private fields) but include the resolved cron the UI
+      // needs to display "off / inherits / <expr>" plus a humanized
+      // label and next_run_at when applicable.
+      const items = file.registered.map((r) => {
+        const type = ws.triggerTypes.get(r.type);
+        const resolved_cron =
+          r.cron === false || r.cron === ''
+            ? false
+            : typeof r.cron === 'string' && r.cron.length > 0
+              ? r.cron
+              : (type?.default_cron ?? null);
+        // next_run_at is null unless this trigger is enabled AND has a
+        // parseable cron expression. Disabled / webhook-only triggers
+        // never get a next-fire prediction.
+        const cronExpr =
+          r.enabled && typeof resolved_cron === 'string' && resolved_cron.length > 0
+            ? resolved_cron
+            : null;
+        return {
+          id: r.id,
+          type: r.type,
+          name: r.name ?? null,
+          source_plugin_id: type?.source_plugin_id ?? null,
+          type_description: type?.description ?? null,
+          params: r.params,
+          cron: r.cron,
+          resolved_cron,
+          cron_label: cronExpr ? cronLabel(cronExpr) : null,
+          next_run_at: cronExpr ? nextRunAfter(cronExpr, now) : null,
+          enabled: r.enabled,
+          subscriber_thread_id: r.subscriber_thread_id ?? null,
+          registered_at: r.registered_at,
+          last_run_at: r.last_run_at ?? null,
+          last_run_status: r.last_run_status ?? null,
+          last_run_error: r.last_run_error ?? null,
+        };
+      });
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ items }));
+      return;
+    }
+
+    // GET /api/triggers/<id>/script — return the script source + runtime
+    // + on-disk path for a registered trigger. Resolves via the same chain
+    // used by trigger.test / trigger.fire (plugin TYPE → one-off template).
+    {
+      const m = url.pathname.match(/^\/api\/triggers\/([^/]+)\/script\/?$/);
+      if (m && req.method === 'GET') {
+        const id = decodeURIComponent(m[1]);
+        const file = readTriggersFile(triggersJsonPath(ws));
+        const row = file.registered.find((r) => r.id === id);
+        if (!row) {
+          res.writeHead(404, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: { code: 'NOT_FOUND', message: `trigger ${id} not registered` } }));
+          return;
+        }
+        const type = ws.triggerTypes.get(row.type);
+        const oneoff = type ? null : loadOneOffTemplate(ws, row.type);
+        const tpl = !type && !oneoff ? findTemplate(ws, row.type) : null;
+        const scriptAbs = type?.file_abs ?? oneoff?.scriptAbs ?? tpl?.scriptAbs ?? null;
+        const runtime =
+          (type as unknown as { runtime?: string } | undefined)?.runtime
+          ?? oneoff?.manifest.runtime
+          ?? tpl?.manifest.runtime
+          ?? 'tsx';
+        if (!scriptAbs) {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({
+            id, type: row.type, runtime,
+            path: null, path_rel: null, source: null, found: false,
+            error: { code: 'SCRIPT_NOT_FOUND', message: `no script resolved for type ${row.type}` },
+          }));
+          return;
+        }
+        let source: string | null = null;
+        let errCode: string | null = null;
+        let errMessage: string | null = null;
+        try {
+          source = readFileSync(scriptAbs, 'utf8');
+          if (source.length > 256 * 1024) {
+            // Don't ship megabyte trigger scripts over the wire; trim.
+            source = source.slice(0, 256 * 1024) + '\n\n…(truncated at 256 KiB)…';
+          }
+        } catch (err) {
+          errCode = 'READ_FAILED';
+          errMessage = (err as Error).message;
+        }
+        const path_rel = (() => {
+          try { return relative(ws.projectDir, scriptAbs); } catch { return scriptAbs; }
+        })();
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          id, type: row.type, runtime,
+          path: scriptAbs, path_rel,
+          source, found: source !== null,
+          error: errCode ? { code: errCode, message: errMessage } : null,
+        }));
+        return;
+      }
+    }
+
+    // POST /api/triggers/<id>/fire — force-run a trigger right now.
+    // Thin HTTP wrapper around the `trigger.fire` MCP tool — enqueues a
+    // real fire row, the dispatcher picks it up identically to a cron tick.
+    {
+      const m = url.pathname.match(/^\/api\/triggers\/([^/]+)\/fire\/?$/);
+      if (m && req.method === 'POST') {
+        const id = decodeURIComponent(m[1]);
+        let body: { payload?: unknown } = {};
+        try {
+          const chunks: Buffer[] = [];
+          let total = 0;
+          for await (const c of req) {
+            const buf = c instanceof Buffer ? c : Buffer.from(c);
+            total += buf.length;
+            if (total > 64 * 1024) break;
+            chunks.push(buf);
+          }
+          const text = Buffer.concat(chunks).toString('utf8');
+          if (text.length > 0) body = JSON.parse(text) as { payload?: unknown };
+        } catch {
+          // empty/invalid body is fine — payload is optional.
+        }
+        const tool = getRegistry().get('trigger.instance.fire');
+        if (!tool) {
+          res.writeHead(500, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: { code: 'TOOL_NOT_REGISTERED', message: 'trigger.fire is not in the registry' } }));
+          return;
+        }
+        try {
+          const result = (await tool.handler(
+            { id, payload: body.payload ?? null },
+            { source: 'http-api' },
+          )) as { isError?: boolean; structuredContent?: unknown; content?: unknown };
+          const status = result.isError ? 422 : 200;
+          res.writeHead(status, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({
+            ok: !result.isError,
+            structuredContent: result.structuredContent ?? null,
+            content: result.content ?? null,
+          }));
+        } catch (err) {
+          res.writeHead(500, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: { code: 'TOOL_THREW', message: (err as Error).message } }));
+        }
+        return;
+      }
+    }
+
+    // GET /api/triggers/<id>/runs — list recent fires (default last 10) +
+    // include the latest fire's stdout/stderr inline so the UI doesn't need
+    // a second round-trip to render the most useful slice.
+    {
+      const m = url.pathname.match(/^\/api\/triggers\/([^/]+)\/runs\/?$/);
+      if (m && req.method === 'GET') {
+        const id = decodeURIComponent(m[1]);
+        const limit = Math.max(1, Math.min(50, parseInt(url.searchParams.get('limit') ?? '10', 10) || 10));
+        let db;
+        try { db = getDatabase(); } catch (err) {
+          res.writeHead(500, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: { code: 'DB_UNAVAILABLE', message: (err as Error).message } }));
+          return;
+        }
+        const rows = db.prepare(
+          `SELECT fire_id, source, status, attempt, scheduled_at, started_at, finished_at,
+                  exit_code, duration_ms, output_dir, error
+             FROM fires WHERE trigger_id = ?
+             ORDER BY scheduled_at DESC LIMIT ?`,
+        ).all(id, limit) as Array<{
+          fire_id: string;
+          source: string;
+          status: string;
+          attempt: number;
+          scheduled_at: number;
+          started_at: number | null;
+          finished_at: number | null;
+          exit_code: number | null;
+          duration_ms: number | null;
+          output_dir: string | null;
+          error: string | null;
+        }>;
+
+        function readOutputFile(dir: string | null, attempt: number, name: string, cap = 256 * 1024): string | null {
+          if (!dir) return null;
+          // output_dir is the PARENT (`<ws>/.clawdevbox/fires/<fire_id>`),
+          // but the dispatcher writes stdout/stderr inside `attempt-<N>/`.
+          // Try the attempt subdir first, fall back to the parent (older rows).
+          const candidates = [
+            join(dir, `attempt-${attempt}`, name),
+            join(dir, name),
+          ];
+          for (const p of candidates) {
+            try {
+              let txt = readFileSync(p, 'utf8');
+              if (txt.length > cap) txt = txt.slice(0, cap) + '\n\n…(truncated at 256 KiB)…';
+              return txt;
+            } catch { /* try next */ }
+          }
+          return null;
+        }
+
+        const items = rows.map((r) => ({ ...r, has_output_dir: !!r.output_dir }));
+        // Inline stdout/stderr for the most recent fire that ACTUALLY ran
+        // (i.e. skip `running` rows whose files don't exist yet, and
+        // `skipped` rows that never produced any output). Keeps the
+        // "Last run" UI useful even when cron is mid-tick.
+        let latest: {
+          fire_id: string;
+          stdout: string | null;
+          stderr: string | null;
+          stdout_parsed: unknown | null;
+        } | null = null;
+        const latestFinished = rows.find(
+          (r) => r.output_dir && r.status !== 'running' && r.status !== 'skipped',
+        );
+        if (latestFinished) {
+          const stdout = readOutputFile(latestFinished.output_dir, latestFinished.attempt, 'stdout.txt');
+          const stderr = readOutputFile(latestFinished.output_dir, latestFinished.attempt, 'stderr.txt');
+          let stdoutParsed: unknown = null;
+          if (stdout) {
+            try { stdoutParsed = JSON.parse(stdout); } catch { /* not JSON, leave null */ }
+          }
+          latest = { fire_id: latestFinished.fire_id, stdout, stderr, stdout_parsed: stdoutParsed };
+        }
+
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ items, latest }));
+        return;
+      }
+    }
+
+    // Pending approvals (for the "needs your input" badge).
+    if (url.pathname === '/api/approvals' && req.method === 'GET') {
+      const items = approvals.listPending();
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ items }));
+      return;
+    }
+
+    if (url.pathname === '/api/events' && req.method === 'GET') {
+      handleSse(req, res);
+      return;
+    }
+
+    // --- Push notifications --------------------------------------------
+    if (url.pathname === '/api/push/vapid' && req.method === 'GET') {
+      const enabled = !!cfg.notifications?.enabled;
+      const pub = cfg.notifications?.vapid?.publicKey;
+      if (!enabled || !pub) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ enabled: false }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ enabled: true, publicKey: pub }));
+      return;
+    }
+    if (url.pathname === '/api/push/status' && req.method === 'GET') {
+      const enabled = !!cfg.notifications?.enabled && !!cfg.notifications?.vapid;
+      const subs = enabled
+        ? listSubscriptions({ globalDir: cfg.globalDir, projectDir: cfg.projectDir })
+        : [];
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          enabled,
+          subscriptions: subs.map((s) => ({
+            endpoint: s.endpoint,
+            label: s.label,
+            created_at: s.created_at,
+            last_seen_at: s.last_seen_at,
+          })),
+        }),
+      );
+      return;
+    }
+    if (url.pathname === '/api/push/subscribe' && req.method === 'POST') {
+      handlePushSubscribe(
+        req,
+        res,
+        { globalDir: cfg.globalDir, projectDir: cfg.projectDir },
+        !!cfg.notifications?.enabled,
+      );
+      return;
+    }
+    if (url.pathname === '/api/push/unsubscribe' && req.method === 'POST') {
+      handlePushUnsubscribe(req, res, { globalDir: cfg.globalDir, projectDir: cfg.projectDir });
+      return;
+    }
+    if (url.pathname === '/api/push/test' && req.method === 'POST') {
+      const vapid = cfg.notifications?.vapid;
+      if (!vapid || !cfg.notifications?.enabled) {
+        res.writeHead(409, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'notifications not enabled — re-run `clawdevbox init`' }));
+        return;
+      }
+      sendNotification({ globalDir: cfg.globalDir, projectDir: cfg.projectDir }, vapid, {
+        title: 'clawdevbox',
+        body: 'Test notification — push is working.',
+        url: '/',
+        tag: 'clawdevbox-test',
+      })
+        .then((result) => {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify(result));
+        })
+        .catch((err: unknown) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          res.writeHead(500, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: msg }));
+        });
+      return;
+    }
+
+    if (url.pathname === '/api/main-agent/status' && req.method === 'GET') {
+      const status = getMainAgentStatus();
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(status));
+      return;
+    }
+
+    if (url.pathname === '/api/main-agent/restart' && req.method === 'POST') {
+      // Kill (if running) + respawn the main agent. Used by the dashboard's
+      // dedicated Main Agent tab to recover from "agent exited / provider
+      // binary missing" without restarting the whole clawdevbox process.
+      // Loopback-only by virtue of the same auth posture as /api/* (bearer
+      // optional in dev; tunnel-mode requires it).
+      //
+      // `?new_session=true` (or JSON body { "new_session": true }) drops
+      // the sticky main-agent session-id file BEFORE respawning, so the
+      // new process starts a clean conversation. Default behaviour
+      // resumes the prior session — see main-agent-session-id.ts.
+      let newSession = url.searchParams.get('new_session') === 'true';
+      // Best-effort JSON body parse (POSTed by the SPA). Ignore body
+      // errors; the query-string form is the canonical wire format and
+      // the default is "preserve session" if neither is provided.
+      if (!newSession && (req.headers['content-type'] ?? '').includes('application/json')) {
+        try {
+          const body = await readJsonBody<{ new_session?: boolean }>(req, res);
+          if (body && body.new_session === true) newSession = true;
+        } catch { /* fall through with newSession=false */ }
+      }
+      restartMainAgent({
+        workspace: ws,
+        cfg,
+        host: cfg.http.host,
+        port: boundPort,
+        newSession,
+      }).then((status) => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(status));
+      }).catch((err) => {
+        res.writeHead(500, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          running: false,
+          not_running_reason: err instanceof Error ? err.message : String(err),
+        }));
+      });
+      return;
+    }
+
+    if (url.pathname === '/api/tunnel/status' && req.method === 'GET') {
+      const status = getTunnelStatus();
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(status));
+      return;
+    }
+
+    if (url.pathname === '/api/share-tunnel/status' && req.method === 'GET') {
+      const status = getShareTunnelStatus();
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(status));
+      return;
+    }
+
+    // ---- Daemons: list + live health + start/stop/restart/logs ----------
+    // Backs the dashboard "Daemons" tab. Reads the supervisor + db from the
+    // same global ctx the daemon.* MCP tools use (only set under
+    // `clawdevbox start`). Loopback-only, same auth posture as the rest of
+    // /api/*.
+    if (url.pathname === '/api/daemons' || url.pathname.startsWith('/api/daemons/')) {
+      const daemonCtx = (globalThis as Record<string, unknown>).__clawdevboxDaemonToolCtx as
+        | { db: BetterSqlite3Database; supervisor: DaemonSupervisor }
+        | undefined;
+      if (!daemonCtx) {
+        res.writeHead(503, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'daemon supervisor not available' }));
+        return;
+      }
+      const { db: ddb, supervisor } = daemonCtx;
+
+      const projectDaemonApi = (d: DaemonRow, live: DaemonRunRow | null): Record<string, unknown> => {
+        const liveActive = !!live && (live.status === 'running' || live.status === 'starting');
+        let health: string;
+        if (liveActive) health = live!.status === 'starting' ? 'starting' : 'running';
+        else if (!d.enabled) health = 'stopped';
+        else if (d.last_error) health = 'crashed';
+        else health = 'down';
+        return {
+          id: d.id,
+          name: d.name,
+          workspace_id: d.workspace_id,
+          runtime: d.runtime,
+          command: JSON.parse(d.command_json),
+          cwd: d.cwd,
+          enabled: !!d.enabled,
+          health,
+          pid: liveActive ? live!.pid : null,
+          started_at: liveActive ? live!.started_at : null,
+          uptime_ms: liveActive && live!.started_at ? Date.now() - live!.started_at : null,
+          restart_count: d.restart_count,
+          last_exit_at: d.last_exit_at,
+          last_error: d.last_error,
+          next_restart_at: d.next_restart_at,
+        };
+      };
+
+      // GET /api/daemons — list all daemons + derived health.
+      if (url.pathname === '/api/daemons' && req.method === 'GET') {
+        const items = listDaemons(ddb, {}).map((d) => projectDaemonApi(d, getLiveRun(ddb, d.id)));
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ items }));
+        return;
+      }
+
+      // POST /api/daemons — register/upsert a daemon.
+      if (url.pathname === '/api/daemons' && req.method === 'POST') {
+        const body = await readJsonBody<{
+          id?: string; name?: string; runtime?: string;
+          command?: string[]; cwd?: string; env?: Record<string, string>;
+          workspace_id?: string; enabled?: boolean;
+        }>(req, res);
+        if (!body || !body.name || !body.runtime || !body.command) {
+          res.writeHead(400, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'name, runtime, and command are required' }));
+          return;
+        }
+        // Skip if already exists with the same id
+        if (body.id && getDaemon(ddb, body.id)) {
+          const existing = getDaemon(ddb, body.id)!;
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, status: 'already_exists', daemon: projectDaemonApi(existing, getLiveRun(ddb, body.id)) }));
+          return;
+        }
+        const wsId = body.workspace_id ?? 'global';
+        const row = upsertDaemon(ddb, {
+          id: body.id,
+          name: body.name,
+          workspace_id: wsId,
+          runtime: body.runtime as 'node' | 'tsx' | 'python' | 'bash' | 'pwsh' | 'direct',
+          command: body.command,
+          cwd: body.cwd ?? null,
+          env: body.env,
+          enabled: body.enabled ?? true,
+        });
+        supervisor.tick();
+        res.writeHead(201, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, status: 'registered', daemon: projectDaemonApi(row, getLiveRun(ddb, row.id)) }));
+        return;
+      }
+
+      // /api/daemons/<id>[/<action>]
+      const rest = url.pathname.slice('/api/daemons/'.length);
+      const slash = rest.indexOf('/');
+      const id = decodeURIComponent(slash === -1 ? rest : rest.slice(0, slash));
+      const action = slash === -1 ? '' : rest.slice(slash + 1);
+      const row = getDaemon(ddb, id);
+      if (!row) {
+        res.writeHead(404, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: `daemon ${id} not found` }));
+        return;
+      }
+
+      // GET /api/daemons/<id>/logs?tail_bytes=N — tail the latest run log.
+      if (action === 'logs' && req.method === 'GET') {
+        const runs = listRecentRuns(ddb, id, 50);
+        const run = runs[0];
+        const tailBytes = Math.min(262_144, Math.max(256, Number(url.searchParams.get('tail_bytes')) || 32_768));
+        const tail = run?.log_path ? readDaemonLog(run.log_path, tailBytes) : '';
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ run_id: run?.id ?? null, log_path: run?.log_path ?? null, tail }));
+        return;
+      }
+
+      // POST /api/daemons/<id>/{start,stop,restart}
+      if (req.method === 'POST' && (action === 'start' || action === 'stop' || action === 'restart')) {
+        try {
+          if (action === 'start') {
+            setDaemonEnabled(ddb, id, true);
+            ddb.prepare(
+              `UPDATE daemons SET restart_count = 0, next_restart_at = NULL, last_error = NULL WHERE id = ?`,
+            ).run(id);
+            supervisor.tick();
+          } else if (action === 'stop') {
+            setDaemonEnabled(ddb, id, false);
+            await supervisor.stopDaemon(id);
+          } else {
+            await supervisor.restart(id);
+          }
+          const updated = getDaemon(ddb, id)!;
+          const projected = projectDaemonApi(updated, getLiveRun(ddb, id));
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, daemon: projected }));
+        } catch (err) {
+          res.writeHead(500, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: err instanceof Error ? err.message : String(err) }));
+        }
+        return;
+      }
+
+      res.writeHead(405, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'method not allowed' }));
+      return;
+    }
+
+    // Agent-CLI provider registry — bearer-protected list endpoint.
+    if (await handleAgentCliApi(req, res, ws, cfg, expectedToken)) return;
+
+    // Library — read-only catalog of recipes / skills / trigger templates
+    // + memory (facts / lessons / wiki) for the web UI's Library tab.
+    if (await handleLibraryApi(req, res, ws, expectedToken)) return;
+
+    // Lightweight LLM inference API.
+    const llmApiCtx: LlmApiContext = { expectedToken };
+    if (await handleLlmApi(req, res, llmApiCtx)) return;
+
+    // Trigger-kernel introspection / control + Mode B callbacks.
+    if (cronApiCtx) {
+      if (await handleCronApi(req, res, cronApiCtx)) return;
+    }
+
+    // SPA history-mode fallback. The Vue Router uses HTML5 history mode
+    // so deep links like `/inbox/<id>`, `/recipes/<id>`, `/main-agent`
+    // need to resolve to the same index.html that `/` serves — the
+    // router then matches the URL client-side. Vite handles this in
+    // dev via its own SPA fallback; in production this handler covers
+    // both reload-on-deep-link and the PWA "open as app" code path.
+    //
+    // Match an explicit allow-list of SPA route prefixes (instead of a
+    // generic "is HTML?" fallback) so we never accidentally swallow an
+    // unrelated 404 (e.g. a misspelled `/api/foo` would otherwise be
+    // hidden by an HTML response). Note that `/artifact/<id>` (singular)
+    // is a SERVER-RENDERED host page handled by terminal-server.ts; the
+    // SPA's plural `/artifacts/<id>` route never collides with it.
+    if (req.method === 'GET' && isSpaRoute(url.pathname)) {
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end(homePageHtml);
+      return;
+    }
+
+    dispatchTerminalRequest(req, res);
+  });
+
+  // Attach terminal viewer to the same server (it adds the WS upgrade
+  // handler internally; request dispatch is composed above).
+  await startTerminalServer({ workspace: ws, sharedServer: httpServer });
+
+  // Construct the dispatcher and bind the session-helper context before
+  // listen, so MCP session.* tools cannot observe an uninitialized context
+  // after the HTTP server starts accepting requests.
+  const dispatcher = new Dispatcher(opened.db, ws, {
+    maxConcurrent: cfg.cron.max_concurrent,
+    drainMs: cfg.cron.dispatcher_drain_ms,
+    callbackUrlBase: `http://${cfg.http.host}:${cfg.http.port}`,
+    defaultAgentCli: cfg.defaultAgentCli ?? 'copilot',
+  });
+
+  // Late-bind the session-helper context so MCP tools in tools/session.ts
+  // can access dispatcher + db + cfg + ws at call time (they're registered
+  // during buildServer(), before these values exist).
+  (globalThis as Record<string, unknown>).__clawdevboxSessionHelperCtx = {
+    db: opened.db,
+    dispatcher,
+    ws,
+    cfg,
+  };
+
+  const listenResult = await listenOrConfirmExisting(
+    httpServer,
+    cfg.http.host,
+    cfg.http.port,
+    expectedToken,
+  );
+  if (listenResult === 'already-running') {
+    logger.info(
+      { port: cfg.http.port },
+      'clawdevbox HTTP service already running — exiting cleanly',
+    );
+    closeDatabase();
+    process.exit(0);
+  }
+  if (listenResult === 'conflict') {
+    logger.error(
+      { port: cfg.http.port },
+      `port ${cfg.http.port} is in use by something else — exiting`,
+    );
+    closeDatabase();
+    process.exit(1);
+  }
+
+  const addr = httpServer.address();
+  const boundPort =
+    addr && typeof addr === 'object' ? addr.port : cfg.http.port;
+
+  // Bring up the trigger kernel — dispatcher first (it accepts pickUp()
+  // calls immediately), then the scheduler that pokes it on each wake.
+  testHookDispatcher = dispatcher;
+
+  // Reclaim zombie fires left `running` by a previous process that crashed
+  // or was hard-killed (skipping Dispatcher.stop()'s graceful drain). Such
+  // rows make the §6.3 overlap-skip in claimNextFire treat them as in-flight
+  // forever, silently blocking every subsequent queued fire for that trigger.
+  // Must run BEFORE dispatcher.start()/scheduler.start(): the dispatcher owns
+  // no in-flight fires yet, so every `running` row belongs to the dead
+  // process and is safe to reclaim (no active-fire race).
+  try {
+    const reclaim = reclaimOrphanFires(opened.db);
+    if (reclaim.reclaimed.length > 0 || reclaim.dead.length > 0) {
+      logger.warn(
+        { reclaimed: reclaim.reclaimed.length, dead: reclaim.dead.length },
+        'dispatcher: reclaimed orphan fires left running by a previous process',
+      );
+    }
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'dispatcher: orphan fire reclaim failed (non-fatal)',
+    );
+  }
+
+  dispatcher.start();
+  const scheduler = new Scheduler(opened.db, dispatcher, ws);
+  scheduler.start();
+
+  // Daemon supervisor — keeps `enabled=1` script daemons always running.
+  // Looks up each daemon's workspace path through the workspaces table on
+  // demand so a new workspace mid-session also resolves.
+  const daemonSupervisor = new DaemonSupervisor(opened.db, {
+    resolveWorkspacePath: (workspace_id: string) => {
+      const row = opened.db.prepare('SELECT path FROM workspaces WHERE id = ?')
+        .get(workspace_id) as { path: string } | undefined;
+      return row?.path ?? null;
+    },
+  });
+
+  // Sync plugin-declared daemons into the desired-state table BEFORE the
+  // supervisor starts ticking. The supervisor only reads from this table;
+  // any daemon declared in a plugin's `clawdevbox.daemons[]` becomes a
+  // managed row, and any plugin-sourced row whose plugin no longer
+  // declares it gets deleted (the supervisor tears down the live run).
+  try {
+    const { reconcilePluginDaemons } = await import('../plugin-daemons.ts');
+    const recon = reconcilePluginDaemons(opened.db, ws);
+    if (recon.upserted > 0 || recon.disabled > 0 || recon.deleted > 0) {
+      logger.info(
+        recon,
+        'plugin-daemons: reconciled plugin-declared daemons',
+      );
+    }
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'plugin-daemons: initial reconcile failed (non-fatal)',
+    );
+  }
+
+  daemonSupervisor.start();
+  (globalThis as Record<string, unknown>).__clawdevboxDaemonToolCtx = {
+    db: opened.db,
+    supervisor: daemonSupervisor,
+    defaultWorkspacePath: cfg.projectDir,
+  };
+  testHookDaemonSupervisor = daemonSupervisor;
+
+  // Idle-session reaper — kills tmux-backed sessions that have sat idle
+  // with no viewer attached for > 15 min, so /spawn'd copilot/agency
+  // processes don't accumulate after the user closes their browser tab.
+  // Exempts the Main Agent.
+  const idleReaper = startIdleReaper({
+    db: opened.db,
+    tmuxClient,
+  });
+  // Validation worker — services validation-gated recipe steps: spawns a
+  // headless verifier per `validating` step, applies its verdict, and
+  // delivers the next-step (PASS) or rework (FAIL) message back to the
+  // worker session. Injected deps are bound to this server's context.
+  const validationWorker = startValidationWorker(
+    defaultValidationWorkerDeps({ db: opened.db, dispatcher, ws, cfg, workspacesRoot: cfg.workspacesRoot }),
+  );
+  const laneWorker = startLaneDispatchWorker(
+    defaultLaneDispatchWorkerDeps({ db: opened.db, dispatcher, ws, cfg, workspacesRoot: cfg.workspacesRoot }),
+  );
+  cronApiCtx = {
+    db: opened.db,
+    scheduler,
+    dispatcher,
+    dbPath: opened.path,
+    schemaVersion: opened.schemaVersion,
+    service: {
+      pid: process.pid,
+      port: boundPort,
+      started_at: serviceStartedAt,
+      version: ownVersion,
+    },
+    expectedToken,
+    ws,
+    cfg,
+  };
+
+  // Durable artifact-outbox delivery worker. Messages viewers send from an
+  // artifact (Q&A questions, inline review comments) are enqueued by
+  // `POST /artifact/<id>/ask` and delivered here asynchronously — resuming or
+  // spawning a closed session first, waiting for the agent to be idle, then
+  // dispatching, with retry/backoff on failure. Decoupling delivery from the
+  // HTTP request is what keeps the browser Send button from freezing and
+  // guarantees no message is dropped when the terminal is asleep.
+  const artifactOutboxWorker = startArtifactOutboxWorker(sessionHelperCtxFromCron(cronApiCtx));
+  cronApiCtx.outboxWorker = artifactOutboxWorker;
+  testHookArtifactOutboxWorker = artifactOutboxWorker;
+  logger.info(
+    {
+      max_concurrent: cfg.cron.max_concurrent,
+      drain_ms: cfg.cron.dispatcher_drain_ms,
+    },
+    'trigger kernel started',
+  );
+
+  // Sweep stale `inuse.<pid>.lock` files left under
+  // `~/.copilot/session-state/<uuid>/` by prior copilot processes that
+  // were force-killed (clawdevbox crash, OS reboot, SIGKILL). If we don't
+  // remove these BEFORE the main agent (or any other spawn) starts, the
+  // next copilot --session-id=<uuid> hits the "Session in use" modal which
+  // swallows our initial prompt.
+  try {
+    const { scanned, removed } = cleanCopilotStaleLocks();
+    if (scanned > 0) {
+      logger.info({ scanned, removed }, 'startup: swept stale copilot inuse locks');
+    }
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'startup: stale-lock sweep threw',
+    );
+  }
+
+  // Spawn the dev-buddy main agent. Failures are non-fatal — the home page
+  // still loads; the agent tab just shows a disconnected terminal.
+  const mainAgent = await startMainAgent({
+    workspace: ws,
+    cfg,
+    host: cfg.http.host,
+    port: boundPort,
+  });
+
+  // Bring up the public tunnel (if configured). Spawn errors (CLI missing,
+  // not logged in, network) are captured in tunnelStatus.error so the
+  // banner + /api/tunnel/status surface a clear, actionable message.
+  let tunnelStatus: TunnelStatus = getTunnelStatus();
+  if (cfg.tunnel.kind === 'devtunnel' && cfg.tunnel.auto_start) {
+    // Refresh PATH from registry / scan install dirs BEFORE probing for
+    // devtunnel. On Windows the service can boot in a shell that pre-dates
+    // a winget install (Run-key auto-start, npx invocation from an old
+    // terminal, etc.) — the registry refresh catches that.
+    const { ensureDevtunnelOnPath } = await import('./ensure-devtunnel.ts');
+    ensureDevtunnelOnPath();
+
+    const tunnelName = cfg.tunnel.name ?? deriveTunnelName(cfg.projectDir);
+    tunnelStatus = await startTunnel({
+      kind: 'devtunnel',
+      name: tunnelName,
+      port: boundPort,
+      allowAnonymous: cfg.tunnel.allow_anonymous,
+    });
+  }
+
+  // -------- Share endpoint ------------------------------------------------
+  // A second HTTP listener that serves ONLY artifact view + comment routes,
+  // exposed via its own (optionally tenant-restricted) devtunnel. See
+  // src/share-server.ts and src/share-tunnel.ts for the surface area.
+  let shareHandle: ShareServerHandle | null = null;
+  let shareTunnelStatus: ShareTunnelStatus = getShareTunnelStatus();
+  if (cfg.share.enabled) {
+    try {
+      shareHandle = await startShareServer({
+        port: cfg.share.port,
+        host: cfg.share.host,
+        allowDispatch: cfg.share.allow_dispatch,
+        // Bind the /dispatch path on the share endpoint to the existing
+        // cron-api handler so we get the full smart-routing for free
+        // (instance-id, fire-id, target resolution). cronApiCtx is in
+        // scope here — assigned a few dozen lines above before main-agent
+        // boot — so the closure has a valid context at request time.
+        dispatchHandler: cfg.share.allow_dispatch
+          ? (req, res) => {
+              if (!cronApiCtx) {
+                res.writeHead(503, { 'content-type': 'application/json; charset=utf-8' });
+                res.end(JSON.stringify({ error: 'CRON_NOT_READY', detail: 'try again' }));
+                return;
+              }
+              void handleCronApi(req, res, cronApiCtx);
+            }
+          : null,
+      });
+      logger.info(
+        { port: shareHandle.port(), host: shareHandle.host() },
+        'share-server listening',
+      );
+      if (
+        cfg.share.tunnel.kind === 'devtunnel' &&
+        cfg.tunnel.auto_start
+      ) {
+        const { ensureDevtunnelOnPath } = await import('./ensure-devtunnel.ts');
+        ensureDevtunnelOnPath();
+        const shareTunnelName =
+          cfg.share.tunnel.name ??
+          `${cfg.tunnel.name ?? deriveTunnelName(cfg.projectDir)}-share`;
+        shareTunnelStatus = await startShareTunnel({
+          name: shareTunnelName,
+          port: shareHandle.port(),
+          allowAnonymous: cfg.share.tunnel.allow_anonymous,
+          tenants: cfg.share.tunnel.tenants,
+        });
+      }
+    } catch (err) {
+      logger.warn(
+        { err: err instanceof Error ? err.message : String(err) },
+        'share-server start failed (main HTTP server unaffected)',
+      );
+    }
+  }
+
+  logger.info(
+    {
+      transport: 'streamable-http',
+      projectDir: ws.projectDir,
+      url: `http://${cfg.http.host}:${boundPort}/mcp`,
+      home: `http://${cfg.http.host}:${boundPort}/`,
+      mainAgent: mainAgent.running ? 'running' : 'not-started',
+      tunnel: {
+        kind: tunnelStatus.kind,
+        running: tunnelStatus.running,
+        url: tunnelStatus.url,
+        error: tunnelStatus.error,
+      },
+      share: shareHandle
+        ? {
+            port: shareHandle.port(),
+            tunnel_kind: shareTunnelStatus.kind,
+            tunnel_running: shareTunnelStatus.running,
+            tunnel_url: shareTunnelStatus.url,
+            tunnel_error: shareTunnelStatus.error,
+          }
+        : { enabled: false },
+      plugins: ws.plugins.size,
+      hostedErrors: hostedErrors.length,
+    },
+    'ready',
+  );
+
+  const tunnelBannerLine = formatTunnelBannerLine(
+    tunnelStatus,
+    boundPort,
+    expectedToken,
+    cfg.tunnel.allow_anonymous,
+  );
+
+  const shareBannerLines = shareHandle
+    ? formatShareBannerLine(
+        shareHandle.host(),
+        shareHandle.port(),
+        shareTunnelStatus,
+        cfg.share.allow_dispatch,
+      )
+    : '';
+
+  // Print a friendly banner to stderr so the user sees it in their terminal.
+  const mcpLine = expectedToken
+    ? `  MCP:        http://${cfg.http.host}:${boundPort}/mcp  (Authorization: Bearer ${maskToken(expectedToken)})\n`
+    : `  MCP:        http://${cfg.http.host}:${boundPort}/mcp  (no bearer auth — loopback only)\n`;
+  process.stderr.write(
+    `\nclawdevbox ready at http://${cfg.http.host}:${boundPort}\n` +
+      `  Home:       http://${cfg.http.host}:${boundPort}/   (Inbox + Main Agent)\n` +
+      mcpLine +
+      `  Terminal:   http://${cfg.http.host}:${boundPort}/terminal/<instance_id>\n` +
+      `  Artifacts:  http://${cfg.http.host}:${boundPort}/artifact/<id>\n` +
+      `  Health:     http://${cfg.http.host}:${boundPort}/healthz\n` +
+      `  Main agent: ${
+        mainAgent.running
+          ? `${mainAgent.agent_cli} (running)`
+          : `NOT running — ${
+              mainAgent.not_running_reason ??
+              `reason unknown (check the warn log lines above and the Agent tab at /terminal/main)`
+            }`
+      }\n` +
+      tunnelBannerLine +
+      shareBannerLines +
+      `\nPress Ctrl+C to stop.\n`,
+  );
+
+  // Pre-warm API caches in the background so the first browser request is
+  // fast (warm) rather than cold (18-20 s filesystem scan).  Fire-and-forget
+  // after a short delay to avoid contending with the main-agent spawn.
+  setImmediate(() => {
+    warmInboxCache();
+    warmRecipeCache();
+  });
+
+  // Periodic auto-update check (every 6 hours). Non-blocking, best-effort.
+  const AUTO_UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1000;
+  const autoUpdateCheck = async () => {
+    try {
+      const { execSync } = await import('node:child_process');
+      const latest = execSync('npm view clawdevbox version', { encoding: 'utf8', timeout: 10_000, windowsHide: true }).trim();
+      const { readFileSync } = await import('node:fs');
+      const { join, dirname } = await import('node:path');
+      const { fileURLToPath } = await import('node:url');
+      const pkgPath = join(dirname(fileURLToPath(import.meta.url)), '..', 'package.json');
+      const current = JSON.parse(readFileSync(pkgPath, 'utf8')).version;
+      if (latest && current && latest !== current) {
+        logger.info({ current, latest }, 'auto-update: newer version available');
+        process.stderr.write(`\n[auto-update] clawdevbox ${latest} available (current: ${current}). Run: clawdevbox update\n`);
+      }
+    } catch { /* best-effort */ }
+  };
+  // First check after 30s, then every 6 hours
+  setTimeout(autoUpdateCheck, 30_000);
+  const autoUpdateTimer = setInterval(autoUpdateCheck, AUTO_UPDATE_INTERVAL_MS);
+  autoUpdateTimer.unref?.();
+
+  const shutdown = (signal: NodeJS.Signals): void => {
+    logger.info({ signal }, 'shutting down');
+    // Kill all live pty trees FIRST so child agent processes (agency.exe,
+    // copilot.exe, claude.exe, plus their grandchildren) don't outlive us
+    // as orphans. The two-phase implementation tries graceful exit via
+    // \x03\x03 (double Ctrl+C) first so copilot can clean up its session
+    // lock files, then force-kills the survivors.
+    killAllSessions(2000)
+      .then((killed) => {
+        if (killed > 0) logger.info({ killed }, 'shutdown: killed pty trees');
+      })
+      .catch((err) => {
+        logger.warn(
+          { err: err instanceof Error ? err.message : String(err) },
+          'shutdown: killAllSessions threw',
+        );
+      });
+    // Order: stop scheduler (no new wakes) → drain dispatcher → stop tunnel
+    // → close DB → close HTTP. We give the dispatcher its configured drain
+    // window before the hard 5s exit timeout below kicks in.
+    scheduler.stop();
+    heapMonitor.stop();
+    idleReaper.stop();
+    validationWorker.stop();
+    laneWorker.stop();
+    testHookArtifactOutboxWorker?.stop();
+    // Daemon supervisor: gracefully stop every supervised daemon. Best-
+    // effort; bounded by the supervisor's drainMs.
+    daemonSupervisor.stop().catch((err) => {
+      logger.warn(
+        { err: err instanceof Error ? err.message : String(err) },
+        'daemon-supervisor.stop threw',
+      );
+    });
+    dispatcher
+      .stop()
+      .catch((err) => {
+        logger.warn(
+          { err: err instanceof Error ? err.message : String(err) },
+          'dispatcher.stop threw',
+        );
+      })
+      .finally(() => {
+        // Stop share tunnel + share server in parallel with the main
+        // tunnel. None of them block the others; we wait for all before
+        // closing the DB so the order matches the assets we hold open.
+        Promise.allSettled([
+          stopTunnel(),
+          stopShareTunnel(),
+          stopShareServer(),
+        ]).finally(() => {
+          closeDatabase();
+          httpServer.close(() => process.exit(0));
+        });
+      });
+    // Hard exit after grace period in case sockets keep us alive.
+    setTimeout(() => process.exit(0), 30_000).unref();
+  };
+  process.once('SIGINT', () => shutdown('SIGINT'));
+  process.once('SIGTERM', () => shutdown('SIGTERM'));
+}
+
+function formatTunnelBannerLine(
+  t: TunnelStatus,
+  localPort: number,
+  token: string | null,
+  allowAnonymous: boolean,
+): string {
+  if (t.kind === 'none') return '';
+  if (t.error) {
+    return `  Tunnel:     devtunnel "${t.name ?? '?'}" FAILED — ${t.error}\n`;
+  }
+  if (!t.running) {
+    return `  Tunnel:     devtunnel "${t.name ?? '?'}" starting…\n`;
+  }
+  const accessNote = allowAnonymous
+    ? 'anonymous OK — only /mcp bearer auth gates access'
+    : 'private — clients need a devtunnel access token + the /mcp bearer';
+  if (t.url) {
+    const mcpAuthSuffix = token ? `  (Authorization: Bearer ${maskToken(token)})` : '  (no bearer auth)';
+    return (
+      `  Tunnel:     ${t.url}   →   localhost:${localPort}  (${accessNote})\n` +
+      `              public MCP: ${t.url}/mcp${mcpAuthSuffix}\n` +
+      (t.inspect_url ? `              inspect:    ${t.inspect_url}\n` : '') +
+      (!allowAnonymous
+        ? `              get token:  devtunnel token ${t.name ?? '<name>'} -s\n`
+        : '')
+    );
+  }
+  return `  Tunnel:     devtunnel "${t.name ?? '?'}" running (URL pending — check /api/tunnel/status)\n`;
+}
+
+function formatShareBannerLine(
+  localHost: string,
+  localPort: number,
+  t: ShareTunnelStatus,
+  allowDispatch: boolean,
+): string {
+  const dispatchTag = allowDispatch ? 'send: on' : 'send: off';
+  const localLine = `  Share:      http://${localHost}:${localPort}/artifact/<id>   (${dispatchTag})\n`;
+  if (t.kind === 'none') {
+    return localLine + `              (no share tunnel configured — local-only)\n`;
+  }
+  if (t.error) {
+    return localLine + `              tunnel "${t.name ?? '?'}" FAILED — ${t.error}\n`;
+  }
+  if (!t.running) {
+    return localLine + `              tunnel "${t.name ?? '?'}" starting…\n`;
+  }
+  let accessNote: string;
+  if (t.access.allow_anonymous) {
+    accessNote = 'anonymous OK — anyone with the URL can view + comment';
+  } else if (t.access.tenants.length > 0) {
+    accessNote = `tenant-restricted (${t.access.tenants.length} tenant${t.access.tenants.length === 1 ? '' : 's'})`;
+  } else {
+    accessNote = 'owner-only — colleagues need a devtunnel access token';
+  }
+  if (t.url) {
+    return (
+      localLine +
+      `              public:  ${t.url}/artifact/<id>  (${accessNote})\n` +
+      (t.inspect_url ? `              inspect: ${t.inspect_url}\n` : '')
+    );
+  }
+  return localLine + `              tunnel "${t.name ?? '?'}" running (URL pending)\n`;
+}
+
+function maskToken(t: string): string {
+  if (t.length <= 8) return '****';
+  return `${t.slice(0, 4)}…${t.slice(-4)}`;
+}
+
+/**
+ * Read up to MAX bytes of a JSON request body. Returns the parsed object,
+ * or writes a 400 and returns null.
+ */
+async function readJsonBody<T>(req: IncomingMessage, res: ServerResponse): Promise<T | null> {
+  const MAX = 64 * 1024; // 64KB — push subscriptions are <1KB; this is plenty.
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const c of req) {
+    const buf = c instanceof Buffer ? c : Buffer.from(c);
+    total += buf.length;
+    if (total > MAX) {
+      res.writeHead(413, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'body too large' }));
+      return null;
+    }
+    chunks.push(buf);
+  }
+  const text = Buffer.concat(chunks).toString('utf8');
+  if (text.length === 0) {
+    res.writeHead(400, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'empty body' }));
+    return null;
+  }
+  try {
+    return JSON.parse(text) as T;
+  } catch (err) {
+    res.writeHead(400, { 'content-type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        error: 'invalid JSON: ' + (err instanceof Error ? err.message : String(err)),
+      }),
+    );
+    return null;
+  }
+}
+
+async function handlePushSubscribe(
+  req: IncomingMessage,
+  res: ServerResponse,
+  loc: { globalDir: string; projectDir: string },
+  enabled: boolean,
+): Promise<void> {
+  if (!enabled) {
+    logger.warn({ projectDir: loc.projectDir }, 'push subscribe rejected: notifications disabled in config');
+    res.writeHead(409, { 'content-type': 'application/json' });
+    res.end(
+      JSON.stringify({ error: 'notifications not enabled — re-run `clawdevbox init`' }),
+    );
+    return;
+  }
+  const body = await readJsonBody<{
+    endpoint: string;
+    keys?: { p256dh?: string; auth?: string };
+    label?: string;
+  }>(req, res);
+  if (!body) return;
+  if (!body.endpoint || !body.keys?.p256dh || !body.keys?.auth) {
+    logger.warn(
+      { hasEndpoint: !!body.endpoint, hasP256: !!body.keys?.p256dh, hasAuth: !!body.keys?.auth },
+      'push subscribe rejected: incomplete body',
+    );
+    res.writeHead(400, { 'content-type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        error: 'body must include { endpoint, keys: { p256dh, auth } }',
+      }),
+    );
+    return;
+  }
+  const record: PushSubscriptionRecord = addSubscription(loc, {
+    endpoint: body.endpoint,
+    keys: { p256dh: body.keys.p256dh, auth: body.keys.auth },
+    label: typeof body.label === 'string' ? body.label.slice(0, 80) : undefined,
+  });
+  logger.info(
+    { endpointHost: tryUrlHost(record.endpoint), label: record.label },
+    'push subscribe accepted',
+  );
+  res.writeHead(200, { 'content-type': 'application/json' });
+  res.end(JSON.stringify({ ok: true, endpoint: record.endpoint }));
+}
+
+function tryUrlHost(u: string): string {
+  try { return new URL(u).host; } catch { return '?'; }
+}
+
+async function handlePushUnsubscribe(
+  req: IncomingMessage,
+  res: ServerResponse,
+  loc: { globalDir: string; projectDir: string },
+): Promise<void> {
+  const body = await readJsonBody<{ endpoint: string }>(req, res);
+  if (!body) return;
+  if (!body.endpoint) {
+    res.writeHead(400, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'body must include { endpoint }' }));
+    return;
+  }
+  const removed = removeSubscription(loc, body.endpoint);
+  res.writeHead(200, { 'content-type': 'application/json' });
+  res.end(JSON.stringify({ ok: true, removed }));
+}
+
+/**
+ * Handle the inbox lifecycle mutation routes — `state`, `snooze`,
+ * `archive`, `done`. All four ultimately delegate to the InboxStore
+ * (which emits SSE 'inbox' on mutation so connected SPAs auto-refresh).
+ * Returns the enriched updated item.
+ */
+async function handleInboxAction(
+  req: IncomingMessage,
+  res: ServerResponse,
+  id: string,
+  verb: 'state' | 'snooze' | 'archive' | 'done',
+  cfg: ResolvedConfig,
+): Promise<void> {
+  const existing = inbox.read(id);
+  if (!existing) {
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'inbox item not found', id }));
+    return;
+  }
+
+  let updated;
+  if (verb === 'archive') {
+    updated = inbox.archive(id);
+  } else if (verb === 'done') {
+    updated = inbox.setState(id, 'done');
+  } else if (verb === 'state') {
+    const body = await readJsonBody<{ state?: string }>(req, res);
+    if (!body) return;
+    const allowed = ['new', 'open', 'done', 'archived'] as const;
+    if (!body.state || !(allowed as readonly string[]).includes(body.state)) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(
+        JSON.stringify({ error: `state must be one of: ${allowed.join(', ')}` }),
+      );
+      return;
+    }
+    updated = inbox.setState(id, body.state as 'new' | 'open' | 'done' | 'archived');
+  } else if (verb === 'snooze') {
+    const body = await readJsonBody<{ until?: number }>(req, res);
+    if (!body) return;
+    if (typeof body.until !== 'number' || !Number.isFinite(body.until)) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'until must be a unix-ms number' }));
+      return;
+    }
+    if (body.until <= Date.now()) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          error: 'until must be in the future',
+          now: Date.now(),
+          until: body.until,
+        }),
+      );
+      return;
+    }
+    updated = inbox.snooze(id, body.until);
+  } else {
+    res.writeHead(400, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: `unknown verb: ${verb}` }));
+    return;
+  }
+
+  if (!updated) {
+    // shouldn't happen given the `existing` check above, but defensive
+    res.writeHead(500, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'mutation returned no item' }));
+    return;
+  }
+  const [enriched] = enrichInboxItemsForList(
+    [updated],
+  );
+  res.writeHead(200, { 'content-type': 'application/json' });
+  res.end(JSON.stringify({ item: enriched }));
+}
+
+/**
+ * Walk an inbox item's replies (newest → oldest) looking for an
+ * agent-authored reply that carries unanswered `questions: [...]`. If
+ * one is found, those questions are the "active batch" the user should
+ * answer next. Otherwise, fall back to the item's top-level `questions`.
+ *
+ * This is what enables multi-turn batched Q&A: agent replies with new
+ * questions → user answers those, not the original item-level ones.
+ *
+ * A reply's questions are considered "active" when at least one of them
+ * has `closed !== true`. Once the user answers the batch, all questions
+ * in that batch are marked closed, so the search falls back to the
+ * next-most-recent reply (or item-level).
+ */
+function findActiveQuestionBatch(item: import('../store.ts').InboxItem): {
+  source: 'item' | 'reply';
+  reply_id?: string;
+  questions: InboxQuestion[];
+} | null {
+  const replies = Array.isArray(item.replies) ? item.replies : [];
+  for (let i = replies.length - 1; i >= 0; i--) {
+    const r = replies[i];
+    if (r.author === 'agent' && Array.isArray(r.questions) && r.questions.length > 0) {
+      const open = r.questions.some((q) => q.closed !== true);
+      if (open) {
+        return { source: 'reply', reply_id: r.id, questions: r.questions };
+      }
+    }
+  }
+  const itemQs = Array.isArray(item.questions) ? item.questions : [];
+  if (itemQs.length > 0 && itemQs.some((q) => q.closed !== true)) {
+    return { source: 'item', questions: itemQs };
+  }
+  return null;
+}
+
+interface InboxReplyRequest {
+  /**
+   * Legacy single-question fields. Used when the item has exactly one
+   * question — applied to that sole question. For multi-question items
+   * pass `answers` instead.
+   */
+  option_ids?: string[];
+  /** Optional freeform text contributed by the user. */
+  text?: string;
+  /**
+   * Batched per-question answers for multi-question items. Each entry
+   * carries the user's selection for one question (matched by
+   * `question_id`). Every question on the item MUST have an entry —
+   * partial submissions are rejected.
+   */
+  answers?: Array<{
+    question_id: string;
+    option_ids?: string[];
+    text?: string;
+  }>;
+  /** When false, skip the dispatch step (just persist the reply). Default: true. */
+  dispatch?: boolean;
+}
+
+interface InboxReplyResponse {
+  item: unknown;
+  reply: InboxReply;
+  dispatch: InboxReply['dispatch'];
+}
+
+/**
+ * POST /api/inbox/compose — create a user-authored inbox item and optionally
+ * spawn an agent session. Supports image attachments (base64) saved to temp.
+ *
+ * Body:
+ *   prompt    string (required unless draft=true)
+ *   title     string (optional — defaults to first line of prompt)
+ *   provider  string (optional — defaults to configured)
+ *   labels    string[] (optional)
+ *   images    string[] (optional — base64 encoded image data)
+ *   draft     boolean (optional — if true, save without spawning)
+ *
+ * On send (draft=false):
+ *   1. Save any images to temp dir
+ *   2. Create inbox item (author: user, state: open)
+ *   3. Spawn agent session with prompt + inbox_item_id + image paths
+ *   4. Update inbox item dispatch.session_id with the spawned session
+ *
+ * On draft (draft=true):
+ *   1. Save any images to temp dir
+ *   2. Create inbox item (state: draft) — no spawn
+ */
+async function handleInboxCompose(
+  req: IncomingMessage,
+  res: ServerResponse,
+  ctx: CronApiContext | null,
+): Promise<void> {
+  const body = await readJsonBody<{
+    prompt?: string;
+    title?: string;
+    provider?: string;
+    labels?: string[];
+    images?: string[];
+    draft?: boolean;
+  }>(req, res);
+  if (!body) return;
+
+  const isDraft = body.draft === true;
+  const prompt = (body.prompt ?? '').trim();
+
+  if (!isDraft && !prompt) {
+    res.writeHead(400, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'prompt is required when draft=false' }));
+    return;
+  }
+
+  // Save images to temp
+  const imagePaths: string[] = [];
+  if (Array.isArray(body.images) && body.images.length > 0) {
+    const { tmpdir } = await import('node:os');
+    const { mkdirSync, writeFileSync } = await import('node:fs');
+    const uploadDir = join(tmpdir(), 'clawdevbox-uploads');
+    mkdirSync(uploadDir, { recursive: true });
+    for (const b64 of body.images) {
+      if (typeof b64 !== 'string' || b64.length === 0) continue;
+      const id = randomUUID().slice(0, 8);
+      const filePath = join(uploadDir, `compose-${id}.png`);
+      const buf = Buffer.from(b64, 'base64');
+      writeFileSync(filePath, buf);
+      imagePaths.push(filePath);
+    }
+  }
+
+  // Derive title
+  const title = body.title?.trim() || prompt.split('\n')[0]?.slice(0, 120) || 'Draft';
+
+  // Build description (prompt with resolved image paths)
+  let description = prompt;
+  if (imagePaths.length > 0) {
+    for (let i = 0; i < imagePaths.length; i++) {
+      description = description.replace(
+        new RegExp(`paste://img-${i + 1}`, 'g'),
+        imagePaths[i],
+      );
+    }
+  }
+
+  // Create inbox item
+  const itemId = `compose-${randomUUID().slice(0, 12)}`;
+  const now = Date.now();
+  const { item: inboxItem } = inbox.upsert(itemId, 'compose', 'user', {
+    title,
+    preview: prompt.slice(0, 200) || undefined,
+    description,
+    description_format: 'markdown',
+    description_size: description.length,
+    state: isDraft ? ('draft' as any) : 'open',
+    labels: body.labels,
+    unread: false,
+  });
+  // Write the body file so the full message is readable later
+  if (description) {
+    const { writeInboxBody } = await import('../inbox-persistence.ts');
+    const globalDir = ctx?.cfg?.globalDir ?? (await import('node:os')).homedir() + '/.clawdevbox';
+    writeInboxBody(globalDir, itemId, description, 'markdown');
+  }
+  emitChange('inbox');
+
+  if (isDraft) {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      item: inboxItem,
+      session: null,
+      image_paths: imagePaths,
+    }));
+    return;
+  }
+
+  // Spawn agent session
+  if (!ctx) {
+    res.writeHead(503, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'server context not available for spawn' }));
+    return;
+  }
+
+  // Build prompt for agent with inbox context
+  // Replace paste://img-N markers with actual file paths
+  let resolvedPrompt = prompt;
+  if (imagePaths.length > 0) {
+    for (let i = 0; i < imagePaths.length; i++) {
+      resolvedPrompt = resolvedPrompt.replace(
+        new RegExp(`paste://img-${i + 1}`, 'g'),
+        imagePaths[i],
+      );
+    }
+  }
+
+  const agentPrompt = [
+    `[Inbox item: ${itemId}] The user sent you a message via the inbox. Reply by calling inbox.upsert with id="${itemId}" to update this item, or use inbox.reply to respond.`,
+    '',
+    resolvedPrompt,
+  ].join('\n');
+
+  try {
+    const { spawnDispatchOrResume } = await import('../session-helpers.ts');
+    const shCtx = sessionHelperCtxFromCron(ctx);
+    const result = await spawnDispatchOrResume(shCtx, {
+      prompt: agentPrompt,
+      provider: body.provider,
+    });
+
+    if (!result.ok) {
+      res.writeHead(500, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: result.message, code: result.code }));
+      return;
+    }
+
+    // Update the inbox item with dispatch info so freeform reply can route back
+    inbox.upsert(itemId, 'compose', 'user', {
+      dispatch: {
+        session_id: result.session_id,
+        provider: body.provider ?? undefined,
+      },
+    } as any);
+    emitChange('inbox');
+
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      item: inbox.read(itemId),
+      session: {
+        instance_id: result.instance_id,
+        session_id: result.session_id,
+      },
+      image_paths: imagePaths,
+    }));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.writeHead(500, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: msg }));
+  }
+}
+
+/**
+ * POST /api/inbox/<id>/send-draft — send a previously saved draft.
+ * Spawns an agent session with the draft's content.
+ */
+async function handleSendDraft(
+  req: IncomingMessage,
+  res: ServerResponse,
+  id: string,
+  ctx: CronApiContext | null,
+): Promise<void> {
+  const existing = inbox.read(id);
+  if (!existing) {
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'inbox item not found', id }));
+    return;
+  }
+
+  if (!ctx) {
+    res.writeHead(503, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'server context not available for spawn' }));
+    return;
+  }
+
+  // Allow optional body to override prompt/provider
+  const body = await readJsonBody<{ prompt?: string; provider?: string }>(req, res);
+  if (!body) return;
+
+  const prompt = body.prompt?.trim() || (existing as any).description || existing.preview || '';
+  if (!prompt) {
+    res.writeHead(400, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'draft has no content to send' }));
+    return;
+  }
+
+  const agentPrompt = [
+    `[Inbox item: ${id}] The user sent you a message via the inbox. Reply by calling inbox.upsert with id="${id}" to update this item, or use inbox.reply to respond.`,
+    '',
+    prompt,
+  ].join('\n');
+
+  try {
+    const { spawnDispatchOrResume } = await import('../session-helpers.ts');
+    const shCtx = sessionHelperCtxFromCron(ctx);
+    const result = await spawnDispatchOrResume(shCtx, {
+      prompt: agentPrompt,
+      provider: body.provider,
+    });
+
+    if (!result.ok) {
+      res.writeHead(500, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: result.message, code: result.code }));
+      return;
+    }
+
+    // Transition from draft to open + add dispatch info
+    inbox.upsert(id, 'compose', 'user', {
+      state: 'open',
+      dispatch: {
+        session_id: result.session_id,
+        provider: body.provider ?? undefined,
+      },
+    } as any);
+    emitChange('inbox');
+
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      item: inbox.read(id),
+      session: {
+        instance_id: result.instance_id,
+        session_id: result.session_id,
+      },
+    }));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.writeHead(500, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: msg }));
+  }
+}
+
+/**
+ * POST /api/inbox/<id>/reply — user-side answer to a question.
+ *
+ * Steps:
+ *   1. Validate the item has at least one question and none are closed.
+ *   2. Validate each per-question answer against its `options` + `mode`.
+ *      Multi-question items require every question to be answered
+ *      (batch UX).
+ *   3. Compile the per-question + composite answer text + dispatched
+ *      prompt (prompt_template subst).
+ *   4. Append a user `InboxReply` to `replies[]` with batch `answers[]`
+ *      breakdown (close all questions if `close_on_answer`).
+ *   5. If the routing question's `dispatch.session_id` is set AND
+ *      body.dispatch !== false, route to spawnDispatchOrResume.
+ *   6. Update the reply with the dispatch outcome and respond.
+ */
+async function handleInboxReply(
+  req: IncomingMessage,
+  res: ServerResponse,
+  id: string,
+  ctx: CronApiContext | null,
+): Promise<void> {
+  const existing = inbox.read(id);
+  if (!existing) {
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'inbox item not found', id }));
+    return;
+  }
+  const activeBatch = findActiveQuestionBatch(existing);
+
+  const body = await readJsonBody<InboxReplyRequest>(req, res);
+  if (!body) return; // readJsonBody already responded
+
+  // Two reply shapes:
+  //   - STRUCTURED: `answers[]` (or legacy `option_ids`/`text` for 1-question)
+  //     applied to the active question batch.
+  //   - FREEFORM:   `text` only, with NO active questions → dispatches the
+  //     wrapped text to the item-level `dispatch.session_id`.
+  // A request with `text` AND no `answers` AND no active batch is freeform.
+  const itemDispatch = (existing as { dispatch?: { session_id?: string; provider?: string; workspace_id?: string; workspace_path?: string; prompt_template?: string } }).dispatch;
+  const isFreeformOnly =
+    !activeBatch &&
+    typeof body.text === 'string' &&
+    body.text.trim().length > 0 &&
+    !(Array.isArray(body.answers) && body.answers.length > 0);
+
+  if (isFreeformOnly) {
+    await handleFreeformReply(req, res, id, existing, body, itemDispatch, ctx);
+    return;
+  }
+
+  if (!activeBatch) {
+    res.writeHead(409, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      error: 'inbox item has no open questions — pass `text` for a freeform reply or omit',
+      code: 'NO_QUESTION',
+      id,
+    }));
+    return;
+  }
+  const questions = activeBatch.questions;
+
+  const { validateBatchAnswer, compileBatchAnswer, pickDispatchRouter } =
+    await import('../inbox-reply.ts');
+
+  // Choose the raw payload shape: prefer `answers[]` (batch); fall back
+  // to the legacy `{option_ids, text}` for single-question items.
+  const rawPayload = Array.isArray(body.answers) && body.answers.length > 0
+    ? body.answers
+    : { option_ids: body.option_ids, text: body.text };
+
+  const validation = validateBatchAnswer(questions, rawPayload);
+  if (!validation.ok) {
+    const status = validation.error.code === 'UNKNOWN_OPTION' ? 400 : 400;
+    res.writeHead(status, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(validation.error));
+    return;
+  }
+  const validated = validation.value;
+  const compiled = compileBatchAnswer(validated);
+
+  // Aggregate legacy fields by flattening across all answers.
+  const allOptionIds: string[] = validated.flatMap((v) => v.option_ids);
+  const flatFreeform = validated.map((v) => v.freeform).filter((s) => s.length > 0).join('\n');
+
+  // ---- Append the reply (closing all questions if configured) ------------
+  const reply: InboxReply = {
+    id: mintInboxReplyId(),
+    author: 'user',
+    text: compiled.answer_text,
+    option_ids: allOptionIds.length > 0 ? allOptionIds : undefined,
+    freeform: flatFreeform || undefined,
+    answers: compiled.entries.map((e) => ({
+      question_id: e.question_id,
+      option_ids: e.option_ids.length > 0 ? e.option_ids : undefined,
+      freeform: e.freeform || undefined,
+      text: e.answer_text,
+    })),
+    created_at: Date.now(),
+  };
+
+  // Batch UX: close every question once the user submits the batch
+  // (unless any question explicitly opted out via close_on_answer:false).
+  // When the active batch lives on an agent-reply (multi-turn), we
+  // close that reply's questions; otherwise we close item-level ones.
+  const closeAll = questions.every((q) => (q.close_on_answer ?? true) === true);
+  const newState: InboxState | undefined = existing.state === 'new' ? 'open' : undefined;
+  // For reply-level batches, suppress the global "close all questions"
+  // path because that closes item-level questions which may be a
+  // different batch. We handle the close via a follow-up updateReply.
+  const closeItemQuestions = closeAll && activeBatch.source === 'item';
+  const appendResult = inbox.appendReply(id, reply, {
+    closeQuestion: closeItemQuestions,
+    newState,
+  });
+  if (!appendResult) {
+    res.writeHead(500, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'failed to append reply' }));
+    return;
+  }
+  // Reply-level batch: close the agent-reply's questions in place.
+  if (closeAll && activeBatch.source === 'reply' && activeBatch.reply_id) {
+    const targetReply = appendResult.item.replies?.find((r) => r.id === activeBatch.reply_id);
+    if (targetReply && Array.isArray(targetReply.questions)) {
+      const closedQs = targetReply.questions.map((q) => ({ ...q, closed: true }));
+      inbox.updateReply(id, activeBatch.reply_id, { questions: closedQs });
+    }
+  }
+
+  // ---- Dispatch to the agent ---------------------------------------------
+  // Routing precedence:
+  //   1. First question with `dispatch.session_id` set (per-question routing).
+  //   2. Item-level `dispatch` (the always-on freeform reply target —
+  //      also used as fallback when questions don't have their own dispatch,
+  //      which is the COMMON case for items created via the inbox.upsert
+  //      session_id shorthand or auto-injected from the request header).
+  const router = pickDispatchRouter(questions);
+  const routerDispatch = router?.dispatch ?? itemDispatch;
+  let dispatchOutcome: InboxReply['dispatch'] | undefined;
+  const shouldDispatch =
+    body.dispatch !== false &&
+    !!routerDispatch?.session_id &&
+    !!compiled.dispatch_prompt;
+
+  if (shouldDispatch && ctx && routerDispatch) {
+    try {
+      const { spawnDispatchOrResume } = await import('../session-helpers.ts');
+      const sessionCtx = sessionHelperCtxFromCron(ctx);
+      const result = await spawnDispatchOrResume(sessionCtx, {
+        prompt: compiled.dispatch_prompt,
+        session_id: routerDispatch.session_id ?? null,
+        provider: routerDispatch.provider ?? null,
+        workspace_id: routerDispatch.workspace_id ?? null,
+        workspace_path: routerDispatch.workspace_path ?? null,
+        default_workspace_path: null,
+      });
+      if (result.ok) {
+        dispatchOutcome = {
+          mode: result.mode,
+          instance_id: result.instance_id,
+          session_id: result.session_id,
+        };
+      } else {
+        dispatchOutcome = {
+          mode: 'failed',
+          code: result.code,
+          error: result.message,
+        };
+      }
+    } catch (err) {
+      dispatchOutcome = {
+        mode: 'failed',
+        code: 'EXCEPTION',
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+  } else if (shouldDispatch && !ctx) {
+    // Race: HTTP server is listening but the dispatcher context isn't
+    // bound yet (only happens in the tiny window between httpServer.listen
+    // and cronApiCtx assignment in cli/start.ts). Record a clear outcome
+    // instead of silently dropping the dispatch.
+    dispatchOutcome = {
+      mode: 'failed',
+      code: 'DISPATCHER_NOT_READY',
+      error: 'cronApiCtx not yet bound — try again after the server fully boots',
+    };
+  } else if (!shouldDispatch) {
+    dispatchOutcome = { mode: 'noop' };
+  }
+
+  // ---- Persist dispatch outcome on the reply ----------------------------
+  let finalItem: InboxItem = appendResult.item;
+  if (dispatchOutcome) {
+    const patched = inbox.updateReply(id, reply.id, { dispatch: dispatchOutcome });
+    if (patched) finalItem = patched.item;
+  }
+
+  const [enriched] = enrichInboxItemsForList([finalItem]);
+  const response: InboxReplyResponse = {
+    item: enriched ?? finalItem,
+    reply: { ...reply, dispatch: dispatchOutcome },
+    dispatch: dispatchOutcome,
+  };
+  res.writeHead(200, { 'content-type': 'application/json' });
+  res.end(JSON.stringify(response));
+}
+
+/** Build a SessionHelperCtx from the CronApiContext that's hoisted at request time. */
+function sessionHelperCtxFromCron(ctx: CronApiContext): import('../session-helpers.ts').SessionHelperCtx {
+  const wsRef = ctx.ws ?? (ctx.dispatcher as unknown as { ws?: Workspace }).ws;
+  if (!wsRef) {
+    throw new Error('workspace not available in this server context');
+  }
+  if (!ctx.cfg) {
+    throw new Error('resolved config not available in this server context');
+  }
+  return { db: ctx.db, dispatcher: ctx.dispatcher, ws: wsRef, cfg: ctx.cfg };
+}
+
+/**
+ * Handle a freeform-text-only reply (no answers, no active questions).
+ * Wraps the user's text with item context and dispatches it as a new
+ * prompt to the item-level `dispatch.session_id`. Default wrapping:
+ *   `User replied to inbox "<title>" (id=<id>): <text>`
+ * Overridable via `dispatch.prompt_template`. If the item has no
+ * dispatch configured, responds 409 with a clear error.
+ */
+async function handleFreeformReply(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  id: string,
+  existing: InboxItem,
+  body: InboxReplyRequest,
+  itemDispatch: {
+    session_id?: string;
+    provider?: string;
+    workspace_id?: string;
+    workspace_path?: string;
+    prompt_template?: string;
+  } | undefined,
+  ctx: CronApiContext | null,
+): Promise<void> {
+  if (!itemDispatch?.session_id) {
+    res.writeHead(409, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      error: 'item has no dispatch.session_id; freeform replies require an item-level dispatch target',
+      code: 'NO_DISPATCH',
+      id,
+    }));
+    return;
+  }
+  const text = (body.text ?? '').trim();
+  const title = existing.title ?? '(untitled)';
+  const template = itemDispatch.prompt_template
+    ?? `User replied to inbox "${title}" (id=${id}): {answer}`;
+  const dispatchPrompt = template
+    .replace(/\{answer\}/g, text)
+    .replace(/\{option_ids\}/g, '')
+    .replace(/\{freeform\}/g, text);
+
+  // Append the user reply (no question closing — no questions to close).
+  const reply: InboxReply = {
+    id: mintInboxReplyId(),
+    author: 'user',
+    text,
+    freeform: text,
+    created_at: Date.now(),
+  };
+  const newState: InboxState | undefined = existing.state === 'new' ? 'open' : undefined;
+  const appendResult = inbox.appendReply(id, reply, { closeQuestion: false, newState });
+  if (!appendResult) {
+    res.writeHead(500, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'failed to append reply' }));
+    return;
+  }
+
+  // Dispatch the wrapped prompt.
+  let dispatchOutcome: InboxReply['dispatch'] | undefined;
+  const shouldDispatch = body.dispatch !== false;
+  if (shouldDispatch && ctx) {
+    try {
+      const { spawnDispatchOrResume } = await import('../session-helpers.ts');
+      const sessionCtx = sessionHelperCtxFromCron(ctx);
+      const result = await spawnDispatchOrResume(sessionCtx, {
+        prompt: dispatchPrompt,
+        session_id: itemDispatch.session_id,
+        provider: itemDispatch.provider ?? null,
+        workspace_id: itemDispatch.workspace_id ?? null,
+        workspace_path: itemDispatch.workspace_path ?? null,
+        default_workspace_path: null,
+      });
+      dispatchOutcome = result.ok
+        ? { mode: result.mode, instance_id: result.instance_id, session_id: result.session_id }
+        : { mode: 'failed', code: result.code, error: result.message };
+    } catch (err) {
+      dispatchOutcome = {
+        mode: 'failed',
+        code: 'EXCEPTION',
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+  } else if (shouldDispatch && !ctx) {
+    dispatchOutcome = {
+      mode: 'failed',
+      code: 'DISPATCHER_NOT_READY',
+      error: 'cronApiCtx not yet bound — try again after the server fully boots',
+    };
+  } else {
+    dispatchOutcome = { mode: 'noop' };
+  }
+
+  let finalItem: InboxItem = appendResult.item;
+  if (dispatchOutcome) {
+    const patched = inbox.updateReply(id, reply.id, { dispatch: dispatchOutcome });
+    if (patched) finalItem = patched.item;
+  }
+
+  const [enriched] = enrichInboxItemsForList([finalItem]);
+  const response: InboxReplyResponse = {
+    item: enriched ?? finalItem,
+    reply: { ...reply, dispatch: dispatchOutcome },
+    dispatch: dispatchOutcome,
+  };
+  res.writeHead(200, { 'content-type': 'application/json' });
+  res.end(JSON.stringify(response));
+}
+
+/**
+ * Resume an agent CLI session. The caller passes the recipe-instance id
+ * of the original run; we look up its `session_id` + `workspace_path` +
+ * `agent_cli`, mint a new instance row tied back via `resume_of`, then
+ * `pty.spawn` the agent with the appropriate `--resume <session_id>`
+ * flag (Claude / Copilot / echo-stub). Demonstrates the explicit-session-id
+ * pattern end-to-end.
+ *
+ * Body (optional): `{ prompt?: string }`. Defaults to "Continue."
+ */
+async function handleRecipeResume(
+  req: IncomingMessage,
+  res: ServerResponse,
+  recipeInstanceId: string,
+  cfg: ResolvedConfig,
+  ws: Workspace,
+): Promise<void> {
+  // Locate the source instance directly from the DB (fast, no workspace scan).
+  const allInstances = listAllRecipeInstancesFromDb();
+  const source = allInstances.find((it) => it.id === recipeInstanceId);
+  if (!source) {
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'recipe instance not found', id: recipeInstanceId }));
+    return;
+  }
+  // Two paths supported:
+  //   - source.session_id PRESENT  →  spawn agent with --resume <id>
+  //                                   (real reattach to the prior conversation)
+  //   - source.session_id MISSING  →  mint a fresh UUID and spawn agent
+  //                                   with --session-id <new uuid> (init kind='new').
+  //                                   The CLI starts in the recipe's workspace
+  //                                   so it picks up the same project context.
+  //                                   This is the "continue in workspace" path
+  //                                   the user explicitly asked for — without
+  //                                   this, recipes created via recipe.instance.begin
+  //                                   that never had a CLI session would show
+  //                                   only the empty "session has exited" log.
+  //
+  // The original `if (!source.session_id) return 409` early-return is gone:
+  // we now always have SOMETHING useful to do.
+
+  // Resume is interactive — no -p prompt is passed to the CLI. We still
+  // accept an optional `prompt` in the body purely as the displayed
+  // "first message" on the recipe-instance row (useful in the UI to
+  // distinguish multiple resumes of the same session). Echo-stub uses
+  // it as its inline-script prompt; real CLIs ignore it.
+  // `keep_instance_id`: when true (the SPA's default for the "Terminal"
+  // re-attach flow), DO NOT mint a new recipe-instance row — instead
+  // upsert the existing row back to status=running and bind the new
+  // agent_sessions entry to it. Keeps the rail tidy (one recipe = one
+  // visible row, regardless of how many times the user re-attaches).
+  const body = (await readJsonBody<{ prompt?: string; keep_instance_id?: boolean }>(req, res)) ?? {};
+  const prompt = body.prompt && body.prompt.length > 0 ? body.prompt : 'Resumed interactively from the UI.';
+  const keepInstanceId = body.keep_instance_id === true;
+
+  const newInstanceId = keepInstanceId ? recipeInstanceId : mintRecipeInstanceId();
+  // When source has a session_id we resume; otherwise mint fresh.
+  const hasPriorSession = !!source.session_id;
+  const sessionId = hasPriorSession ? source.session_id! : randomUUID();
+  const workspacePath = source.workspace_path;
+
+  // Resolve the agent CLI to spawn for the reattach.
+  // For real CLI recipes (copilot/claude/agency) we honor the original
+  // agent_cli. For 'inline' recipes (recipe.instance.begin) there's no
+  // spawned process to reattach to — but the session_id IS still a
+  // valid CLI session that was created by the CALLING agent. The user
+  // explicitly wants the Terminal button to "resume the session" in
+  // that case, so we fall back to the workspace's defaultAgentCli
+  // (which is the CLI most likely to recognise the session id).
+  let agentCli = source.agent_cli;
+  if (agentCli === 'inline' || agentCli === 'unknown' || !ws.agentCliProviders.has(agentCli)) {
+    const fallback = cfg.defaultAgentCli;
+    if (fallback && ws.agentCliProviders.has(fallback)) {
+      agentCli = fallback;
+    }
+  }
+
+  // When keepInstanceId, preserve the original recipe-instance metadata
+  // (prompt, params, started_at, recipe_name, etc.) — only fields that
+  // genuinely change on re-attach are touched (status back to running,
+  // pid cleared until spawn returns one, completed_at/result/message
+  // cleared so the row stops looking like it finished). Without this
+  // guard the upsert would clobber the original prompt/started_at,
+  // which is jarring when the user reattaches mid-conversation.
+  const instance: RecipeInstanceRow = keepInstanceId
+    ? {
+        ...(source as RecipeInstanceRow),
+        agent_cli: agentCli,
+        pid: null,
+        status: 'running',
+        completed_at: null,
+        result: null,
+        message: null,
+        session_id: sessionId,
+      }
+    : {
+        id: newInstanceId,
+        recipe_id: source.recipe_id,
+        recipe_snapshot: source.recipe_snapshot,
+        workspace_id: source.workspace_id,
+        workspace_path: workspacePath,
+        prompt,
+        params: source.params ?? {},
+        agent_cli: agentCli,
+        pid: null,
+        started_at: Date.now(),
+        status: 'running',
+        completed_at: null,
+        result: null,
+        message: null,
+        session_id: sessionId,
+        resume_of: recipeInstanceId,
+      };
+  writeRecipeInstance(workspacePath, instance);
+
+  // Resolve the provider from the workspace registry and delegate spawn.
+  const provider = ws.agentCliProviders.get(agentCli);
+  if (!provider) {
+    res.writeHead(400, { 'content-type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        error: {
+          code: 'UNKNOWN_AGENT_CLI',
+          message: `provider '${agentCli}' is not registered (source agent_cli=${source.agent_cli}, default=${cfg.defaultAgentCli ?? '<unset>'})`,
+        },
+      }),
+    );
+    return;
+  }
+
+  const providerCtx = buildProviderCtx(ws, cfg);
+  const spawnEnv: Record<string, string> = {
+    CLAWDEVBOX_PROJECT_DIR: workspacePath,
+    CLAWDEVBOX_RECIPE_INSTANCE_ID: newInstanceId,
+    CLAWDEVBOX_WORKSPACE_ID: source.workspace_id,
+    CLAWDEVBOX_WORKSPACES_ROOT: cfg.workspacesRoot,
+    CLAWDEVBOX_SESSION_ID: sessionId,
+  };
+
+  let pid: number | undefined;
+  try {
+    const handle = await provider.spawnSession(providerCtx, {
+      mode: 'interactive',
+      // Pick the right init shape:
+      //   - hasPriorSession → real resume of the prior session
+      //   - !hasPriorSession → fresh new session in the recipe's
+      //     workspace (the CLI starts in that dir so files / context
+      //     are already loaded)
+      init: hasPriorSession
+        ? { kind: 'resume', session_id: sessionId }
+        : { kind: 'new', session_id: sessionId },
+      role: 'recipe-instance',
+      prompt,
+      workspaceInfo: { id: source.workspace_id, path: workspacePath },
+      ambientEnv: spawnEnv,
+      mcp: {
+        url: `http://${cfg.http.host}:${cfg.http.port}/mcp`,
+        secret: cfg.http.token ?? '',
+        workspaceId: source.workspace_id,
+        recipeInstanceId: newInstanceId,
+        projectDir: workspacePath,
+        sessionId,
+      },
+      recipeInstanceId: newInstanceId,
+      agentSessionId: sessionId,
+      ptyCols: 120,
+      ptyRows: 30,
+    });
+    pid = handle.pid ?? undefined;
+
+    // Tmux-backed providers (copilot, claude) set handle.session, not handle.pty.
+    // Register with tmuxSessionRegistry for WS attachment, and skip pty-registry.
+    if (handle.session) {
+      tmuxSessionRegistry.register(newInstanceId, handle.session);
+      // Log to disk via snapshot polling (tmux sessions don't expose raw pty stream)
+      handle.exited.then(({ exitCode }) => {
+        const current = readRecipeInstance(workspacePath, newInstanceId);
+        if (current && current.status === 'running') {
+          const ok = exitCode === 0;
+          writeRecipeInstance(workspacePath, {
+            ...current,
+            status: ok ? 'success' : 'failure',
+            completed_at: Date.now(),
+            message: `agent exited with code ${exitCode}${ok ? '' : ' (no recipe.done call)'}`,
+          });
+        }
+      }).catch(() => {});
+    } else if (handle.pty) {
+      registerPty({
+        instanceId: newInstanceId,
+        workspaceId: source.workspace_id,
+        cols: 120,
+        rows: 30,
+        ipty: handle.pty,
+      });
+      // Persist a copy of the pty stream to disk for post-mortem inspection.
+      const logPath = join(
+        workspacePath,
+        '.clawdevbox',
+        'recipe-instances',
+        newInstanceId + '.log',
+      );
+      const logStream = (await import('node:fs')).createWriteStream(logPath, { flags: 'a' });
+      handle.pty.onData((data) => { logStream.write(data); });
+      handle.pty.onExit(({ exitCode }) => {
+        try { logStream.end(); } catch { /* ignore */ }
+        const current = readRecipeInstance(workspacePath, newInstanceId);
+        if (current && current.status === 'running') {
+          const ok = exitCode === 0;
+          writeRecipeInstance(workspacePath, {
+            ...current,
+            status: ok ? 'success' : 'failure',
+            completed_at: Date.now(),
+            message: `agent exited with code ${exitCode}${ok ? '' : ' (no recipe.done call)'}`,
+          });
+        }
+      });
+    }
+    // Re-read before merging pid to avoid clobbering a fast-completing
+    // agent (echo-stub) that already wrote status=success.
+    const cur = readRecipeInstance(workspacePath, newInstanceId);
+    if (cur) writeRecipeInstance(workspacePath, { ...cur, pid: pid ?? null });
+    else writeRecipeInstance(workspacePath, { ...instance, pid: pid ?? null });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    writeRecipeInstance(workspacePath, {
+      ...instance,
+      status: 'failure',
+      completed_at: Date.now(),
+      message: `spawn failed: ${msg}`,
+    });
+    res.writeHead(500, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: msg }));
+    return;
+  }
+
+  res.writeHead(200, { 'content-type': 'application/json' });
+  res.end(JSON.stringify({
+    new_recipe_instance_id: newInstanceId,
+    session_id: sessionId,
+    resume_of: recipeInstanceId,
+    pid: pid ?? null,
+    agent_cli: agentCli,
+  }));
+}
+
+/**
+ * Build a per-request lookup index covering every registered workspace
+ * + the project dir. Resolves attachment / recipe-instance references
+ * without making each lookup re-traverse the filesystem.
+ */
+interface ResolutionIndex {
+  /** workspace_id → workspace path (also includes the project dir as 'project'). */
+  workspacePaths: Map<string, string>;
+  /** artifact_id → first workspace_id that holds it (or null if missing). */
+  artifactWorkspaceById: Map<string, { workspaceId: string; type: string; title: string } | null>;
+  /** recipe_instance_id → workspace_id holding it. */
+  recipeInstanceWorkspaceById: Map<string, string | null>;
+}
+
+/**
+ * Build a lookup index for the specific artifact IDs and recipe instance IDs
+ * referenced in the given inbox items. Uses targeted DB queries (2 queries max)
+ * instead of scanning all registered workspaces.
+ */
+function buildResolutionIndex(items: ReturnType<typeof inbox.list>): ResolutionIndex {
+  const workspacePaths = new Map<string, string>();
+  const artifactWorkspaceById = new Map<
+    string,
+    { workspaceId: string; type: string; title: string } | null
+  >();
+  const recipeInstanceWorkspaceById = new Map<string, string | null>();
+
+  if (items.length === 0) {
+    return { workspacePaths, artifactWorkspaceById, recipeInstanceWorkspaceById };
+  }
+
+  // Collect only the IDs that are actually referenced.
+  const artifactIds: string[] = [];
+  const recipeInstanceIds: string[] = [];
+  for (const item of items) {
+    const attachments = Array.isArray(item.attachments)
+      ? (item.attachments as Array<{ artifact_id?: string }>)
+      : [];
+    for (const a of attachments) {
+      if (typeof a.artifact_id === 'string' && a.artifact_id) {
+        artifactIds.push(a.artifact_id);
+      }
+    }
+    // Reply attachments — agents can attach artifacts on follow-up replies.
+    const replies = Array.isArray(item.replies)
+      ? (item.replies as Array<{ attachments?: Array<{ artifact_id?: string }> }>)
+      : [];
+    for (const r of replies) {
+      const repAtts = Array.isArray(r.attachments) ? r.attachments : [];
+      for (const a of repAtts) {
+        if (typeof a.artifact_id === 'string' && a.artifact_id) {
+          artifactIds.push(a.artifact_id);
+        }
+      }
+    }
+    const ri = item.recipe_instance as { id: string } | null | undefined;
+    if (ri && typeof ri.id === 'string' && ri.id) {
+      recipeInstanceIds.push(ri.id);
+    }
+  }
+
+  let db;
+  try { db = getDatabase(); } catch { /* DB not open yet */ }
+  if (!db) return { workspacePaths, artifactWorkspaceById, recipeInstanceWorkspaceById };
+
+  if (artifactIds.length > 0) {
+    const ph = artifactIds.map(() => '?').join(',');
+    const rows = db
+      .prepare(`SELECT id, workspace_id, type, COALESCE(title, '') AS title FROM artifacts WHERE id IN (${ph})`)
+      .all(...artifactIds) as Array<{ id: string; workspace_id: string; type: string; title: string }>;
+    for (const row of rows) {
+      artifactWorkspaceById.set(row.id, {
+        workspaceId: row.workspace_id,
+        type: row.type,
+        title: row.title,
+      });
+    }
+  }
+
+  if (recipeInstanceIds.length > 0) {
+    const ph = recipeInstanceIds.map(() => '?').join(',');
+    const rows = db
+      .prepare(`SELECT id, workspace_id FROM recipe_instances WHERE id IN (${ph})`)
+      .all(...recipeInstanceIds) as Array<{ id: string; workspace_id: string }>;
+    for (const row of rows) {
+      recipeInstanceWorkspaceById.set(row.id, row.workspace_id);
+    }
+  }
+
+  return { workspacePaths, artifactWorkspaceById, recipeInstanceWorkspaceById };
+}
+
+interface EnrichedAttachment {
+  artifact_id: string;
+  workspace_id: string | null;
+  title: string | null;
+  type: string | null;
+  /** `/artifact/<id>` if found; null otherwise. */
+  view_url: string | null;
+  resolved: boolean;
+}
+
+interface EnrichedRecipeRef {
+  id: string;
+  workspace_id: string | null;
+  resolved: boolean;
+}
+
+/**
+ * Add transient `view_url` + `resolved` fields to each item's
+ * attachments and recipe_instance link. Uses targeted DB queries
+ * to resolve only the IDs referenced in these items.
+ */
+function enrichInboxItemsForList(
+  items: ReturnType<typeof inbox.list>,
+) {
+  if (items.length === 0) return [];
+  const idx = buildResolutionIndex(items);
+
+  return items.map((it) => {
+    const enrichAtt = (a: {
+      artifact_id: string;
+      workspace_id?: string;
+      title?: string;
+      type?: string;
+    }): EnrichedAttachment => {
+      const hit = idx.artifactWorkspaceById.get(a.artifact_id) ?? null;
+      const wsId = a.workspace_id ?? hit?.workspaceId ?? null;
+      return {
+        artifact_id: a.artifact_id,
+        workspace_id: wsId,
+        title: a.title ?? hit?.title ?? null,
+        type: a.type ?? hit?.type ?? null,
+        view_url: hit ? `/artifact/${encodeURIComponent(a.artifact_id)}` : null,
+        resolved: !!hit,
+      };
+    };
+
+    const attachments = Array.isArray(it.attachments) ? (it.attachments as Array<{
+      artifact_id: string;
+      workspace_id?: string;
+      title?: string;
+      type?: string;
+    }>) : [];
+    const enrichedAttachments: EnrichedAttachment[] = attachments.map(enrichAtt);
+
+    let recipeInstance: EnrichedRecipeRef | null = null;
+    const ri = it.recipe_instance as { id: string; workspace_id?: string } | null | undefined;
+    if (ri && typeof ri.id === 'string') {
+      const hitWs = idx.recipeInstanceWorkspaceById.get(ri.id) ?? null;
+      recipeInstance = {
+        id: ri.id,
+        workspace_id: ri.workspace_id ?? hitWs ?? null,
+        resolved: !!hitWs,
+      };
+    }
+
+    // Pass replies through; if any reply carries attachments, enrich those
+    // too so the SPA gets the same `view_url` / `resolved` hints as the
+    // item-level attachments.
+    const replies = Array.isArray(it.replies)
+      ? (it.replies as unknown as Array<Record<string, unknown> & { attachments?: Array<{
+          artifact_id: string;
+          workspace_id?: string;
+          title?: string;
+          type?: string;
+        }> }>)
+      : undefined;
+    const enrichedReplies = replies?.map((r) => {
+      const atts = Array.isArray(r.attachments) ? r.attachments.map(enrichAtt) : undefined;
+      return atts ? { ...r, attachments: atts } : r;
+    });
+
+    return {
+      ...it,
+      attachments: enrichedAttachments,
+      recipe_instance: recipeInstance,
+      ...(enrichedReplies ? { replies: enrichedReplies } : {}),
+    };
+  });
+}
+
+/** Sort priority — running first, then by completed-most-recent. */
+function recipeSortRank(status: string): number {
+  switch (status) {
+    case 'running':
+      return 0;
+    case 'success':
+      return 1;
+    case 'failure':
+      return 2;
+    case 'cancelled':
+      return 3;
+    default:
+      return 9;
+  }
+}
+
+/**
+ * SSE handler. Emits a `change` event whenever something the home page
+ * cares about mutates — inbox / recipes / agent / tunnel. The browser
+ * re-fetches the relevant API endpoint; the bus doesn't ship payloads, so
+ * stale state isn't possible.
+ *
+ * Also sends a heartbeat comment every 25s so proxies that idle out long
+ * connections (devtunnel, browser, corporate) keep the stream alive.
+ */
+function handleSse(req: IncomingMessage, res: ServerResponse): void {
+  res.writeHead(200, {
+    'content-type': 'text/event-stream; charset=utf-8',
+    'cache-control': 'no-cache, no-transform',
+    connection: 'keep-alive',
+    // Disable buffering through nginx-style proxies and devtunnel.
+    'x-accel-buffering': 'no',
+  });
+  // Push an opener so the client knows the connection is live and can
+  // do an initial reconcile.
+  res.write(`retry: 5000\n\n`);
+  res.write(`event: hello\ndata: {}\n\n`);
+
+  // SSE write backpressure guard. If the client connection is half-open
+  // (TCP didn't notice the peer is gone, or a proxy is buffering), naïve
+  // res.write() returns true but the data piles up in Node's send buffer
+  // indefinitely. Over hours of background `change` events from the
+  // event bus this can balloon into hundreds of MB per dead-but-not-
+  // closed connection.
+  //
+  // Fix: when res.write() returns false (buffer above highWaterMark),
+  // pause emitting until 'drain' fires. If 'drain' doesn't come within
+  // a short timeout, treat the client as dead and tear the connection
+  // down so cleanup() runs and the change-bus listener is unsubscribed.
+  const DRAIN_TIMEOUT_MS = 30_000;
+  let drainTimer: NodeJS.Timeout | null = null;
+  let waitingForDrain = false;
+  const safeWrite = (chunk: string): boolean => {
+    if (waitingForDrain) {
+      // Already backpressured — drop the chunk. This is the SSE
+      // contract: clients are responsible for reconnecting and
+      // doing a full re-sync via /api/* after the gap.
+      return false;
+    }
+    let ok = false;
+    try { ok = res.write(chunk); } catch { return false; }
+    if (!ok) {
+      waitingForDrain = true;
+      drainTimer = setTimeout(() => {
+        // Client hasn't drained in 30s — assume dead, force-close so
+        // cleanup() runs. This is the only way to release the backed-up
+        // buffer.
+        try { res.destroy(); } catch { /* already closed */ }
+      }, DRAIN_TIMEOUT_MS);
+      if (drainTimer.unref) drainTimer.unref();
+      res.once('drain', () => {
+        waitingForDrain = false;
+        if (drainTimer) { clearTimeout(drainTimer); drainTimer = null; }
+      });
+    }
+    return ok;
+  };
+
+  const sendChange = (topic: string) => {
+    safeWrite(`event: change\ndata: ${JSON.stringify({ topic })}\n\n`);
+  };
+  const unsubscribe = onChange(sendChange);
+
+  const heartbeat = setInterval(() => {
+    safeWrite(`: ping ${Date.now()}\n\n`);
+  }, 25_000);
+  // Don't keep the event loop alive for the heartbeat.
+  if (typeof heartbeat.unref === 'function') heartbeat.unref();
+
+  const cleanup = () => {
+    clearInterval(heartbeat);
+    if (drainTimer) { clearTimeout(drainTimer); drainTimer = null; }
+    unsubscribe();
+  };
+  req.on('close', cleanup);
+  req.on('error', cleanup);
+  res.on('close', cleanup);
+}
+
+/**
+ * Wrap `server.listen(port, host)` so a second `clawdevbox start` against
+ * the same port either:
+ *   - returns `'already-running'`  if the existing listener responds to
+ *                                  `GET /api/cron/status` with the expected
+ *                                  token AND a body shaped like our own
+ *                                  status payload, OR
+ *   - returns `'conflict'`         if EADDRINUSE but the probe doesn't
+ *                                  confirm a clawdevbox instance.
+ * The plain success case returns `'listening'`.
+ *
+ * Exported so `tests/mcp-bootstrap.test.mjs` can exercise it without
+ * needing a full `runStart` boot.
+ */
+export async function listenOrConfirmExisting(
+  server: import('node:http').Server,
+  host: string,
+  port: number,
+  token: string | null,
+): Promise<'listening' | 'already-running' | 'conflict'> {
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const onError = (err: unknown) => reject(err);
+      server.once('error', onError);
+      server.listen(port, host, () => {
+        server.off('error', onError);
+        resolve();
+      });
+    });
+    return 'listening';
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== 'EADDRINUSE') throw err;
+    // Probe to see if it's our own service. When no token is configured the
+    // running instance also has no auth, so we omit Authorization here.
+    let probe: Response | null = null;
+    try {
+      const headers: Record<string, string> = {};
+      if (token) headers.authorization = `Bearer ${token}`;
+      probe = await fetch(`http://${host}:${port}/api/cron/status`, {
+        headers,
+        signal: AbortSignal.timeout(2000),
+      });
+    } catch {
+      return 'conflict';
+    }
+    if (!probe || !probe.ok) return 'conflict';
+    let body: unknown = null;
+    try {
+      body = await probe.json();
+    } catch {
+      return 'conflict';
+    }
+    const b = body as { db?: unknown; scheduler?: unknown; dispatcher?: unknown } | null;
+    if (b && b.db && b.scheduler && b.dispatcher) return 'already-running';
+    return 'conflict';
+  }
+}
+
+
+/**
+ * Spawn the foreground `clawdevbox start` as a detached background process,
+ * register the OS auto-start entry so it relaunches at login, and record
+ * the PID + port in `<globalDir>/service.json`.
+ *
+ * The detached child is launched with the same Node binary that ran us
+ * (`process.execPath`) and the entry script `process.argv[1]`. That keeps
+ * the install resilient to PATH changes — `clawdevbox stop` and the OS
+ * auto-start command reference absolute paths, not bare `clawdevbox`.
+ *
+ * Idempotent: if a previous install is still running, refuses to spawn a
+ * second instance and reports the existing PID. Re-exported for
+ * `cli/restart.ts` which composes stopService + installAsService.
+ */
+export async function installAsService(cfg: ResolvedConfig, flags: Flags): Promise<void> {
+  const existing = readServiceState(cfg.globalDir);
+  if (existing && isProcessAlive(existing.pid)) {
+    logger.info(
+      {
+        pid: existing.pid,
+        port: existing.port,
+        started_at: new Date(existing.started_at).toISOString(),
+      },
+      'service is already running — run `clawdevbox stop` first to relaunch',
+    );
+    process.stdout.write(
+      `Service already running (pid ${existing.pid}, port ${existing.port ?? '?'}).\n` +
+        `Run \`clawdevbox stop\` first if you want to relaunch.\n`,
+    );
+    return;
+  }
+
+  const { execPath, execArgs } = resolveExecForService();
+  // The detached child runs `start` (no `--service` recursion). We forward
+  // --project / --global / --port / --host / --token so the child sees the
+  // same effective config the user kicked us off with.
+  const childArgs = [...execArgs, 'start'];
+  const forward = (k: string) => {
+    const v = flags[k];
+    if (typeof v === 'string') childArgs.push(`--${k}`, v);
+  };
+  forward('project');
+  forward('global');
+  forward('workspaces-root');
+  forward('port');
+  forward('host');
+  forward('token');
+
+  const { pid, logPath } = spawnDetached(execPath, childArgs, {
+    logDir: cfg.globalDir,
+  });
+
+  const state: ServiceState = {
+    pid,
+    port: cfg.http.port,
+    started_at: Date.now(),
+    version: readOwnVersion(),
+    exec_path: execPath,
+    exec_args: childArgs,
+  };
+  writeServiceState(cfg.globalDir, state);
+
+  // Health-probe the child so we don't claim success against a process
+  // that crashed during startup (port-in-use, bad token, plugin import
+  // failure, ...). On failure we surface the error AND clean up state so
+  // a follow-up `clawdevbox stop` doesn't think a service is running.
+  // We give cold starts a generous 30s — workspaces with many plugins
+  // (each importing zod / heavy deps) can legitimately take 5–10s to bind.
+  const probe = await probeHealth({
+    host: cfg.http.host,
+    port: cfg.http.port,
+    timeoutMs: 30000,
+  });
+  if (!probe.ok) {
+    logger.error(
+      { reason: probe.reason, pid, port: cfg.http.port, logPath },
+      'detached server did not become healthy — rolling back state',
+    );
+    // Tear down whatever we just spawned + clear state. Auto-start has
+    // not been registered yet at this point.
+    try {
+      if (isProcessAlive(pid)) {
+        if (process.platform === 'win32') {
+          // Last-chance taskkill — server might have bound the port but
+          // hung on init; we don't want a zombie listening on the user's
+          // chosen port.
+          const { spawnSync: sp } = await import('node:child_process');
+          sp('taskkill', ['/PID', String(pid), '/T', '/F'], {
+            stdio: 'ignore',
+            encoding: 'utf8',
+          });
+        } else {
+          process.kill(pid, 'SIGTERM');
+        }
+      }
+    } catch {
+      /* best-effort */
+    }
+    const { clearServiceState } = await import('../service.ts');
+    clearServiceState(cfg.globalDir);
+    const tailHint = logPath
+      ? ` Last lines of ${logPath}:\n${tailFile(logPath, 30)}\n`
+      : '';
+    process.stdout.write(
+      `Service spawn failed: ${probe.reason}\n` +
+        (logPath ? `Full child log: ${logPath}\n` : '') +
+        tailHint +
+        `Run \`clawdevbox start\` in the foreground to see the underlying error.\n`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+
+  // Register OS auto-start. The same execPath + childArgs are used so the
+  // login launch behaves identically to `clawdevbox start`.
+  let autoStartInfo: { installed: boolean; path: string; platform: string } | null = null;
+  let autoStartError: string | null = null;
+  try {
+    autoStartInfo = installAutoStart({ execPath, args: childArgs });
+  } catch (err) {
+    autoStartError = err instanceof Error ? err.message : String(err);
+    logger.warn(
+      { err: autoStartError },
+      'auto-start registration failed — service will run for this login session only',
+    );
+  }
+
+  const lines = [
+    `Service installed.`,
+    `  pid:        ${pid}`,
+    `  port:       ${cfg.http.port}`,
+    `  health:     http://${cfg.http.host}:${cfg.http.port}/healthz  (verified)`,
+    `  state file: ${join(cfg.globalDir, 'service.json')}`,
+  ];
+  if (logPath) {
+    lines.push(`  log file:   ${logPath}`);
+  }
+  if (autoStartInfo) {
+    lines.push(`  auto-start: ${autoStartInfo.platform} (${autoStartInfo.path})`);
+  } else if (autoStartError) {
+    lines.push(`  auto-start: FAILED — ${autoStartError}`);
+  }
+  lines.push(``, `Stop with: clawdevbox stop  (or: npx clawdevbox stop)`);
+  process.stdout.write(lines.join('\n') + '\n');
+
+  // If a devtunnel is configured, poll the running service for the public
+  // URL and print URL + QR. Best-effort — failures don't unwind the
+  // already-installed service.
+  if (cfg.tunnel.kind === 'devtunnel' && cfg.http.token) {
+    const tunnel = await fetchTunnelStatus({
+      host: cfg.http.host,
+      port: cfg.http.port,
+      token: cfg.http.token,
+      timeoutMs: 30000,
+      waitForUrl: true,
+    });
+    if (tunnel?.url) {
+      const { renderTunnelInfo } = await import('./tunnel-display.ts');
+      renderTunnelInfo({
+        url: tunnel.url,
+        token: cfg.http.token,
+        inspectUrl: tunnel.inspect_url ?? null,
+      });
+    } else if (tunnel?.error) {
+      process.stdout.write(`\nTunnel:     ${tunnel.error}\n`);
+    } else {
+      process.stdout.write(
+        `\nTunnel:     URL not yet available — run \`clawdevbox status\` in a few seconds.\n`,
+      );
+    }
+  }
+}
+
+/**
+ * Best-effort resolution of how to re-launch this CLI in a detached child.
+ * Returns the Node binary + script path so OS auto-start entries reference
+ * absolute paths.
+ */
+function resolveExecForService(): { execPath: string; execArgs: string[] } {
+  // The Node process running us provides both halves.
+  const execPath = process.execPath;
+  // Prefer argv[1] when it points at a readable file — that's the CLI
+  // entry. When running under `node --import tsx`, argv[1] is still the
+  // source `.ts` file, which tsx can re-load. When running the published
+  // `clawdevbox` shim, argv[1] is the .js entry. Either way it's the right
+  // thing to pass.
+  const here = dirname(fileURLToPath(import.meta.url));
+  const candidates = [
+    process.argv[1],
+    resolve(here, '..', '..', 'dist', 'cli.js'),
+    resolve(here, '..', 'cli.js'),
+  ].filter((p): p is string => typeof p === 'string' && p.length > 0);
+  for (const c of candidates) {
+    if (existsSync(c)) return { execPath, execArgs: [c] };
+  }
+  // Fall back to the first candidate even if it doesn't exist — the user
+  // sees a clearer "ENOENT" from spawn than from us guessing.
+  return { execPath, execArgs: [candidates[0] ?? ''] };
+}
+
+/** Read this package's version (for `service.json` and `status` output). */
+function readOwnVersion(): string {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const candidates = [
+    resolve(here, '..', '..', 'package.json'),
+    resolve(here, '..', 'package.json'),
+  ];
+  for (const c of candidates) {
+    try {
+      if (existsSync(c)) {
+        const parsed = JSON.parse(readFileSync(c, 'utf8')) as { version?: string };
+        if (parsed.version) return parsed.version;
+      }
+    } catch {
+      /* try next */
+    }
+  }
+  return '0.0.0';
+}
+
+/** Last N lines of a file (best-effort, returns '' on any error). */
+function tailFile(path: string, lines: number): string {
+  try {
+    const raw = readFileSync(path, 'utf8');
+    const all = raw.split(/\r?\n/);
+    const tail = all.slice(-Math.max(1, lines));
+    return tail.map((l) => `  | ${l}`).join('\n');
+  } catch {
+    return '';
+  }
+}
+
+

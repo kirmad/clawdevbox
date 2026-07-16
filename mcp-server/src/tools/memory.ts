@@ -1,0 +1,1976 @@
+/**
+ * tools/memory.ts
+ *
+ * MCP tools for the memory subsystem:
+ *
+ *   Writes (Phase 1):
+ *     - add_fact, add_lesson, add_session_summary, add_wiki_page
+ *   Reads  (Phase 2):
+ *     - get_fact, memory_status
+ *   qmd-backed (Phase 3):
+ *     - memory_init, search_memory, get_wiki_index
+ *   Voting (Phase 4):
+ *     - vote_fact, vote_lesson, vote_wiki
+ *   Lesson dedup (Phase 4):
+ *     - add_lesson auto-strengthens existing duplicate via exact-content
+ *       match (lex mode) or qmd vector similarity (hybrid mode)
+ *   Wiki updates (Phase 7):
+ *     - update_wiki with replace_section/append/prepend/find_replace/
+ *       full_replace operations
+ *
+ * Each handler is exported as a pure function (testable in isolation)
+ * with its own `ToolCtx` argument so tests can stub the vault chain,
+ * identity, and `now` without needing a real Workspace.
+ */
+
+import { fileURLToPath } from 'node:url';
+import { randomUUID } from 'node:crypto';
+import {
+  existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, statSync,
+} from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { dirname, join, relative, sep } from 'node:path';
+import { z } from 'zod';
+import { defineTool } from './registry.ts';
+import type { Workspace } from '../workspace.ts';
+import { resolveConfig } from '../config.ts';
+import {
+  loadVaultChain, type VaultInfo,
+  loadMemoryConfig, resolveIdentity, type Identity, type MemoryConfig,
+  DEFAULT_MEMORY_CONFIG,
+} from './memory-config.ts';
+import {
+  buildFilename, resolveVault, vaultPathFor, eventsPathFor, vaultMemoryRoot, MEMORY_ROOT_DIR,
+  withCollisionSuffix, type MemoryType, type Scope, typeFolder,
+} from './memory-paths.ts';
+import { withVaultLock } from './memory-vault-lock.ts';
+import {
+  buildFrontmatter, splitFrontmatterAndBody,
+  type AnyFrontmatter, type MemoryFrontmatter, type LessonFrontmatter,
+  type SessionFrontmatter, type WikiFrontmatter,
+} from './memory-frontmatter.ts';
+import { appendEvent, readEvents, foldEvents, decayConfidence } from './memory-events.ts';
+import {
+  commitInline, getRepoState, syncRepo, abortRebase, tryPush, type SyncOutcome,
+} from './memory-git.ts';
+import {
+  attemptAutoResolve, type SpawnAgentFn, type AutoResolveResult,
+} from './memory-autoresolve.ts';
+import {
+  getStore, registerVaultCollections, registerProjectContexts,
+  scheduleReindex, flushReindex, searchAcrossCollections,
+  decomposeDisplayPath, type QmdSearchHit,
+} from './memory-qmd.ts';
+
+// ---------------------------------------------------------------------------
+// ToolCtx — pure-function handlers consume this; the MCP registration layer
+// builds a real ctx from the workspace; tests build a stub.
+// ---------------------------------------------------------------------------
+
+export interface ToolCtx {
+  chain: VaultInfo[];
+  identity: Identity;
+  config: MemoryConfig;
+  now: () => Date;
+  /** Phase 8 — injected so handlers can spawn a sub-agent for conflict
+   *  auto-resolution. Tests pass a stub; production wires to session.send. */
+  spawnAgent?: SpawnAgentFn;
+  /** Optional inbox hook (best-effort). Tests pass a stub. */
+  inbox?: (entry: { severity: 'info' | 'warning'; title: string; hint: string }) => Promise<void> | void;
+}
+
+// ---------------------------------------------------------------------------
+// Shared write path
+// ---------------------------------------------------------------------------
+
+interface WriteRequest {
+  type: MemoryType;
+  scope: Scope;
+  vault_id?: string;
+  title: string;
+  body: string;
+  /** Build frontmatter from common fields + provided type-specific fields. */
+  buildExtras: (common: {
+    id: string; title: string; created: string; created_by: string;
+    scope: Scope; vault_id: string; tags: string[];
+  }) => AnyFrontmatter;
+  tags: string[];
+  /** Optional: passed to `created` event (lesson uses initial_confidence). */
+  extraCreatedFields?: Record<string, unknown>;
+  /** Wiki only — the explicit relative path the agent provided. */
+  wikiPath?: string;
+}
+
+interface WriteResult {
+  slug: string;
+  path: string;
+  vault_id: string;
+  action: 'created';
+}
+
+async function writeNewDoc(ctx: ToolCtx, req: WriteRequest): Promise<WriteResult> {
+  const vault = resolveVault(ctx.chain, req.scope, req.vault_id);
+  const now = ctx.now();
+  const filename = buildFilename(req.type, req.wikiPath ?? req.title, now);
+
+  return withVaultLock(vault.id, async () => {
+    // Collision handling: append -2, -3 if the file already exists.
+    let finalFilename = filename;
+    for (let attempt = 0; attempt < 50; attempt++) {
+      const candidate = withCollisionSuffix(filename, attempt);
+      const candidatePath = vaultPathFor(vault, req.type, candidate);
+      if (!existsSync(candidatePath)) {
+        finalFilename = candidate;
+        break;
+      }
+      if (req.type === 'wiki') {
+        // Wiki paths are hand-curated; collision = explicit error rather than suffix.
+        throw new Error(`wiki page already exists: wiki/${candidate}`);
+      }
+      if (attempt === 49) {
+        throw new Error(`too many filename collisions for ${candidate}`);
+      }
+    }
+
+    const filePath = vaultPathFor(vault, req.type, finalFilename);
+    const eventsPath = eventsPathFor(vault, req.type, finalFilename);
+    mkdirSync(dirname(filePath), { recursive: true });
+
+    const id = randomUUID();
+    const created = now.toISOString();
+    const fm = req.buildExtras({
+      id, title: req.title, created, created_by: ctx.identity.email,
+      scope: req.scope, vault_id: vault.id, tags: req.tags,
+    });
+
+    const yaml = buildFrontmatter(fm);
+    const body = req.body.endsWith('\n') ? req.body : req.body + '\n';
+    writeFileSync(filePath, `${yaml}\n${body}`, 'utf8');
+
+    appendEvent(eventsPath, {
+      ts: created,
+      actor: ctx.identity.email,
+      type: 'created',
+      ...(req.extraCreatedFields ?? {}),
+    });
+
+    const relFile = relative(vault.path, filePath).split(sep).join('/');
+    const relEvents = relative(vault.path, eventsPath).split(sep).join('/');
+    commitInline(vault.path, [relFile, relEvents], `${req.type}: ${req.title}`);
+
+    // Best-effort: schedule a reindex on this vault's qmd collection.
+    // Failure here is non-fatal — the file is already committed.
+    try {
+      const store = await getStore(ctx.config);
+      scheduleReindex(store, vault.id, ctx.config);
+    } catch {
+      // qmd not initialized yet; memory_init will pick this up on next run
+    }
+
+    return {
+      slug: finalFilename,
+      path: relFile,
+      vault_id: vault.id,
+      action: 'created',
+    };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// add_fact
+// ---------------------------------------------------------------------------
+
+const addFactSchema = z.object({
+  content: z.string().min(1),
+  scope: z.enum(['personal', 'team']),
+  citations: z.string().min(1),
+  reason: z.string().min(1),
+  vault_id: z.string().optional(),
+  category: z.enum(['pattern', 'preference', 'architecture', 'bug', 'workflow', 'fact']).optional(),
+  concepts: z.array(z.string()).optional(),
+  title: z.string().optional(),
+});
+
+export type AddFactArgs = z.infer<typeof addFactSchema>;
+
+export async function handleAddFact(ctx: ToolCtx, args: AddFactArgs): Promise<WriteResult> {
+  const title = args.title ?? deriveTitle(args.content);
+  return writeNewDoc(ctx, {
+    type: 'fact',
+    scope: args.scope,
+    vault_id: args.vault_id,
+    title,
+    body: args.content,
+    tags: args.concepts ?? [],
+    buildExtras: (c) => ({
+      ...c,
+      type: 'fact',
+      category: args.category,
+      citations: args.citations,
+      reason: args.reason,
+    } as MemoryFrontmatter),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// add_lesson — with Phase 4 auto-strengthen-on-duplicate
+// ---------------------------------------------------------------------------
+
+const addLessonSchema = z.object({
+  content: z.string().min(1),
+  scope: z.enum(['personal', 'team']),
+  vault_id: z.string().optional(),
+  context: z.string().optional(),
+  confidence: z.number().min(0).max(1).optional(),
+  tags: z.array(z.string()).optional(),
+  title: z.string().optional(),
+});
+
+export type AddLessonArgs = z.infer<typeof addLessonSchema>;
+
+export interface AddLessonResult {
+  vault_id: string;
+  path: string;
+  slug: string;
+  action: 'created' | 'reinforced';
+  similarity?: number;     // when action='reinforced'
+  target?: string;         // existing slug when action='reinforced'
+}
+
+export async function handleAddLesson(
+  ctx: ToolCtx,
+  args: AddLessonArgs,
+): Promise<AddLessonResult> {
+  const vault = resolveVault(ctx.chain, args.scope, args.vault_id);
+
+  // Phase 4: check for duplicate first.
+  const dup = await findDuplicateLesson(ctx, vault, args.content);
+  if (dup) {
+    return withVaultLock(vault.id, async () => {
+      // Append a `reinforced` event to the existing lesson.
+      // dup.vaultRelPath is vault-relative ("memories/lessons/<file>.md");
+      // strip the memories/ prefix before extracting the rest-after-type.
+      const segments = stripMemoryRootPrefix(dup.vaultRelPath).split('/').filter(Boolean);
+      const restAfterType = segments.slice(1).join('/');
+      const eventsPath = eventsPathFor(vault, 'lesson', restAfterType);
+      appendEvent(eventsPath, {
+        ts: ctx.now().toISOString(),
+        actor: ctx.identity.email,
+        type: 'reinforced',
+        source_content: args.content,
+        confidence_delta: 0.1,
+      });
+      const relEvents = relative(vault.path, eventsPath).split(sep).join('/');
+      commitInline(vault.path, [relEvents], `lesson: reinforced ${dup.vaultRelPath}`);
+      return {
+        vault_id: vault.id,
+        path: dup.vaultRelPath,
+        slug: restAfterType,
+        action: 'reinforced',
+        similarity: dup.similarity,
+        target: dup.vaultRelPath,
+      };
+    });
+  }
+
+  // No duplicate — create new lesson.
+  const title = args.title ?? deriveTitle(args.content);
+  const confidence = args.confidence ?? 0.5;
+  const result = await writeNewDoc(ctx, {
+    type: 'lesson',
+    scope: args.scope,
+    vault_id: args.vault_id,
+    title,
+    body: args.content,
+    tags: args.tags ?? [],
+    extraCreatedFields: { initial_confidence: confidence },
+    buildExtras: (c) => ({
+      ...c,
+      type: 'lesson',
+      context: args.context,
+      initial_confidence: confidence,
+    } as LessonFrontmatter),
+  });
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// add_session_summary
+// ---------------------------------------------------------------------------
+
+const addSessionSummarySchema = z.object({
+  title: z.string().min(1).max(100),
+  narrative: z.string().min(1),
+  scope: z.enum(['personal', 'team']),
+  vault_id: z.string().optional(),
+  decisions: z.array(z.string()).optional(),
+  files: z.array(z.string()).optional(),
+  concepts: z.array(z.string()).optional(),
+  session_id: z.string().optional(),
+});
+
+export type AddSessionSummaryArgs = z.infer<typeof addSessionSummarySchema>;
+
+export async function handleAddSessionSummary(
+  ctx: ToolCtx,
+  args: AddSessionSummaryArgs,
+): Promise<WriteResult> {
+  const body = renderSessionBody(args);
+  return writeNewDoc(ctx, {
+    type: 'session',
+    scope: args.scope,
+    vault_id: args.vault_id,
+    title: args.title,
+    body,
+    tags: args.concepts ?? [],
+    buildExtras: (c) => ({
+      ...c,
+      type: 'session',
+      session_id: args.session_id,
+      decisions: args.decisions,
+      files: args.files,
+    } as SessionFrontmatter),
+  });
+}
+
+function renderSessionBody(args: AddSessionSummaryArgs): string {
+  const sections: string[] = [];
+  sections.push(`# ${args.title}\n`);
+  sections.push(args.narrative.trim() + '\n');
+  if (args.decisions && args.decisions.length) {
+    sections.push('## Decisions\n');
+    sections.push(args.decisions.map((d) => `- ${d}`).join('\n') + '\n');
+  }
+  if (args.files && args.files.length) {
+    sections.push('## Files touched\n');
+    sections.push(args.files.map((f) => `- \`${f}\``).join('\n') + '\n');
+  }
+  return sections.join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// add_wiki_page
+// ---------------------------------------------------------------------------
+
+const addWikiPageSchema = z.object({
+  path: z.string().min(1),
+  content: z.string().min(1),
+  scope: z.enum(['personal', 'team']),
+  vault_id: z.string().optional(),
+  keywords: z.array(z.string()).optional(),
+  title: z.string().optional(),
+});
+
+export type AddWikiPageArgs = z.infer<typeof addWikiPageSchema>;
+
+export async function handleAddWikiPage(
+  ctx: ToolCtx,
+  args: AddWikiPageArgs,
+): Promise<WriteResult> {
+  const title = args.title ?? deriveTitleFromPath(args.path);
+  return writeNewDoc(ctx, {
+    type: 'wiki',
+    scope: args.scope,
+    vault_id: args.vault_id,
+    title,
+    body: args.content,
+    tags: args.keywords ?? [],
+    wikiPath: args.path,
+    buildExtras: (c) => ({ ...c, type: 'wiki' } as WikiFrontmatter),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// get_fact
+// ---------------------------------------------------------------------------
+
+const getFactSchema = z.object({
+  path: z.string().min(1),
+  scope: z.enum(['personal', 'team']).optional(),
+  vault_id: z.string().optional(),
+});
+
+export type GetFactArgs = z.infer<typeof getFactSchema>;
+
+export interface GetFactResult {
+  vault_id: string;
+  path: string;                      // vault-relative
+  type: MemoryType;
+  frontmatter: AnyFrontmatter;
+  body: string;
+  events_summary: ReturnType<typeof foldEvents>;
+}
+
+export async function handleGetFact(
+  ctx: ToolCtx,
+  args: GetFactArgs,
+): Promise<GetFactResult> {
+  const candidates: VaultInfo[] = args.vault_id
+    ? [resolveVault(ctx.chain, args.scope ?? 'personal', args.vault_id)]
+    : args.scope
+      ? ctx.chain.filter((v) => v.kind === args.scope)
+      : [...ctx.chain];
+  if (candidates.length === 0) {
+    throw new Error(`no vaults match the requested scope/vault_id`);
+  }
+
+  const relPath = args.path.endsWith('.md') ? args.path : `${args.path}.md`;
+  let found: { vault: VaultInfo; abs: string } | null = null;
+  // Accept either vault-relative ("memories/<type>/<rest>")
+  // or memory-root-relative ("<type>/<rest>") — try both
+  // in each vault before moving on.
+  for (const v of candidates) {
+    const direct = join(v.path, relPath);
+    if (existsSync(direct)) { found = { vault: v, abs: direct }; break; }
+    const underRoot = join(vaultMemoryRoot(v), relPath);
+    if (existsSync(underRoot)) { found = { vault: v, abs: underRoot }; break; }
+  }
+  if (!found) {
+    const tried = candidates.map((v) => v.id).join(', ');
+    throw new Error(`memory file not found: ${relPath} (searched vaults: ${tried})`);
+  }
+
+  const raw = readFileSync(found.abs, 'utf8');
+  const { frontmatter, body } = splitFrontmatterAndBody(raw);
+  const type = frontmatter.type;
+
+  // Map frontmatter type to its sidecar file.
+  // relPath can be either:
+  //   - vault-relative: "memories/<typeFolder>/<rest>.md" (what add_* returns)
+  //   - memory-root-relative: "<typeFolder>/<rest>.md" (legacy/short form)
+  const segments = stripMemoryRootPrefix(relPath).split('/').filter(Boolean);
+  const eventsPath = eventsPathFor(found.vault, type, segments.slice(1).join('/'));
+  const events = readEvents(eventsPath);
+  const folded = foldEvents(events, {
+    isLesson: type === 'lesson',
+    isWiki: type === 'wiki',
+  });
+
+  return {
+    vault_id: found.vault.id,
+    path: relPath,
+    type,
+    frontmatter,
+    body,
+    events_summary: folded,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// memory_status (config + vault sections; qmd + git populated later)
+// ---------------------------------------------------------------------------
+
+const memoryStatusSchema = z.object({}).strict();
+
+export type MemoryStatusArgs = z.infer<typeof memoryStatusSchema>;
+
+export interface MemoryStatusResult {
+  git: Record<string, unknown>;
+  qmd: {
+    db_path: string;
+    db_size_bytes: number;
+    collections: Array<{ name: string; doc_count: number }>;
+    models_loaded: boolean;
+    last_embed: string | null;
+    last_embed_error: string | null;
+    pending_index_queue: number;
+  };
+  config: {
+    vaults: Array<{ id: string; kind: 'personal' | 'team'; path: string; has_remote: boolean }>;
+    decay: { floor: number; half_life_days: number };
+    duplicate_threshold: number;
+    qmd_search_mode: 'lex' | 'hybrid' | 'vec';
+    auto_resolve_conflicts: 'manual' | 'auto';
+  };
+  identity: { email: string; name: string; source: 'git' | 'os' };
+  warnings: string[];
+}
+
+export async function handleMemoryStatus(
+  ctx: ToolCtx,
+  _args: MemoryStatusArgs,
+): Promise<MemoryStatusResult> {
+  // Per-vault git state (best-effort — missing repos report nothing).
+  const git: Record<string, unknown> = {};
+  for (const vault of ctx.chain) {
+    try {
+      const state = getRepoState(vault.path);
+      git[vault.id] = state;
+    } catch (err) {
+      git[vault.id] = { error: (err as Error).message };
+    }
+  }
+
+  // qmd stats (only when store has been initialized for the configured dbPath).
+  let qmdSection: MemoryStatusResult['qmd'] = {
+    db_path: ctx.config.qmd_db_path,
+    db_size_bytes: 0,
+    collections: [],
+    models_loaded: ctx.config.qmd_search_mode !== 'lex',
+    last_embed: null,
+    last_embed_error: null,
+    pending_index_queue: 0,
+  };
+  try {
+    const store = await getStore(ctx.config);
+    const cols = await store.listCollections();
+    qmdSection = {
+      ...qmdSection,
+      collections: cols.map((c) => ({ name: c.name, doc_count: c.doc_count ?? 0 })),
+    };
+  } catch {
+    // qmd not yet initialized — that's fine.
+  }
+
+  return {
+    git,
+    qmd: qmdSection,
+    config: {
+      vaults: ctx.chain.map((v) => ({
+        id: v.id,
+        kind: v.kind,
+        path: v.path,
+        has_remote: v.remote !== null,
+      })),
+      decay: ctx.config.decay,
+      duplicate_threshold: ctx.config.duplicate_threshold,
+      qmd_search_mode: ctx.config.qmd_search_mode,
+      auto_resolve_conflicts: ctx.config.auto_resolve_conflicts,
+    },
+    identity: ctx.identity,
+    warnings: [],
+  };
+}
+
+// ---------------------------------------------------------------------------
+// memory_sync — manual fetch + pull --rebase + push for each vault
+// ---------------------------------------------------------------------------
+
+const memorySyncSchema = z.object({
+  vault_id: z.string().optional(),
+  scope: z.enum(['personal', 'team', 'all']).optional(),
+}).strict();
+
+export type MemorySyncArgs = z.infer<typeof memorySyncSchema>;
+
+export interface MemorySyncResult {
+  outcomes: Array<{ vault_id: string } & SyncOutcome & {
+    auto_resolve?: AutoResolveResult;
+  }>;
+  any_conflicts: boolean;
+  any_errors: boolean;
+}
+
+export async function handleMemorySync(
+  ctx: ToolCtx,
+  args: MemorySyncArgs,
+): Promise<MemorySyncResult> {
+  const scope = args.scope ?? 'all';
+  const vaults = args.vault_id
+    ? ctx.chain.filter((v) => v.id === args.vault_id)
+    : scope === 'all'
+      ? ctx.chain
+      : ctx.chain.filter((v) => v.kind === scope);
+
+  const outcomes: MemorySyncResult['outcomes'] = [];
+  let anyConflicts = false;
+  let anyErrors = false;
+  for (const vault of vaults) {
+    let outcome = await withVaultLock(vault.id, async () => syncRepo(vault.path));
+    let autoResolve: AutoResolveResult | undefined;
+
+    // Phase 8: if conflict and config opted in, try auto-resolve.
+    if (outcome.conflict && ctx.config.auto_resolve_conflicts === 'auto' && ctx.spawnAgent) {
+      autoResolve = await runAutoResolveForOutcome(ctx, vault, outcome);
+      if (autoResolve.resolved) {
+        // Merge worked — retry the push step.
+        const push = await withVaultLock(vault.id, async () => tryPush(vault.path));
+        outcome = {
+          ...outcome,
+          conflict: false,
+          pulled: true,
+          pushed: push.ok,
+          message: push.ok ? 'auto-resolved + pushed' : `auto-resolved but push failed: ${push.message}`,
+        };
+      } else {
+        // Couldn't resolve — abort the rebase so the working tree returns
+        // to a clean state.
+        await withVaultLock(vault.id, async () => { abortRebase(vault.path); });
+        outcome = { ...outcome, message: `${outcome.message}; auto-resolve declined: ${autoResolve.reason}` };
+      }
+    }
+
+    outcomes.push({ vault_id: vault.id, ...outcome, ...(autoResolve ? { auto_resolve: autoResolve } : {}) });
+    if (outcome.conflict) anyConflicts = true;
+    if (!outcome.conflict && !outcome.pushed && vault.remote !== null) {
+      if (outcome.message !== 'ok' && !outcome.message.startsWith('no remote') && !outcome.message.startsWith('auto-resolved')) {
+        anyErrors = true;
+      }
+    }
+  }
+  return { outcomes, any_conflicts: anyConflicts, any_errors: anyErrors };
+}
+
+async function runAutoResolveForOutcome(
+  ctx: ToolCtx,
+  vault: VaultInfo,
+  outcome: SyncOutcome,
+): Promise<AutoResolveResult> {
+  // syncRepo may have surfaced multiple conflicting paths — try them
+  // one at a time. If any succeed, we count the overall as resolved.
+  const paths = outcome.conflict_paths ?? [];
+  if (paths.length === 0 || !outcome.base_sha || !outcome.our_sha || !outcome.their_sha) {
+    return {
+      attempted: false,
+      resolved: false,
+      reason: 'missing conflict context (paths or SHAs)',
+    };
+  }
+  // Attempt only the first conflicting path for now; a multi-file
+  // auto-resolve loop is future work.
+  return attemptAutoResolve(
+    {
+      vault,
+      conflictPath: paths[0],
+      base_sha: outcome.base_sha,
+      our_sha: outcome.our_sha,
+      their_sha: outcome.their_sha,
+    },
+    {
+      config: ctx.config,
+      spawnAgent: ctx.spawnAgent!,
+      now: ctx.now,
+      inbox: ctx.inbox,
+    },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// memory_init — scaffold folders, register qmd collections + contexts
+// ---------------------------------------------------------------------------
+
+const memoryInitSchema = z.object({}).strict();
+
+export type MemoryInitArgs = z.infer<typeof memoryInitSchema>;
+
+export interface MemoryInitResult {
+  vaults: Array<{
+    id: string;
+    kind: Scope;
+    path: string;
+    has_remote: boolean;
+    skeleton_status: 'ok';
+  }>;
+  qmd_status: {
+    collections: number;
+    indexed_docs: number;
+    models_loaded: boolean;
+  };
+}
+
+const TYPE_FOLDERS_LIST: MemoryType[] = ['fact', 'lesson', 'session', 'wiki'];
+
+export async function handleMemoryInit(
+  ctx: ToolCtx,
+  _args: MemoryInitArgs,
+): Promise<MemoryInitResult> {
+  if (ctx.chain.length === 0) {
+    throw new Error(
+      'No vaults registered. Use clawdevbox vault setup to register at least one vault, ' +
+      'then re-run memory_init. (paths.get inspects the current chain.)',
+    );
+  }
+
+  // Scaffold the <type>/ folders in each vault, INSIDE the
+  // memories/ subroot so the vault root stays clean for other content.
+  for (const vault of ctx.chain) {
+    if (!existsSync(vault.path)) {
+      throw new Error(`vault ${vault.id} path does not exist on disk: ${vault.path}`);
+    }
+    const root = vaultMemoryRoot(vault);
+    mkdirSync(root, { recursive: true });
+    for (const type of TYPE_FOLDERS_LIST) {
+      mkdirSync(join(root, typeFolder(type)), { recursive: true });
+    }
+  }
+
+  // Register qmd collections + per-path contexts + initial index.
+  const store = await getStore(ctx.config);
+  await registerVaultCollections(store, ctx.chain);
+  await registerProjectContexts(store, ctx.chain);
+  await store.update();
+  // Skip embed unless hybrid/vec mode — embed loads GGUF models.
+  if (ctx.config.qmd_search_mode !== 'lex') {
+    try { await store.embed({}); } catch { /* ignore; lex still works */ }
+  }
+
+  const collections = await store.listCollections();
+  const indexedDocs = collections.reduce((acc, c) => acc + (c.doc_count ?? 0), 0);
+
+  return {
+    vaults: ctx.chain.map((v) => ({
+      id: v.id,
+      kind: v.kind,
+      path: v.path,
+      has_remote: v.remote !== null,
+      skeleton_status: 'ok',
+    })),
+    qmd_status: {
+      collections: collections.length,
+      indexed_docs: indexedDocs,
+      models_loaded: ctx.config.qmd_search_mode !== 'lex',
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// search_memory — qmd-backed with confidence-weighted ranking
+// ---------------------------------------------------------------------------
+
+const searchMemorySchema = z.object({
+  query: z.string().min(1),
+  scope: z.enum(['personal', 'team', 'all']).optional(),
+  vault_id: z.string().optional(),
+  types: z.array(z.enum(['fact', 'lesson', 'session', 'wiki'])).optional(),
+  limit: z.number().int().min(1).max(100).optional(),
+  min_score: z.number().min(0).max(1).optional(),
+  mode: z.enum(['hybrid', 'lex', 'vec']).optional(),
+});
+
+export type SearchMemoryArgs = z.infer<typeof searchMemorySchema>;
+
+export interface SearchMemoryHit {
+  path: string;
+  type: MemoryType;
+  scope: Scope;
+  vault_id: string;
+  title: string;
+  snippet: string;
+  score: number;
+  confidence?: number;
+  votes?: { up: number; down: number };
+  last_modified: string;
+}
+
+export interface SearchMemoryResult {
+  results: SearchMemoryHit[];
+  total: number;
+}
+
+export async function handleSearchMemory(
+  ctx: ToolCtx,
+  args: SearchMemoryArgs,
+): Promise<SearchMemoryResult> {
+  const scope = args.scope ?? 'all';
+  const types = args.types ?? ['fact', 'lesson', 'session', 'wiki'];
+  const limit = args.limit ?? 10;
+  const minScore = args.min_score ?? 0;
+  const mode = args.mode ?? ctx.config.qmd_search_mode;
+
+  // Resolve vault ids
+  const vaultsForScope = args.vault_id
+    ? ctx.chain.filter((v) => v.id === args.vault_id)
+    : scope === 'all'
+      ? ctx.chain
+      : ctx.chain.filter((v) => v.kind === scope);
+  if (vaultsForScope.length === 0) {
+    return { results: [], total: 0 };
+  }
+  const vaultById = new Map(vaultsForScope.map((v) => [v.id, v]));
+
+  // Ensure collections are registered (lazy init on first search)
+  const store = await getStore(ctx.config);
+  await registerVaultCollections(store, vaultsForScope);
+
+  const rawHits = await searchAcrossCollections(store, {
+    collections: vaultsForScope.map((v) => v.id),
+    query: args.query,
+    limit: limit * 3,
+    minScore: 0,
+    mode,
+  });
+
+  const now = ctx.now().getTime();
+  const adapted: SearchMemoryHit[] = [];
+
+  for (const hit of rawHits) {
+    const vault = vaultById.get(hit.collectionName);
+    if (!vault) continue;
+    const decomposed = decomposeDisplayPath(hit.displayPath);
+    if (!decomposed) continue;
+    if (!types.includes(decomposed.type)) continue;
+
+    // Load events + frontmatter for ranking & last_modified.
+    // displayPath is collection-relative; the collection is rooted at
+    // <vault>/memories so absolute path lives under vaultMemoryRoot().
+    const absMd = join(vaultMemoryRoot(vault), hit.displayPath);
+    let folded;
+    let lastModified = '';
+    try {
+      lastModified = statSync(absMd).mtime.toISOString();
+    } catch { /* ignore */ }
+
+    try {
+      const eventsPath = eventsPathFor(vault, decomposed.type, decomposed.rest);
+      const events = readEvents(eventsPath);
+      folded = foldEvents(events, {
+        isLesson: decomposed.type === 'lesson',
+        isWiki: decomposed.type === 'wiki',
+      });
+    } catch { /* missing events — fine, treat as unrated */ }
+
+    let finalScore = hit.score;
+    let confidence: number | undefined;
+    if (folded) {
+      if (decomposed.type === 'lesson' && typeof folded.confidence_stored === 'number') {
+        const lastReinforcedAt = folded.last_reinforced
+          ? new Date(folded.last_reinforced).getTime()
+          : new Date(folded.created.at || lastModified || now).getTime();
+        confidence = decayConfidence({
+          confidence_stored: folded.confidence_stored,
+          last_reinforced_at: lastReinforcedAt,
+          now,
+          floor: ctx.config.decay.floor,
+          half_life_days: ctx.config.decay.half_life_days,
+        });
+        finalScore = hit.score * (0.5 + 0.5 * confidence);
+      } else if (decomposed.type !== 'session') {
+        const net = (folded.votes.up - folded.votes.down);
+        const voteBoost = 1 + 0.1 * Math.log1p(Math.max(0, net));
+        finalScore = hit.score * voteBoost;
+      }
+    }
+
+    if (finalScore < minScore) continue;
+
+    adapted.push({
+      path: hit.displayPath,
+      type: decomposed.type,
+      scope: vault.kind,
+      vault_id: vault.id,
+      title: hit.title || decomposed.rest,
+      snippet: hit.body.slice(0, 280),
+      score: finalScore,
+      confidence,
+      votes: folded ? { up: folded.votes.up, down: folded.votes.down } : undefined,
+      last_modified: lastModified,
+    });
+  }
+
+  adapted.sort((a, b) => b.score - a.score);
+  const truncated = adapted.slice(0, limit);
+  return { results: truncated, total: adapted.length };
+}
+
+// ---------------------------------------------------------------------------
+// get_wiki_index — navigable tree of <vault>/wiki/
+// ---------------------------------------------------------------------------
+
+const getWikiIndexSchema = z.object({
+  scope: z.enum(['personal', 'team', 'all']).optional(),
+  vault_id: z.string().optional(),
+  root: z.string().optional(),
+  depth: z.number().int().optional(),
+  include: z.object({
+    summaries: z.boolean().optional(),
+    tags: z.boolean().optional(),
+    metadata: z.boolean().optional(),
+    links: z.boolean().optional(),
+  }).optional(),
+});
+
+export type GetWikiIndexArgs = z.infer<typeof getWikiIndexSchema>;
+
+export type WikiTreeNode =
+  | {
+      type: 'folder';
+      path: string;
+      page_count: number;
+      children: WikiTreeNode[];
+    }
+  | {
+      type: 'page';
+      path: string;
+      title: string;
+      summary?: string;
+      tags?: string[];
+      author?: string;
+      last_modified?: string;
+      votes?: { up: number; down: number };
+      links_out?: string[];
+    };
+
+export interface GetWikiIndexResult {
+  root: string;
+  total_pages: number;
+  truncated_at_depth: boolean;
+  tree: WikiTreeNode[];
+}
+
+interface ResolvedInclude {
+  summaries: boolean;
+  tags: boolean;
+  metadata: boolean;
+  links: boolean;
+}
+
+export async function handleGetWikiIndex(
+  ctx: ToolCtx,
+  args: GetWikiIndexArgs,
+): Promise<GetWikiIndexResult> {
+  const scope = args.scope ?? 'all';
+  const depth = args.depth ?? 2;
+  const include: ResolvedInclude = {
+    summaries: args.include?.summaries ?? true,
+    tags: args.include?.tags ?? true,
+    metadata: args.include?.metadata ?? true,
+    links: args.include?.links ?? false,
+  };
+
+  const vaults = args.vault_id
+    ? ctx.chain.filter((v) => v.id === args.vault_id)
+    : scope === 'all'
+      ? ctx.chain
+      : ctx.chain.filter((v) => v.kind === scope);
+
+  const tree: WikiTreeNode[] = [];
+  let totalPages = 0;
+  let truncated = false;
+
+  for (const vault of vaults) {
+    const root = vaultMemoryRoot(vault);
+    if (!existsSync(root)) continue;
+    const wikiRoot = join(root, 'wiki');
+    if (!existsSync(wikiRoot)) continue;
+    const subroot = args.root ? join(wikiRoot, args.root.replace(/^\/+/, '')) : wikiRoot;
+    if (!existsSync(subroot)) continue;
+
+    const result = walkWiki({
+      absRoot: wikiRoot,
+      absDir: subroot,
+      relPrefix: args.root?.replace(/^\/+|\/+$/g, '') ?? '',
+      depthRemaining: depth < 0 ? Infinity : depth,
+      include,
+      vault,
+    });
+    totalPages += result.pageCount;
+    if (result.truncated) truncated = true;
+    tree.push(...result.nodes);
+  }
+
+  return {
+    root: args.root ?? '/',
+    total_pages: totalPages,
+    truncated_at_depth: truncated,
+    tree,
+  };
+}
+
+interface WalkArgs {
+  absRoot: string;
+  absDir: string;
+  relPrefix: string;
+  depthRemaining: number;
+  include: ResolvedInclude;
+  vault: VaultInfo;
+}
+
+function walkWiki(args: WalkArgs): { nodes: WikiTreeNode[]; pageCount: number; truncated: boolean } {
+  const entries = safeReaddirEntries(args.absDir);
+  const nodes: WikiTreeNode[] = [];
+  let pageCount = 0;
+  let truncated = false;
+
+  for (const entry of entries) {
+    if (entry.name.startsWith('.')) continue;
+    const childAbs = join(args.absDir, entry.name);
+    const childRel = args.relPrefix ? `${args.relPrefix}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) {
+      const recursiveCount = countMdFiles(childAbs);
+      pageCount += recursiveCount;
+      if (args.depthRemaining <= 0) {
+        truncated = true;
+        nodes.push({
+          type: 'folder',
+          path: childRel + '/',
+          page_count: recursiveCount,
+          children: [],
+        });
+        continue;
+      }
+      const sub = walkWiki({
+        ...args,
+        absDir: childAbs,
+        relPrefix: childRel,
+        depthRemaining: args.depthRemaining - 1,
+      });
+      if (sub.truncated) truncated = true;
+      nodes.push({
+        type: 'folder',
+        path: childRel + '/',
+        page_count: recursiveCount,
+        children: sub.nodes,
+      });
+    } else if (entry.isFile() && entry.name.endsWith('.md')) {
+      pageCount++;
+      nodes.push(buildPageNode(childAbs, childRel, args.include, args.vault));
+    }
+  }
+
+  return { nodes, pageCount, truncated };
+}
+
+function safeReaddirEntries(path: string): import('node:fs').Dirent[] {
+  if (!existsSync(path)) return [];
+  try {
+    return readdirSync(path, { withFileTypes: true });
+  } catch { return []; }
+}
+
+function countMdFiles(dir: string): number {
+  let count = 0;
+  for (const entry of safeReaddirEntries(dir)) {
+    if (entry.name.startsWith('.')) continue;
+    const abs = join(dir, entry.name);
+    if (entry.isDirectory()) count += countMdFiles(abs);
+    else if (entry.isFile() && entry.name.endsWith('.md')) count++;
+  }
+  return count;
+}
+
+const WIKILINK_RE = /\[\[([^\]|]+)(?:\|[^\]]*)?\]\]/g;
+const MDLINK_RE = /\[[^\]]*\]\(([^)]+\.md(?:#[^)]*)?)\)/g;
+
+function buildPageNode(
+  absPath: string,
+  relPath: string,
+  include: ResolvedInclude,
+  vault: VaultInfo,
+): WikiTreeNode {
+  const node: WikiTreeNode = { type: 'page', path: relPath, title: relPath };
+  let body = '';
+  let frontmatter: AnyFrontmatter | null = null;
+  try {
+    const raw = readFileSync(absPath, 'utf8');
+    const split = splitFrontmatterAndBody(raw);
+    frontmatter = split.frontmatter;
+    body = split.body;
+    node.title = frontmatter.title || relPath;
+  } catch {
+    // Read fallback — file without frontmatter is allowed for plain wiki pages.
+    try { body = readFileSync(absPath, 'utf8'); } catch { /* ignore */ }
+  }
+
+  if (include.summaries) {
+    node.summary = firstParagraphAfterH1(body);
+  }
+  if (include.tags && frontmatter?.tags) {
+    node.tags = [...frontmatter.tags];
+  }
+  if (include.metadata) {
+    try {
+      const stat = statSync(absPath);
+      node.last_modified = stat.mtime.toISOString();
+    } catch { /* ignore */ }
+    if (frontmatter?.created_by) node.author = frontmatter.created_by;
+    try {
+      const eventsPath = eventsPathFor(vault, 'wiki', relPath);
+      const folded = foldEvents(readEvents(eventsPath), { isWiki: true });
+      if (folded.votes.up || folded.votes.down) {
+        node.votes = { up: folded.votes.up, down: folded.votes.down };
+      }
+    } catch { /* ignore */ }
+  }
+  if (include.links) {
+    node.links_out = extractLinks(body);
+  }
+  return node;
+}
+
+function firstParagraphAfterH1(body: string): string {
+  const lines = body.split('\n');
+  let idx = 0;
+  while (idx < lines.length && (!lines[idx].trim() || lines[idx].trim().startsWith('#'))) idx++;
+  const paragraph: string[] = [];
+  while (idx < lines.length && lines[idx].trim()) {
+    paragraph.push(lines[idx].trim());
+    idx++;
+  }
+  return paragraph.join(' ').slice(0, 280);
+}
+
+function extractLinks(body: string): string[] {
+  const out = new Set<string>();
+  let m;
+  WIKILINK_RE.lastIndex = 0;
+  while ((m = WIKILINK_RE.exec(body))) {
+    out.add(normalizeLink(m[1]));
+  }
+  MDLINK_RE.lastIndex = 0;
+  while ((m = MDLINK_RE.exec(body))) {
+    out.add(normalizeLink(m[1]));
+  }
+  return [...out];
+}
+
+function normalizeLink(link: string): string {
+  // Strip anchor + extension for wiki-style display
+  return link.replace(/#.*$/, '').replace(/\.md$/i, '');
+}
+
+// ---------------------------------------------------------------------------
+// Lesson dedup (Phase 4)
+//
+// In lex mode (default): exact normalized-content match against existing
+//   lessons in the same vault. Cheap and deterministic.
+// In hybrid/vec mode: qmd vector similarity with config.duplicate_threshold.
+//
+// On duplicate, append a `reinforced` event to the existing file's
+// events.jsonl instead of creating a new file.
+// ---------------------------------------------------------------------------
+
+function normalizeContent(s: string): string {
+  return s.toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Strip a leading "memories/" prefix from a path so the remainder is
+ * memory-root-relative (<typeFolder>/<rest>). Used by handlers
+ * that accept both vault-relative paths (returned by add_*) and shorter
+ * memory-root-relative paths in their `path` arguments.
+ */
+function stripMemoryRootPrefix(p: string): string {
+  const prefix = `${MEMORY_ROOT_DIR}/`;
+  return p.startsWith(prefix) ? p.slice(prefix.length) : p;
+}
+
+interface DedupHit {
+  vaultRelPath: string;     // memories/lessons/<slug>.md (vault-relative)
+  similarity: number;       // 0-1
+}
+
+async function findDuplicateLesson(
+  ctx: ToolCtx,
+  vault: VaultInfo,
+  content: string,
+): Promise<DedupHit | null> {
+  // Both modes start by scanning existing lesson files in the vault —
+  // this is fast (small directory listing) and avoids racing the qmd
+  // index, which may not yet contain a just-written lesson.
+  const lessonsDir = vaultPathFor(vault, 'lesson', '');
+  if (!existsSync(lessonsDir)) return null;
+  let entries: string[];
+  try {
+    entries = readdirSync(lessonsDir).filter((f) => f.endsWith('.md'));
+  } catch {
+    return null;
+  }
+  const normalizedNew = normalizeContent(content);
+
+  // Phase 4a: exact normalized content match (works in any mode).
+  for (const filename of entries) {
+    const abs = join(lessonsDir, filename);
+    try {
+      const raw = readFileSync(abs, 'utf8');
+      const { body } = splitFrontmatterAndBody(raw);
+      if (normalizeContent(body) === normalizedNew) {
+        return {
+          vaultRelPath: `${MEMORY_ROOT_DIR}/lessons/${filename}`,
+          similarity: 1.0,
+        };
+      }
+    } catch { /* ignore unparseable */ }
+  }
+
+  // Phase 4b: qmd vector similarity (hybrid/vec modes only).
+  if (ctx.config.qmd_search_mode === 'lex') return null;
+  try {
+    const store = await getStore(ctx.config);
+    await registerVaultCollections(store, ctx.chain);
+    const results = await store.searchVector(content, { collection: vault.id, limit: 3 });
+    for (const r of results) {
+      const display = (r as any).displayPath ?? (r as any).path ?? '';
+      const stripped = display.startsWith(`${vault.id}/`)
+        ? display.slice(vault.id.length + 1)
+        : display;
+      const dec = decomposeDisplayPath(stripped);
+      if (!dec || dec.type !== 'lesson') continue;
+      const score = typeof (r as any).score === 'number' ? (r as any).score : 0;
+      if (score >= ctx.config.duplicate_threshold) {
+        return { vaultRelPath: `${MEMORY_ROOT_DIR}/${stripped}`, similarity: score };
+      }
+    }
+  } catch { /* qmd unavailable; treat as no-dup */ }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Voting (Phase 4)
+// ---------------------------------------------------------------------------
+
+const voteSchema = z.object({
+  path: z.string().min(1),
+  direction: z.enum(['up', 'down']),
+  scope: z.enum(['personal', 'team']).optional(),
+  vault_id: z.string().optional(),
+  reason: z.string().optional(),
+});
+
+export type VoteArgs = z.infer<typeof voteSchema>;
+
+export interface VoteResult {
+  vault_id: string;
+  path: string;
+  action: 'voted';
+  votes: { up: number; down: number };
+  /** For lessons: decay-adjusted confidence after this vote. */
+  confidence?: number;
+}
+
+async function handleVote(
+  ctx: ToolCtx,
+  args: VoteArgs,
+  expectedType: MemoryType,
+): Promise<VoteResult> {
+  // Locate the file in the vault chain.
+  const relPath = args.path.endsWith('.md') ? args.path : `${args.path}.md`;
+  const candidates: VaultInfo[] = args.vault_id
+    ? ctx.chain.filter((v) => v.id === args.vault_id)
+    : args.scope
+      ? ctx.chain.filter((v) => v.kind === args.scope)
+      : [...ctx.chain];
+  if (candidates.length === 0) {
+    throw new Error('no vaults match the requested scope/vault_id');
+  }
+  let target: { vault: VaultInfo; abs: string } | null = null;
+  // Accept either vault-relative or memory-root-relative paths — try both.
+  for (const v of candidates) {
+    const direct = join(v.path, relPath);
+    if (existsSync(direct)) { target = { vault: v, abs: direct }; break; }
+    const underRoot = join(vaultMemoryRoot(v), relPath);
+    if (existsSync(underRoot)) { target = { vault: v, abs: underRoot }; break; }
+  }
+  if (!target) {
+    throw new Error(`vote target not found: ${relPath} (searched ${candidates.map((v) => v.id).join(', ')})`);
+  }
+
+  // Parse frontmatter to validate type.
+  const raw = readFileSync(target.abs, 'utf8');
+  const { frontmatter } = splitFrontmatterAndBody(raw);
+  if (frontmatter.type !== expectedType) {
+    throw new Error(
+      `vote_${expectedType} called on a ${frontmatter.type} document. ` +
+      `Use vote_${frontmatter.type} instead.`,
+    );
+  }
+
+  return withVaultLock(target.vault.id, async () => {
+    // relPath may be vault-relative ("memories/<type>/<rest>")
+    // or memory-root-relative ("<type>/<rest>"); normalize.
+    const segments = stripMemoryRootPrefix(relPath).split('/').filter(Boolean);
+    const restAfterType = segments.slice(1).join('/');
+    const eventsPath = eventsPathFor(target.vault, expectedType, restAfterType);
+    const ts = ctx.now().toISOString();
+    appendEvent(eventsPath, {
+      ts,
+      actor: ctx.identity.email,
+      type: 'voted',
+      direction: args.direction,
+      ...(args.reason ? { reason: args.reason } : {}),
+    });
+
+    // Commit the new events line.
+    const relEvents = relative(target.vault.path, eventsPath).split(sep).join('/');
+    commitInline(target.vault.path, [relEvents], `vote: ${args.direction} ${relPath}`);
+
+    // Recompute folded state for the return payload.
+    const folded = foldEvents(readEvents(eventsPath), {
+      isLesson: expectedType === 'lesson',
+      isWiki: expectedType === 'wiki',
+    });
+    const result: VoteResult = {
+      vault_id: target.vault.id,
+      path: relPath,
+      action: 'voted',
+      votes: { ...folded.votes },
+    };
+    if (expectedType === 'lesson' && typeof folded.confidence_stored === 'number') {
+      const lastReinforcedAt = folded.last_reinforced
+        ? new Date(folded.last_reinforced).getTime()
+        : new Date(folded.created.at || ts).getTime();
+      result.confidence = decayConfidence({
+        confidence_stored: folded.confidence_stored,
+        last_reinforced_at: lastReinforcedAt,
+        now: ctx.now().getTime(),
+        floor: ctx.config.decay.floor,
+        half_life_days: ctx.config.decay.half_life_days,
+      });
+    }
+    return result;
+  });
+}
+
+export async function handleVoteFact(ctx: ToolCtx, args: VoteArgs): Promise<VoteResult> {
+  return handleVote(ctx, args, 'fact');
+}
+export async function handleVoteLesson(ctx: ToolCtx, args: VoteArgs): Promise<VoteResult> {
+  return handleVote(ctx, args, 'lesson');
+}
+export async function handleVoteWiki(ctx: ToolCtx, args: VoteArgs): Promise<VoteResult> {
+  return handleVote(ctx, args, 'wiki');
+}
+
+// ---------------------------------------------------------------------------
+// update_wiki (Phase 7)
+// ---------------------------------------------------------------------------
+
+const updateWikiSchema = z.object({
+  path: z.string().min(1),
+  scope: z.enum(['personal', 'team']),
+  vault_id: z.string().optional(),
+  operation: z.enum(['replace_section', 'append', 'prepend', 'find_replace', 'full_replace']),
+  content: z.string(),
+  section: z.string().optional(),
+  find_text: z.string().optional(),
+  expected_replacements: z.number().int().nonnegative().optional(),
+});
+
+export type UpdateWikiArgs = z.infer<typeof updateWikiSchema>;
+
+export interface UpdateWikiResult {
+  vault_id: string;
+  path: string;
+  action: 'updated';
+  operation: UpdateWikiArgs['operation'];
+  lines_changed: number;
+}
+
+export async function handleUpdateWiki(
+  ctx: ToolCtx,
+  args: UpdateWikiArgs,
+): Promise<UpdateWikiResult> {
+  const vault = resolveVault(ctx.chain, args.scope, args.vault_id);
+  // Accept any of these path shapes:
+  //   - "architecture/data-flow.md"               (wiki-relative)
+  //   - "wiki/architecture/data-flow.md"          (memory-root-relative shortcut)
+  //   - "memories/wiki/architecture/data-flow.md" (vault-relative;
+  //      returned by add_wiki_page.path / search_memory)
+  let wikiRelPath = args.path.endsWith('.md') ? args.path : `${args.path}.md`;
+  const fullPrefix = `${MEMORY_ROOT_DIR}/wiki/`;
+  const shortPrefix = `wiki/`;
+  if (wikiRelPath.startsWith(fullPrefix)) {
+    wikiRelPath = wikiRelPath.slice(fullPrefix.length);
+  } else if (wikiRelPath.startsWith(shortPrefix)) {
+    wikiRelPath = wikiRelPath.slice(shortPrefix.length);
+  }
+  const abs = vaultPathFor(vault, 'wiki', wikiRelPath);
+  if (!existsSync(abs)) {
+    throw new Error(`wiki page not found: wiki/${wikiRelPath}`);
+  }
+
+  return withVaultLock(vault.id, async () => {
+    const raw = readFileSync(abs, 'utf8');
+    const { frontmatter, body } = splitFrontmatterAndBody(raw);
+    const newBody = applyWikiOperation(body, args);
+    const linesChanged = Math.abs(newBody.split('\n').length - body.split('\n').length);
+
+    const fmYaml = buildFrontmatter(frontmatter);
+    const full = `${fmYaml}\n${newBody.endsWith('\n') ? newBody : newBody + '\n'}`;
+    writeFileSync(abs, full, 'utf8');
+
+    // Append edited event
+    const eventsPath = eventsPathFor(vault, 'wiki', wikiRelPath);
+    appendEvent(eventsPath, {
+      ts: ctx.now().toISOString(),
+      actor: ctx.identity.email,
+      type: 'edited',
+      operation: args.operation,
+      ...(args.section ? { section: args.section } : {}),
+      lines_changed: linesChanged,
+    });
+
+    const relFile = relative(vault.path, abs).split(sep).join('/');
+    const relEvents = relative(vault.path, eventsPath).split(sep).join('/');
+    commitInline(vault.path, [relFile, relEvents], `wiki: ${relFile} (${args.operation})`);
+
+    // Schedule reindex
+    try {
+      const store = await getStore(ctx.config);
+      scheduleReindex(store, vault.id, ctx.config);
+    } catch { /* ignore */ }
+
+    return {
+      vault_id: vault.id,
+      path: relFile,
+      action: 'updated',
+      operation: args.operation,
+      lines_changed: linesChanged,
+    };
+  });
+}
+
+function applyWikiOperation(body: string, args: UpdateWikiArgs): string {
+  switch (args.operation) {
+    case 'full_replace':
+      return args.content;
+    case 'append':
+      return body + (body.endsWith('\n') ? '' : '\n') + args.content;
+    case 'prepend':
+      return args.content + (args.content.endsWith('\n') ? '' : '\n') + body;
+    case 'find_replace': {
+      if (!args.find_text) {
+        throw new Error('find_replace operation requires `find_text`');
+      }
+      const occurrences = body.split(args.find_text).length - 1;
+      if (typeof args.expected_replacements === 'number' && occurrences !== args.expected_replacements) {
+        throw new Error(
+          `find_replace expected ${args.expected_replacements} replacement(s) but found ${occurrences}`,
+        );
+      }
+      return body.split(args.find_text).join(args.content);
+    }
+    case 'replace_section': {
+      if (!args.section) {
+        throw new Error('replace_section operation requires `section` (the markdown header)');
+      }
+      return replaceMarkdownSection(body, args.section, args.content);
+    }
+  }
+}
+
+function replaceMarkdownSection(body: string, sectionHeader: string, replacement: string): string {
+  const header = sectionHeader.trim();
+  // Determine header level (number of leading #)
+  const headerMatch = header.match(/^(#+)\s/);
+  if (!headerMatch) {
+    throw new Error(`section header "${header}" must start with one or more # followed by a space`);
+  }
+  const headerLevel = headerMatch[1].length;
+  const lines = body.split('\n');
+  const startIdx = lines.findIndex((l) => l.trim() === header);
+  if (startIdx === -1) {
+    throw new Error(`section header "${header}" not found in document`);
+  }
+  // End: next header of same or higher level, or EOF.
+  let endIdx = lines.length;
+  for (let i = startIdx + 1; i < lines.length; i++) {
+    const m = lines[i].match(/^(#+)\s/);
+    if (m && m[1].length <= headerLevel) {
+      endIdx = i;
+      break;
+    }
+  }
+  const before = lines.slice(0, startIdx).join('\n');
+  const after = lines.slice(endIdx).join('\n');
+  const newSection = `${header}\n\n${replacement.trim()}\n`;
+  return [before, newSection, after].filter((s) => s.length > 0).join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// get_lessons — top lessons by combined score (decay × vote boost)
+//
+// This is the "session-start preload" tool. Unlike search_memory which is
+// query-driven, get_lessons walks the lesson files on disk, folds events for
+// each, scores by
+//   combined = decay_adjusted_confidence × (1 + log1p(max(0, up - down)))
+// and returns the top N per scope (personal + team).
+// ---------------------------------------------------------------------------
+
+const getLessonsSchema = z.object({
+  limit_personal: z.number().int().positive().max(50).optional(),
+  limit_team: z.number().int().positive().max(50).optional(),
+}).strict();
+
+export type GetLessonsArgs = z.infer<typeof getLessonsSchema>;
+
+export interface RankedLesson {
+  vault_id: string;
+  scope: 'personal' | 'team';
+  path: string;            // vault-relative (memories/lessons/<file>.md)
+  title: string;
+  content: string;         // full body
+  confidence: number;      // decay-adjusted
+  votes: { up: number; down: number };
+  reinforcement_count: number;
+  last_reinforced: string;
+  combined_score: number;
+}
+
+export interface GetLessonsResult {
+  personal: RankedLesson[];
+  team: RankedLesson[];
+  context: {
+    vaults_searched: Array<{ id: string; kind: 'personal' | 'team' }>;
+    total_candidates: number;
+  };
+}
+
+export async function handleGetLessons(
+  ctx: ToolCtx,
+  args: GetLessonsArgs,
+): Promise<GetLessonsResult> {
+  const limitPersonal = args.limit_personal ?? 10;
+  const limitTeam = args.limit_team ?? 10;
+
+  const candidates: RankedLesson[] = [];
+  const now = ctx.now().getTime();
+
+  for (const vault of ctx.chain) {
+    const root = vaultMemoryRoot(vault);
+    if (!existsSync(root)) continue;
+    const lessonsDir = join(root, 'lessons');
+    if (!existsSync(lessonsDir)) continue;
+    let entries: string[];
+    try {
+      entries = readdirSync(lessonsDir).filter((f) => f.endsWith('.md'));
+    } catch {
+      continue;
+    }
+    for (const filename of entries) {
+      const abs = join(lessonsDir, filename);
+      let raw: string;
+      try {
+        raw = readFileSync(abs, 'utf8');
+      } catch {
+        continue;
+      }
+      const { frontmatter, body } = splitFrontmatterAndBody(raw);
+      if (frontmatter.type !== 'lesson') continue;
+      const eventsPath = eventsPathFor(vault, 'lesson', filename);
+      const folded = foldEvents(readEvents(eventsPath), { isLesson: true });
+
+      const storedConfidence = typeof folded.confidence_stored === 'number'
+        ? folded.confidence_stored
+        : 0.5;
+      const lastReinforcedAt = folded.last_reinforced
+        ? new Date(folded.last_reinforced).getTime()
+        : new Date(folded.created.at || '').getTime() || now;
+      const confidence = decayConfidence({
+        confidence_stored: storedConfidence,
+        last_reinforced_at: lastReinforcedAt,
+        now,
+        floor: ctx.config.decay.floor,
+        half_life_days: ctx.config.decay.half_life_days,
+      });
+      const net = folded.votes.up - folded.votes.down;
+      const voteBoost = 1 + Math.log1p(Math.max(0, net));
+      const combined = confidence * voteBoost;
+
+      const title = typeof frontmatter.title === 'string' && frontmatter.title
+        ? frontmatter.title
+        : deriveTitle(body);
+
+      candidates.push({
+        vault_id: vault.id,
+        scope: vault.kind,
+        path: `${MEMORY_ROOT_DIR}/lessons/${filename}`,
+        title,
+        content: body.trim(),
+        confidence,
+        votes: { up: folded.votes.up, down: folded.votes.down },
+        reinforcement_count: folded.reinforcement_count ?? 0,
+        last_reinforced: folded.last_reinforced ?? folded.created.at ?? '',
+        combined_score: combined,
+      });
+    }
+  }
+
+  const personal = candidates
+    .filter((c) => c.scope === 'personal')
+    .sort((a, b) => b.combined_score - a.combined_score)
+    .slice(0, limitPersonal);
+  const team = candidates
+    .filter((c) => c.scope === 'team')
+    .sort((a, b) => b.combined_score - a.combined_score)
+    .slice(0, limitTeam);
+
+  return {
+    personal,
+    team,
+    context: {
+      vaults_searched: ctx.chain.map((v) => ({ id: v.id, kind: v.kind })),
+      total_candidates: candidates.length,
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function deriveTitle(content: string): string {
+  const firstLine = content.split('\n')[0].trim();
+  if (firstLine.length <= 60) return firstLine || 'untitled';
+  return firstLine.slice(0, 60);
+}
+
+function deriveTitleFromPath(path: string): string {
+  const stem = path.replace(/\.md$/i, '');
+  const last = stem.split('/').pop() ?? stem;
+  return last.replace(/[-_]+/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+// ---------------------------------------------------------------------------
+// MCP registration
+// ---------------------------------------------------------------------------
+
+interface MemoryRegistrationOptions {
+  /** Override config path (used by tests to provide a temp file). */
+  configPath?: string;
+}
+
+export function registerMemoryEntries(
+  ws: Workspace,
+  opts: MemoryRegistrationOptions = {},
+): void {
+  const sourceFile = fileURLToPath(import.meta.url);
+
+  // Build a fresh ctx per call so config / identity are re-read
+  // (cheap; lets the user edit memory-config.json without restart).
+  async function buildCtx(): Promise<ToolCtx> {
+    const configPath = opts.configPath ?? defaultConfigPath(ws);
+    const config = loadMemoryConfig(configPath);
+    const identity = await resolveIdentity();
+    const chain = loadVaultChainSafe(ws);
+    return {
+      chain,
+      identity,
+      config,
+      now: () => new Date(),
+      spawnAgent: makeProductionSpawnAgent(),
+      inbox: undefined, // could be wired to inbox.upsert in a follow-on
+    };
+  }
+
+  function asJson(payload: unknown) {
+    return {
+      content: [{ type: 'text' as const, text: JSON.stringify(payload, null, 2) }],
+      structuredContent: payload,
+    };
+  }
+
+  defineTool({
+    name: 'add_fact',
+    description:
+      'Save a durable atomic fact to the facts folder in a clawdevbox vault. ' +
+      'Use for conventions, gotchas, decisions, or any insight a future agent should remember. ' +
+      'Requires content + scope + citations + reason.',
+    parameters: addFactSchema,
+    handler: async (args) => asJson(await handleAddFact(await buildCtx(), args as AddFactArgs)),
+    source: 'builtin',
+    sourceFile,
+    examples: [{
+      description: 'Add a fact about JWT validation',
+      args: {
+        content: 'Always validate JWT exp before iat',
+        scope: 'team',
+        citations: 'src/auth/jwt.ts:42',
+        reason: 'We hit this in prod twice; future auth work must validate exp first.',
+      },
+    }],
+  });
+
+  defineTool({
+    name: 'add_lesson',
+    description:
+      'Save a lesson learned to the lessons folder. Lessons have confidence scores ' +
+      'that will strengthen with reinforcement (Phase 4) and decay over time without it.',
+    parameters: addLessonSchema,
+    handler: async (args) => asJson(await handleAddLesson(await buildCtx(), args as AddLessonArgs)),
+    source: 'builtin',
+    sourceFile,
+  });
+
+  defineTool({
+    name: 'add_session_summary',
+    description:
+      'Append a structured retrospective for the current session: title + narrative + ' +
+      'decisions + files touched + concepts.',
+    parameters: addSessionSummarySchema,
+    handler: async (args) =>
+      asJson(await handleAddSessionSummary(await buildCtx(), args as AddSessionSummaryArgs)),
+    source: 'builtin',
+    sourceFile,
+  });
+
+  defineTool({
+    name: 'add_wiki_page',
+    description:
+      '[DEPRECATED — use upsert_wiki] Create a new wiki page. Errors if exists.',
+    parameters: addWikiPageSchema,
+    handler: async (args) =>
+      asJson(await handleAddWikiPage(await buildCtx(), args as AddWikiPageArgs)),
+    source: 'builtin',
+    sourceFile,
+  });
+
+  // -- upsert_wiki (combined create + update) --------------------------------
+  const upsertWikiSchema = z.object({
+    path: z.string().min(1).describe('Wiki-relative path (e.g. "architecture/overview" or "setup-guide"). .md extension added automatically.'),
+    content: z.string().min(1).describe('Full page content (for create or full_replace) or partial content (for append/prepend/find_replace/replace_section).'),
+    scope: z.enum(['personal', 'team']),
+    vault_id: z.string().optional(),
+    operation: z.enum(['full_replace', 'append', 'prepend', 'find_replace', 'replace_section']).optional().describe('How to apply content. Default: "full_replace". On create, always uses full content regardless of operation.'),
+    section: z.string().optional().describe('Section heading for replace_section operation.'),
+    find_text: z.string().optional().describe('Text to find for find_replace operation.'),
+    keywords: z.array(z.string()).optional().describe('Keywords/tags for the page (used on create).'),
+    title: z.string().optional().describe('Human-readable title (used on create; defaults to path).'),
+  });
+
+  defineTool({
+    name: 'upsert_wiki',
+    description:
+      'Create or update a wiki page. If the page does not exist, creates it with the given content. ' +
+      'If it exists, applies the operation (default: full_replace). Combines add_wiki_page + update_wiki into one tool. ' +
+      'Path is wiki-relative (e.g. "architecture/overview"). Returns the action taken: "created" or "updated".',
+    parameters: upsertWikiSchema,
+    handler: async (args) => {
+      const ctx = await buildCtx();
+      const vault = resolveVault(ctx.chain, args.scope, args.vault_id);
+      // Normalize path
+      let wikiRelPath = args.path.endsWith('.md') ? args.path : `${args.path}.md`;
+      const fullPrefix = `${MEMORY_ROOT_DIR}/wiki/`;
+      const shortPrefix = `wiki/`;
+      if (wikiRelPath.startsWith(fullPrefix)) wikiRelPath = wikiRelPath.slice(fullPrefix.length);
+      else if (wikiRelPath.startsWith(shortPrefix)) wikiRelPath = wikiRelPath.slice(shortPrefix.length);
+
+      const abs = vaultPathFor(vault, 'wiki', wikiRelPath);
+      if (existsSync(abs)) {
+        // UPDATE path
+        const updateArgs: UpdateWikiArgs = {
+          path: wikiRelPath,
+          scope: args.scope,
+          vault_id: args.vault_id,
+          operation: args.operation ?? 'full_replace',
+          content: args.content,
+          section: args.section,
+          find_text: args.find_text,
+        };
+        return asJson(await handleUpdateWiki(ctx, updateArgs));
+      } else {
+        // CREATE path
+        const createArgs: AddWikiPageArgs = {
+          path: args.path,
+          content: args.content,
+          scope: args.scope,
+          vault_id: args.vault_id,
+          keywords: args.keywords,
+          title: args.title,
+        };
+        return asJson(await handleAddWikiPage(ctx, createArgs));
+      }
+    },
+    source: 'builtin',
+    sourceFile,
+  });
+
+  defineTool({
+    name: 'get_fact',
+    description:
+      'Fetch a single fact/lesson/session/wiki document by vault-relative path. ' +
+      'Returns frontmatter + body + folded events (votes, confidence, edit history).',
+    parameters: getFactSchema,
+    handler: async (args) => asJson(await handleGetFact(await buildCtx(), args as GetFactArgs)),
+    source: 'builtin',
+    sourceFile,
+  });
+
+  defineTool({
+    name: 'memory_status',
+    description:
+      'Report sync state, qmd index health, queue depths, and a snapshot of the active ' +
+      'memory configuration including the registered vault chain.',
+    parameters: memoryStatusSchema,
+    handler: async (args) =>
+      asJson(await handleMemoryStatus(await buildCtx(), args as MemoryStatusArgs)),
+    source: 'builtin',
+    sourceFile,
+  });
+
+  defineTool({
+    name: 'memory_init',
+    description:
+      'One-time setup: scaffold the <type>/ folder skeleton in each registered ' +
+      'vault, register qmd collections (one per vault) and per-path contexts, run an ' +
+      'initial filesystem index. Idempotent — safe to re-run anytime.',
+    parameters: memoryInitSchema,
+    handler: async (args) => asJson(await handleMemoryInit(await buildCtx(), args as MemoryInitArgs)),
+    source: 'builtin',
+    sourceFile,
+  });
+
+  defineTool({
+    name: 'search_memory',
+    description:
+      'Hybrid search across fact/lesson/session/wiki documents in one or more vaults. ' +
+      'Scope filter (personal/team/all) maps to vault.kind; types filter selects which ' +
+      'document folders. Lessons are re-ranked by decay-adjusted confidence; ' +
+      'facts/wiki by vote tally.',
+    parameters: searchMemorySchema,
+    handler: async (args) => asJson(await handleSearchMemory(await buildCtx(), args as SearchMemoryArgs)),
+    source: 'builtin',
+    sourceFile,
+  });
+
+  defineTool({
+    name: 'get_wiki_index',
+    description:
+      'Return a navigable tree of the wiki/ folder across one or more vaults. Use ' +
+      'depth/root to drill in. Includes title + summary + tags + outbound links per page.',
+    parameters: getWikiIndexSchema,
+    handler: async (args) => asJson(await handleGetWikiIndex(await buildCtx(), args as GetWikiIndexArgs)),
+    source: 'builtin',
+    sourceFile,
+  });
+
+  defineTool({
+    name: 'vote_fact',
+    description:
+      'Upvote or downvote a fact. Appends a vote event to the fact\'s sidecar log, ' +
+      'commits it, and returns the updated vote tally. Per-actor latest vote wins.',
+    parameters: voteSchema,
+    handler: async (args) => asJson(await handleVoteFact(await buildCtx(), args as VoteArgs)),
+    source: 'builtin',
+    sourceFile,
+  });
+
+  defineTool({
+    name: 'vote_lesson',
+    description:
+      'Upvote or downvote a lesson. Appends a vote event, commits, and returns the new ' +
+      'vote tally + decay-adjusted confidence. Per-actor latest vote wins.',
+    parameters: voteSchema,
+    handler: async (args) => asJson(await handleVoteLesson(await buildCtx(), args as VoteArgs)),
+    source: 'builtin',
+    sourceFile,
+  });
+
+  defineTool({
+    name: 'vote_wiki',
+    description:
+      'Upvote or downvote a wiki page. Appends a vote event and commits. ' +
+      'Per-actor latest vote wins.',
+    parameters: voteSchema,
+    handler: async (args) => asJson(await handleVoteWiki(await buildCtx(), args as VoteArgs)),
+    source: 'builtin',
+    sourceFile,
+  });
+
+  defineTool({
+    name: 'update_wiki',
+    description:
+      '[DEPRECATED — use upsert_wiki] Edit an existing wiki page. Operations: replace_section, append, prepend, ' +
+      'find_replace, full_replace.',
+    parameters: updateWikiSchema,
+    handler: async (args) => asJson(await handleUpdateWiki(await buildCtx(), args as UpdateWikiArgs)),
+    source: 'builtin',
+    sourceFile,
+  });
+
+  defineTool({
+    name: 'memory_sync',
+    description:
+      'Manually fetch + pull --rebase + push each registered vault that has a git ' +
+      'remote configured. Optional scope/vault_id filters limit which vaults to sync. ' +
+      'Returns per-vault outcomes including conflict detection.',
+    parameters: memorySyncSchema,
+    handler: async (args) => asJson(await handleMemorySync(await buildCtx(), args as MemorySyncArgs)),
+    source: 'builtin',
+    sourceFile,
+  });
+
+  defineTool({
+    name: 'get_lessons',
+    description:
+      'Return the top-ranked lessons preloaded for session-start context. ' +
+      'Walks <vault>/memories/lessons/, ' +
+      'computes combined_score = decay_adjusted_confidence × (1 + log1p(votes_up - votes_down)) ' +
+      'per lesson, and returns the top N personal + top N team. CALL THIS AT SESSION START ' +
+      'before answering anything substantive — these are durable heuristics future-you ' +
+      'should weigh from the first turn.',
+    parameters: getLessonsSchema,
+    handler: async (args) => asJson(await handleGetLessons(await buildCtx(), args as GetLessonsArgs)),
+    source: 'builtin',
+    sourceFile,
+    examples: [{
+      description: 'Preload the top 5 personal lessons',
+      args: { limit_personal: 5 },
+    }],
+  });
+}
+
+function defaultConfigPath(ws: Workspace): string {
+  return join(ws.globalDir, 'memory-config.json');
+}
+
+function loadVaultChainSafe(ws: Workspace): VaultInfo[] {
+  const cfg = resolveConfig({ projectDir: ws.projectDir, globalDir: ws.globalDir });
+  return loadVaultChain(cfg.vaults);
+}
+
+/**
+ * Production spawnAgent for Phase 8 conflict auto-resolve. Uses the
+ * global session-helper ctx (set by `clawdevbox start`) to call
+ * spawnDispatchOrResume. Polls every 2s for up to timeoutMs for a new
+ * merge commit on the conflicting branch. If the global isn't set
+ * (e.g., MCP server running in a test or stdio mode without the live
+ * dispatcher), returns exit_code 1 immediately with a clear reason.
+ */
+function makeProductionSpawnAgent(): SpawnAgentFn {
+  return async ({ cwd, prompt, sessionId, timeoutMs }) => {
+    type GlobalCtx = {
+      __clawdevboxSessionHelperCtx?: {
+        db: unknown;
+        dispatcher: unknown;
+        ws: unknown;
+        cfg: unknown;
+      };
+    };
+    const g = globalThis as unknown as GlobalCtx;
+    const sessionCtx = g.__clawdevboxSessionHelperCtx;
+    if (!sessionCtx) {
+      return {
+        exit_code: 1,
+        reason: 'session-helper ctx not initialized; auto-resolve requires `clawdevbox start`',
+      };
+    }
+    // Lazy-import to avoid eager dependency cycles.
+    const { spawnDispatchOrResume } = await import('../session-helpers.ts');
+    const startSha = currentShaOf(cwd);
+    const r = await (spawnDispatchOrResume as any)(sessionCtx, {
+      prompt,
+      session_id: sessionId,
+      provider: null,
+      agent: null,
+      model: null,
+      workspace_id: null,
+      workspace_path: cwd,
+    });
+    if (!r?.ok) {
+      return { exit_code: 1, reason: `spawn failed: ${r?.code ?? 'UNKNOWN'} ${r?.message ?? ''}` };
+    }
+    // Poll for a new commit on HEAD (every 2s, up to timeoutMs).
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      const nowSha = currentShaOf(cwd);
+      if (nowSha && nowSha !== startSha) {
+        return { exit_code: 0, merged_commit: nowSha, reason: 'detected new commit' };
+      }
+    }
+    return { exit_code: 1, reason: `spawn timed out after ${timeoutMs}ms without producing a merge commit` };
+  };
+}
+
+function currentShaOf(cwd: string): string {
+  try {
+    const r = spawnSync('git', ['rev-parse', 'HEAD'], { cwd, encoding: 'utf8', windowsHide: true });
+    return (r.stdout ?? '').trim();
+  } catch {
+    return '';
+  }
+}
+
+// Re-export DEFAULT_MEMORY_CONFIG for tests that want a baseline config
+// without touching disk.
+export { DEFAULT_MEMORY_CONFIG };

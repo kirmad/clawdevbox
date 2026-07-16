@@ -1,0 +1,42 @@
+id: ado.new-pr-watcher
+description: >-
+  Poll ADO for ACTIVE pull requests in a repo. The first successful fire
+  baselines every currently-open matching PR (dispatches nothing); subsequent
+  fires dispatch a READ-ONLY review prompt to a fresh dev-buddy agent for each
+  NEW pull request (not seen on a previous fire). Supports opened_by /
+  assigned_to / include_drafts filters. Useful for auto-reviewing incoming PRs.
+runtime: tsx
+accepts_webhook: true
+identity_param: repo
+default_cron: '*/5 * * * *'
+parameters:
+  - name: org
+    type: string
+    required: true
+    description: ADO organization slug (e.g. 'myorg' in dev.azure.com/myorg)
+  - name: project
+    type: string
+    required: true
+    description: ADO project name (e.g. 'MyProject')
+  - name: repo
+    type: string
+    required: true
+    description: ADO repository name to watch for new pull requests
+  - name: opened_by
+    type: string
+    required: false
+    description: >-
+      Only dispatch PRs authored by this uniqueName (e.g. 'me@contoso.com')
+  - name: assigned_to
+    type: string
+    required: false
+    description: >-
+      Only dispatch PRs where this uniqueName is a reviewer
+  - name: include_drafts
+    type: boolean
+    required: false
+    description: Include draft PRs (default false — drafts are skipped)
+  - name: worktree_path
+    type: string
+    required: false
+    description: Working directory for the dispatched agent

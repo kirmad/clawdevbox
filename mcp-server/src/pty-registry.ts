@@ -1,0 +1,666 @@
+/**
+ * pty-registry.ts
+ *
+ * In-memory registry of live recipe ptys, keyed by recipe_instance_id.
+ * `recipe.run` spawns a hidden node-pty (no OS console window on Windows via
+ * ConPTY) and hands the IPty to this registry. Browser clients can later
+ * attach over the terminal-server HTTP/WS endpoint and stream live output,
+ * send keystrokes, resize, or kill the agent — without leaking the spawn
+ * details into every consumer.
+ *
+ * This is the smaller cousin of taskdock's TerminalService
+ * (src/main/terminal/terminal-service.ts) — a single mode (interactive),
+ * unified output stream, fixed scrollback. We keep the same vocabulary
+ * (snapshot / data / exit) so the terminal-server WebSocket protocol
+ * mirrors taskdock's.
+ *
+ * Lifecycle:
+ *   register()        → store session, hook IPty.onData/onExit
+ *   subscribe()       → start receiving live chunks; first delivers snapshot
+ *   write/resize/kill → forward to underlying IPty
+ *   onExit            → flush exit event to subscribers, mark `exited`
+ *                       but keep session in map for `EXIT_RETAIN_MS` so
+ *                       late attaches still see the tail
+ */
+
+import type { IPty } from 'node-pty';
+import { spawnSync } from 'node:child_process';
+import type { AgentCliProvider, AgentHandle } from './agent-clis/types.ts';
+// SessionConductor was removed in the tmux migration. The legacy `conductor`
+// field on PtyEntry is retained as null-only for source-level compat with
+// call sites that read it; pending-dispatch-registry now owns dispatch
+// queueing, and update_status MCP tool owns done-detection.
+type SessionConductor = never;
+import { emitChange } from './event-bus.ts';
+import { logger } from './logger.ts';
+import { watchCopilotStatus, type StatusWatcher } from './agent-clis/copilot-events.ts';
+import { updateDerivedState } from './db/agent-sessions-store.ts';
+import { getDatabase } from './db/index.ts';
+
+// ============================================================================
+// Tunables
+// ============================================================================
+
+/** Rolling output buffer kept per session for late-attach snapshots. */
+const BUFFER_LIMIT_BYTES = 256 * 1024;
+
+/** Hold exited sessions this long so a reconnecting viewer still sees the tail. */
+const EXIT_RETAIN_MS = 10_000;
+
+/**
+ * Keep viewer-side terminal events away from Copilot's initial prompt submit.
+ * On Windows ConPTY, early xterm attach side effects (resizes plus terminal
+ * query/focus replies) can leave the prompt text in the input box while
+ * swallowing the submit.
+ */
+const INITIAL_PROMPT_VIEWER_GATE_GRACE_MS = 10_000;
+
+// ============================================================================
+// Types
+// ============================================================================
+
+export type PtyServerEvent =
+  | { type: 'snapshot'; content: string; cols: number; rows: number; exited: boolean; exitCode?: number }
+  | { type: 'data'; chunk: string }
+  | { type: 'exit'; exitCode: number; signal?: number };
+
+export type PtySubscriber = (event: PtyServerEvent) => void;
+
+/**
+ * Lightweight metadata captured at spawn time and surfaced in the terminal
+ * viewer header so a human reattaching to a running pty can see WHAT shell
+ * is in the pane, WHERE it was started, and WHICH recipe/session/agent it
+ * belongs to without grepping logs.
+ *
+ * All fields are best-effort — registerPty() takes them as `meta?` and
+ * older call sites (e.g. the playwright fixture) can still register without
+ * meta. The terminal-server then falls back to on-disk recipe-instance state
+ * for archived sessions.
+ */
+export interface PtySessionMeta {
+  /** Working directory the pty was spawned in (absolute path). */
+  cwd?: string;
+  /** Command line as a single human-readable string, e.g. `claude --resume sess_x`. */
+  commandLine?: string;
+  /** Provider id (e.g. `copilot`, `claude`, `agency`). */
+  agentCli?: string;
+  /** Agent session id (recipe.run's sessionId — not the recipe_instance_id). */
+  sessionId?: string;
+  /** Recipe id (slug) if this pty backs a recipe instance. */
+  recipeId?: string;
+  /** Epoch ms when registerPty was called. */
+  startedAt: number;
+}
+
+export interface PtyRegisterOptions {
+  instanceId: string;
+  workspaceId: string;
+  cols: number;
+  rows: number;
+  ipty: IPty;
+  meta?: Omit<PtySessionMeta, 'startedAt'>;
+  /**
+   * Provider that spawned this pty. Required for the registry to build a
+   * SessionConductor. When omitted, the session has no conductor and
+   * getConductor(instanceId) returns null. Legacy callers (playwright
+   * fixture, raw test harnesses) can still register without this.
+   */
+  provider?: AgentCliProvider;
+  /**
+   * Agent handle whose .pty is `ipty`. Required iff `provider` is provided —
+   * the conductor needs handle.exited to track the exited state transition.
+   */
+  agentHandle?: AgentHandle;
+}
+
+type AgentHandleWithInitialPrompt = AgentHandle & {
+  initialPromptDelivery?: Promise<unknown>;
+};
+
+interface PtySession {
+  instanceId: string;
+  workspaceId: string;
+  ipty: IPty;
+  cols: number;
+  rows: number;
+  buffer: string[];
+  bufferBytes: number;
+  subscribers: Set<PtySubscriber>;
+  exited: boolean;
+  exitCode: number | null;
+  meta: PtySessionMeta;
+  conductor: SessionConductor | null;
+  initialPromptGateActive: boolean;
+  pendingResize: { cols: number; rows: number } | null;
+  /**
+   * Monotonic total UTF-16 code units appended to this session's output
+   * stream (NOT the current buffer length — counts content already dropped
+   * from the ring). Cursor offset basis for readScrollback.
+   */
+  totalCodeUnits: number;
+  /**
+   * Code-unit offset of the FIRST character currently in the ring.
+   * Advances when appendToBuffer drops head entries past BUFFER_LIMIT_BYTES.
+   */
+  headCodeUnits: number;
+  /** Epoch ms at register time. Encoded into cursor so respawn invalidates. */
+  spawnTs: number;
+  /**
+   * Live status watcher tailing the agent's events.jsonl. Set when the
+   * provider declares `idleSignal: 'copilot-events'` AND the meta has a
+   * sessionId. Stopped in onExit. null otherwise.
+   */
+  statusWatcher: StatusWatcher | null;
+  /**
+   * Most recent live state emitted by the statusWatcher
+   * ('idle' | 'thinking' | 'tool_use' | 'error'), or null if no event
+   * has been observed yet. This is the SOURCE OF TRUTH for live UI state
+   * on pty-registered sessions — many of them (notably the Main Agent)
+   * have no `agent_sessions` DB row, so the DB-backed derived_state
+   * column is empty even when the watcher is firing.
+   */
+  derivedState: string | null;
+  /**
+   * Agent-self-reported status text (via the update_status MCP tool),
+   * mirrored in-memory for pty-registered sessions that have no
+   * agent_sessions DB row (notably the Main Agent). For sessions with
+   * a DB row, the DB column agent_sessions.status_text is the source
+   * of truth and this field stays null.
+   */
+  statusText: string | null;
+  /** Sticky overall goal (mirror of agent_sessions.task_title). */
+  taskTitle: string | null;
+  /** Current sub-goal (mirror of agent_sessions.subtask_title). */
+  subtaskTitle: string | null;
+  /** Epoch ms of last status field update. */
+  statusTextAt: number | null;
+}
+
+// ============================================================================
+// Registry
+// ============================================================================
+
+const sessions = new Map<string, PtySession>();
+
+/** Append a chunk to the ring buffer, dropping head entries while we're over the limit. */
+function appendToBuffer(s: PtySession, chunk: string): void {
+  s.buffer.push(chunk);
+  s.bufferBytes += chunk.length;
+  s.totalCodeUnits += chunk.length;
+  while (s.bufferBytes > BUFFER_LIMIT_BYTES && s.buffer.length > 1) {
+    const head = s.buffer.shift();
+    if (head !== undefined) {
+      s.bufferBytes -= head.length;
+      s.headCodeUnits += head.length;
+    }
+  }
+}
+
+function applyResize(s: PtySession, cols: number, rows: number): boolean {
+  s.cols = cols;
+  s.rows = rows;
+  try {
+    s.ipty.resize(cols, rows);
+  } catch {
+    return false;
+  }
+  return true;
+}
+
+function initialPromptDeliveryOf(handle?: AgentHandle): Promise<unknown> | null {
+  const delivery = (handle as AgentHandleWithInitialPrompt | undefined)?.initialPromptDelivery;
+  return delivery && typeof delivery.then === 'function' ? delivery : null;
+}
+
+function flushPendingResize(s: PtySession): boolean {
+  const pending = s.pendingResize;
+  s.pendingResize = null;
+  if (!pending || s.exited) return true;
+  return applyResize(s, pending.cols, pending.rows);
+}
+
+export function registerPty(opts: PtyRegisterOptions): void {
+  if (sessions.has(opts.instanceId)) {
+    throw new Error(`pty session already registered for instance ${opts.instanceId}`);
+  }
+  const session: PtySession = {
+    instanceId: opts.instanceId,
+    workspaceId: opts.workspaceId,
+    ipty: opts.ipty,
+    cols: opts.cols,
+    rows: opts.rows,
+    buffer: [],
+    bufferBytes: 0,
+    subscribers: new Set(),
+    exited: false,
+    exitCode: null,
+    meta: { ...(opts.meta ?? {}), startedAt: Date.now() },
+    conductor: null,
+    initialPromptGateActive: false,
+    pendingResize: null,
+    totalCodeUnits: 0,
+    headCodeUnits: 0,
+    spawnTs: Date.now(),
+    statusWatcher: null,
+    derivedState: null,
+    statusText: null,
+    taskTitle: null,
+    subtaskTitle: null,
+    statusTextAt: null,
+  };
+
+  // Conductor creation removed in tmux migration; see src/pending-dispatch-registry.ts
+  const conductor: SessionConductor | null = null;
+  session.conductor = conductor;
+
+  const initialPromptDelivery = initialPromptDeliveryOf(opts.agentHandle);
+  if (initialPromptDelivery) {
+    session.initialPromptGateActive = true;
+    const releaseInitialPromptGate = () => {
+      const timer = setTimeout(() => {
+        const cur = sessions.get(opts.instanceId);
+        if (cur !== session) return;
+        cur.initialPromptGateActive = false;
+        flushPendingResize(cur);
+      }, INITIAL_PROMPT_VIEWER_GATE_GRACE_MS);
+      timer.unref?.();
+    };
+    initialPromptDelivery.then(releaseInitialPromptGate, releaseInitialPromptGate);
+  }
+
+  sessions.set(opts.instanceId, session);
+  emitChange('sessions');
+
+  // Start the events.jsonl-based live status watcher when the provider
+  // exposes the copilot-events idle signal. Updates:
+  //   1. session.derivedState (in-memory; source of truth for pty-registered
+  //      sessions that may not have an agent_sessions DB row, e.g. the
+  //      Main Agent).
+  //   2. agent_sessions.derived_state (DB; harmless no-op when row absent).
+  // Stopped in onExit below.
+  if (opts.provider?.capabilities?.idleSignal === 'copilot-events'
+      && session.meta.sessionId) {
+    const sessionId = session.meta.sessionId;
+    const recipeInstanceId = opts.instanceId;
+    try {
+      session.statusWatcher = watchCopilotStatus(sessionId, (cls) => {
+        // In-memory write — always succeeds; primary surface for UI.
+        if (session.derivedState !== cls.state) {
+          session.derivedState = cls.state;
+          emitChange('sessions');
+        }
+        // DB write — best-effort; only changes anything if there's a row.
+        try {
+          updateDerivedState(getDatabase(), recipeInstanceId, {
+            state: cls.state,
+            ts: Date.now(),
+          });
+        } catch (err) {
+          logger.debug({ err: String(err), recipeInstanceId },
+            'pty-registry: updateDerivedState failed');
+        }
+      });
+    } catch (err) {
+      logger.warn({ err: String(err), sessionId, recipeInstanceId },
+        'pty-registry: watchCopilotStatus failed to start');
+    }
+  }
+
+  opts.ipty.onData((data) => {
+    appendToBuffer(session, data);
+    for (const sub of session.subscribers) {
+      try { sub({ type: 'data', chunk: data }); } catch { /* viewer drop */ }
+    }
+  });
+
+  opts.ipty.onExit(({ exitCode, signal }) => {
+    session.exited = true;
+    session.exitCode = exitCode ?? 0;
+    if (session.statusWatcher) {
+      try { session.statusWatcher.stop(); } catch { /* idempotent */ }
+      session.statusWatcher = null;
+    }
+    for (const sub of session.subscribers) {
+      try { sub({ type: 'exit', exitCode: exitCode ?? 0, signal }); } catch { /* viewer drop */ }
+    }
+    emitChange('sessions');
+    setTimeout(() => {
+      // Drop the session only if no one is still hanging on.
+      const s = sessions.get(opts.instanceId);
+      if (s && s.exited && s.subscribers.size === 0) {
+        sessions.delete(opts.instanceId);
+        emitChange('sessions');
+      }
+    }, EXIT_RETAIN_MS);
+  });
+}
+
+export function hasSession(instanceId: string): boolean {
+  return sessions.has(instanceId);
+}
+
+/**
+ * Forcibly evict a pty session from the registry without waiting for
+ * the post-exit retention window. Use ONLY when the caller is about
+ * to re-register a fresh pty at the same instanceId (e.g. main-agent
+ * Restart). Without this, registerPty would throw "already registered"
+ * because killPty leaves the exited session row around for up to
+ * EXIT_RETAIN_MS so late viewers can still pull scrollback.
+ *
+ * Returns true if a session was removed, false if there was none.
+ */
+export function evictPty(instanceId: string): boolean {
+  const had = sessions.delete(instanceId);
+  if (had) emitChange('sessions');
+  return had;
+}
+
+/**
+ * Returns true only if the session is in the registry AND not exited.
+ * Use this for "is the pty still usable" checks (smart routing's
+ * live-or-spawn decision); use hasSession for "is the row still present
+ * for late-attach viewers" checks.
+ */
+export function isSessionLive(instanceId: string): boolean {
+  const s = sessions.get(instanceId);
+  return !!s && !s.exited;
+}
+
+/**
+ * Return the metadata captured at register time for `instanceId`, or null
+ * if the pty has fully exited and been garbage-collected. Used by the
+ * terminal viewer to populate the header with cwd / command / session.
+ */
+export function getSessionMeta(instanceId: string): PtySessionMeta | null {
+  const s = sessions.get(instanceId);
+  return s ? s.meta : null;
+}
+
+/**
+ * Compatibility stub. SessionConductor was removed in the tmux migration;
+ * callers should subscribe to `pending-dispatch-registry` for dispatch state
+ * and `agent_sessions.status_text/needs_user_input` for live status.
+ */
+export function getConductor(_instanceId: string): SessionConductor | null {
+  return null;
+}
+
+export function subscribe(
+  instanceId: string,
+  fn: PtySubscriber,
+): { unsubscribe: () => void; sentSnapshot: boolean } {
+  const s = sessions.get(instanceId);
+  if (!s) return { unsubscribe: () => {}, sentSnapshot: false };
+  s.subscribers.add(fn);
+  try {
+    fn({
+      type: 'snapshot',
+      content: s.buffer.join(''),
+      cols: s.cols,
+      rows: s.rows,
+      exited: s.exited,
+      exitCode: s.exitCode ?? undefined,
+    });
+  } catch { /* viewer drop */ }
+  return {
+    sentSnapshot: true,
+    unsubscribe: () => {
+      const cur = sessions.get(instanceId);
+      if (!cur) return;
+      cur.subscribers.delete(fn);
+      if (cur.exited && cur.subscribers.size === 0) {
+        sessions.delete(instanceId);
+      }
+    },
+  };
+}
+
+export function writeToPty(instanceId: string, data: string): boolean {
+  const s = sessions.get(instanceId);
+  if (!s || s.exited) return false;
+  if (s.initialPromptGateActive) return true;
+  s.ipty.write(data);
+  return true;
+}
+
+export function resizePty(instanceId: string, cols: number, rows: number): boolean {
+  const s = sessions.get(instanceId);
+  if (!s || s.exited) return false;
+  if (s.initialPromptGateActive) {
+    s.cols = cols;
+    s.rows = rows;
+    s.pendingResize = { cols, rows };
+    return true;
+  }
+  return applyResize(s, cols, rows);
+}
+
+export function killPty(instanceId: string, signal?: string): boolean {
+  const s = sessions.get(instanceId);
+  if (!s || s.exited) return false;
+  // On Windows, ipty.kill() alone leaves child copilot.exe / agency.exe
+  // processes alive (ConPTY tears down the pipe but not the descendants).
+  // Use the same tree-kill helper that shutdown uses so the pty is fully
+  // gone after this call returns.
+  if (process.platform === 'win32') {
+    killPtyTree(s);
+    return true;
+  }
+  try {
+    s.ipty.kill(signal);
+  } catch {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Force-kill the pty AND its entire descendant process tree.
+ *
+ * `ipty.kill()` alone is insufficient on Windows for agents that spawn
+ * wrapping processes (e.g. `agency.exe` spawns `copilot.exe` which spawns
+ * more `agency.exe` helpers). ConPTY tears down the pipe, but the child
+ * tree can outlive the pty, holding session-file locks that surface later
+ * as "Session in use" modals on the next spawn.
+ *
+ * On Windows we use `taskkill /T /F /PID <pid>` (recursive force-kill).
+ * On POSIX we fall back to `ipty.kill()` (which by default sends SIGHUP to
+ * the process group via the pty controller, killing descendants).
+ */
+function killPtyTree(s: PtySession): void {
+  const pid = s.ipty.pid;
+  if (process.platform === 'win32' && typeof pid === 'number' && pid > 0) {
+    try {
+      spawnSync('taskkill', ['/T', '/F', '/PID', String(pid)], {
+        windowsHide: true,
+        timeout: 5000,
+      });
+    } catch (err) {
+      logger.warn(
+        { instanceId: s.instanceId, pid, err: err instanceof Error ? err.message : String(err) },
+        'pty-registry: taskkill failed, falling back to ipty.kill()',
+      );
+      try { s.ipty.kill(); } catch { /* ignore */ }
+    }
+  } else {
+    try { s.ipty.kill(); } catch { /* ignore */ }
+  }
+}
+
+/**
+ * Walk all live sessions and kill their pty trees. Returns the number of
+ * sessions that were killed. Called from the shutdown handler in start.ts
+ * to prevent orphan agent processes from outliving clawdevbox.
+ *
+ * Two-phase shutdown:
+ *   1. GRACEFUL: write `\x03\x03` (double Ctrl+C, copilot's clean-exit
+ *      sequence) to each pty, then wait up to `gracefulMs` for the pty
+ *      to actually exit. Clean exits let copilot remove its
+ *      `~/.copilot/session-state/<uuid>/inuse.<pid>.lock` files, which
+ *      prevents the "Session in use" modal on the next spawn into the
+ *      same session.
+ *   2. FORCE: for any pty that didn't exit gracefully, force-kill the
+ *      whole descendant process tree (taskkill /T /F on Windows,
+ *      ipty.kill() / SIGHUP on POSIX). This will leave stale locks
+ *      behind, but at least we don't orphan the processes.
+ */
+export async function killAllSessions(gracefulMs = 2000): Promise<number> {
+  const live: PtySession[] = [];
+  for (const s of sessions.values()) {
+    if (!s.exited) live.push(s);
+  }
+  if (live.length === 0) return 0;
+
+  // Phase 1: ask each pty to exit cleanly. Copilot's "clean exit" is two
+  // consecutive Ctrl+C bytes ("ctrl+c again to exit"). claude.exe also
+  // honors this; e2e-test-runner ignores it (we'll force-kill it below).
+  for (const s of live) {
+    try { s.ipty.write('\x03\x03'); } catch { /* pipe may already be torn */ }
+  }
+
+  // Wait up to gracefulMs for sessions to mark themselves exited via the
+  // onExit handler. Poll in small intervals so we wake up promptly.
+  const deadline = Date.now() + gracefulMs;
+  while (Date.now() < deadline) {
+    if (live.every((s) => s.exited)) break;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+
+  // Phase 2: force-kill anyone still alive.
+  let killed = 0;
+  for (const s of live) {
+    if (s.exited) {
+      killed++;
+      continue;
+    }
+    killPtyTree(s);
+    killed++;
+  }
+  return killed;
+}
+
+export function listSessions(): {
+  instanceId: string;
+  workspaceId: string;
+  exited: boolean;
+  derivedState: string | null;
+  statusText: string | null;
+  taskTitle: string | null;
+  subtaskTitle: string | null;
+}[] {
+  return Array.from(sessions.values()).map((s) => ({
+    instanceId: s.instanceId,
+    workspaceId: s.workspaceId,
+    exited: s.exited,
+    derivedState: s.derivedState,
+    statusText: s.statusText,
+    taskTitle: s.taskTitle,
+    subtaskTitle: s.subtaskTitle,
+  }));
+}
+
+/**
+ * Tri-state status update for a pty-registered session.
+ * Same semantics as agent-sessions-store.updateStatusBySessionId:
+ *   - undefined → leave unchanged (sticky)
+ *   - ""        → clear
+ *   - non-empty → set
+ * Returns true iff any field actually changed.
+ */
+export interface PtyStatusUpdate {
+  taskTitle?: string;
+  subtaskTitle?: string;
+  status?: string;
+}
+
+export function setPtyStatusFields(cliSessionId: string, update: PtyStatusUpdate): boolean {
+  for (const s of sessions.values()) {
+    if (s.meta.sessionId !== cliSessionId) continue;
+    let changed = false;
+    if (update.taskTitle !== undefined) {
+      const v = update.taskTitle === '' ? null : update.taskTitle;
+      if (s.taskTitle !== v) { s.taskTitle = v; changed = true; }
+    }
+    if (update.subtaskTitle !== undefined) {
+      const v = update.subtaskTitle === '' ? null : update.subtaskTitle;
+      if (s.subtaskTitle !== v) { s.subtaskTitle = v; changed = true; }
+    }
+    if (update.status !== undefined) {
+      const v = update.status === '' ? null : update.status;
+      if (s.statusText !== v) { s.statusText = v; changed = true; }
+    }
+    if (changed) s.statusTextAt = Date.now();
+    return changed;
+  }
+  return false;
+}
+
+/**
+ * @deprecated Use setPtyStatusFields. Kept for the v9 single-text-field
+ * path. Will be removed once nothing imports it.
+ */
+export function setPtyStatusText(cliSessionId: string, text: string | null): boolean {
+  return setPtyStatusFields(cliSessionId, { status: text ?? '' });
+}
+
+export interface ReadScrollbackOpts {
+  since: number;
+}
+
+export interface ReadScrollbackResult {
+  /** Content from Math.max(since, headCodeUnits) to totalCodeUnits. */
+  content: string;
+  /** Total code units written so far. New cursor offset. */
+  totalOffset: number;
+  /** First code unit still in the ring. */
+  headOffset: number;
+  /** Session spawn timestamp — encode into cursor so respawn invalidates. */
+  spawnTs: number;
+  exited: boolean;
+  exitCode?: number;
+}
+
+/**
+ * Return scrollback slice from `Math.max(since, headOffset)` to current
+ * total. Returns null when the session isn't in the registry. Caller
+ * compares `since` with `headOffset` to compute truncated_before.
+ */
+export function readScrollback(
+  instanceId: string,
+  opts: ReadScrollbackOpts,
+): ReadScrollbackResult | null {
+  const s = sessions.get(instanceId);
+  if (!s) return null;
+  const since = Math.max(opts.since, s.headCodeUnits);
+  const full = s.buffer.join('');
+  const startInFull = since - s.headCodeUnits;
+  const content = startInFull >= full.length ? '' : full.slice(startInFull);
+  return {
+    content,
+    totalOffset: s.totalCodeUnits,
+    headOffset: s.headCodeUnits,
+    spawnTs: s.spawnTs,
+    exited: s.exited,
+    exitCode: s.exitCode ?? undefined,
+  };
+}
+
+/**
+ * Test hatch — wipes the live registry. Throws when called outside tests
+ * to prevent accidental imports from clearing live ptys in production.
+ * Detection: process.env.NODE_ENV === 'test' OR process.env.npm_lifecycle_event
+ * matches 'test*' (covers `npm test`, `npm run test:*`), OR Node's test
+ * worker context is present, OR `node --test` is the entry point (detected via
+ * process.execArgv).
+ */
+export function _resetForTests(): void {
+  const isTest =
+    process.env.NODE_ENV === 'test' ||
+    /^test/i.test(process.env.npm_lifecycle_event ?? '') ||
+    process.env.NODE_TEST_CONTEXT === 'child-v8' ||
+    process.execArgv.some((arg) => arg === '--test' || arg.startsWith('--test='));
+  if (!isTest) {
+    throw new Error('_resetForTests: refusing to clear pty-registry outside test context');
+  }
+  sessions.clear();
+}

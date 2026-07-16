@@ -1,0 +1,35 @@
+{
+  "_comment": "Mock skill catalog used during testing. In production the skill obtains this via `skill.list` MCP tool. For RED/GREEN tests we provide it inline so the sub-agent has the same world model in both phases.",
+  "available_skills": [
+    {
+      "id": "superpowers/systematic-debugging",
+      "name": "systematic-debugging",
+      "description": "Use when encountering any bug, test failure, or unexpected behavior, before proposing fixes. Forces reproduce-first then form/verify hypotheses one at a time."
+    },
+    {
+      "id": "superpowers/test-driven-development",
+      "name": "test-driven-development",
+      "description": "Use when implementing any feature or bugfix, before writing implementation code. Red-green-refactor cycle."
+    },
+    {
+      "id": "superpowers/brainstorming",
+      "name": "brainstorming",
+      "description": "Use before any creative work - creating features, building components, adding functionality, or modifying behavior."
+    },
+    {
+      "id": "superpowers/verification-before-completion",
+      "name": "verification-before-completion",
+      "description": "Use when about to claim work is complete, fixed, or passing, before committing or creating PRs."
+    },
+    {
+      "id": "superpowers/root-cause-tracing",
+      "name": "root-cause-tracing",
+      "description": "Use when a bug has surface-level symptoms but the cause is upstream."
+    },
+    {
+      "id": "dev-buddy/fetching-agent-sessions",
+      "name": "fetching-agent-sessions",
+      "description": "Use when fetching/normalizing sessions across CLIs."
+    }
+  ]
+}

@@ -1,0 +1,45 @@
+{
+  "id": "<provider-specific>",
+  "provider": "<copilot-cli|claude-code|agency-cli>",
+  "cwd": "C:\\git\\example-app",
+  "started_at": "2026-05-30T14:00:00.000Z",
+  "ended_at": "2026-05-30T14:05:00.000Z",
+  "summary": "Add status badge to README",
+  "turns": [
+    {
+      "index": 0,
+      "role": "user",
+      "text": "Add a status badge to the README",
+      "tool_name": null,
+      "tool_success": null,
+      "ts": "2026-05-30T14:00:00.000Z"
+    },
+    {
+      "index": 1,
+      "role": "tool",
+      "text": "view README.md",
+      "tool_name": "view",
+      "tool_success": true,
+      "ts": "2026-05-30T14:00:30.000Z"
+    },
+    {
+      "index": 2,
+      "role": "tool",
+      "text": "edit README.md",
+      "tool_name": "edit",
+      "tool_success": true,
+      "ts": "2026-05-30T14:02:00.000Z"
+    },
+    {
+      "index": 3,
+      "role": "assistant",
+      "text": "Added status badge to README.md",
+      "tool_name": null,
+      "tool_success": null,
+      "ts": "2026-05-30T14:05:00.000Z"
+    }
+  ],
+  "files_touched": [
+    { "path": "README.md", "op": "edit" }
+  ]
+}

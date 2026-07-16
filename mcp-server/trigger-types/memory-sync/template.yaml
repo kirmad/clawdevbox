@@ -1,0 +1,21 @@
+id: memory-sync
+file: trigger.ts
+runtime: tsx
+description: >-
+  Periodic memory vault git sync. Commits local changes with meaningful
+  messages, fetches from remote, audits incoming content for safety,
+  auto-resolves merge conflicts, and notifies the user via inbox.
+default_cron: "0 9 * * *"
+identity_param: vault_scope
+accepts_webhook: false
+parameters:
+  - name: vault_scope
+    type: string
+    required: false
+    description: >-
+      Which vaults to sync: 'all' (default), 'personal', or 'team'.
+  - name: auto_push
+    type: boolean
+    required: false
+    description: >-
+      Whether to push local commits to origin. Default true.

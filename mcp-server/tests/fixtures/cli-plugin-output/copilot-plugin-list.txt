@@ -1,0 +1,3 @@
+Installed plugins:
+  • superpowers@superpowers-marketplace (v5.1.0)
+  • calls@example-plugins (v1.4.0)

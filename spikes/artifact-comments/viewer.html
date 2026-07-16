@@ -1,0 +1,56 @@
+<!doctype html>
+<!--
+  viewer.html — the iframe content.
+
+  Stands in for /artifact/<id> in clawdevbox. Loads:
+    1. the renderer (markdown-renderer.mjs, modeled on renderers/markdown.mjs)
+    2. the comment overlay (comment-overlay.mjs, the library being designed)
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>artifact viewer</title>
+  <style>
+    :root { color-scheme: dark; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      background: #15171d; color: #d4d4d4;
+      font: 14px/1.6 'Segoe UI', system-ui, sans-serif;
+    }
+    #content { padding: 24px 28px; max-width: 880px; margin: 0 auto; }
+  </style>
+</head>
+<body>
+  <div id="content"></div>
+
+  <script type="module">
+    import { renderMarkdown } from './markdown-renderer.mjs';
+    import { enableComments } from './comment-overlay.mjs';
+
+    const urlParams = new URLSearchParams(location.search);
+    const artifactId = urlParams.get('artifact') ?? 'art_demo01';
+
+    const ctx = {
+      artifactId,
+      manifest: { title: 'Q3 Engineering Plan', type: 'markdown' },
+      fetchFile: async (name) => {
+        const r = await fetch('/' + name);
+        if (!r.ok) throw new Error('fetchFile failed: ' + name);
+        return r.text();
+      },
+    };
+
+    const root = document.getElementById('content');
+
+    async function mount() {
+      root.innerHTML = '';
+      const body = await renderMarkdown(root, ctx);
+      await enableComments(body, ctx);
+    }
+
+    mount().catch((err) => {
+      root.innerHTML = '<pre style="color:#f14c4c">' + String(err?.stack ?? err) + '</pre>';
+    });
+  </script>
+</body>
+</html>

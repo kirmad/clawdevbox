@@ -1,0 +1,18 @@
+{
+  "name": "clawdevbox-trigger-test-harness",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "End-to-end test harness for Clawdevbox trigger scripts against real Azure DevOps. Mocks only the Clawdevbox side.",
+  "scripts": {
+    "mock": "tsx mock-clawdevbox.ts",
+    "setup:ado": "bash setup-ado.sh",
+    "setup:ado:ps1": "pwsh -File setup-ado.ps1",
+    "test": "tsx test-driver.ts",
+    "test:help": "tsx test-driver.ts --help",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

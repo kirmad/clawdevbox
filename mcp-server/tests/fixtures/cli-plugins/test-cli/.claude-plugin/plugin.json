@@ -1,0 +1,15 @@
+{
+  "name": "test-cli",
+  "version": "0.1.0",
+  "description": "Fixture plugin for the AgentCliProvider loader tests.",
+  "clawdevbox": {
+    "agent_clis": [
+      {
+        "id": "test-cli",
+        "module": "test-provider.mjs",
+        "display_name": "Test CLI Provider",
+        "description": "Returns a fake handle."
+      }
+    ]
+  }
+}

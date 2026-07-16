@@ -1,0 +1,87 @@
+# Clawdevbox recipe template (sub-recipe shape). See spec §6.4.
+#
+# Author-side comment responder. Sibling of `respond-to-pr-comment`,
+# which is the reviewer-side recipe. Biased toward "you wrote this
+# code, you can change it" — trivial nits auto-apply without an
+# approval; only non-trivial change requests gate on user approval.
+#
+# Invoked by the `ado.comment-watcher` trigger registered in
+# implement-feature / fix-bug Phase 5/6. The trigger frames the new
+# comment as the prompt; this recipe is the sequence the agent
+# follows.
+
+id: address-pr-feedback
+name: "Address PR feedback (author side)"
+description: >
+  Respond to a single inbound PR comment on a PR the agent authored.
+  Triage as question | nit | change-request | affirmation; apply
+  trivial nits without approval; gate non-trivial change requests on
+  user approval; post the reply linking commit hashes when code
+  changed.
+kind: pr_review
+default_client: copilot
+mcp_servers:
+  - ado
+  - clawdevbox
+
+steps:
+  - id: 1
+    goal: >
+      Read the inbound comment via `ado.list_pr_comments` (filtered to
+      the new comment id passed in via prompt context) and the
+      surrounding diff via `ado.get_pr` + the relevant file content
+      from the worktree. Also read prior agent replies in this PR
+      thread so you don't repeat yourself.
+
+  - id: 2
+    goal: >
+      Consult the `analyze-pr-comment` skill to classify the comment
+      as one of: **question**, **nit**, **change-request**, or
+      **affirmation**. Emit `view.emit({ view_id: 'comment_triage',
+      payload: { class, rationale } })` so the user can see the call.
+
+      For nits, additionally decide *trivial vs non-trivial*: a typo,
+      a one-line rename, or a formatting fix is trivial; anything that
+      crosses a function boundary or touches logic is non-trivial and
+      escalates to change-request.
+    depends: [1]
+
+  - id: 3
+    goal: >
+      Branch on classification.
+
+      - **Question.** Draft a clear answer grounded in the diff. Cite
+        line numbers. No code change. Skip to step 5.
+
+      - **Nit (trivial).** Apply the change in the worktree, commit
+        with `nit: <short>` message, push to the PR source branch. No
+        approval. Capture the commit hash for step 5.
+
+      - **Nit (non-trivial) / Change-request.** Draft an action plan
+        (which files, what change, why). `approval.request` with the
+        plan. On approval, apply via the worktree, commit, push.
+        Capture the commit hash. On rejection or edit, revise and
+        re-request approval.
+
+      - **Affirmation.** Draft a 2-word acknowledgement. Skip to
+        step 5.
+    depends: [2]
+
+  - id: 4
+    goal: >
+      Only if code changed in step 3: re-run the repo test slice that
+      covers the changed area. If tests fail, revert the commit, post
+      a comment explaining the regression instead of the original fix,
+      and surface a blocking inbox card.
+    depends: [3]
+
+  - id: 5
+    goal: >
+      Post the reply via `ado.comment_pr`. If a commit was pushed in
+      step 3, link the commit hash from the reply ("Pushed in
+      <hash>"). `thread.append_message` recording what was sent and
+      whether code changed. `thread.set_state('suspended')` so the
+      comment watcher fires again on the next reviewer comment.
+      `recipe.done({ status: 'success', message: <class>-<applied?>
+       })`.
+    depends: [4]

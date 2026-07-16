@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel in-progress runs for the same ref (e.g., rapid pushes)
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build & fast tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: |
+            mcp-server/package-lock.json
+            mcp-server/web/package-lock.json
+
+      - name: Install mcp-server deps
+        working-directory: mcp-server
+        run: npm ci
+
+      - name: Install web SPA deps
+        working-directory: mcp-server/web
+        run: npm ci || npm install
+        # web/ may not have a committed package-lock; fall back to install.
+
+      - name: Typecheck
+        working-directory: mcp-server
+        run: npm run typecheck
+
+      - name: Build
+        working-directory: mcp-server
+        run: npm run build
+
+      - name: Fast test subset
+        working-directory: mcp-server
+        run: |
+          node --import tsx --test --test-force-exit \
+            tests/smoke.test.mjs \
+            tests/workspace.test.mjs \
+            tests/validators.test.mjs \
+            tests/db-migrations.test.mjs \
+            tests/db-stores.test.mjs \
+            tests/inbox-persistence.test.mjs \
+            tests/scheduler.test.mjs \
+            tests/dispatcher.test.mjs \
+            tests/cron-api.test.mjs \
+            tests/manifest-load.test.mjs \
+            tests/marketplace-load.test.mjs \
+            tests/trigger-runner.test.mjs \
+            tests/ado-assigned-items-watcher.test.mjs \
+            tests/ado-new-pr-watcher.test.mjs \
+            tests/memory-git-sync.test.mjs \
+            tests/memory-sync-register.test.mjs \
+            tests/memory-sync-tool.test.mjs \
+            tests/memory-sync-trigger.test.mjs \
+            tests/trigger-observations.test.mjs \
+            tests/vault-trigger-discovery.test.mjs
+        # trigger-templates.test.mjs is intentionally excluded from the fast
+        # subset: each test boots a full stdio MCP server (cold `tsx` compile),
+        # so running it alongside the other parallel test files would risk a
+        # startup resource storm and blow the job timeout. It is now readiness-
+        # aware and runs via the serialized `npm run test:triggers` path
+        # (--test-concurrency=1) instead.
+
+      - name: Trigger integration tests
+        working-directory: mcp-server
+        run: npm run test:triggers
+
+      - name: Verify packaged contents (npm pack --dry-run)
+        working-directory: mcp-server
+        run: npm pack --dry-run

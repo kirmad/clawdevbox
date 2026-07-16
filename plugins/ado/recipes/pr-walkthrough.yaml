@@ -1,0 +1,61 @@
+# plugins/ado/recipes/pr-walkthrough.yaml
+id: pr-walkthrough
+name: "PR Walkthrough (ADO)"
+description: >
+  Produce an interactive PR walkthrough artifact — a 5-minute final-judge
+  review surface backed by the agent's verdict, confidence dashboard,
+  attention plan, disqualifiers, and pre-answered FAQ.
+kind: pr_review
+default_client: claude
+mcp_servers:
+  - ado
+  - clawdevbox
+timeout_minutes: 0
+
+steps:
+  - id: 1
+    goal: >
+      Fetch the PR via `ado.get_pr` + `ado.get_pr_iteration({iteration_id: 'latest'})`.
+      Consult the `build-pr-walkthrough` skill for the full procedure. Begin
+      authoring `walkthrough.json` in memory: PR identity + 5-bullet summary
+      (via `summarize-pr-changes` skill).
+
+  - id: 2
+    goal: >
+      Cluster the changed files into 5-10 narrative steps per `build-pr-walkthrough`
+      §2. For each step author: title, why, focusNewLine, badges, timeBudget,
+      optional mermaid diagram. Identify any batch steps (10+ files with the
+      same edit) and any new-file steps.
+    depends: [1]
+
+  - id: 3
+    goal: >
+      Materialize per-step files: `original__<safe>.txt`, `modified__<safe>.txt`,
+      `diff__<safe>.patch` for each step's file. Use `git show` (or ADO blob
+      API) — see `build-pr-walkthrough` §10.
+    depends: [2]
+
+  - id: 4
+    goal: >
+      Author the verdict (recommendation + oneLiner + confidence + agentNotes),
+      the 6-gauge confidence dashboard, the 5-min attention plan
+      (`whatToLookAt`), the disqualifier checklist, and the pre-answered FAQ.
+      Refer to `build-pr-walkthrough` §4-§8.
+    depends: [3]
+
+  - id: 5
+    goal: >
+      Write the artifact via `artifact.add({type: 'pr-walkthrough', ...,
+      recipe_instance_id: <this run>, files: [manifest.json, walkthrough.json,
+      original__*, modified__*, diff__*]})`. Take the returned `view_url`
+      and `share_url` and post them as the inbox card's `agent_message`.
+    depends: [4]
+
+  - id: 6
+    goal: >
+      Register a long-running listener for Q&A questions on this artifact.
+      Suspend the recipe; on each new question (signal from server), wake,
+      compose a thorough answer per `build-pr-walkthrough` §11, call
+      `pr-walkthrough.answer({artifact_id, step_n, question_id, text})`,
+      re-suspend.
+    depends: [5]

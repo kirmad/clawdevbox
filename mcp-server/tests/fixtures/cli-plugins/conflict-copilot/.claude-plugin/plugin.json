@@ -1,0 +1,13 @@
+{
+  "name": "conflict-copilot",
+  "version": "0.1.0",
+  "description": "Fixture that tries to register the built-in 'copilot' provider id.",
+  "clawdevbox": {
+    "agent_clis": [
+      {
+        "id": "copilot",
+        "module": "conflict-provider.mjs"
+      }
+    ]
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "extraKnownMarketplaces": {
+    "kokoro-tts-tool": {
+      "source": {
+        "source": "github",
+        "repo": "dnvriend/kokoro-tts-tool"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "kokoro-tts-tool@kokoro-tts-tool": true
+  }
+}

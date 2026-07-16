@@ -1,0 +1,34 @@
+# Synthetic test plugin used by triggers/test/test-driver.ts Scenario G.
+#
+# Clawdevbox plugin manifest. See spec §10.2 and plugins/ado/plugin.yaml for
+# the reference shape. This file is intentionally minimal:
+#   - one trigger (`heartbeat`) registered under `provides.triggers`
+#   - no recipes / no skills / no MCP servers
+#   - no auth env required
+#
+# The heartbeat trigger always emits a single Mode B callback with the prompt
+# `"plugin heartbeat tick"`. Scenario G asserts that:
+#   1. plugin discovery sees this manifest and registers the trigger
+#   2. firing /hooks/heartbeat reaches the bundled script
+#   3. the trigger's scope in the registry is exactly "plugin:test-plugin"
+#   4. the captured callback's prompt matches what the script emits
+
+id: test-plugin
+name: "Test plugin (heartbeat)"
+version: "1.0.0"
+description: >
+  Synthetic plugin used by the trigger test harness to prove plugin discovery
+  + bundled-trigger registration + the plugin-scoped callback contract. Emits
+  one heartbeat callback per fire; that's it.
+
+author: "Clawdevbox test harness"
+license: "MIT"
+
+provides:
+  triggers:
+    - id: heartbeat
+      file: triggers/heartbeat.ts
+      cron: "*/30 * * * * *"
+
+requires:
+  clawdevbox_version: ">=1.0.0"

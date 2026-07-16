@@ -1,0 +1,123 @@
+id: daily-standup
+name: "Morning summary of overnight activity"
+description: >
+  Opt-in. Designed to be cron-scheduled once per weekday morning (e.g.
+  9 AM local). Summarizes inbox items that landed overnight, approvals
+  pending, recipe runs that completed, and one suggested focus for the
+  day. Writes an artifact + an inbox card. Push only if there's
+  something genuinely time-sensitive.
+agent: dev-buddy
+
+inputs:
+  hours_back:
+    description: "How many hours of history to summarize. Default 16 (covers an overnight)."
+    type: integer
+    required: false
+    default: 16
+  push_if_urgent:
+    description: "Send a push notification only if the summary surfaces an urgent item. Default true."
+    type: boolean
+    required: false
+    default: true
+
+prompt: |
+  Produce the morning standup summary for this workspace.
+
+  ## Step 1 — Gather (parallel reads, all Tier-1)
+
+  All scoped to the last `{{hours_back}}` hours:
+
+  - `inbox.list({ state: 'all', limit: 50 })` — filter client-side to
+    items created or last-touched in the window.
+  - `approval.list_pending()` — all pending, regardless of age.
+  - `recipe.list({ scope: 'workspace', kind: 'instances', limit: 50 })`
+    — filter to instances that closed in the window.
+  - `trigger.list_registered()` — note any that fired in the window.
+
+  ## Step 2 — Compose the artifact
+
+  Build a markdown summary structured as:
+
+  ```
+  # Standup — <local date, formatted in workspace timezone>
+
+  ## TL;DR
+  <3-5 sentences. Lead with anything urgent. Mention CI / incidents /
+  approvals first if any. End with the one thing the user should do
+  first.>
+
+  ## Inbox (last {{hours_back}}h)
+  - **New (N):** `<id>` <title> — `<state>` <one-line context>
+  - **Updated (M):** …
+
+  ## Approvals pending (K)
+  - `<approval_id>` <title> — pending <age> (e.g. "pending 6h")
+
+  ## Recipes completed
+  - `<ri_…>` <recipe id> — <status> — <one-line outcome>
+
+  ## Suggested focus
+  <One paragraph. The recommended task for the morning, with the
+  artifact / recipe / inbox id the user would start from.>
+  ```
+
+  Write it as an artifact:
+
+  ```
+  artifact.add({
+    id: 'standup-<YYYY-MM-DD>',
+    type: 'markdown',
+    title: 'Standup — <date>',
+    files: { 'content.md': '<the markdown above>' },
+  })
+  ```
+
+  Capture the returned `view_url`.
+
+  ## Step 3 — Write the inbox card
+
+  ```
+  inbox.create({
+    kind: 'standup',
+    tag: 'standup-<YYYY-MM-DD>',
+    title: 'Standup — <one-line TL;DR>',
+    body: '[Open standup](<view_url>)\n\n<the TL;DR paragraph>',
+  })
+  ```
+
+  ## Step 4 — Push if urgent (only when `push_if_urgent: true`)
+
+  Push only if the standup surfaced one of:
+  - Sev 1 / Sev 2 incident in the inbox.
+  - Approval pending > 8 hours.
+  - 3+ consecutive CI failures.
+
+  Otherwise skip the push. Standup output lives in the inbox; the user
+  reads it on their schedule.
+
+  When pushing:
+
+  ```
+  notify.send({
+    title: 'Standup — <urgent reason>',
+    body: '<one sentence>',
+    url: <view_url>,
+    tag: 'standup-urgent-<YYYY-MM-DD>',
+    require_interaction: false,
+  })
+  ```
+
+  ## Step 5 — Finish
+
+  Report `artifact view_url` and `inbox card id` in the `recipe.done`
+  message:
+
+  ```
+  recipe.done({
+    status: 'success',
+    message: 'standup written: <view_url> ; inbox card <id> ; pushed: <true|false>'
+  })
+  ```
+
+  Do not write to chat from this recipe — chat is the user's surface,
+  not yours.

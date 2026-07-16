@@ -1,0 +1,12 @@
+{
+  "name": "dev-buddy",
+  "description": "Senior-engineer main agent for clawdevbox — autonomous, plans/delegates/verifies, manages inbox and memory.",
+  "version": "1.3.2",
+  "author": {
+    "name": "Clawdevbox team"
+  },
+  "keywords": ["clawdevbox", "main-agent", "autonomous", "developer-assistant"],
+  "agents": "agents/",
+  "skills": "skills/",
+  "hooks": "hooks.json"
+}

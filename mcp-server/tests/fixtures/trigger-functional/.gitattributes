@@ -1,0 +1,4 @@
+# Pre-fix trigger fixtures are historical, byte-stable source captures.
+# Keep them exactly as committed (no CRLF renormalization) so the negative
+# controls reproduce the old contract failures deterministically.
+* -text

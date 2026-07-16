@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "clawdevbox": {
+      "type": "http",
+      "url": "http://127.0.0.1:5299/mcp",
+      "headers": {
+        "X-Clawdevbox-Project-Dir": "C:\\git\\clawdevbox\\.worktrees\\tmux-migration\\mcp-server"
+      },
+      "tools": [
+        "*"
+      ]
+    }
+  }
+}

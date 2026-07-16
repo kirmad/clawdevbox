@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "ado",
+  "version": "1.0.1",
+  "description": "Recipes, skills, and hostable tools for working with Azure DevOps pull requests, comments, and iterations.",
+  "author": {
+    "name": "Clawdevbox team"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/clawdevbox/plugin-ado",
+  "clawdevbox": {
+    "recipes": [
+      {
+        "id": "pr-review",
+        "file": "recipes/pr-review.yaml"
+      },
+      {
+        "id": "respond-to-pr-comment",
+        "file": "recipes/respond-to-pr-comment.yaml"
+      },
+      {
+        "id": "triage-work-item",
+        "file": "recipes/triage-work-item.yaml"
+      },
+      {
+        "id": "implement-feature",
+        "file": "recipes/implement-feature.yaml"
+      },
+      {
+        "id": "fix-bug",
+        "file": "recipes/fix-bug.yaml"
+      },
+      {
+        "id": "address-pr-feedback",
+        "file": "recipes/address-pr-feedback.yaml"
+      }
+    ],
+    "tools": [
+      {
+        "id": "ado.get_pr",
+        "file": "tools/get_pr.ts"
+      },
+      {
+        "id": "ado.list_pr_comments",
+        "file": "tools/list_pr_comments.ts"
+      },
+      {
+        "id": "ado.comment_pr",
+        "file": "tools/comment_pr.ts"
+      },
+      {
+        "id": "ado.list_iterations",
+        "file": "tools/list_iterations.ts"
+      },
+      {
+        "id": "ado.get_pr_status",
+        "file": "tools/get_pr_status.ts"
+      },
+      {
+        "id": "ado.get_work_item",
+        "file": "tools/get_work_item.ts"
+      },
+      {
+        "id": "ado.list_work_items",
+        "file": "tools/list_work_items.ts"
+      },
+      {
+        "id": "ado.list_work_item_comments",
+        "file": "tools/list_work_item_comments.ts"
+      },
+      {
+        "id": "ado.add_work_item_comment",
+        "file": "tools/add_work_item_comment.ts"
+      },
+      {
+        "id": "ado.update_work_item",
+        "file": "tools/update_work_item.ts"
+      },
+      {
+        "id": "ado.create_pr",
+        "file": "tools/create_pr.ts"
+      },
+      {
+        "id": "ado.get_work_item_updates",
+        "file": "tools/get_work_item_updates.ts"
+      }
+    ]
+  },
+  "requires": {
+    "clawdevbox_version": ">=1.0.0",
+    "env": [
+      "ADO_ORG",
+      "ADO_BEARER_TOKEN"
+    ]
+  }
+}

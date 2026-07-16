@@ -1,0 +1,22 @@
+{
+  "$schema": "https://clawdevbox.local/schemas/triggers.schema.json",
+  "triggers": [],
+  "_runtime": [
+    {
+      "id": "ado-comments-thr_01HX",
+      "description": "Watch comments on PR 2401; ask the agent to address each.",
+      "command": "tsx $CLAWDEVBOX_PROJECT_DIR/.clawdevbox/triggers/_runtime/ado-comments-thr_01HX.ts",
+      "cron": "*/30 * * * * *",
+      "subscriber_thread_id": "thr_01HX...",
+      "expires_at": 1764576000000
+    },
+    {
+      "id": "pr-pulse-thr_01HX",
+      "description": "Watch PR for live activity (comments + iterations) for up to 60s; alert agent immediately on each event.",
+      "command": "tsx $CLAWDEVBOX_PROJECT_DIR/.clawdevbox/triggers/_runtime/pr-pulse-thr_01HX.ts",
+      "cron": "0 */1 * * *",
+      "subscriber_thread_id": "thr_01HX...",
+      "expires_at": 1764576000000
+    }
+  ]
+}

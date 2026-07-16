@@ -1,0 +1,34 @@
+id: feedback-sync
+name: Skill Feedback Sync
+description: |
+  Aggregate local skill feedback signals and surface correction and
+  promotion/demotion candidates. Run weekly (or manually) before opening
+  feedback PRs to the team vault. Does NOT open PRs automatically — that
+  step is human-gated per docs/FEEDBACK-OPERATIONS.md.
+default_client: copilot
+mcp_servers:
+  - clawdevbox
+steps:
+  - id: aggregate-and-report
+    goal: |
+      1. Call skill.feedback.aggregate to collapse local.jsonl → agg.json.
+         Report: how many raw signals processed, how many skills summarised.
+
+      2. Call skill.feedback.pending with kind='all'.
+         Report the three categories:
+           - pending_corrections: skills with corrections_30d >= 2 and a patch ready
+           - promotion_candidates: score_30d > 0.75 AND uses_30d >= 10 AND errors_30d = 0
+           - demotion_candidates: score_30d < 0.30 OR errors_30d >= 3
+
+      3. If any corrections, promotions, or demotions are pending, remind the
+         vault-auditor to open the appropriate PRs following the instructions
+         in docs/FEEDBACK-OPERATIONS.md. Name each pending skill_id explicitly.
+
+      4. If nothing is pending, say so briefly.
+
+      5. Do NOT read or repeat any message content, user identity, or prompt
+         text. Do NOT include correction patch content in the summary — just
+         the skill_id and counts.
+
+      6. Call recipe.done with status='success' and a one-line message such as:
+         "Aggregated N signals across M skills; K correction(s), P promotion(s), D demotion(s) pending."

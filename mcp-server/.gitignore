@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.log
+*.bak
+.tmp-test-workspace/
+tests/.mcp-bootstrap.full.bak
+artifacts/
+tests/.tmp/

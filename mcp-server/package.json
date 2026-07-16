@@ -1,0 +1,98 @@
+{
+  "name": "clawdevbox",
+  "version": "0.1.17",
+  "description": "ClawDevbox — a toolkit for running AI coding agents headlessly. MCP server (stdio + Streamable HTTP), interactive CLI for project init, hidden-pty agent runs, browser-based terminal viewer, recipes/skills/plugins/triggers, and an extensible artifact renderer chain.",
+  "type": "module",
+  "bin": {
+    "clawdevbox": "./dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "default": "./dist/cli.js"
+    },
+    "./agent-clis": {
+      "types": "./src/agent-clis/index.ts",
+      "default": "./dist/agent-clis.mjs"
+    }
+  },
+  "files": [
+    "dist",
+    "plugins",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "prepublishOnly": "npm run build",
+    "mcp": "tsx src/cli/index.ts mcp",
+    "start": "tsx src/cli/index.ts start",
+    "init": "tsx src/cli/index.ts init",
+    "web:dev": "npm --prefix web run dev",
+    "web:build": "npm --prefix web run build",
+    "web:install": "npm --prefix web install",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test tests/smoke.test.mjs tests/hosted-tools.test.mjs tests/work-item-tools.test.mjs tests/workspace.test.mjs tests/service.test.mjs tests/inbox-persistence.test.mjs tests/validators.test.mjs tests/db-migrations.test.mjs tests/db-migrations-v5.test.mjs tests/db-stores.test.mjs tests/async-mutex.test.mjs tests/pty-registry-scrollback.test.mjs tests/cli-sessions/special-keys.test.mjs tests/cli-sessions/tmux-client.test.mjs tests/cli-sessions/tmux-session.test.mjs tests/cli-sessions/tmux-session-runtime.test.mjs tests/cli-sessions/tmux-session-registry.test.mjs tests/cli-sessions/wait-for-ready.test.mjs tests/scheduler.test.mjs tests/dispatch-bytes-e2e.test.mjs tests/dispatch-endpoint.test.mjs tests/dispatch-spawn-e2e.test.mjs tests/dispatcher.test.mjs tests/recipe-runner-interactive.test.mjs tests/recipe-step-tools.test.mjs tests/recipe-step-validation.test.mjs tests/recipe-validation-worker.test.mjs tests/recipe-build-step-decls.test.mjs tests/recipe-multi-gate.test.mjs tests/recipe-terminal-links.test.mjs tests/recipe-lane-execution.test.mjs tests/cron-api.test.mjs tests/mcp-bootstrap.test.mjs tests/kernel-smoke.test.mjs tests/main-agent-conductor.test.mjs tests/agent-clis.test.mjs tests/agent-clis-capabilities.test.mjs tests/pending-dispatch-registry.test.mjs tests/update-status-tool.test.mjs tests/dispatcher-tmux.test.mjs tests/tools-session.test.mjs tests/spawn-endpoint.test.mjs tests/init-cli-chooser.test.mjs tests/api-agent-clis.test.mjs tests/api-sessions.test.mjs tests/api-sessions-list.test.mjs tests/api-sessions-resume.test.mjs tests/cli-provider-e2e.test.mjs tests/manifest-load.test.mjs tests/marketplace-load.test.mjs tests/marketplace-cli.test.mjs tests/plugin-renderers.test.mjs tests/cli-plugin-sync.test.mjs tests/init-client-probe.test.mjs tests/plugin-sync-e2e.test.mjs tests/builtin-marketplace.test.mjs tests/recipe-real-e2e.test.mjs tests/api-test-hooks.test.mjs tests/daemon-supervisor.test.mjs tests/copilot-events.test.mjs tests/memory-config.test.mjs tests/memory-paths.test.mjs tests/memory-vault-lock.test.mjs tests/memory-frontmatter.test.mjs tests/memory-events.test.mjs tests/memory-git.test.mjs tests/memory-qmd.test.mjs tests/memory-tools-e2e.test.mjs tests/memory-mcp-integration.test.mjs tests/memory-phase4-7.test.mjs tests/memory-phase6.test.mjs tests/memory-phase8.test.mjs tests/memory-get-lessons.test.mjs tests/ado-auth.test.mjs tests/inbox-multi-questions.test.mjs tests/inbox-reply-e2e.test.mjs tests/inbox-unread.test.mjs tests/json-doc-store.test.mjs tests/json-doc-store-api.test.mjs tests/qa-store.test.mjs tests/pr-walkthrough-tool.test.mjs tests/comment-overlay.test.mjs tests/pr-walkthrough-renderer.test.mjs tests/artifact-session-endpoint.test.mjs tests/share-server.test.mjs tests/artifact-share-tunnel.test.mjs tests/memory-sync-audit.test.mjs tests/memory-sync-e2e.test.mjs tests/ado-new-pr-watcher.test.mjs tests/trigger-runner.test.mjs tests/ado-assigned-items-watcher.test.mjs tests/memory-git-sync.test.mjs tests/memory-sync-register.test.mjs tests/memory-sync-tool.test.mjs tests/memory-sync-trigger.test.mjs tests/trigger-observations.test.mjs tests/vault-trigger-discovery.test.mjs tests/library-api.test.mjs",
+    "test:e2e": "playwright test",
+    "test:e2e:pr-walkthrough": "playwright test tests/pr-walkthrough-e2e.playwright.test.mjs",
+    "test:triggers:live:local": "node scripts/live-local-probe.mjs",
+    "test:triggers": "node --import tsx --test --test-force-exit --test-concurrency=1 tests/trigger-templates.test.mjs tests/trigger-runner.test.mjs"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "dependencies": {
+    "@clack/prompts": "^0.7.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@tobilu/qmd": "^2.5.3",
+    "@toon-format/toon": "^2.1.0",
+    "@types/qrcode-terminal": "^0.12.2",
+    "@types/ws": "^8.18.1",
+    "better-sqlite3": "^12.10.0",
+    "cron-parser": "^4.9.0",
+    "cronstrue": "^2.59.0",
+    "js-yaml": "^4.1.0",
+    "node-pty": "^1.1.0",
+    "pino": "^10.3.1",
+    "playwright-core": "^1.60.0",
+    "qrcode-terminal": "^0.12.0",
+    "tsx": "^4.0.0",
+    "web-push": "^3.6.7",
+    "ws": "^8.20.0",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.59.1",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^22.0.0",
+    "@types/web-push": "^3.6.4",
+    "esbuild": "^0.24.0",
+    "jsdom": "^29.1.1",
+    "playwright": "^1.59.1",
+    "typescript": "^5.4.0"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/kirmad/clawdevbox",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kirmad/clawdevbox.git"
+  },
+  "bugs": {
+    "url": "https://github.com/kirmad/clawdevbox/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "ai-agents",
+    "coding-agents",
+    "recipes",
+    "plugins",
+    "agent",
+    "headless"
+  ]
+}

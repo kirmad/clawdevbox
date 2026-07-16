@@ -1,0 +1,30 @@
+id: ado.assigned-items-watcher
+description: >-
+  Poll ADO for work items assigned to a user. On each fire, queries the
+  configured org/project for items assigned to assigned_to, dispatches a
+  prompt listing any NEW items (not seen in the previous fire) to the
+  configured provider. Useful for auto-triaging incoming work items.
+runtime: tsx
+accepts_webhook: true
+parameters:
+  - name: org
+    type: string
+    required: true
+    description: ADO organization slug (e.g. 'myorg')
+  - name: project
+    type: string
+    required: true
+    description: ADO project name (e.g. 'myproject')
+  - name: assigned_to
+    type: string
+    required: true
+    description: ADO uniqueName to watch (e.g. 'devuser@example.com')
+  - name: worktree_path
+    type: string
+    required: false
+    description: Working directory for the dispatched agent
+  - name: extra_where
+    type: string
+    required: false
+    description: >-
+      Additional WIQL WHERE clause (e.g. "[System.State] <> 'Closed'")

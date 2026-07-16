@@ -1,0 +1,62 @@
+# Clawdevbox template (sub-recipe shape). See spec §7.2 + §7.6.
+#
+# This recipe is invoked two ways:
+#   - INLINE from `pr-review` step 6 (the parent agent reads this body
+#     and follows the steps within its own session — no child thread).
+#   - AS A PROMPT-BOUND CALLBACK from the `ado-comment-watcher` trigger
+#     (the trigger's prompt frames the comment as work; the agent picks
+#     up this recipe by name to structure the response).
+#
+# Either way, the agent applies the `analyze-pr-comment` skill for tone
+# and structure. This recipe is the *sequence*; the skill is the *style*.
+
+id: respond-to-pr-comment
+name: "Respond to a PR comment (ADO)"
+description: >
+  Author an agent reply to a single inbound PR comment, weighing tone
+  and intent. Used both as a style guide referenced from `pr-review`
+  and as the sequence the `ado-comment-watcher` trigger expects the
+  agent to follow.
+kind: pr_review
+default_client: claude
+mcp_servers:
+  - ado
+  - clawdevbox
+
+steps:
+  - id: 1
+    goal: >
+      Read the comment, the surrounding diff, and any prior agent
+      replies in this thread. Apply the `analyze-pr-comment` skill to
+      classify the comment as a question, a change request, or an
+      affirmation.
+
+  - id: 2
+    goal: >
+      Branch on classification:
+
+      - **Question.** Draft a clear answer grounded in the diff. Cite
+        line numbers. No code change. Skip step 3 and go to step 4.
+      - **Change request.** Draft an action plan (what files, what
+        change, why). Call `approval.request` with the plan; the user
+        approves, rejects, or edits. Skip to step 3.
+      - **Affirmation.** Draft a two-word acknowledgement. Skip step 3.
+    depends: [1]
+
+  - id: 3
+    goal: >
+      Only on an approved change request: apply the change. Use the
+      project's normal edit + commit flow (the agent's own coding
+      loop, not Clawdevbox primitives). Push the commit to the PR
+      source branch. Register `artifact.write` for the patch so it's
+      attached to the thread for audit.
+    depends: [2]
+
+  - id: 4
+    goal: >
+      Post the reply via `ado.comment_pr`. Append a
+      `thread.append_message` recording what was sent. If you applied
+      a change in step 3, link the commit hash from the reply. Call
+      `thread.set_state` back to `suspended` so the watcher can fire
+      again on the next comment.
+    depends: [3]

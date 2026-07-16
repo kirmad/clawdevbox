@@ -1,0 +1,91 @@
+/* Global CSS — reset, layout shell, and a few overrides PrimeVue's Aura
+   preset doesn't cover (tunnel/inbox state colors, mobile rail). PrimeVue
+   variables drive most surface colors via the cssLayer config in main.ts. */
+
+* { box-sizing: border-box; }
+html, body, #app { margin: 0; padding: 0; height: 100%; }
+body {
+  background: var(--p-content-background, #14161b);
+  color: var(--p-text-color, #d8dee9);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 13px;
+  line-height: 1.45;
+  overscroll-behavior: contain;
+}
+
+a { color: var(--p-primary-color, #88c0d0); }
+code, pre { font-family: ui-monospace, Consolas, Menlo, monospace; font-size: 12.5px; }
+
+/* App grid — base setup. The actual desktop/mobile grid is controlled
+   by `.app-shell.desktop` / `.app-shell.mobile` rules inside App.vue
+   (which can react to `useMediaQuery` instead of CSS-only breakpoints).
+   That lets us swap the sidebar from inline (desktop) → Drawer (mobile)
+   based on the same media-query state JS sees. */
+.app-shell {
+  height: 100%;
+  display: grid;
+}
+.app-onboard { grid-area: onboard; }
+.app-sidebar { grid-area: sidebar; min-width: 0; border-right: 1px solid var(--p-content-border-color, #2a2e38); background: #14161b; }
+.app-main    { grid-area: main; min-width: 0; min-height: 0; overflow: hidden; display: flex; flex-direction: column; }
+
+/* PrimeVue tab fine-tuning — the default top tab list is fine, but we
+   want the panel below to grow to fill available height. */
+.p-tabs { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+.p-tabpanels { flex: 1; min-height: 0; overflow: hidden; padding: 0; }
+.p-tabpanel { height: 100%; display: flex; flex-direction: column; }
+
+/* Hide focus rings on touch but keep them for keyboard users. */
+:focus-visible { outline: 2px solid var(--p-primary-color, #88c0d0); outline-offset: 1px; }
+
+/* Fullscreen pane — used by InboxDetailPanel + ArtifactPanel. The
+   z-index is below PrimeVue's overlay layer (Toast, ConfirmDialog,
+   Drawer all use ≥10000) so confirmations/errors stay visible. */
+.fs-pane {
+  position: fixed !important;
+  inset: 0 !important;
+  z-index: 9000 !important;
+  background: var(--p-content-background, #14161b) !important;
+  /* Restore normal box-shadow to indicate the elevated layer. */
+  box-shadow: 0 0 0 1px var(--p-content-border-color, #2a2e38), 0 12px 32px rgba(0, 0, 0, 0.5);
+}
+
+/* xterm host — sits inside AgentPanel. */
+.term-host {
+  flex: 1;
+  min-height: 0;
+  background: #15171d;
+  padding: 4px;
+}
+.xterm, .xterm-viewport, .xterm-screen { background: #15171d !important; }
+
+/* Tunnel + push pills in the sidebar — colored by state. */
+.pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 8px;
+  border-radius: 9999px;
+  font-size: 10px;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  background: #2a2e38;
+  color: #c0c5ce;
+}
+.pill[data-state="live"]    { background: #1a4a3a; color: #a3e0c4; }
+.pill[data-state="pending"] { background: #4a3a1a; color: #e6d090; }
+.pill[data-state="error"]   { background: #4a1f1f; color: #f0a8a8; }
+.pill[data-state="off"]     { background: #2a2e38; color: #6c7080; }
+
+/* Live indicator dot used in pane headers. */
+.live-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: #4a4a4a;
+  display: inline-block;
+}
+.live-dot[data-state="live"]    { background: #4ec9b0; box-shadow: 0 0 0 0 rgba(78, 201, 176, 0.4); animation: live-pulse 2.4s ease-out infinite; }
+.live-dot[data-state="offline"] { background: #d27e7e; }
+@keyframes live-pulse {
+  0%   { box-shadow: 0 0 0 0 rgba(78, 201, 176, 0.4); }
+  70%  { box-shadow: 0 0 0 10px rgba(78, 201, 176, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(78, 201, 176, 0); }
+}

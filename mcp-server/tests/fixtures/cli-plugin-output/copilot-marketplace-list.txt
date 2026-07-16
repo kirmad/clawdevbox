@@ -1,0 +1,7 @@
+✨ Included with GitHub Copilot:
+  ◆ copilot-plugins (GitHub: github/copilot-plugins)
+  ◆ awesome-copilot (GitHub: github/awesome-copilot)
+
+Registered marketplaces:
+  • superpowers-marketplace (GitHub: obra/superpowers-marketplace)
+  • example-plugins (URL: https://dev.azure.com/myorg/myproject/_git/ado-private)

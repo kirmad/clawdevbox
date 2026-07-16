@@ -1,0 +1,13 @@
+{
+  "name": "bad-shape",
+  "version": "0.1.0",
+  "description": "Fixture for INVALID_PROVIDER_SHAPE.",
+  "clawdevbox": {
+    "agent_clis": [
+      {
+        "id": "bad-shape",
+        "module": "bad-provider.mjs"
+      }
+    ]
+  }
+}

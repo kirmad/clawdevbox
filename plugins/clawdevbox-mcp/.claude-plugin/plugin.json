@@ -1,0 +1,9 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "clawdevbox-mcp",
+  "version": "0.1.0",
+  "description": "Registers the clawdevbox MCP server with the configured agent CLI.",
+  "author": { "name": "Clawdevbox team" },
+  "keywords": ["clawdevbox", "mcp", "core"],
+  "mcpServers": "./.mcp.json"
+}

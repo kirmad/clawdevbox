@@ -1,0 +1,200 @@
+<!doctype html>
+<!--
+  index.html — host page for the spike.
+
+  Mirrors the architecture: the artifact lives in a sandboxed <iframe>
+  (viewer.html), and this parent page listens for postMessage events from
+  the iframe to perform the "send-to-agent" hand-off via /api/session-send.
+
+  The "Last send" panel on the right shows what the agent would receive.
+  The terminal running server.mjs prints the same thing to stdout.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Artifact Comments — Spike</title>
+  <style>
+    :root { color-scheme: dark; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      background: #0e1117; color: #d4d4d4;
+      display: grid;
+      grid-template-rows: 48px 1fr;
+    }
+    header {
+      display: flex; align-items: center; gap: 16px;
+      padding: 0 16px; background: #15171d;
+      border-bottom: 1px solid #2d3138;
+    }
+    header h1 { font-size: 14px; margin: 0; font-weight: 600; letter-spacing: 0.5px; color: #fff; }
+    header .meta { font-size: 11px; color: #8b949e; }
+    header .spacer { flex: 1; }
+    header button {
+      background: #22252b; border: 1px solid #3e3e42; color: #d4d4d4;
+      padding: 5px 11px; border-radius: 4px; font-size: 11px; cursor: pointer;
+    }
+    header button:hover { background: #2a2d33; }
+    main {
+      display: grid;
+      grid-template-columns: 1fr 360px;
+      min-height: 0;
+    }
+    #frame-wrap {
+      position: relative; min-height: 0; min-width: 0;
+      border-right: 1px solid #2d3138;
+      background: #15171d;
+    }
+    iframe {
+      width: 100%; height: 100%; border: 0; background: #15171d;
+    }
+    aside {
+      padding: 12px 14px; overflow: auto; background: #15171d;
+      display: flex; flex-direction: column; gap: 12px;
+    }
+    aside h2 { font-size: 12px; margin: 0; color: #fff; letter-spacing: 0.5px; }
+    aside .subtitle { font-size: 11px; color: #8b949e; margin-top: -4px; }
+    .panel {
+      background: #1b1d22; border: 1px solid #2d3138; border-radius: 4px;
+      padding: 10px;
+    }
+    pre {
+      background: #0e1117; border: 1px solid #2d3138; border-radius: 4px;
+      color: #d4d4d4; padding: 10px;
+      font-family: Consolas, 'Liberation Mono', Menlo, monospace; font-size: 11px;
+      white-space: pre-wrap; word-break: break-word;
+      max-height: 70vh; overflow: auto; margin: 0;
+    }
+    .empty { color: #8b949e; font-style: italic; font-size: 11px; }
+    .pill {
+      display: inline-block; padding: 1px 7px; border-radius: 10px;
+      background: #2d3138; color: #d4d4d4; font-size: 10px; margin-right: 4px;
+    }
+    .pill.ok { background: #1f3a2a; color: #98ed98; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>📝 Artifact Comments — Spike</h1>
+    <span class="meta">artifact <code>art_demo01</code> · spike</span>
+    <span class="spacer"></span>
+    <button id="reload-iframe" title="Force the iframe to remount (validates re-anchoring)">↻ Re-render artifact</button>
+    <button id="reset-store" title="Delete .store/ contents — wipe drafts, attachments, history">⌫ Reset store</button>
+  </header>
+
+  <main>
+    <div id="frame-wrap">
+      <iframe id="viewer"
+              src="/viewer.html?artifact=art_demo01"
+              sandbox="allow-scripts allow-same-origin allow-downloads"
+              referrerpolicy="same-origin"
+              title="artifact viewer"></iframe>
+    </div>
+    <aside>
+      <div class="panel">
+        <h2>Last send</h2>
+        <div class="subtitle">
+          This is the literal markdown bundle the iframe would push to the agent
+          via <code>session.send</code>. The same thing is printed in the
+          <code>server.mjs</code> terminal.
+        </div>
+        <div id="last-send-meta" style="margin-top:8px"></div>
+        <pre id="last-send-body" class="empty">— no sends yet — try selecting text in the artifact and clicking 💬</pre>
+      </div>
+      <div class="panel">
+        <h2>Store contents</h2>
+        <div class="subtitle">Refreshed on every send / draft change.</div>
+        <pre id="store-listing" class="empty">—</pre>
+      </div>
+    </aside>
+  </main>
+
+  <script type="module">
+    // ----- Host: listen to iframe postMessages and perform the hand-off -----
+    const iframe = document.getElementById('viewer');
+    const lastBody = document.getElementById('last-send-body');
+    const lastMeta = document.getElementById('last-send-meta');
+    const storeListing = document.getElementById('store-listing');
+
+    window.addEventListener('message', async (ev) => {
+      if (ev.origin !== location.origin) return;
+      if (ev.source !== iframe.contentWindow) return;
+      const msg = ev.data;
+      if (!msg || typeof msg !== 'object') return;
+
+      if (msg.type === 'artifact:send-comments') {
+        const { artifactId, draftCount, markdown } = msg.payload;
+        try {
+          const r = await fetch('/api/session-send', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ artifactId, draftCount, markdown }),
+          });
+          if (!r.ok) throw new Error(await r.text());
+          const { deliveredAt } = await r.json();
+
+          lastBody.classList.remove('empty');
+          lastBody.textContent = markdown;
+          lastMeta.innerHTML =
+            `<span class="pill ok">delivered</span>` +
+            `<span class="pill">artifact ${artifactId}</span>` +
+            `<span class="pill">${draftCount} comment${draftCount === 1 ? '' : 's'}</span>` +
+            `<span class="pill">${new Date(deliveredAt).toLocaleTimeString()}</span>`;
+
+          ev.source.postMessage({
+            type: 'artifact:send-comments:ack',
+            payload: { artifactId, ok: true, deliveredAt },
+          }, ev.origin);
+        } catch (err) {
+          ev.source.postMessage({
+            type: 'artifact:send-comments:ack',
+            payload: { artifactId, ok: false, error: String(err?.message ?? err) },
+          }, ev.origin);
+        }
+        refreshStoreListing();
+      }
+
+      if (msg.type === 'artifact:drafts-changed') {
+        refreshStoreListing();
+      }
+    });
+
+    document.getElementById('reload-iframe').addEventListener('click', () => {
+      iframe.src = iframe.src;  // remount
+    });
+
+    document.getElementById('reset-store').addEventListener('click', async () => {
+      if (!confirm('Delete ALL spike store contents (drafts, attachments, history)?')) return;
+      // We don't expose a bulk-reset endpoint; reset by listing + deleting.
+      for (const col of ['artifact-comments', 'artifact-comment-attachments', 'artifact-comment-history']) {
+        const r = await fetch('/api/store/' + col);
+        if (!r.ok) continue;
+        const { ids } = await r.json();
+        await Promise.all(ids.map(id =>
+          fetch('/api/store/' + col + '/' + id, { method: 'DELETE' })
+        ));
+      }
+      iframe.src = iframe.src;
+      refreshStoreListing();
+    });
+
+    async function refreshStoreListing() {
+      const lines = [];
+      for (const col of ['artifact-comments', 'artifact-comment-attachments', 'artifact-comment-history']) {
+        try {
+          const r = await fetch('/api/store/' + col);
+          if (!r.ok) { lines.push(`[${col}] (none)`); continue; }
+          const { ids } = await r.json();
+          lines.push(`[${col}] ${ids.length}`);
+          for (const id of ids.slice(0, 10)) lines.push('  - ' + id);
+          if (ids.length > 10) lines.push(`  … and ${ids.length - 10} more`);
+        } catch { lines.push(`[${col}] (error)`); }
+      }
+      storeListing.textContent = lines.join('\n');
+      storeListing.classList.remove('empty');
+    }
+    refreshStoreListing();
+    setInterval(refreshStoreListing, 5000);
+  </script>
+</body>
+</html>

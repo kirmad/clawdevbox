@@ -1,0 +1,1086 @@
+/**
+ * tools/trigger.ts
+ *
+ * The trigger MCP surface (spec §6.1 + §8) — split cleanly into TYPES
+ * (capabilities shipped by plugins) and REGISTERED instances (concrete
+ * bindings persisted in `.clawdevbox/triggers.json`).
+ *
+ * Seven tools:
+ *
+ *   - trigger.list_types        — capabilities available from loaded plugins
+ *   - trigger.list_registered   — active registered instances
+ *   - trigger.register          — bind a type to concrete params (writes
+ *                                 to triggers.json `registered[]`)
+ *   - trigger.unregister        — remove a registered instance (type stays)
+ *   - trigger.update_params     — modify params and/or cron without
+ *                                 unregister/re-register
+ *   - trigger.enable / .disable — toggle the `enabled` flag
+ *   - trigger.fire              — manually fire a registered trigger; emits
+ *                                 a queued run_id. The actual webhook POST
+ *                                 to the registered instance's `/hooks/<id>`
+ *                                 endpoint is the scheduler's job.
+ *
+ * Cron has three states per registration (spec §8.4):
+ *
+ *   - string                      → override the type's default_cron
+ *   - null / undefined            → inherit the type's default_cron
+ *   - false / ""                  → cron disabled (webhook/manual only)
+ *
+ * Param validation: the type's `parameters[]` declaration is converted into
+ * a hand-rolled validator. Defaults are applied for absent optional params.
+ * Required params missing surface as PARAM_VALIDATION with structured errors.
+ */
+
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { join, resolve as pathResolve, sep } from 'node:path';
+import { tmpdir } from 'node:os';
+import { randomBytes } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+import { z } from 'zod';
+import { aliasTool, defineTool, getRegistry } from './registry.ts';
+import { runTriggerScript, collectObservations } from '../trigger-runner.ts';
+import type { TriggerTypeParameter } from '../workspace.ts';
+import { logger } from '../logger.ts';
+import {
+  isValidCronExpression,
+  validateAgentAuthoredTemplate,
+  validateBackoffMs,
+  validateMaxAttempts,
+  validateRuntime,
+  validateTriggerParams,
+  type TriggerRuntime,
+} from '../validators.ts';
+import { mintId } from '../store.ts';
+import {
+  mintRegisteredId,
+  readTriggersFile,
+  writeTriggersFile,
+  type RegisteredTrigger,
+} from '../triggers-store.ts';
+import { enqueueFire } from '../db/fires-store.ts';
+import { getDatabase } from '../db/index.ts';
+import { ensureWorkspace } from '../db/workspaces-store.ts';
+import {
+  deleteOneOffTemplate,
+  deleteTemplate,
+  deleteVaultTemplate,
+  findTemplate,
+  listVaultTemplates,
+  loadOneOffTemplate,
+  loadVaultTemplate,
+  mintOneOffId,
+  templateExists,
+  toRegisteredType,
+  writeOneOffTemplate,
+  writeTemplate,
+  writeVaultTemplate,
+  type LoadedTemplate,
+  type TemplateManifest,
+  type TemplateScope,
+} from '../template-store.ts';
+import {
+  loadVaultChainForWorkspace,
+  resolveVaultById,
+} from '../vault-paths.ts';
+import type { VaultInfo } from '../vault-chain.ts';
+import {
+  reloadTypeRegistries,
+  triggersJsonPath,
+  type RegisteredTriggerType,
+  type Workspace,
+} from '../workspace.ts';
+import { notFound, structuredError, validationError } from '../scope.ts';
+import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+
+function ensureFileUnderClawdevbox(projectDir: string, relPath: string):
+  { ok: true; path: string } | { ok: false; error: CallToolResult } {
+  const root = pathResolve(projectDir, '.clawdevbox');
+  const abs = pathResolve(projectDir, relPath);
+  if (!abs.startsWith(root + sep) && abs !== root) {
+    return { ok: false, error: structuredError('SCRIPT_FILE_OUTSIDE_WORKSPACE',
+      `script_file must resolve under .clawdevbox/. Got: ${relPath}`,
+      { script_file: relPath, resolved: abs }) };
+  }
+  if (!existsSync(abs)) {
+    return { ok: false, error: structuredError('SCRIPT_FILE_NOT_FOUND',
+      `script_file does not exist: ${relPath}`,
+      { script_file: relPath, resolved: abs }) };
+  }
+  return { ok: true, path: abs };
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+/** Build the structured-error response for a parameter-validation failure. */
+function paramValidationError(
+  errors: Array<{ path: string; code: string; message: string }>,
+): CallToolResult {
+  const text = errors.map((e) => `${e.path}: ${e.message}`).join('\n');
+  return {
+    isError: true,
+    content: [{ type: 'text', text: `Parameter validation failed:\n${text}` }],
+    structuredContent: { code: 'PARAM_VALIDATION', message: 'Parameter validation failed.', errors },
+  };
+}
+
+/** Resolve a `cron` field on a registration into one of three normalized values. */
+function normalizeCron(raw: unknown): { ok: true; cron: string | null | false } | { ok: false; message: string } {
+  if (raw === undefined) return { ok: true, cron: null };
+  if (raw === null) return { ok: true, cron: null };
+  if (raw === false || raw === '') return { ok: true, cron: false };
+  if (typeof raw === 'string') {
+    if (!isValidCronExpression(raw)) {
+      return { ok: false, message: `cron expression ${JSON.stringify(raw)} is not a valid 5- or 6-field cron.` };
+    }
+    return { ok: true, cron: raw };
+  }
+  return { ok: false, message: 'cron must be a string (override), null (inherit), or false (disable).' };
+}
+
+/**
+ * Project a registered trigger to the structured-content shape returned by
+ * `trigger.list_registered`. Resolves cron inheritance from the type so the
+ * agent sees the effective schedule without a second lookup.
+ */
+function projectRegistered(
+  reg: RegisteredTrigger,
+  ws: Workspace,
+): RegisteredTrigger & { resolved_cron: string | false | null; type_exists: boolean } {
+  const type = ws.triggerTypes.get(reg.type);
+  let resolved: string | false | null;
+  if (reg.cron === false) {
+    resolved = false; // disabled
+  } else if (reg.cron === null) {
+    resolved = type?.default_cron ?? null; // inherit, may still be null
+  } else {
+    resolved = reg.cron;
+  }
+  return { ...reg, resolved_cron: resolved, type_exists: !!type };
+}
+
+/** Convert a RegisteredTriggerType to the projection returned by trigger.list_types. */
+function projectType(t: RegisteredTriggerType): Record<string, unknown> {
+  return {
+    id: t.id,
+    source_plugin_id: t.source_plugin_id,
+    scope: t.scope,
+    description: t.description ?? '',
+    file: t.file,
+    file_abs: t.file_abs,
+    default_cron: t.default_cron ?? null,
+    accepts_webhook: t.accepts_webhook ?? true,
+    identity_param: t.identity_param ?? null,
+    parameters: t.parameters ?? [],
+  };
+}
+
+// ============================================================================
+// Registration
+// ============================================================================
+
+/**
+ * Dispatch a template write to the right backend based on its scope string.
+ * 'project'/'global' → `<scope>/trigger-types/`. 'vault:<id>' → vault path.
+ * Throws if the vault id doesn't match a configured vault.
+ */
+function writeTemplateAnyScope(
+  ws: Workspace, scope: TemplateScope,
+  opts: { manifest: TemplateManifest; scriptContent: string },
+): { dir: string; scriptAbs: string } {
+  if (typeof scope === 'string' && scope.startsWith('vault:')) {
+    const v = resolveVaultById(loadVaultChainForWorkspace(ws), scope.slice('vault:'.length));
+    return writeVaultTemplate(v, opts);
+  }
+  return writeTemplate(ws, scope as 'project' | 'global', opts);
+}
+
+/** Dispatch a template delete to the right backend based on scope. */
+function deleteTemplateAnyScope(ws: Workspace, scope: TemplateScope, id: string): boolean {
+  if (typeof scope === 'string' && scope.startsWith('vault:')) {
+    const v = resolveVaultById(loadVaultChainForWorkspace(ws), scope.slice('vault:'.length));
+    return deleteVaultTemplate(v, id);
+  }
+  return deleteTemplate(ws, scope as 'project' | 'global', id);
+}
+
+export function registerTriggerEntries(ws: Workspace): void {
+  // -- trigger.list_types ---------------------------------------------------
+  defineTool({
+    name: 'trigger.type.list',
+    description: 'TYPE CATALOG: List trigger TYPES (capabilities) discovered from enabled plugins AND agent-authored templates (spec §8.2 / §10.4). Read-only view of everything that could be `trigger.instance.register`-ed. Each entry carries the parameter schema, default cron, callback binding, and source plugin. Use trigger.instance.register to create a concrete instance from one.',
+    parameters: z.object({
+        scope: z
+          .string()
+          .regex(/^plugin:[a-z][a-z0-9-]*$/, 'plugin:<id>')
+          .optional()
+          .describe('Filter to a single plugin scope (e.g. "plugin:ado"). Default: all plugins.'),
+        search: z
+          .string()
+          .min(1)
+          .optional()
+          .describe('Substring filter against id or description.'),
+      }),
+    handler: async (args) => {
+      const all = [...ws.triggerTypes.values()].sort((a, b) => a.id.localeCompare(b.id));
+      let filtered = all;
+      if (args.scope) {
+        filtered = filtered.filter((t) => t.scope === args.scope);
+      }
+      if (args.search) {
+        const q = args.search.toLowerCase();
+        filtered = filtered.filter(
+          (t) =>
+            t.id.toLowerCase().includes(q) ||
+            (t.description ?? '').toLowerCase().includes(q),
+        );
+      }
+      const projected = filtered.map(projectType);
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Found ${projected.length} trigger type(s)${ws.triggerTypeErrors.length > 0 ? ` (with ${ws.triggerTypeErrors.length} load error(s))` : ''}.`,
+          },
+        ],
+        structuredContent: {
+          trigger_types: projected,
+          count: projected.length,
+          load_errors: ws.triggerTypeErrors,
+        },
+      };
+    },
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
+
+  // -- trigger.list_registered ----------------------------------------------
+  defineTool({
+    name: 'trigger.instance.list',
+    description: 'List REGISTERED trigger instances from `.clawdevbox/triggers.json` (spec §8.3). Each entry shows the bound params, cron resolution (inherited/overridden/disabled), and last-run status. Use trigger.list_types to see available capabilities.',
+    parameters: z.object({
+        enabled: z.boolean().optional(),
+        type_id: z.string().min(1).optional().describe('Filter to a single trigger type id.'),
+        subscriber_thread_id: z
+          .string()
+          .min(1)
+          .optional()
+          .describe('Filter to hot triggers bound to this thread.'),
+      }),
+    handler: async (args) => {
+      const file = readTriggersFile(triggersJsonPath(ws));
+      let rows = file.registered.map((r) => projectRegistered(r, ws));
+      if (args.enabled !== undefined) {
+        rows = rows.filter((r) => r.enabled === args.enabled);
+      }
+      if (args.type_id) {
+        rows = rows.filter((r) => r.type === args.type_id);
+      }
+      if (args.subscriber_thread_id) {
+        rows = rows.filter((r) => r.subscriber_thread_id === args.subscriber_thread_id);
+      }
+      return {
+        content: [{ type: 'text', text: `Found ${rows.length} registered trigger(s).` }],
+        structuredContent: { registered: rows, count: rows.length },
+      };
+    },
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
+
+  // -- trigger.register -----------------------------------------------------
+  defineTool({
+    name: 'trigger.instance.register',
+    description: '⚠️ PREREQUISITE (only when supplying `script`): read the `authoring-triggers` skill FIRST via `skill.read({ id: "authoring-triggers" })`. Inline scripts hit the same envelope/state/cursor/auth contract as plugin TYPES — skipping the skill yields subtle silent bugs. (Not needed when registering a saved type_id.) INSTANCE: Register a trigger INSTANCE. Three mutually-exclusive sources: (a) `type_id` for a saved TYPE (plugin or agent-authored); (b) `script` for an inline one-off; (c) `script_file` for a file under `.clawdevbox/`. One-off paths default to `once: true`, `cron: false` (manual/webhook only). Validates params against the type schema (where one exists), mints `<type_id>#<key>` (or auto-template id for one-offs), and writes to `triggers.json`.',
+    parameters: z.object({
+        type_id: z.string().min(1).optional(),
+        script: z.string().optional(),
+        script_file: z.string().optional(),
+        runtime: z.enum(['node', 'tsx', 'python', 'bash']).optional()
+          .describe('Required when script or script_file is supplied.'),
+        name: z.string().min(1).max(120).optional()
+          .describe('Human-readable label (e.g. "Teams chat listener", "Hourly QoE sanity-check") shown by the SPA in place of the auto-minted registered-id. Optional; falls back to id when omitted.'),
+        params: z.record(z.string(), z.unknown()).optional(),
+        cron: z.union([z.string(), z.null(), z.literal(false), z.literal('')]).optional(),
+        subscriber_thread_id: z.string().min(1).optional(),
+        expires_at: z.number().optional(),
+        once: z.boolean().optional(),
+        max_attempts: z.number().int().optional()
+          .describe('Override the default of 3. Integer in [1, 100].'),
+        backoff_ms: z.array(z.number().int()).optional()
+          .describe('Override the default of [30000, 120000, 600000]. Non-empty array of integers in [0, 86400000].'),
+      }),
+    handler: async (args) => {
+      const sources = [args.type_id, args.script, args.script_file].filter((x) => typeof x === 'string').length;
+      if (sources !== 1) {
+        return structuredError('INVALID_REQUEST',
+          'Provide exactly one of `type_id`, `script`, or `script_file`.',
+          { type_id_provided: !!args.type_id, script_provided: !!args.script, script_file_provided: !!args.script_file });
+      }
+
+      let typeId: string;
+      let isAdhoc = false;
+      let oneoffTemplateId: string | null = null;
+
+      if (args.type_id) {
+        typeId = args.type_id;
+      } else {
+        if (!args.runtime) {
+          return structuredError('RUNTIME_REQUIRED',
+            'runtime is required when supplying script or script_file.', {});
+        }
+        let scriptContent: string;
+        if (args.script) {
+          scriptContent = args.script;
+        } else {
+          const guard = ensureFileUnderClawdevbox(ws.projectDir, args.script_file!);
+          if (!guard.ok) return guard.error;
+          scriptContent = readFileSync(guard.path, 'utf8');
+        }
+        oneoffTemplateId = mintOneOffId();
+        writeOneOffTemplate(ws, {
+          id: oneoffTemplateId,
+          runtime: args.runtime as TriggerRuntime,
+          scriptContent,
+        });
+        const loaded = loadOneOffTemplate(ws, oneoffTemplateId);
+        if (!loaded) {
+          return structuredError('TRIGGER_TEMPLATE_WRITE_FAILED',
+            'Failed to read back the one-off template just written.', { id: oneoffTemplateId });
+        }
+        ws.triggerTypes.set(oneoffTemplateId, toRegisteredType(loaded));
+        typeId = oneoffTemplateId;
+        isAdhoc = true;
+      }
+
+      const type = ws.triggerTypes.get(typeId);
+      if (!type) {
+        return structuredError('TRIGGER_TYPE_NOT_FOUND',
+          `Trigger type ${typeId} is not declared by any loaded plugin or template.`,
+          { type_id: typeId });
+      }
+
+      const params = args.params ?? {};
+      const paramsCheck = validateTriggerParams(type.parameters, params);
+      if (!paramsCheck.ok) {
+        if (isAdhoc && oneoffTemplateId) deleteOneOffTemplate(ws, oneoffTemplateId);
+        return paramValidationError(paramsCheck.errors);
+      }
+
+      const cronInput = args.cron === undefined && isAdhoc ? false : args.cron;
+      const cronCheck = normalizeCron(cronInput);
+      if (!cronCheck.ok) {
+        if (isAdhoc && oneoffTemplateId) deleteOneOffTemplate(ws, oneoffTemplateId);
+        return paramValidationError([{ path: 'cron', code: 'CRON_INVALID', message: cronCheck.message }]);
+      }
+
+      let maxAttemptsValue: number | undefined;
+      if (args.max_attempts !== undefined) {
+        const ma = validateMaxAttempts(args.max_attempts);
+        if (!ma.ok) {
+          if (isAdhoc && oneoffTemplateId) deleteOneOffTemplate(ws, oneoffTemplateId);
+          return paramValidationError([
+            { path: 'max_attempts', code: 'INVALID_MAX_ATTEMPTS', message: ma.message },
+          ]);
+        }
+        maxAttemptsValue = ma.value;
+      }
+      let backoffMsValue: number[] | undefined;
+      if (args.backoff_ms !== undefined) {
+        const bo = validateBackoffMs(args.backoff_ms);
+        if (!bo.ok) {
+          if (isAdhoc && oneoffTemplateId) deleteOneOffTemplate(ws, oneoffTemplateId);
+          return paramValidationError([
+            { path: 'backoff_ms', code: 'INVALID_BACKOFF_MS', message: bo.message },
+          ]);
+        }
+        backoffMsValue = bo.value;
+      }
+
+      const id = mintRegisteredId(type.id, paramsCheck.params, type.identity_param);
+      const path = triggersJsonPath(ws);
+      const file = readTriggersFile(path);
+      if (file.registered.some((r) => r.id === id)) {
+        if (isAdhoc && oneoffTemplateId) deleteOneOffTemplate(ws, oneoffTemplateId);
+        return structuredError('TRIGGER_ALREADY_REGISTERED',
+          `A registered trigger with id ${id} already exists.`,
+          { id, type_id: type.id });
+      }
+
+      const initialState: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(paramsCheck.params)) initialState[k] = v;
+
+      const row: RegisteredTrigger = {
+        id, type: type.id,
+        name: args.name,
+        params: paramsCheck.params,
+        cron: cronCheck.cron, enabled: true,
+        subscriber_thread_id: args.subscriber_thread_id ?? null,
+        expires_at: args.expires_at ?? null,
+        once: args.once ?? (isAdhoc ? true : false),
+        registered_at: Date.now(),
+        state: initialState,
+        last_run_at: null, last_run_status: null, last_run_error: null,
+      };
+      if (maxAttemptsValue !== undefined) row.max_attempts = maxAttemptsValue;
+      if (backoffMsValue !== undefined) row.backoff_ms = backoffMsValue;
+      file.registered = [...file.registered, row];
+      writeTriggersFile(path, file);
+
+      return {
+        content: [{ type: 'text', text: `Registered trigger ${id} (type=${type.id}${isAdhoc ? ', adhoc' : ''}).` }],
+        structuredContent: {
+          id, type: type.id, registered: projectRegistered(row, ws),
+          adhoc: isAdhoc, template_id: oneoffTemplateId,
+        },
+      };
+    },
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
+
+  // -- trigger.unregister ---------------------------------------------------
+  defineTool({
+    name: 'trigger.instance.unregister',
+    description: 'INSTANCE: Remove a registered trigger instance by id. For one-off registrations, also drops the auto-template directory under `_oneoff/`. The underlying TYPE stays available for non-oneoff types.',
+    parameters: z.object({ id: z.string().min(1) }),
+    handler: async (args) => {
+      const path = triggersJsonPath(ws);
+      const file = readTriggersFile(path);
+      const row = file.registered.find((r) => r.id === args.id);
+      if (!row) return notFound('registered_trigger', args.id);
+      file.registered = file.registered.filter((r) => r.id !== args.id);
+      writeTriggersFile(path, file);
+      let oneoffRemoved = false;
+      if (row.type.startsWith('local.oneoff.')) {
+        oneoffRemoved = deleteOneOffTemplate(ws, row.type);
+        ws.triggerTypes.delete(row.type);
+      }
+      return {
+        content: [
+          { type: 'text', text: `Unregistered trigger ${args.id}${oneoffRemoved ? ' (template removed)' : ''}.` },
+        ],
+        structuredContent: { id: args.id, removed: 1, oneoff_template_removed: oneoffRemoved },
+      };
+    },
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
+
+  // -- trigger.update_params ------------------------------------------------
+  defineTool({
+    name: 'trigger.instance.update_params',
+    description: 'INSTANCE: Modify the params and/or cron of a registered trigger without unregister/re-register (spec §8.3). Re-validates params against the type schema. The registered id is stable — even when an identity param changes, the id is NOT remitted (use trigger.instance.unregister + trigger.instance.register if you want a new id).',
+    parameters: z.object({
+        id: z.string().min(1),
+        name: z.string().min(1).max(120).optional()
+          .describe('Replace the human-readable label shown by the SPA.'),
+        params: z
+          .record(z.string(), z.unknown())
+          .optional()
+          .describe('When present, REPLACES params entirely; re-validated against the type schema.'),
+        cron: z
+          .union([z.string(), z.null(), z.literal(false), z.literal('')])
+          .optional()
+          .describe('When present, replaces the cron field. Pass null to inherit; false/"" to disable.'),
+        max_attempts: z.number().int().optional()
+          .describe('Override the trigger\'s max_attempts. Integer in [1, 100].'),
+        backoff_ms: z.array(z.number().int()).optional()
+          .describe('Override the trigger\'s backoff_ms ladder. Non-empty array of integers in [0, 86400000].'),
+      }),
+    handler: async (args) => {
+      const path = triggersJsonPath(ws);
+      const file = readTriggersFile(path);
+      const idx = file.registered.findIndex((r) => r.id === args.id);
+      if (idx < 0) return notFound('registered_trigger', args.id);
+      const row = file.registered[idx];
+
+      if (
+        args.params === undefined &&
+        args.cron === undefined &&
+        args.max_attempts === undefined &&
+        args.backoff_ms === undefined &&
+        args.name === undefined
+      ) {
+        return structuredError(
+          'NO_CHANGES',
+          'trigger.update_params requires at least one of `params`, `cron`, `max_attempts`, `backoff_ms`, or `name`.',
+          { id: args.id },
+        );
+      }
+
+      let nextParams = row.params;
+      if (args.params !== undefined) {
+        const type = ws.triggerTypes.get(row.type);
+        if (!type) {
+          return structuredError(
+            'TRIGGER_TYPE_NOT_FOUND',
+            `Cannot validate params: trigger type ${row.type} is no longer declared by any plugin.`,
+            { id: args.id, type_id: row.type },
+          );
+        }
+        const check = validateTriggerParams(type.parameters, args.params);
+        if (!check.ok) return paramValidationError(check.errors);
+        nextParams = check.params;
+      }
+
+      let nextCron = row.cron;
+      if (args.cron !== undefined) {
+        const cronCheck = normalizeCron(args.cron);
+        if (!cronCheck.ok) {
+          return paramValidationError([{ path: 'cron', code: 'CRON_INVALID', message: cronCheck.message }]);
+        }
+        nextCron = cronCheck.cron;
+      }
+
+      let nextMaxAttempts = row.max_attempts;
+      if (args.max_attempts !== undefined) {
+        const ma = validateMaxAttempts(args.max_attempts);
+        if (!ma.ok) {
+          return paramValidationError([
+            { path: 'max_attempts', code: 'INVALID_MAX_ATTEMPTS', message: ma.message },
+          ]);
+        }
+        nextMaxAttempts = ma.value;
+      }
+
+      let nextBackoffMs = row.backoff_ms;
+      if (args.backoff_ms !== undefined) {
+        const bo = validateBackoffMs(args.backoff_ms);
+        if (!bo.ok) {
+          return paramValidationError([
+            { path: 'backoff_ms', code: 'INVALID_BACKOFF_MS', message: bo.message },
+          ]);
+        }
+        nextBackoffMs = bo.value;
+      }
+
+      const updated: RegisteredTrigger = {
+        ...row,
+        name: args.name ?? row.name,
+        params: nextParams,
+        cron: nextCron,
+        max_attempts: nextMaxAttempts,
+        backoff_ms: nextBackoffMs,
+      };
+      file.registered[idx] = updated;
+      writeTriggersFile(path, file);
+      return {
+        content: [{ type: 'text', text: `Updated trigger ${args.id}.` }],
+        structuredContent: { id: args.id, registered: projectRegistered(updated, ws) },
+      };
+    },
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
+
+  // -- trigger.enable / trigger.disable -------------------------------------
+  defineTool({
+    name: 'trigger.instance.enable',
+    description: "INSTANCE: Enable a registered trigger by flipping its 'enabled' flag (spec §8.3). The registration row stays on disk; disabled triggers are skipped by the cron daemon but can still be fired manually via trigger.instance.fire.",
+    parameters: z.object({ id: z.string().min(1) }),
+    handler: async (args) => {
+      const path = triggersJsonPath(ws);
+      const file = readTriggersFile(path);
+      const idx = file.registered.findIndex((r) => r.id === args.id);
+      if (idx < 0) return notFound('registered_trigger', args.id);
+      const next: RegisteredTrigger = { ...file.registered[idx], enabled: true };
+      file.registered[idx] = next;
+      writeTriggersFile(path, file);
+      return {
+        content: [
+          { type: 'text', text: `Enabled trigger ${args.id}.` },
+        ],
+        structuredContent: { id: args.id, enabled: true },
+      };
+    },
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
+
+  defineTool({
+    name: 'trigger.instance.disable',
+    description: "INSTANCE: Disable a registered trigger by flipping its 'enabled' flag (spec §8.3). The registration row stays on disk; disabled triggers are skipped by the cron daemon but can still be fired manually via trigger.instance.fire.",
+    parameters: z.object({ id: z.string().min(1) }),
+    handler: async (args) => {
+      const path = triggersJsonPath(ws);
+      const file = readTriggersFile(path);
+      const idx = file.registered.findIndex((r) => r.id === args.id);
+      if (idx < 0) return notFound('registered_trigger', args.id);
+      const next: RegisteredTrigger = { ...file.registered[idx], enabled: false };
+      file.registered[idx] = next;
+      writeTriggersFile(path, file);
+      return {
+        content: [
+          { type: 'text', text: `Disabled trigger ${args.id}.` },
+        ],
+        structuredContent: { id: args.id, enabled: false },
+      };
+    },
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
+
+  // -- trigger.fire ---------------------------------------------------------
+  defineTool({
+    name: 'trigger.instance.fire',
+    description: 'INSTANCE: Manually fire a registered trigger by id. Returns a queued run_id and logs the fire intent. A future in-process cron daemon (or external scheduler) handles the actual webhook POST to `/hooks/<id>`. Works regardless of cron state — manual fires always succeed.',
+    parameters: z.object({
+        id: z.string().min(1),
+        payload: z.unknown().optional(),
+      }),
+    handler: async (args) => {
+      const path = triggersJsonPath(ws);
+      const file = readTriggersFile(path);
+      const reg = file.registered.find((r) => r.id === args.id);
+      if (!reg) return notFound('registered_trigger', args.id);
+      const db = getDatabase();
+      const workspace = ensureWorkspace(db, { path: ws.projectDir });
+      const fire = enqueueFire(db, {
+        workspace_id: workspace.id,
+        trigger_id: reg.id,
+        source: 'manual',
+        scheduled_at: Date.now(),
+        max_attempts: reg.max_attempts ?? 3,
+        payload: args.payload,
+      });
+      logger.info(
+        { triggerId: reg.id, triggerType: reg.type, fireId: fire.fire_id, payload: args.payload ?? null },
+        'trigger.fire enqueued',
+      );
+      return {
+        content: [{ type: 'text', text: `Queued trigger ${reg.id} (fire_id=${fire.fire_id}).` }],
+        structuredContent: {
+          id: reg.id,
+          type: reg.type,
+          fire_id: fire.fire_id,
+          trigger_id: reg.id,
+          status: fire.status,
+        },
+      };
+    },
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
+
+  // -- trigger.create_template ---------------------------------------------
+  defineTool({
+    name: 'trigger.template.create',
+    description: '⚠️ PREREQUISITE: read the `authoring-triggers` skill FIRST via `skill.read({ id: "authoring-triggers" })`. It codifies the envelope contract, state shape, cursor design, auth, spawn routing, bootstrap, and 12 other footguns — skipping it produces subtle silent bugs (events never fire, state never advances, auth never resolves). TEMPLATE: Create a new agent-authored trigger TYPE on disk. Persisted as `<scope>/trigger-types/<id>/template.yaml + trigger.<ext>`. Scope can be `project`, `global`, or `vault:<vault_id>` (saves to a team/personal vault — syncs via git). Reloads `ws.triggerTypes` so `trigger.instance.register` can immediately consume it. Id must start with `local.`.',
+    parameters: z.object({
+        id: z.string().min(1).describe("Type id; must match /^local\\.[a-z][a-z0-9-]*(\\.[a-z][a-z0-9-]*)*$/."),
+        scope: z
+          .union([
+            z.enum(['project', 'global']),
+            z.string().regex(/^vault:[a-z][a-z0-9_-]*$/, 'vault:<vault_id>'),
+          ])
+          .optional()
+          .describe("Default 'project'. Use 'vault:<id>' to save into a configured vault (syncs via git)."),
+        description: z.string().min(1),
+        runtime: z.enum(['node', 'tsx', 'python', 'bash']),
+        script: z.string().optional().describe('Inline script source. XOR with script_file.'),
+        script_file: z.string().optional().describe('Path under <projectDir>/.clawdevbox/. Copied into the template dir.'),
+        default_cron: z.string().optional(),
+        identity_param: z.string().optional(),
+        accepts_webhook: z.boolean().optional(),
+        parameters: z.array(z.record(z.string(), z.unknown())).optional(),
+      }),
+    handler: async (args) => {
+      const scope = (args.scope ?? 'project') as TemplateScope;
+      const isVaultScope = typeof scope === 'string' && scope.startsWith('vault:');
+      const hasScript = typeof args.script === 'string';
+      const hasFile = typeof args.script_file === 'string';
+      if (hasScript === hasFile) {
+        return structuredError('INVALID_REQUEST',
+          'Provide exactly one of `script` (inline) or `script_file` (path).',
+          { script_provided: hasScript, script_file_provided: hasFile });
+      }
+
+      const manifest: TemplateManifest = {
+        id: args.id,
+        file: `trigger.${args.runtime === 'tsx' ? 'ts' : args.runtime === 'node' ? 'js' : args.runtime === 'python' ? 'py' : 'sh'}`,
+        runtime: args.runtime as TriggerRuntime,
+        description: args.description,
+      };
+      if (args.default_cron !== undefined) manifest.default_cron = args.default_cron;
+      if (args.identity_param !== undefined) manifest.identity_param = args.identity_param;
+      if (args.accepts_webhook !== undefined) manifest.accepts_webhook = args.accepts_webhook;
+      if (Array.isArray(args.parameters)) manifest.parameters = args.parameters as unknown as TemplateManifest['parameters'];
+
+      const validation = validateAgentAuthoredTemplate(manifest);
+      if (!validation.ok) {
+        return validationError(validation.errors);
+      }
+
+      // Existence check across both backends. For vault scope, look in that
+      // specific vault only; for project/global, the existing helper works.
+      if (isVaultScope) {
+        const vaultId = scope.slice('vault:'.length);
+        let vault: VaultInfo;
+        try {
+          vault = resolveVaultById(loadVaultChainForWorkspace(ws), vaultId);
+        } catch (err) {
+          return structuredError('VAULT_NOT_FOUND', (err as Error).message, { vault_id: vaultId });
+        }
+        if (loadVaultTemplate(vault, args.id)) {
+          return structuredError('TRIGGER_TEMPLATE_EXISTS',
+            `A template with id ${args.id} already exists in vault ${vaultId}.`,
+            { id: args.id, scope });
+        }
+      } else if (templateExists(ws, scope as 'project' | 'global', args.id)) {
+        return structuredError('TRIGGER_TEMPLATE_EXISTS',
+          `A template with id ${args.id} already exists in scope ${scope}.`,
+          { id: args.id, scope });
+      }
+
+      let scriptContent: string;
+      if (hasScript) {
+        scriptContent = args.script!;
+      } else {
+        const fileGuard = ensureFileUnderClawdevbox(ws.projectDir, args.script_file!);
+        if (!fileGuard.ok) return fileGuard.error;
+        scriptContent = readFileSync(fileGuard.path, 'utf8');
+      }
+
+      const written = writeTemplateAnyScope(ws, scope, { manifest, scriptContent });
+      await reloadTypeRegistries(ws);
+
+      return {
+        content: [{ type: 'text', text: `Created template ${args.id} (scope=${scope}).` }],
+        structuredContent: {
+          id: args.id, scope, path: written.dir,
+          script_path: written.scriptAbs, type_exists: true,
+        },
+      };
+    },
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
+
+  // -- trigger.list_templates ----------------------------------------------
+  defineTool({
+    name: 'trigger.template.list',
+    description: 'TEMPLATE: List agent-authored trigger TYPES across project + global + every configured vault. Vault-stored templates surface with scope=`vault:<id>`.',
+    parameters: z.object({
+        scope: z
+          .union([
+            z.enum(['project', 'global', 'all']),
+            z.string().regex(/^vault:[a-z][a-z0-9_-]*$/, 'vault:<vault_id>'),
+          ])
+          .optional()
+          .describe("Default 'all' (project + global + vaults). Pass 'vault:<id>' for a single vault."),
+        search: z.string().min(1).optional(),
+      }),
+    handler: async (args) => {
+      const filter = args.scope ?? 'all';
+      const all = [...ws.triggerTypes.values()].sort((a, b) => a.id.localeCompare(b.id));
+      let filtered = all.filter((t) =>
+        t.scope === 'project' ||
+        t.scope === 'global' ||
+        (typeof t.scope === 'string' && t.scope.startsWith('vault:')),
+      );
+      if (filter !== 'all') filtered = filtered.filter((t) => t.scope === filter);
+      if (args.search) {
+        const q = args.search.toLowerCase();
+        filtered = filtered.filter((t) =>
+          t.id.toLowerCase().includes(q) || (t.description ?? '').toLowerCase().includes(q),
+        );
+      }
+      const projected = filtered.map(projectType);
+      return {
+        content: [{ type: 'text', text: `Found ${projected.length} agent-authored template(s).` }],
+        structuredContent: { trigger_types: projected, count: projected.length },
+      };
+    },
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
+
+  // -- trigger.update_template --------------------------------------------
+  defineTool({
+    name: 'trigger.template.update',
+    description: '⚠️ PREREQUISITE (only when supplying `script` or `script_file`): read the `authoring-triggers` skill FIRST via `skill.read({ id: "authoring-triggers" })`. The skill\'s pre-deploy checklist (§15) catches the bugs that bite mid-edit (state casing, cursor logic, bootstrap flag, auth fallback). TEMPLATE: Update an agent-authored trigger template in place (project, global, or vault:<id>). Manifest fields omitted from the call are preserved; script is replaced only when `script` or `script_file` is supplied. Reloads `ws.triggerTypes` on success.',
+    parameters: z.object({
+        id: z.string().min(1),
+        description: z.string().optional(),
+        runtime: z.enum(['node', 'tsx', 'python', 'bash']).optional(),
+        script: z.string().optional(),
+        script_file: z.string().optional(),
+        default_cron: z.string().optional(),
+        identity_param: z.string().optional(),
+        accepts_webhook: z.boolean().optional(),
+        parameters: z.array(z.record(z.string(), z.unknown())).optional(),
+      }),
+    handler: async (args) => {
+      const existing = findTemplate(ws, args.id);
+      if (!existing) return structuredError('TRIGGER_TEMPLATE_NOT_FOUND',
+        `Template ${args.id} not found.`, { id: args.id });
+
+      const hasScript = typeof args.script === 'string';
+      const hasFile = typeof args.script_file === 'string';
+      if (hasScript && hasFile) {
+        return structuredError('INVALID_REQUEST',
+          'Provide at most one of `script` or `script_file`.',
+          { script_provided: true, script_file_provided: true });
+      }
+      const manifestKeys: Array<keyof typeof args> = [
+        'description', 'runtime', 'default_cron', 'identity_param',
+        'accepts_webhook', 'parameters',
+      ];
+      const anyManifestChange = manifestKeys.some((k) => args[k] !== undefined);
+      if (!hasScript && !hasFile && !anyManifestChange) {
+        return structuredError('NO_CHANGES',
+          'trigger.update_template requires at least one field to change.',
+          { id: args.id });
+      }
+
+      const merged: TemplateManifest = { ...existing.manifest };
+      if (args.runtime !== undefined) {
+        const r = validateRuntime(args.runtime);
+        if (!r.ok) return validationError([{ path: 'runtime', code: 'ENUM', message: r.message }]);
+        merged.runtime = r.runtime;
+        merged.file = `trigger.${r.runtime === 'tsx' ? 'ts' : r.runtime === 'node' ? 'js' : r.runtime === 'python' ? 'py' : 'sh'}`;
+      }
+      if (args.description !== undefined) merged.description = args.description;
+      if (args.default_cron !== undefined) merged.default_cron = args.default_cron;
+      if (args.identity_param !== undefined) merged.identity_param = args.identity_param;
+      if (args.accepts_webhook !== undefined) merged.accepts_webhook = args.accepts_webhook;
+      if (Array.isArray(args.parameters)) merged.parameters = args.parameters as unknown as TemplateManifest['parameters'];
+
+      const validation = validateAgentAuthoredTemplate(merged);
+      if (!validation.ok) return validationError(validation.errors);
+
+      let scriptContent: string;
+      if (hasScript) {
+        scriptContent = args.script!;
+      } else if (hasFile) {
+        const guard = ensureFileUnderClawdevbox(ws.projectDir, args.script_file!);
+        if (!guard.ok) return guard.error;
+        scriptContent = readFileSync(guard.path, 'utf8');
+      } else {
+        scriptContent = readFileSync(existing.scriptAbs, 'utf8');
+      }
+
+      if (args.runtime !== undefined && existing.manifest.runtime !== merged.runtime) {
+        try { rmSync(existing.scriptAbs, { force: true }); } catch { /* ignore */ }
+      }
+
+      const written = writeTemplateAnyScope(ws, existing.scope, { manifest: merged, scriptContent });
+      await reloadTypeRegistries(ws);
+
+      return {
+        content: [{ type: 'text', text: `Updated template ${args.id}.` }],
+        structuredContent: { id: args.id, scope: existing.scope, path: written.dir },
+      };
+    },
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
+
+  // -- trigger.delete_template -------------------------------------------
+  defineTool({
+    name: 'trigger.template.delete',
+    description: 'TEMPLATE: Delete an agent-authored trigger template by id. Refuses to delete plugin-shipped TYPES (use plugin.uninstall) or templates referenced by registered instances (trigger.instance.unregister first).',
+    parameters: z.object({ id: z.string().min(1) }),
+    handler: async (args) => {
+      const existing = findTemplate(ws, args.id);
+      if (!existing) {
+        const inMap = ws.triggerTypes.get(args.id);
+        if (inMap && inMap.scope.startsWith('plugin:')) {
+          return structuredError('TRIGGER_TEMPLATE_NOT_AUTHORED',
+            `${args.id} is a plugin-shipped trigger type. Use plugin.uninstall to remove it.`,
+            { id: args.id, scope: inMap.scope });
+        }
+        return structuredError('TRIGGER_TEMPLATE_NOT_FOUND',
+          `Template ${args.id} not found.`, { id: args.id });
+      }
+      const file = readTriggersFile(triggersJsonPath(ws));
+      const refs = file.registered.filter((r) => r.type === args.id).map((r) => r.id);
+      if (refs.length > 0) {
+        return structuredError('TRIGGER_TEMPLATE_IN_USE',
+          `Template ${args.id} is referenced by ${refs.length} registered instance(s). Unregister them first.`,
+          { id: args.id, registered_ids: refs });
+      }
+      const removed = deleteTemplateAnyScope(ws, existing.scope, args.id);
+      await reloadTypeRegistries(ws);
+      return {
+        content: [{ type: 'text', text: `Deleted template ${args.id} (scope=${existing.scope}).` }],
+        structuredContent: { id: args.id, scope: existing.scope, removed },
+      };
+    },
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
+
+  // -- trigger.test ---------------------------------------------------------
+  defineTool({
+    name: 'trigger.test',
+    description: '⚠️ PREREQUISITE (only when supplying inline `script`): read the `authoring-triggers` skill FIRST via `skill.read({ id: "authoring-triggers" })`. The skill catches the silent-failure modes that `trigger.test` would otherwise mask (exit 0 + empty output = looks healthy but did nothing useful). Run a trigger script with a synthesized envelope and capture the result. NON-MUTATING — does not write to triggers.json or update state. Three input sources (XOR): `id` (registered instance), `template_id` (saved type, any scope), or `script` + `runtime` (inline). Captures stdout/stderr and any observation files the script wrote to envelope.output_dir. Hard timeout (default 30s).',
+    parameters: z.object({
+        id: z.string().min(1).optional(),
+        template_id: z.string().min(1).optional(),
+        script: z.string().optional(),
+        runtime: z.enum(['node', 'tsx', 'python', 'bash']).optional(),
+        params: z.record(z.string(), z.unknown()).optional(),
+        state: z.record(z.string(), z.unknown()).optional(),
+        payload: z.unknown().optional(),
+        timeout_ms: z.number().int().positive().max(600000).optional(),
+      }),
+    handler: async (args) => {
+      const sources = [args.id, args.template_id, args.script].filter((x) => typeof x === 'string').length;
+      if (sources !== 1) {
+        return structuredError('INVALID_REQUEST',
+          'Provide exactly one of `id`, `template_id`, or `script`.', {});
+      }
+
+      let scriptPath: string;
+      let runtime: TriggerRuntime;
+      let parameters: TriggerTypeParameter[] = [];
+      let resolvedTriggerId: string;
+      let defaultParams: Record<string, unknown> = {};
+      let defaultState: Record<string, unknown> = {};
+
+      let tmpScriptDir: string | null = null;
+
+      if (args.script) {
+        if (!args.runtime) {
+          return structuredError('RUNTIME_REQUIRED',
+            'runtime is required when supplying script.', {});
+        }
+        runtime = args.runtime as TriggerRuntime;
+        const ext = runtime === 'tsx' ? 'mts' : runtime === 'node' ? 'mjs' : runtime === 'python' ? 'py' : 'sh';
+        tmpScriptDir = mkdtempSync(join(tmpdir(), 'cdb-trigger-test-'));
+        const tmpScriptPath = join(tmpScriptDir, `inline.${ext}`);
+        writeFileSync(tmpScriptPath, args.script);
+        scriptPath = tmpScriptPath;
+        resolvedTriggerId = 'inline';
+      } else if (args.template_id) {
+        const loaded = findTemplate(ws, args.template_id) ?? loadOneOffTemplate(ws, args.template_id);
+        const typeFromRegistry = ws.triggerTypes.get(args.template_id);
+        if (!loaded && !typeFromRegistry) {
+          return structuredError('TRIGGER_TEMPLATE_NOT_FOUND',
+            `Template ${args.template_id} not found.`, { template_id: args.template_id });
+        }
+        if (loaded) {
+          scriptPath = loaded.scriptAbs;
+          runtime = (loaded.manifest.runtime ?? 'tsx') as TriggerRuntime;
+          parameters = (loaded.manifest.parameters ?? []) as TriggerTypeParameter[];
+        } else {
+          scriptPath = typeFromRegistry!.file_abs;
+          runtime = ((typeFromRegistry as unknown as { runtime?: TriggerRuntime }).runtime ?? 'tsx') as TriggerRuntime;
+          parameters = typeFromRegistry!.parameters ?? [];
+        }
+        resolvedTriggerId = args.template_id;
+      } else {
+        // by registered id
+        const file = readTriggersFile(triggersJsonPath(ws));
+        const row = file.registered.find((r) => r.id === args.id);
+        if (!row) return notFound('registered_trigger', args.id!);
+        const type = ws.triggerTypes.get(row.type);
+        const oneoffLoaded = type ? null : loadOneOffTemplate(ws, row.type);
+        if (!type && !oneoffLoaded) {
+          return structuredError('TRIGGER_TYPE_NOT_FOUND',
+            `Type ${row.type} for registration ${row.id} not found.`,
+            { id: row.id, type_id: row.type });
+        }
+        if (type) {
+          scriptPath = type.file_abs;
+          runtime = ((type as unknown as { runtime?: TriggerRuntime }).runtime ?? 'tsx') as TriggerRuntime;
+          parameters = type.parameters ?? [];
+        } else {
+          scriptPath = oneoffLoaded!.scriptAbs;
+          runtime = oneoffLoaded!.manifest.runtime;
+          parameters = oneoffLoaded!.manifest.parameters ?? [];
+        }
+        resolvedTriggerId = row.id;
+        defaultParams = row.params;
+        defaultState = row.state;
+      }
+
+      // tsx/node need ESM resolution for top-level await; ensure the script
+      // sits beside a `{"type":"module"}` package.json. For inline we own the
+      // tmp dir; for templates copy the script (NON-MUTATING) into a tmp dir.
+      if (runtime === 'tsx' || runtime === 'node') {
+        if (!tmpScriptDir) {
+          tmpScriptDir = mkdtempSync(join(tmpdir(), 'cdb-trigger-test-'));
+          const ext = runtime === 'tsx' ? 'mts' : 'mjs';
+          const copied = join(tmpScriptDir, `script.${ext}`);
+          writeFileSync(copied, readFileSync(scriptPath, 'utf8'));
+          scriptPath = copied;
+        }
+        const pkgPath = join(tmpScriptDir, 'package.json');
+        if (!existsSync(pkgPath)) {
+          writeFileSync(pkgPath, '{"type":"module"}');
+        }
+      }
+
+      const params = args.params ?? defaultParams;
+      if (parameters.length > 0) {
+        const paramsCheck = validateTriggerParams(parameters, params);
+        if (!paramsCheck.ok) {
+          if (tmpScriptDir) { try { rmSync(tmpScriptDir, { recursive: true, force: true }); } catch { /* ignore */ } }
+          return paramValidationError(paramsCheck.errors);
+        }
+      }
+      const state = args.state ?? (Object.keys(defaultState).length > 0 ? defaultState : { ...params });
+      const payload = args.payload ?? null;
+
+      const tmpOutDir = mkdtempSync(join(tmpdir(), 'cdb-trigger-test-out-'));
+      const runId = mintId('run');
+
+      let runResult: Awaited<ReturnType<typeof runTriggerScript>> | null = null;
+      let observations: ReturnType<typeof collectObservations> = { observations: [], truncated: false };
+      try {
+        runResult = await runTriggerScript({
+          scriptPath, runtime,
+          envelope: {
+            trigger_event_name: 'TriggerFired',
+            trigger_id: resolvedTriggerId, run_id: runId,
+            output_dir: tmpOutDir,
+            // Test-mode envelope omits dispatch_url (no live pty target in unit
+            // tests) and uses an empty spawn_url. trigger.test exists to
+            // exercise script logic + observation-file emission, not to
+            // dispatch to live agents.
+            spawn_url: '',
+            state, payload,
+          },
+          timeoutMs: args.timeout_ms ?? 30000,
+        });
+        // Capture any observation files the script wrote to output_dir BEFORE
+        // the finally block deletes the tmp dir. Bounded + non-mutating.
+        try {
+          observations = collectObservations(tmpOutDir);
+        } catch (err) {
+          logger.warn({ err: String(err) }, 'trigger.test: collectObservations failed');
+        }
+      } finally {
+        if (tmpScriptDir) {
+          try { rmSync(tmpScriptDir, { recursive: true, force: true }); } catch { /* ignore */ }
+        }
+        try { rmSync(tmpOutDir, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
+
+      return {
+        content: [{
+          type: 'text',
+          text: `trigger.test (${resolvedTriggerId}): exit=${runResult.exit_code}, timed_out=${runResult.timed_out}, ${runResult.duration_ms}ms`,
+        }],
+        structuredContent: {
+          run_id: runId,
+          exit_code: runResult.exit_code,
+          duration_ms: runResult.duration_ms,
+          timed_out: runResult.timed_out,
+          stdout: runResult.stdout,
+          stderr: runResult.stderr,
+          stdout_parsed: runResult.stdout_parsed,
+          observations: observations.observations,
+          observations_truncated: observations.truncated,
+          callbacks: [],
+        },
+      };
+    },
+    source: 'builtin',
+    sourceFile: fileURLToPath(import.meta.url),
+  });
+}

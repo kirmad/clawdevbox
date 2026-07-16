@@ -1,0 +1,20 @@
+{
+  "hooks": {
+    "sessionStart": [
+      {
+        "type": "command",
+        "bash": "bash \"${PLUGIN_ROOT}/hooks/inject-primer.sh\"",
+        "powershell": "& \"${PLUGIN_ROOT}\\hooks\\inject-primer.ps1\"",
+        "timeout": 5000
+      }
+    ],
+    "userPromptSubmitted": [
+      {
+        "type": "command",
+        "bash": "bash \"${PLUGIN_ROOT}/hooks/inject-skill-hint.sh\"",
+        "powershell": "& \"${PLUGIN_ROOT}\\hooks\\inject-skill-hint.ps1\"",
+        "timeout": 5000
+      }
+    ]
+  }
+}
