@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Core Concepts · ClawDevbox Docs</title>
+    <meta name="description" content="The ClawDevbox vocabulary: recipes, skills, triggers, plugins, workspaces, artifacts, hostable tools, scope, and the workflow entities." />
+    <script>try{var t=localStorage.getItem("cdb-theme");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}</script>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;850&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+    <link id="hljs-dark" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" />
+    <link id="hljs-light" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" disabled />
+    <link rel="stylesheet" href="assets/css/styles.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%235b4bff'/%3E%3Cpath d='M9 10.5 13.5 16 9 21.5' stroke='white' stroke-width='2.4' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M16 21.5h7' stroke='%23ffce7a' stroke-width='2.4' stroke-linecap='round'/%3E%3C/svg%3E" />
+  </head>
+  <body class="has-toc">
+    <header class="topbar" id="topbar"></header>
+    <div class="sidebar-backdrop"></div>
+    <div class="layout">
+      <aside class="sidebar" id="sidebar"></aside>
+      <main class="content">
+        <div class="content-inner">
+          <span class="eyebrow">Introduction</span>
+          <h1>Core Concepts</h1>
+          <p class="lead">
+            ClawDevbox has a small, sharp vocabulary. Learn these terms once and
+            the rest of the docs read easily. Each primitive is a file on disk
+            and a set of MCP tools — nothing is hidden in the host.
+          </p>
+
+          <h2 id="the-mental-model">The mental model</h2>
+          <p>Three primitives cover most of what agents do, split by the question they answer:</p>
+          <div class="card-grid cols-3">
+            <div class="card"><span class="card-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="7" height="5" rx="1"/><rect x="14" y="15" width="7" height="5" rx="1"/><path d="M6.5 9v4a2 2 0 0 0 2 2H14"/></svg></span><h3>Recipe = <span class="grad">WHAT</span></h3><p>A multi-step pipeline of goals the agent runs and adapts.</p></div>
+            <div class="card"><span class="card-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="9" r="6"/><path d="M8.5 14 7 22l5-3 5 3-1.5-8"/></svg></span><h3>Skill = <span class="grad">HOW</span></h3><p>Procedural knowledge the CLI auto-loads to do a step well.</p></div>
+            <div class="card"><span class="card-ico claw"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 4 14h7l-1 8 9-12h-7l1-8Z"/></svg></span><h3>Trigger = <span class="grad">WHEN</span></h3><p>A cron / webhook / manual script that decides when to act.</p></div>
+          </div>
+
+          <h2 id="authoring-primitives">Authoring primitives</h2>
+
+          <h3 id="recipe">Recipe</h3>
+          <p>
+            A reusable, multi-step task template (TaskDock-style) that the agent uses as a starting point and adapts.
+            A recipe declares <code>id</code>, <code>name</code>, <code>description</code>, and an ordered
+            <code>steps[]</code> array, each step a human-readable goal with optional agent instructions and dependencies.
+            The <strong>template</strong> lives on disk; each run mints an <strong>instance</strong>.
+            → <a href="recipes.html">Recipes guide</a>
+          </p>
+
+          <h3 id="skill">Skill</h3>
+          <p>
+            A markdown file with YAML frontmatter (<code>name</code> + <code>description</code>) that the side-terminal CLI
+            auto-loads as procedural knowledge. Skills capture the <em>how</em>: a repeatable workflow, a house style, a
+            guardrail. They carry a feedback loop that promotes proven skills and demotes stale ones.
+            → <a href="skills.html">Skills guide</a>
+          </p>
+
+          <h3 id="trigger">Trigger</h3>
+          <p>
+            A <strong>trigger type</strong> is a capability — a script plus a parameter schema and default cron. It doesn't
+            fire until you create a <strong>registered instance</strong> bound to concrete params. Instances fire on cron,
+            via webhook, or manually, receiving a JSON envelope on stdin and persisting state on stdout.
+            → <a href="triggers.html">Triggers guide</a>
+          </p>
+
+          <h3 id="plugin">Plugin</h3>
+          <p>
+            A self-contained bundle of recipes, skills, triggers, hostable tools, renderers, and MCP configs that ships as
+            a unit. Plugins install under <code>&lt;globalDir&gt;/plugins/&lt;id&gt;/</code> and are read-only at runtime —
+            customizations go in project scope.
+            → <a href="plugins.html">Plugins guide</a>
+          </p>
+
+          <h2 id="runtime-primitives">Runtime primitives</h2>
+
+          <h3 id="workspace">Workspace</h3>
+          <p>
+            An isolated directory (<code>&lt;workspaces_root&gt;/&lt;id&gt;/</code>) holding a <code>.clawdevbox/</code>
+            state tree plus an <code>artifacts/</code> folder. Every recipe run gets one so agents never step on each other.
+            The canonical registry is <code>&lt;workspaces_root&gt;/index.json</code>.
+          </p>
+
+          <h3 id="artifact">Artifact</h3>
+          <p>
+            A folder at <code>&lt;workspace&gt;/artifacts/&lt;id&gt;/</code> containing a <code>manifest.json</code> plus
+            content files. The manifest's <code>type</code> selects a renderer at view time — <code>markdown</code>,
+            <code>pr-review</code>, or <code>walkthrough</code> out of the box.
+            → <a href="artifacts.html">Artifacts &amp; Renderers</a>
+          </p>
+
+          <h3 id="hostable-tool">Hostable tool</h3>
+          <p>
+            A single TypeScript file inside a plugin's <code>tools/</code> directory that ClawDevbox discovers and exposes
+            as an MCP tool. A lightweight alternative to a full external MCP server: it exports an <code>id</code>,
+            a <code>description</code>, a <code>parameters</code> zod schema, and an <code>execute(args, ctx)</code> function.
+            → <a href="extensibility.html#hostable-tools">Author one</a>
+          </p>
+
+          <h3 id="scope">Scope</h3>
+          <p>Where a recipe / skill / trigger comes from. On id collision, more specific scopes win:</p>
+          <div class="flow">
+            <span class="flow-node accent">project</span>
+            <span class="flow-arrow">shadows</span>
+            <span class="flow-node">plugin:&lt;id&gt;</span>
+            <span class="flow-arrow">shadows</span>
+            <span class="flow-node">global</span>
+          </div>
+          <p class="text-muted">To customize a plugin-shipped asset, copy it into <code>project</code> scope and edit there — plugin scope is read-only.</p>
+
+          <h2 id="workflow-entities">Workflow entities</h2>
+          <p>These live in the SQLite kernel and back the inbox / session experience:</p>
+          <div class="deflist">
+            <div class="def"><dt>Inbox item</dt><dd>A row representing one actionable thing (a PR, work item, incident, epic, or manual ask). The user's primary view. → <a href="inbox.html">Inbox &amp; Workflow</a></dd></div>
+            <div class="def"><dt>Thread</dt><dd>One ongoing run for an inbox item. Recursive via <code>parent_thread_id</code>, which builds the epic decomposition tree.</dd></div>
+            <div class="def"><dt>Message</dt><dd>An append-only log entry on a thread — agent text, a tool call, a tool result, a view emission, or a user message.</dd></div>
+            <div class="def"><dt>Approval</dt><dd>A pending user decision an agent surfaced. The agent's interrupt; resolved through an approval round-trip.</dd></div>
+            <div class="def"><dt>Session</dt><dd>A running agent CLI in a hidden pty. Browser viewers attach live; <code>session.*</code> tools read and drive it. → <a href="sessions.html">Agent Sessions</a></dd></div>
+            <div class="def"><dt>Memory</dt><dd>Durable knowledge — <strong>facts</strong>, <strong>lessons</strong>, and <strong>wiki</strong> — in git-backed personal + team vaults. → <a href="memory.html">Memory</a></dd></div>
+          </div>
+
+          <h2 id="where-everything-lives">Where everything lives</h2>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Concept</th><th>Backing store</th><th>Lifecycle</th></tr></thead>
+              <tbody>
+                <tr><td>Recipe</td><td><code>.clawdevbox/recipes/&lt;id&gt;.yaml</code></td><td>Author-time template.</td></tr>
+                <tr><td>Recipe instance</td><td><code>&lt;workspace&gt;/.clawdevbox/recipe-instances/&lt;id&gt;.json</code></td><td>Per run; tracks status / result / pid / log.</td></tr>
+                <tr><td>Skill</td><td><code>.clawdevbox/skills/&lt;id&gt;.md</code></td><td>Author-time prompt snippet.</td></tr>
+                <tr><td>Trigger</td><td><code>.clawdevbox/triggers.json</code> + <code>triggers/&lt;id&gt;.ts|py|sh</code></td><td>Cron / webhook / manual.</td></tr>
+                <tr><td>Workspace</td><td><code>&lt;workspaces_root&gt;/&lt;id&gt;/</code></td><td>Per run or long-lived.</td></tr>
+                <tr><td>Artifact</td><td><code>&lt;workspace&gt;/artifacts/&lt;id&gt;/</code></td><td>Folder + <code>manifest.json</code>; renderer dispatch on <code>type</code>.</td></tr>
+                <tr><td>Plugin</td><td><code>&lt;global_dir&gt;/plugins/&lt;id&gt;/</code></td><td>Shared across all projects.</td></tr>
+                <tr><td>Memory</td><td>git-backed vault (personal + team)</td><td>Durable; decays / votes over time.</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <nav class="page-nav">
+            <a class="prev" href="architecture.html"><span class="pn-label">← Previous</span><span class="pn-title">Architecture</span></a>
+            <a class="next" href="recipes.html"><span class="pn-label">Next →</span><span class="pn-title">Recipes</span></a>
+          </nav>
+        </div>
+      </main>
+      <nav class="toc" id="toc" aria-label="On this page"></nav>
+    </div>
+    <footer class="site-footer"><p class="mb-0"><strong>ClawDevbox</strong> — engine codename <em>Conductor</em>. MIT licensed. · <a href="https://github.com/kirmad/clawdevbox" target="_blank" rel="noopener">GitHub</a></p></footer>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="assets/js/search-index.js"></script>
+    <script src="assets/js/main.js"></script>
+  </body>
+</html>

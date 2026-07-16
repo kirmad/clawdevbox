@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Inbox &amp; Workflow · ClawDevbox Docs</title>
+    <meta name="description" content="The inbox is where agents surface work and ask questions. Learn inbox items, threads, approvals, how agents ask the user a question, and the notify/ui tools." />
+    <script>try{var t=localStorage.getItem("cdb-theme");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}</script>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;850&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+    <link id="hljs-dark" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" />
+    <link id="hljs-light" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" disabled />
+    <link rel="stylesheet" href="assets/css/styles.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%235b4bff'/%3E%3Cpath d='M9 10.5 13.5 16 9 21.5' stroke='white' stroke-width='2.4' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M16 21.5h7' stroke='%23ffce7a' stroke-width='2.4' stroke-linecap='round'/%3E%3C/svg%3E" />
+  </head>
+  <body class="has-toc">
+    <header class="topbar" id="topbar"></header>
+    <div class="sidebar-backdrop"></div>
+    <div class="layout">
+      <aside class="sidebar" id="sidebar"></aside>
+      <main class="content">
+        <div class="content-inner">
+          <span class="eyebrow">Building Blocks</span>
+          <h1>Inbox &amp; Workflow</h1>
+          <p class="lead">
+            The inbox is the human's side of the loop — a persistent notification center where agents surface work, post
+            progress, and ask for a decision. It's built from four kernel entities: inbox items, threads, messages, and
+            approvals.
+          </p>
+
+          <h2 id="data-model">The data model</h2>
+          <div class="deflist">
+            <div class="def"><dt>Inbox item</dt><dd>A persistent card representing one actionable thing (a PR, work item, incident, epic, or manual ask). Carries kind, state, priority, and an agent-authored prose body.</dd></div>
+            <div class="def"><dt>Thread</dt><dd>An append-only run attached to an inbox item. Recursive via <code>parent_thread_id</code> for epic decomposition.</dd></div>
+            <div class="def"><dt>Message</dt><dd>An event record on a thread — agent text, a tool call, a result, a view emission, or a user message.</dd></div>
+            <div class="def"><dt>Approval</dt><dd>A question/decision round-trip bound to a thread. Suspends the thread until the user answers.</dd></div>
+          </div>
+
+          <h2 id="workflow">The core workflow</h2>
+          <ol class="steps">
+            <li><h4>Surface</h4><p>The agent creates or updates a card with <code>inbox.upsert</code> (idempotent on <code>id</code>), setting a kind, an agent message, and a tone.</p></li>
+            <li><h4>Ask (if needed)</h4><p>Needs input? Attach a question to the item, or open an approval on its thread. The user answers in the inbox UI or an approval modal.</p></li>
+            <li><h4>Progress</h4><p>The agent posts updates as thread messages and transitions state (<code>inbox.set_state</code>) — <code>new → open → snoozed → archived → done</code>.</p></li>
+            <li><h4>Resolve</h4><p>On completion the item is marked done or archived. <code>inbox.mark_read</code> and <code>inbox.snooze</code> manage attention.</p></li>
+          </ol>
+
+          <div class="callout danger">
+            <span class="callout-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 9v4m0 4h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/></svg></span>
+            <div class="callout-body"><div class="callout-title">Hard rule: inbox tools require a session id</div><p class="mb-0">The <code>inbox.*</code> tools only work inside a ClawDevbox-spawned session (where <code>CLAWDEVBOX_SESSION_ID</code> / the session header is set). Without a session id you're not in a ClawDevbox session — respond in normal chat instead. Never use <code>approval.request</code> as a substitute for asking a question.</p></div>
+          </div>
+
+          <h2 id="asking-questions">Asking the user a question</h2>
+          <p>When an agent needs input, it calls <code>inbox.upsert</code> with <code>questions: [...]</code>. The question is persisted on the item, and the thread/session stays the anchor for the round-trip — so the answer flows back to the right run.</p>
+
+          <h2 id="approvals">The approval round-trip</h2>
+          <ol class="steps">
+            <li><h4>Request</h4><p><code>approval.request</code> opens a pending approval and moves the thread to <code>awaiting_user</code>. It carries a question, options, and a renderer-minted nonce.</p></li>
+            <li><h4>Decide</h4><p>The UI renders a decision modal. The user picks an option (or free-text, if allowed).</p></li>
+            <li><h4>Resolve</h4><p><code>approval.resolve</code> stores the answer, appends an <code>approval_resolved</code> message, and returns the thread to <code>running</code>.</p></li>
+          </ol>
+
+          <h2 id="notifications">Notifications: inbox vs ui vs notify</h2>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Call</th><th>Effect</th></tr></thead>
+              <tbody>
+                <tr><td><code>inbox.upsert</code></td><td>Persistent inbox row + list refresh + optional push. Use for durable, actionable items.</td></tr>
+                <tr><td><code>ui.notify</code></td><td>A one-off signal — emit an SSE topic change and/or a browser push in one call.</td></tr>
+                <tr><td><code>notify.send</code></td><td>Push only — a browser push notification to all subscribed devices.</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h2 id="inbox-tools">Inbox, thread &amp; approval tools</h2>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Tool</th><th>Purpose</th></tr></thead>
+              <tbody>
+                <tr><td><code>inbox.upsert</code></td><td>Create/update an item — body, attachments, labels, questions, optional push.</td></tr>
+                <tr><td><code>inbox.list</code> / <code>inbox.read</code></td><td>List items with filters / read one item + recent messages.</td></tr>
+                <tr><td><code>inbox.reply</code></td><td>Append a reply to an item's reply chain.</td></tr>
+                <tr><td><code>inbox.set_state</code> / <code>inbox.snooze</code> / <code>inbox.archive</code> / <code>inbox.mark_read</code></td><td>Manage item state and attention.</td></tr>
+                <tr><td><code>thread.spawn</code></td><td>Create a thread for an inbox item (does not spawn the CLI itself).</td></tr>
+                <tr><td><code>thread.append_message</code> / <code>thread.read</code></td><td>Append / read the thread timeline.</td></tr>
+                <tr><td><code>thread.set_state</code> / <code>thread.cancel</code> / <code>thread.wake</code></td><td>Set state, cancel (recursively), or mark a thread running again.</td></tr>
+                <tr><td><code>approval.request</code> / <code>approval.resolve</code> / <code>approval.list_pending</code></td><td>Open, resolve, and list pending approvals.</td></tr>
+                <tr><td><code>notify.send</code> / <code>ui.notify</code></td><td>Push / SSE-topic notification facade.</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <nav class="page-nav">
+            <a class="prev" href="artifacts.html"><span class="pn-label">← Previous</span><span class="pn-title">Artifacts &amp; Renderers</span></a>
+            <a class="next" href="sessions.html"><span class="pn-label">Next →</span><span class="pn-title">Agent Sessions</span></a>
+          </nav>
+        </div>
+      </main>
+      <nav class="toc" id="toc" aria-label="On this page"></nav>
+    </div>
+    <footer class="site-footer"><p class="mb-0"><strong>ClawDevbox</strong> — engine codename <em>Conductor</em>. MIT licensed. · <a href="https://github.com/kirmad/clawdevbox" target="_blank" rel="noopener">GitHub</a></p></footer>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="assets/js/search-index.js"></script>
+    <script src="assets/js/main.js"></script>
+  </body>
+</html>

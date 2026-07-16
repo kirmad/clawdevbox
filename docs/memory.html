@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Memory · ClawDevbox Docs</title>
+    <meta name="description" content="ClawDevbox memory: facts, lessons and wiki pages in git-backed personal + team vaults. Recall before deriving, record after, vote to keep it honest." />
+    <script>try{var t=localStorage.getItem("cdb-theme");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}</script>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;850&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+    <link id="hljs-dark" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" />
+    <link id="hljs-light" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" disabled />
+    <link rel="stylesheet" href="assets/css/styles.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%235b4bff'/%3E%3Cpath d='M9 10.5 13.5 16 9 21.5' stroke='white' stroke-width='2.4' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M16 21.5h7' stroke='%23ffce7a' stroke-width='2.4' stroke-linecap='round'/%3E%3C/svg%3E" />
+  </head>
+  <body class="has-toc">
+    <header class="topbar" id="topbar"></header>
+    <div class="sidebar-backdrop"></div>
+    <div class="layout">
+      <aside class="sidebar" id="sidebar"></aside>
+      <main class="content">
+        <div class="content-inner">
+          <span class="eyebrow">Building Blocks</span>
+          <h1>Memory</h1>
+          <p class="lead">
+            Memory is what makes each session smarter than the last. Agents recall what's known before acting, capture
+            what they learn after, and vote on what they used. Everything is git-backed markdown in <strong>vaults</strong>,
+            so knowledge is portable, reviewable, and shareable.
+          </p>
+
+          <h2 id="memory-types">The three memory types</h2>
+          <div class="card-grid cols-3">
+            <div class="card" id="facts-card"><span class="card-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M5 4h11a2 2 0 0 1 2 2v14H7a2 2 0 0 0-2 2V4Z"/></svg></span><h3>Fact</h3><p>A short atomic searchable truth — a preference, path, convention, or gotcha. Ranked by vote tally.</p></div>
+            <div class="card"><span class="card-ico claw"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7c.6.5 1 1.3 1 2.3h6c0-1 .4-1.8 1-2.3A7 7 0 0 0 12 2Z"/></svg></span><h3>Lesson</h3><p>An insight from a mistake or hard debug — a non-obvious gotcha or ordering constraint. Confidence decays without reinforcement.</p></div>
+            <div class="card"><span class="card-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2V5Z"/><path d="M8 7h7M8 11h7"/></svg></span><h3>Wiki</h3><p>A curated doc, SOP, or architecture overview — a multi-step reusable procedure. Ranked by vote tally.</p></div>
+          </div>
+
+          <h3 id="facts">Facts</h3>
+          <p>Use for conventions, decisions, env details, and gotchas a future agent should remember. Facts require <strong>citations</strong> (file:line or an exact user quote) and a <strong>reason</strong>.</p>
+          <div class="table-wrap"><table><thead><tr><th>Tool</th><th>Purpose</th></tr></thead><tbody>
+            <tr><td><code>add_fact</code></td><td>Save a durable atomic fact (needs content + scope + citations + reason).</td></tr>
+            <tr><td><code>get_fact</code></td><td>Fetch facts for a path / scope.</td></tr>
+            <tr><td><code>vote_fact</code></td><td>Up/down-vote a fact (adjusts its rank).</td></tr>
+          </tbody></table></div>
+
+          <h3 id="lessons">Lessons</h3>
+          <p>Use for hard-won heuristics — the kind of thing you'd want future-you to weigh from the first turn. <code>get_lessons</code> is the session-start preload of top personal + team lessons.</p>
+          <div class="table-wrap"><table><thead><tr><th>Tool</th><th>Purpose</th></tr></thead><tbody>
+            <tr><td><code>add_lesson</code></td><td>Save a confidence-scored heuristic.</td></tr>
+            <tr><td><code>get_lessons</code></td><td>Return top-ranked lessons for session-start context.</td></tr>
+            <tr><td><code>vote_lesson</code></td><td>Reinforce or weaken a lesson.</td></tr>
+          </tbody></table></div>
+
+          <h3 id="wiki">Wiki</h3>
+          <p>Use for overviews and reusable procedures. Keep wiki pages current — but only update one when you're highly confident the change is final (user approved or code checked in).</p>
+          <div class="table-wrap"><table><thead><tr><th>Tool</th><th>Purpose</th></tr></thead><tbody>
+            <tr><td><code>upsert_wiki</code> / <code>add_wiki_page</code></td><td>Create or update a curated wiki page.</td></tr>
+            <tr><td><code>update_wiki</code></td><td>Patch an existing page.</td></tr>
+            <tr><td><code>get_wiki_index</code></td><td>Browse the wiki tree.</td></tr>
+            <tr><td><code>vote_wiki</code></td><td>Vote on a page.</td></tr>
+          </tbody></table></div>
+
+          <h2 id="vaults">Vaults</h2>
+          <p>Memory lives in vaults resolved as a chain — <strong>personal → team</strong>. Each search accepts a scope, or you can pin a specific <code>vault_id</code>.</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Vault</th><th>Meaning</th><th>Sync</th></tr></thead>
+              <tbody>
+                <tr><td><code>personal</code></td><td>One user's private knowledge, across all repositories.</td><td>Optional backup.</td></tr>
+                <tr><td><code>team</code></td><td>Shared across the team; applies to everyone in a repo.</td><td>git-synced.</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p><code>search_memory</code> takes <code>scope: "personal" | "team" | "all"</code> and a <code>types</code> filter. Team vaults sync through git — <code>memory_sync</code> pulls/pushes, <code>memory_init</code> bootstraps a vault, and <code>memory_status</code> reports vault health.</p>
+
+          <h2 id="the-loop">Recall → record → vote</h2>
+          <ol class="steps">
+            <li><h4>Recall — before you derive</h4><p>Session start: <code>get_lessons({})</code>. Before substantive work: <code>search_memory({ query, scope: "all" })</code> — "have we solved this before?" For a specific file: <code>get_fact({ path })</code>.</p></li>
+            <li><h4>Record — after substantive work</h4><p><code>add_fact</code> for atomic facts, <code>add_lesson</code> for heuristics, <code>upsert_wiki</code> for curated docs. Judge value: will this save time or prevent an error next time?</p></li>
+            <li><h4>Vote — close the loop</h4><p>Up-vote memories that helped; down-vote wrong or stale ones and write a corrective fact in the same turn. Voting is what keeps the knowledge base self-correcting.</p></li>
+          </ol>
+
+          <div class="callout tip">
+            <span class="callout-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7c.6.5 1 1.3 1 2.3h6c0-1 .4-1.8 1-2.3A7 7 0 0 0 12 2Z"/></svg></span>
+            <div class="callout-body"><p class="mb-0">This loop is orchestrated automatically by the <code>auto-learn</code> and <code>using-memory</code> skills. Don't re-derive what memory already knows — search first, derive second, record after.</p></div>
+          </div>
+
+          <h3 id="record-value">What's worth recording</h3>
+          <div class="split">
+            <div class="split-col vs-a"><h4>Record</h4><ul class="mb-0"><li>High-cost mistake + its fix (lesson)</li><li>Unintuitive param or prerequisite (fact)</li><li>A user preference or convention (fact)</li><li>A reusable process or template (wiki)</li></ul></div>
+            <div class="split-col vs-b"><h4>Don't record</h4><ul class="mb-0"><li>One-off Q&amp;A with no reusable process</li><li>Generic concepts findable online</li><li>Ephemeral "for now" instructions</li><li>Secrets, credentials, or PII</li></ul></div>
+          </div>
+
+          <nav class="page-nav">
+            <a class="prev" href="skills.html"><span class="pn-label">← Previous</span><span class="pn-title">Skills</span></a>
+            <a class="next" href="artifacts.html"><span class="pn-label">Next →</span><span class="pn-title">Artifacts &amp; Renderers</span></a>
+          </nav>
+        </div>
+      </main>
+      <nav class="toc" id="toc" aria-label="On this page"></nav>
+    </div>
+    <footer class="site-footer"><p class="mb-0"><strong>ClawDevbox</strong> — engine codename <em>Conductor</em>. MIT licensed. · <a href="https://github.com/kirmad/clawdevbox" target="_blank" rel="noopener">GitHub</a></p></footer>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="assets/js/search-index.js"></script>
+    <script src="assets/js/main.js"></script>
+  </body>
+</html>

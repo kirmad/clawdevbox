@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Artifacts &amp; Renderers · ClawDevbox Docs</title>
+    <meta name="description" content="Artifacts are renderable folders with a manifest. Learn the built-in markdown, pr-review and walkthrough renderers, the resolution chain, and how to add a custom renderer." />
+    <script>try{var t=localStorage.getItem("cdb-theme");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}</script>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;850&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+    <link id="hljs-dark" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" />
+    <link id="hljs-light" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" disabled />
+    <link rel="stylesheet" href="assets/css/styles.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%235b4bff'/%3E%3Cpath d='M9 10.5 13.5 16 9 21.5' stroke='white' stroke-width='2.4' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M16 21.5h7' stroke='%23ffce7a' stroke-width='2.4' stroke-linecap='round'/%3E%3C/svg%3E" />
+  </head>
+  <body class="has-toc">
+    <header class="topbar" id="topbar"></header>
+    <div class="sidebar-backdrop"></div>
+    <div class="layout">
+      <aside class="sidebar" id="sidebar"></aside>
+      <main class="content">
+        <div class="content-inner">
+          <span class="eyebrow">Building Blocks</span>
+          <h1>Artifacts &amp; Renderers</h1>
+          <p class="lead">
+            An artifact is a folder an agent publishes so a human can look at it in the browser — a design doc, a PR
+            review, a code walkthrough. A <strong>renderer</strong> turns that folder into an interactive view, chosen by
+            the artifact's declared <code>type</code>.
+          </p>
+
+          <h2 id="artifact-model">The artifact model</h2>
+          <p>Every artifact is a folder at <code>&lt;workspace&gt;/artifacts/&lt;id&gt;/</code> with a required <code>manifest.json</code> plus free-form content files. The manifest's <code>type</code> is the dispatcher key.</p>
+          <div class="code-block" data-lang="text">
+<pre><code class="language-text">&lt;workspace&gt;/artifacts/design-2401/
+├── manifest.json      { "type": "markdown", "title": "Auth design" }
+└── content.md         # the content the renderer displays</code></pre>
+          </div>
+
+          <h2 id="built-in-renderers">Built-in renderers</h2>
+          <p>Three renderers ship out of the box:</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Renderer</th><th>Expected files</th><th>What it shows</th></tr></thead>
+              <tbody>
+                <tr><td><code>markdown</code></td><td><code>content.md</code></td><td>A markdown article with fenced-code highlighting and Mermaid diagram rendering.</td></tr>
+                <tr><td><code>pr-review</code></td><td><code>review.json</code> (+ optional <code>walkthrough.json</code>, <code>pr.json</code>, file snapshots)</td><td>A full PR review UI: hierarchical file tree, full-file diffs, and a comment rail.</td></tr>
+                <tr><td><code>walkthrough</code></td><td><code>walkthrough.json</code> (+ optional file snapshots)</td><td>A full-viewport code walkthrough with a floating step overlay on top of the code.</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h2 id="resolution-chain">Renderer resolution chain</h2>
+          <p>A renderer is a <code>.mjs</code> module resolved on the artifact's <code>type</code>, most-specific-first:</p>
+          <div class="flow">
+            <span class="flow-node accent">workspace</span>
+            <span class="flow-arrow">→</span>
+            <span class="flow-node">plugin</span>
+            <span class="flow-arrow">→</span>
+            <span class="flow-node">built-in</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Scope</th><th>Path</th><th>Writable via MCP</th></tr></thead>
+              <tbody>
+                <tr><td>workspace</td><td><code>&lt;projectDir&gt;/.clawdevbox/renderers/&lt;type&gt;.mjs</code></td><td><span class="badge ok">yes</span></td></tr>
+                <tr><td>plugin</td><td><code>&lt;plugin.dir&gt;/renderers/&lt;type&gt;.mjs</code></td><td><span class="badge">no</span></td></tr>
+                <tr><td>built-in</td><td>ships with the MCP server</td><td><span class="badge">no</span></td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h2 id="publishing">Publishing an artifact</h2>
+          <p>An agent skill writes the content files, then calls <code>artifact.add</code> to register the folder and make it discoverable. The call returns up to three URLs:</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>URL</th><th>Use</th></tr></thead>
+              <tbody>
+                <tr><td><code>view_url</code></td><td>Loopback browser page — always present when the server is up.</td></tr>
+                <tr><td><code>tunnel_view_url</code></td><td>Your devtunnel URL — open from your other devices on the same tunnel account.</td></tr>
+                <tr><td><code>share_url</code></td><td>Tenant-scoped share-tunnel URL — safe to hand to a colleague (no <code>/mcp</code> bearer needed).</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="callout tip">
+            <span class="callout-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7c.6.5 1 1.3 1 2.3h6c0-1 .4-1.8 1-2.3A7 7 0 0 0 12 2Z"/></svg></span>
+            <div class="callout-body"><p class="mb-0">Call <code>artifact.types</code> before creating one to see each type's required files and recommended producing skill. Optional <code>recipe_instance_id</code> / <code>step_id</code> link an artifact to a recipe run for UI grouping.</p></div>
+          </div>
+
+          <h2 id="custom-renderers">Custom renderers</h2>
+          <p>Shadow or add a type by writing a workspace renderer at <code>.clawdevbox/renderers/&lt;type&gt;.mjs</code> (via <code>renderer.write</code>). A renderer exports a default object with a <code>render(root, ctx)</code> function:</p>
+          <div class="code-block" data-lang="javascript">
+<pre><code class="language-javascript">export default {
+  type: "my-type",
+  async render(root, ctx) {
+    const data = await ctx.fetchFileJson("data.json");
+    root.textContent = JSON.stringify(data, null, 2);
+  },
+};</code></pre>
+          </div>
+          <p>See <a href="extensibility.html#custom-renderers">Extensibility → custom renderers</a> for the full contract.</p>
+
+          <h2 id="artifact-tools">Artifact &amp; renderer tools</h2>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Tool</th><th>Purpose</th></tr></thead>
+              <tbody>
+                <tr><td><code>artifact.add</code></td><td>Register an artifact folder + manifest (optionally write files inline). Returns view URLs.</td></tr>
+                <tr><td><code>artifact.types</code></td><td>List supported artifact types with required files, schemas, and recommended skills.</td></tr>
+                <tr><td><code>artifact.list</code> / <code>artifact.get</code></td><td>List artifacts / read one artifact's manifest + content.</td></tr>
+                <tr><td><code>artifact.delete</code></td><td>Delete an artifact and its on-disk payload.</td></tr>
+                <tr><td><code>artifact.comment_reply</code></td><td>Reply to a comment thread on an artifact (e.g. a PR-review comment).</td></tr>
+                <tr><td><code>renderer.list</code> / <code>renderer.read</code></td><td>List renderers &amp; which is active / read the active source.</td></tr>
+                <tr><td><code>renderer.write</code> / <code>renderer.delete</code></td><td>Write or remove a workspace-level renderer shadow.</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <nav class="page-nav">
+            <a class="prev" href="memory.html"><span class="pn-label">← Previous</span><span class="pn-title">Memory</span></a>
+            <a class="next" href="inbox.html"><span class="pn-label">Next →</span><span class="pn-title">Inbox &amp; Workflow</span></a>
+          </nav>
+        </div>
+      </main>
+      <nav class="toc" id="toc" aria-label="On this page"></nav>
+    </div>
+    <footer class="site-footer"><p class="mb-0"><strong>ClawDevbox</strong> — engine codename <em>Conductor</em>. MIT licensed. · <a href="https://github.com/kirmad/clawdevbox" target="_blank" rel="noopener">GitHub</a></p></footer>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="assets/js/search-index.js"></script>
+    <script src="assets/js/main.js"></script>
+  </body>
+</html>

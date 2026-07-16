@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Extensibility · ClawDevbox Docs</title>
+    <meta name="description" content="How to extend ClawDevbox: author hostable tools, custom renderers, CLI providers and trigger templates, then package them as a plugin. Adding a capability never touches the host." />
+    <script>try{var t=localStorage.getItem("cdb-theme");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}</script>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;850&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+    <link id="hljs-dark" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" />
+    <link id="hljs-light" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" disabled />
+    <link rel="stylesheet" href="assets/css/styles.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%235b4bff'/%3E%3Cpath d='M9 10.5 13.5 16 9 21.5' stroke='white' stroke-width='2.4' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M16 21.5h7' stroke='%23ffce7a' stroke-width='2.4' stroke-linecap='round'/%3E%3C/svg%3E" />
+  </head>
+  <body class="has-toc">
+    <header class="topbar" id="topbar"></header>
+    <div class="sidebar-backdrop"></div>
+    <div class="layout">
+      <aside class="sidebar" id="sidebar"></aside>
+      <main class="content">
+        <div class="content-inner">
+          <span class="eyebrow">Extend &amp; Integrate</span>
+          <h1>Extensibility</h1>
+          <p class="lead">
+            ClawDevbox is built to be extended. Adding a capability is a drop-folder operation — a new recipe, skill,
+            trigger, hostable tool, renderer, or CLI provider — <strong>never a code change to the host</strong>. This page
+            is your map to every extension point.
+          </p>
+
+          <h2 id="ways-to-extend">Ways to extend</h2>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>You want to…</th><th>Extension point</th><th>Where</th></tr></thead>
+              <tbody>
+                <tr><td>Add a repeatable multi-step workflow</td><td><strong>Recipe</strong></td><td><a href="recipes.html">Recipes</a></td></tr>
+                <tr><td>Teach the agent <em>how</em> to do something</td><td><strong>Skill</strong></td><td><a href="skills.html">Skills</a></td></tr>
+                <tr><td>React to a schedule / webhook / event</td><td><strong>Trigger template</strong></td><td><a href="#trigger-templates">below</a></td></tr>
+                <tr><td>Expose a new MCP tool cheaply</td><td><strong>Hostable tool</strong></td><td><a href="#hostable-tools">below</a></td></tr>
+                <tr><td>Render a new kind of artifact</td><td><strong>Custom renderer</strong></td><td><a href="#custom-renderers">below</a></td></tr>
+                <tr><td>Run a different agent CLI</td><td><strong>CLI provider</strong></td><td><a href="#cli-providers">below</a></td></tr>
+                <tr><td>Ship all of the above as a unit</td><td><strong>Plugin</strong></td><td><a href="plugins.html">Plugins</a></td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h2 id="hostable-tools">Author a hostable tool</h2>
+          <p>
+            A hostable tool is the lightest way to add an MCP tool: a single TypeScript file in a plugin's <code>tools/</code>
+            directory that ClawDevbox loads into its own process. It exports an <code>id</code>, a <code>description</code>,
+            a <code>parameters</code> zod schema, and an <code>execute(args, ctx)</code> function.
+          </p>
+          <div class="code-block" data-lang="typescript">
+<pre><code class="language-typescript">import { z } from "zod";
+
+export const id = "ado.get_pr_title";      // namespaced &lt;plugin&gt;.&lt;verb&gt;
+export const description = "Fetch the title of an Azure DevOps pull request.";
+export const parameters = z.object({
+  pr_id: z.string().describe("The numeric PR id, as a string."),
+});
+
+export async function execute(args, ctx) {
+  const pr = await ctx.http.get(
+    `https://dev.azure.com/org/proj/_apis/git/pullrequests/${args.pr_id}`
+  );
+  return { title: pr.title, status: pr.status };
+}</code></pre>
+          </div>
+          <ul>
+            <li>Ids must be <strong>namespaced</strong> — <code>&lt;plugin-name&gt;.&lt;verb&gt;</code> — so they never collide.</li>
+            <li>The tool becomes reachable through the meta-tool gateway like any built-in: <code>learn_tool</code> → <code>run_tool</code>.</li>
+            <li><code>ctx</code> gives you the host's utilities (HTTP, config, secrets resolved from the keychain).</li>
+          </ul>
+          <div class="callout tip">
+            <span class="callout-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7c.6.5 1 1.3 1 2.3h6c0-1 .4-1.8 1-2.3A7 7 0 0 0 12 2Z"/></svg></span>
+            <div class="callout-body"><p class="mb-0">Reach for a hostable tool when a full external MCP server is overkill. Reach for an external MCP server (declared in <code>mcpServers</code>) when the integration is large, stateful, or already exists.</p></div>
+          </div>
+
+          <h2 id="custom-renderers">Author a custom renderer</h2>
+          <p>
+            A renderer turns an artifact folder into a browser view, dispatched on the artifact's <code>type</code>. Write a
+            <code>.mjs</code> module that default-exports an object with a <code>render(root, ctx)</code> function. Drop it at
+            <code>.clawdevbox/renderers/&lt;type&gt;.mjs</code> (workspace) or ship it in a plugin's <code>renderers/</code>.
+          </p>
+          <div class="code-block" data-lang="javascript">
+<pre><code class="language-javascript">export default {
+  type: "metrics-report",
+  async render(root, ctx) {
+    // ctx exposes helpers to read the artifact's files
+    const data = await ctx.fetchFileJson("data.json");
+    const rows = data.rows
+      .map((r) =&gt; `&lt;tr&gt;&lt;td&gt;${r.name}&lt;/td&gt;&lt;td&gt;${r.value}&lt;/td&gt;&lt;/tr&gt;`)
+      .join("");
+    root.innerHTML = `&lt;h1&gt;${data.title}&lt;/h1&gt;&lt;table&gt;${rows}&lt;/table&gt;`;
+  },
+};</code></pre>
+          </div>
+          <p>Resolution is <strong>workspace → plugin → built-in</strong>, so a workspace renderer for an existing type shadows the built-in one. See <a href="artifacts.html">Artifacts &amp; Renderers</a> for the built-in types.</p>
+
+          <h2 id="cli-providers">Add a CLI provider</h2>
+          <p>
+            Want ClawDevbox to drive a different agent CLI? Declare it in your plugin manifest's
+            <code>clawdevbox.agent_clis[]</code> and export a module with a <code>spawnSession()</code> entry point. The
+            provider is responsible for launching the CLI inside the pty with the MCP config wired in.
+          </p>
+          <div class="code-block" data-lang="typescript">
+<pre><code class="language-typescript">// my-provider.ts — referenced from clawdevbox.agent_clis[] in plugin.json
+export const id = "my-cli";
+
+export async function spawnSession(ctx, opts) {
+  // ctx: paths, mcp config path, env; opts: model, prompt, resume id, ...
+  return ctx.spawnPty({
+    command: "my-cli",
+    args: ["--mcp-config", ctx.mcpConfigPath, "--prompt", opts.prompt],
+    env: { ...ctx.env },
+  });
+}</code></pre>
+          </div>
+          <p>Once installed, the provider id can be used as a recipe's <code>default_client</code> or passed when beginning a recipe instance. Built-in providers are <code>copilot</code>, <code>claude</code>, and the <code>echo-stub</code> test provider.</p>
+
+          <h2 id="trigger-templates">Author a trigger template</h2>
+          <p>
+            To make something happen proactively, author a <strong>trigger type</strong> with
+            <code>trigger.template.create</code>, then register concrete instances of it. Trigger scripts follow the stdin
+            envelope contract (read config + state, observe, dispatch, emit new state on stdout).
+          </p>
+          <div class="callout warning">
+            <span class="callout-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 9v4m0 4h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/></svg></span>
+            <div class="callout-body"><p class="mb-0">Read the <code>authoring-triggers</code> skill first — it's the required reference for the envelope, state, cursor, and auth contract. Full details on the <a href="triggers.html">Triggers</a> page.</p></div>
+          </div>
+
+          <h2 id="package-as-plugin">Package it as a plugin</h2>
+          <p>
+            Any combination of the above becomes shareable when you list it in a plugin manifest's <code>clawdevbox</code>
+            block. Then anyone can <code>plugin.install</code> from your git URL and pick up the whole set. The drop-folder
+            philosophy holds end to end: your extension is just files, discovered and merged by scope — the host stays
+            untouched.
+          </p>
+          <div class="card-grid cols-2">
+            <a class="card" href="plugins.html"><h3 class="mt-0">Plugin manifest →</h3><p>See the <code>.claude-plugin/plugin.json</code> shape and the <code>clawdevbox</code> extension block.</p></a>
+            <a class="card" href="mcp-tools.html"><h3 class="mt-0">MCP Tools Reference →</h3><p>Every built-in tool, grouped by namespace, plus the meta-tool gateway.</p></a>
+          </div>
+
+          <nav class="page-nav">
+            <a class="prev" href="plugins.html"><span class="pn-label">← Previous</span><span class="pn-title">Plugins</span></a>
+            <a class="next" href="mcp-tools.html"><span class="pn-label">Next →</span><span class="pn-title">MCP Tools Reference</span></a>
+          </nav>
+        </div>
+      </main>
+      <nav class="toc" id="toc" aria-label="On this page"></nav>
+    </div>
+    <footer class="site-footer"><p class="mb-0"><strong>ClawDevbox</strong> — engine codename <em>Conductor</em>. MIT licensed. · <a href="https://github.com/kirmad/clawdevbox" target="_blank" rel="noopener">GitHub</a></p></footer>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="assets/js/search-index.js"></script>
+    <script src="assets/js/main.js"></script>
+  </body>
+</html>

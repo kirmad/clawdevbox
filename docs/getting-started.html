@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Getting Started · ClawDevbox Docs</title>
+    <meta name="description" content="Install, initialize and run the ClawDevbox MCP server, then wire it up to your agent CLI and run the demos." />
+    <script>try{var t=localStorage.getItem("cdb-theme");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}</script>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;850&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+    <link id="hljs-dark" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" />
+    <link id="hljs-light" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" disabled />
+    <link rel="stylesheet" href="assets/css/styles.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%235b4bff'/%3E%3Cpath d='M9 10.5 13.5 16 9 21.5' stroke='white' stroke-width='2.4' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M16 21.5h7' stroke='%23ffce7a' stroke-width='2.4' stroke-linecap='round'/%3E%3C/svg%3E" />
+  </head>
+  <body class="has-toc">
+    <header class="topbar" id="topbar"></header>
+    <div class="sidebar-backdrop"></div>
+    <div class="layout">
+      <aside class="sidebar" id="sidebar"></aside>
+      <main class="content">
+        <div class="content-inner">
+          <span class="eyebrow">Introduction</span>
+          <h1>Getting Started</h1>
+          <p class="lead">
+            Install ClawDevbox, initialize it once, start the MCP server, and
+            point your agent CLI at it. In a few minutes you'll have hidden
+            agent runs, a live browser viewer, and the full recipe / skill /
+            trigger / memory surface.
+          </p>
+
+          <div class="callout warning">
+            <span class="callout-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 9v4m0 4h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/></svg></span>
+            <div class="callout-body">
+              <div class="callout-title">Pre-release</div>
+              <p class="mb-0">The reference implementation ships as a working sample. APIs and on-disk formats are not stable yet — pin a commit if you build on top of it.</p>
+            </div>
+          </div>
+
+          <h2 id="prerequisites">Prerequisites</h2>
+          <ul>
+            <li><strong>Node.js 18+</strong> — the MCP server runs on Node with <code>node-pty</code> (ConPTY on Windows).</li>
+            <li><strong>An agent CLI</strong> you install yourself — GitHub <code>copilot</code>, <code>claude</code> (Claude Code), Cursor, or any TTY-driven CLI that accepts an MCP config. ClawDevbox does <em>not</em> bundle the agent.</li>
+            <li><strong>git</strong> — for cloning the repo and for git-based plugin / memory-vault sync.</li>
+            <li><strong>A modern browser</strong> — for the live terminal and artifact viewers.</li>
+          </ul>
+
+          <h2 id="install-and-set-up">Install &amp; set up</h2>
+          <p>Clone the repository and install the MCP server's dependencies. The Playwright Chromium download powers the browser verification scripts.</p>
+          <div class="code-block" data-lang="bash">
+<pre><code class="language-bash">git clone https://github.com/kirmad/clawdevbox
+cd clawdevbox/mcp-server
+npm install
+npx playwright install chromium</code></pre>
+          </div>
+
+          <h3 id="initialize">Initialize with <code>clawdevbox init</code></h3>
+          <p><code>clawdevbox init</code> is the single setup command. It asks for an <strong>install scope</strong>:</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Scope</th><th>Where config lives</th><th>When to use</th></tr></thead>
+              <tbody>
+                <tr><td><span class="badge accent">Global</span> <em>(recommended)</em></td><td><code>&lt;globalDir&gt;/config.json</code> (default <code>~/.clawdevbox/config.json</code>); plugins under <code>&lt;globalDir&gt;/plugins/</code></td><td>One install per user. Every project sees the same MCP server, tunnel, and plugin set.</td></tr>
+                <tr><td><span class="badge">Project-specific</span></td><td><code>&lt;projectDir&gt;/.clawdevbox/config.json</code></td><td>Legacy path. A repo needs its own port / token / tunnel.</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="code-block" data-lang="bash">
+<pre><code class="language-bash"># Interactive
+clawdevbox init
+
+# Non-interactive, global, with a plugin from git
+clawdevbox init --scope global --plugin git+https://example.com/some-plugin.git</code></pre>
+          </div>
+          <div class="callout note">
+            <span class="callout-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 8h.01M11 12h1v4h1"/></svg></span>
+            <div class="callout-body"><p class="mb-0"><code>resolveConfig</code> merges both layers when present (<strong>project &gt; global &gt; defaults</strong>). Environment variables and CLI flags override anything on disk.</p></div>
+          </div>
+
+          <h2 id="running-the-server">Running the server</h2>
+          <p>After <code>init</code>, there are three ways to run the MCP server:</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Command</th><th>Mode</th><th>Notes</th></tr></thead>
+              <tbody>
+                <tr><td><code>clawdevbox mcp</code></td><td>Stdio MCP</td><td>Wired up by your agent (Claude Code, Copilot, …) as a stdio server.</td></tr>
+                <tr><td><code>clawdevbox start</code></td><td>HTTP MCP (foreground)</td><td>Runs until you press <kbd>Ctrl</kbd>+<kbd>C</kbd>.</td></tr>
+                <tr><td><code>clawdevbox start --service</code></td><td>HTTP MCP (background)</td><td>Detaches and registers OS auto-start at login. Idempotent.</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="code-block" data-lang="bash">
+<pre><code class="language-bash">clawdevbox start --service     # install + start now (idempotent)
+clawdevbox status              # is it running? auto-start installed?
+clawdevbox stop                # halt; auto-start remains registered
+clawdevbox uninstall-service   # stop + remove auto-start</code></pre>
+          </div>
+          <p>The background service uses the platform's native scheduler for "always running across reboots" semantics:</p>
+          <ul>
+            <li><strong>Windows</strong> — Task Scheduler (<code>schtasks</code>)</li>
+            <li><strong>macOS</strong> — LaunchAgents (<code>launchctl</code>)</li>
+            <li><strong>Linux</strong> — systemd-user (<code>systemctl --user</code>)</li>
+          </ul>
+          <p>PID and port are recorded in <code>&lt;globalDir&gt;/service.json</code> so <code>stop</code> always finds the running instance. Only one global instance is supported per user account.</p>
+
+          <h2 id="wire-up-your-agent">Wire up your agent</h2>
+          <p>At boot the sidecar writes an MCP config the agent CLI can consume. The CLI is spawned with that config so every ClawDevbox tool becomes visible:</p>
+          <div class="code-block" data-lang="json">
+<pre><code class="language-json">{
+  "mcpServers": {
+    "clawdevbox": {
+      "type": "streamable-http",
+      "uri": "http://localhost:5201/mcp",
+      "headers": { "Authorization": "Bearer &lt;per-launch-secret&gt;" }
+    }
+  }
+}</code></pre>
+          </div>
+          <div class="callout tip">
+            <span class="callout-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7c.6.5 1 1.3 1 2.3h6c0-1 .4-1.8 1-2.3A7 7 0 0 0 12 2Z"/></svg></span>
+            <div class="callout-body"><p class="mb-0">Tools are exposed through a <strong>meta-tool gateway</strong> — <code>list_tools</code> → <code>learn_tool</code> → <code>run_tool</code> — so agents only pay schema tokens for the tools they actually use. See the <a href="mcp-tools.html">MCP Tools Reference</a>.</p></div>
+          </div>
+
+          <h2 id="demos-you-can-run">Demos you can run</h2>
+          <p>From <code>mcp-server/</code>, each demo opens a headed Chromium so you can watch it live:</p>
+          <div class="code-block" data-lang="bash">
+<pre><code class="language-bash"># Live terminal viewer over a hidden node-pty
+npx tsx demo-terminal-view.mjs
+
+# Interactive agent CLI inside the hidden pty, viewed in the browser
+npx tsx demo-agency-interactive.mjs
+
+# Code walkthrough overlay (floating panel on top of the diff)
+npx tsx demo-walkthrough.mjs
+
+# Full PR review viewer with hierarchical file tree + full-file diff
+npx tsx demo-pr-review.mjs</code></pre>
+          </div>
+
+          <h2 id="verify-end-to-end">Verify end-to-end</h2>
+          <div class="code-block" data-lang="bash">
+<pre><code class="language-bash"># Agent CLI ↔ MCP round-trip via recipe.run
+node e2e-test.mjs
+
+# Locked-size xterm survives browser resize without misalignment
+npx tsx verify-agency-alignment.mjs
+
+# All three built-in renderers tested in headless Chromium with screenshots
+npx tsx verify-artifacts.mjs</code></pre>
+          </div>
+
+          <h2 id="next-steps">Next steps</h2>
+          <div class="card-grid cols-3">
+            <a class="card" href="architecture.html"><h3 class="mt-0">Architecture →</h3><p>Understand the kernel, the MCP surface, and the "key inversion".</p></a>
+            <a class="card" href="concepts.html"><h3 class="mt-0">Core Concepts →</h3><p>Learn the vocabulary: recipes, triggers, skills, artifacts, scopes.</p></a>
+            <a class="card" href="recipes.html"><h3 class="mt-0">Author a recipe →</h3><p>Template your first multi-step agent pipeline.</p></a>
+          </div>
+
+          <nav class="page-nav">
+            <a class="prev" href="index.html"><span class="pn-label">← Previous</span><span class="pn-title">Home</span></a>
+            <a class="next" href="architecture.html"><span class="pn-label">Next →</span><span class="pn-title">Architecture</span></a>
+          </nav>
+        </div>
+      </main>
+      <nav class="toc" id="toc" aria-label="On this page"></nav>
+    </div>
+    <footer class="site-footer"><p class="mb-0"><strong>ClawDevbox</strong> — engine codename <em>Conductor</em>. MIT licensed. · <a href="https://github.com/kirmad/clawdevbox" target="_blank" rel="noopener">GitHub</a></p></footer>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="assets/js/search-index.js"></script>
+    <script src="assets/js/main.js"></script>
+  </body>
+</html>

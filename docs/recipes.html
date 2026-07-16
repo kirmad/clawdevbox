@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Recipes · ClawDevbox Docs</title>
+    <meta name="description" content="Recipes are reusable, multi-step task templates. Learn the recipe and step shape, validation gates, the template/instance lifecycle, and the recipe.* tools." />
+    <script>try{var t=localStorage.getItem("cdb-theme");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}</script>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;850&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+    <link id="hljs-dark" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" />
+    <link id="hljs-light" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" disabled />
+    <link rel="stylesheet" href="assets/css/styles.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%235b4bff'/%3E%3Cpath d='M9 10.5 13.5 16 9 21.5' stroke='white' stroke-width='2.4' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M16 21.5h7' stroke='%23ffce7a' stroke-width='2.4' stroke-linecap='round'/%3E%3C/svg%3E" />
+  </head>
+  <body class="has-toc">
+    <header class="topbar" id="topbar"></header>
+    <div class="sidebar-backdrop"></div>
+    <div class="layout">
+      <aside class="sidebar" id="sidebar"></aside>
+      <main class="content">
+        <div class="content-inner">
+          <span class="eyebrow">Building Blocks</span>
+          <h1>Recipes</h1>
+          <p class="lead">
+            A recipe is a reusable, multi-step task template — the <strong>WHAT</strong>. It declares an ordered list of
+            goals; the agent reads them as a starting point and adapts. Recipes are executable state machines, whereas
+            <a href="skills.html">skills</a> are documentation.
+          </p>
+
+          <div class="callout note">
+            <span class="callout-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 8h.01M11 12h1v4h1"/></svg></span>
+            <div class="callout-body"><p class="mb-0"><strong>Recipe = WHAT, skill = HOW.</strong> Use a recipe when the workflow is deterministic and repeatable. For one-off work, inline it. For "the user keeps asking for this", elevate it to a recipe.</p></div>
+          </div>
+
+          <h2 id="recipe-shape">Recipe shape</h2>
+          <p>A recipe template (stored at <code>.clawdevbox/recipes/&lt;id&gt;.yaml</code>) has these top-level fields:</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead>
+              <tbody>
+                <tr><td><code>id</code></td><td>string</td><td>Kebab-case id (matches the file name).</td></tr>
+                <tr><td><code>name</code></td><td>string</td><td>Short display name shown in <code>recipe.template.list</code>.</td></tr>
+                <tr><td><code>description</code></td><td>string</td><td>1–3 sentence summary of what the recipe does.</td></tr>
+                <tr><td><code>kind</code></td><td>enum</td><td><code>workitem</code> · <code>pr_review</code> · <code>incident</code> · <code>epic</code> · <code>custom</code>.</td></tr>
+                <tr><td><code>default_client</code></td><td>enum</td><td>Which CLI runs it: <code>copilot</code> · <code>claude</code> · <code>echo-stub</code>.</td></tr>
+                <tr><td><code>mcp_servers</code></td><td>string[]</td><td>MCP server ids the recipe needs.</td></tr>
+                <tr><td><code>steps</code></td><td>array</td><td>Ordered array of step objects (below).</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h2 id="step-shape">Step shape</h2>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Field</th><th>Required</th><th>Meaning</th></tr></thead>
+              <tbody>
+                <tr><td><code>id</code></td><td>yes</td><td>Kebab-case id, unique within the recipe. Addressed by <code>recipe.steps.update_status</code>.</td></tr>
+                <tr><td><code>goal</code></td><td>yes</td><td>≤200-char human-readable TL;DR shown as the step title in the UI.</td></tr>
+                <tr><td><code>ai_instructions</code></td><td>no</td><td>Full agent-facing prompt (≤16000 chars). Reference specific tools, commands, skills.</td></tr>
+                <tr><td><code>depends</code></td><td>no</td><td>Array of step ids this step waits on — enforces topological order.</td></tr>
+                <tr><td><code>required</code></td><td>no</td><td>When <code>true</code>, the step cannot be skipped (a non-negotiable gate).</td></tr>
+                <tr><td><code>params</code> · <code>artifacts</code> · <code>triggers</code></td><td>no</td><td>Step-local param declarations, artifact declarations, and triggers materialized on step entry.</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h2 id="example">A worked example</h2>
+          <p>A small, idempotent 2-step recipe:</p>
+          <div class="code-block" data-lang="yaml">
+<pre><code class="language-yaml">id: cleanup-stale-branches
+name: Prune merged remote branches
+description: &gt;
+  Delete branches already merged to main. Idempotent — safe to re-run.
+kind: custom
+default_client: copilot
+mcp_servers: [clawdevbox]
+steps:
+  - id: scan
+    goal: List branches merged into main
+    ai_instructions: |
+      Run `git branch --merged main` and parse the output. Exclude
+      `main`, `master`, and any `release/*` branch. Save the list for
+      the next step to consume.
+  - id: prune
+    goal: Delete each merged branch (with confirmation)
+    depends: [scan]
+    required: false
+    ai_instructions: |
+      For each branch from step `scan`, ask the user via the inbox before
+      deleting. On confirmation run `git branch -d` and push the delete.</code></pre>
+          </div>
+
+          <h2 id="validation-gates">Validation gates &amp; the step machine</h2>
+          <p>
+            You advance each step with <code>recipe.steps.update_status</code> — set it <strong>before</strong> starting a
+            step and <strong>after</strong> finishing it, every time. The status machine is monotonic:
+          </p>
+          <div class="flow">
+            <span class="flow-node">pending</span>
+            <span class="flow-arrow">→</span>
+            <span class="flow-node accent">in_progress</span>
+            <span class="flow-arrow">→</span>
+            <span class="flow-node">done</span>
+            <span class="flow-arrow">·</span>
+            <span class="flow-node">failed</span>
+            <span class="flow-arrow">·</span>
+            <span class="flow-node">skipped</span>
+          </div>
+          <p>
+            A step can declare <strong>validation gates</strong>. When you mark such a step <code>done</code>, it enters a
+            <code>validating</code> state and an independent verifier session is spawned; it writes a
+            <code>{ verdict, evidence, gaps }</code> record and only then is the step accepted (or bounced back). Steps
+            marked <code>required: true</code> reject any <code>skipped</code> transition.
+          </p>
+          <div class="callout warning">
+            <span class="callout-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 9v4m0 4h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/></svg></span>
+            <div class="callout-body"><p class="mb-0">Record evidence in durable <code>state</code> / <code>result</code> (not only the free-text <code>message</code>) — some gates inspect instance state or the workspace, not the session transcript. Pass <code>recipe_instance_id</code> explicitly if you're on a bifurcated lane console.</p></div>
+          </div>
+
+          <h3 id="lanes">Lanes &amp; sessions</h3>
+          <p>
+            A step may declare an <code>execution.session</code> <em>lane</em>. A lane-dispatch worker spawns or wakes an
+            interactive console per lane, so, for example, implementation and review steps can run in separate agent
+            sessions. Lane <code>main</code> is the initial console the run started in.
+          </p>
+
+          <h2 id="lifecycle">Template → instance lifecycle</h2>
+          <ol class="steps">
+            <li><h4>Author the template</h4><p><code>recipe.template.upsert</code> writes the reusable YAML (project or global scope; plugin scope is read-only).</p></li>
+            <li><h4>Begin an instance</h4><p><code>recipe.instance.begin</code> mints a run instance, resolves a workspace, and spawns the agent CLI. The instance id is injected as <code>CLAWDEVBOX_RECIPE_INSTANCE_ID</code>.</p></li>
+            <li><h4>Advance the steps</h4><p>The running agent calls <code>recipe.steps.update_status</code> as it works, and <code>recipe.instance.update_steps</code> to mutate the materialized plan.</p></li>
+            <li><h4>Observe &amp; finish</h4><p><code>recipe.instance.view_url</code> gives a live PTY viewer; <code>recipe.instance.get</code> reads the durable row; <code>recipe.instance.kill</code> cancels a run.</p></li>
+          </ol>
+
+          <h2 id="recipe-tools">Recipe tools</h2>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Tool</th><th>Purpose</th></tr></thead>
+              <tbody>
+                <tr><td><code>recipe.template.list</code></td><td>List recipe templates across project, plugin, and global scopes.</td></tr>
+                <tr><td><code>recipe.template.get</code></td><td>Read one template's parsed structure + raw source.</td></tr>
+                <tr><td><code>recipe.template.upsert</code></td><td>Create or replace a recipe template (shape-validated).</td></tr>
+                <tr><td><code>recipe.template.delete</code></td><td>Remove a template.</td></tr>
+                <tr><td><code>recipe.instance.begin</code></td><td>Start a run instance and spawn the agent CLI.</td></tr>
+                <tr><td><code>recipe.instance.get</code></td><td>Read a run instance row by id or from the current session.</td></tr>
+                <tr><td><code>recipe.instance.list_running</code></td><td>List live recipe PTY sessions.</td></tr>
+                <tr><td><code>recipe.instance.view_url</code></td><td>Get a browser URL to attach to a running instance's PTY.</td></tr>
+                <tr><td><code>recipe.instance.update_steps</code></td><td>Mutate the materialized step plan (add / remove / update).</td></tr>
+                <tr><td><code>recipe.instance.kill</code></td><td>Cancel a running instance.</td></tr>
+                <tr><td><code>recipe.steps.update_status</code></td><td>Advance one step (<code>in_progress → done | failed | skipped</code>).</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="text-muted">Discover recipes before improvising, and run one when the workflow is deterministic. See the full reference on the <a href="mcp-tools.html#recipe-tools">MCP Tools</a> page.</p>
+
+          <nav class="page-nav">
+            <a class="prev" href="concepts.html"><span class="pn-label">← Previous</span><span class="pn-title">Core Concepts</span></a>
+            <a class="next" href="triggers.html"><span class="pn-label">Next →</span><span class="pn-title">Triggers</span></a>
+          </nav>
+        </div>
+      </main>
+      <nav class="toc" id="toc" aria-label="On this page"></nav>
+    </div>
+    <footer class="site-footer"><p class="mb-0"><strong>ClawDevbox</strong> — engine codename <em>Conductor</em>. MIT licensed. · <a href="https://github.com/kirmad/clawdevbox" target="_blank" rel="noopener">GitHub</a></p></footer>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="assets/js/search-index.js"></script>
+    <script src="assets/js/main.js"></script>
+  </body>
+</html>

@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Agent Sessions · ClawDevbox Docs</title>
+    <meta name="description" content="How ClawDevbox runs agent CLIs in hidden PTY / tmux sessions with live browser viewers, the supported providers, and the session.* and daemon.* tools." />
+    <script>try{var t=localStorage.getItem("cdb-theme");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}</script>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;850&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+    <link id="hljs-dark" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" />
+    <link id="hljs-light" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" disabled />
+    <link rel="stylesheet" href="assets/css/styles.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%235b4bff'/%3E%3Cpath d='M9 10.5 13.5 16 9 21.5' stroke='white' stroke-width='2.4' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M16 21.5h7' stroke='%23ffce7a' stroke-width='2.4' stroke-linecap='round'/%3E%3C/svg%3E" />
+  </head>
+  <body class="has-toc">
+    <header class="topbar" id="topbar"></header>
+    <div class="sidebar-backdrop"></div>
+    <div class="layout">
+      <aside class="sidebar" id="sidebar"></aside>
+      <main class="content">
+        <div class="content-inner">
+          <span class="eyebrow">Building Blocks</span>
+          <h1>Agent Sessions</h1>
+          <p class="lead">
+            Every agent run happens inside a hidden pseudo-terminal — <code>node-pty</code> on POSIX, ConPTY on Windows —
+            so no console window flashes. Browser viewers attach to a live session over WebSocket, and the agent keeps
+            running even if every viewer closes.
+          </p>
+
+          <h2 id="providers">Providers</h2>
+          <p>ClawDevbox drives agent CLIs through pluggable providers:</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Provider</th><th>Status</th></tr></thead>
+              <tbody>
+                <tr><td><code>copilot</code></td><td><span class="badge accent">built-in</span> GitHub Copilot CLI</td></tr>
+                <tr><td><code>claude</code></td><td><span class="badge accent">built-in</span> Claude Code</td></tr>
+                <tr><td><code>echo-stub</code></td><td><span class="badge">built-in</span> deterministic test stub</td></tr>
+                <tr><td><code>agency</code></td><td><span class="badge claw">plugin</span> provider-supplied</td></tr>
+                <tr><td>custom</td><td>declared via <code>clawdevbox.agent_clis[]</code> in a plugin</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>A provider plugin declares <code>clawdevbox.agent_clis[]</code> in its manifest and exports a module with a <code>spawnSession()</code> entry point. See <a href="extensibility.html#cli-providers">Extensibility → CLI providers</a>.</p>
+
+          <h2 id="how-sessions-run">How sessions run</h2>
+          <ol class="steps">
+            <li><h4>Spawn</h4><p>The recipe runner (or a trigger's spawn dispatch) calls the provider's <code>spawnSession(ctx, opts)</code>, which launches the CLI inside a hidden pty with the MCP config wired in.</p></li>
+            <li><h4>Attach</h4><p>A browser viewer subscribes over WebSocket and streams the raw xterm. Multiple viewers can watch the same session; each gets its own attach.</p></li>
+            <li><h4>Persist</h4><p>The agent process outlives its viewers. tmux-backed sessions survive across reconnects and are reconciled on server startup.</p></li>
+          </ol>
+
+          <h2 id="tmux-sessions">tmux-backed sessions</h2>
+          <p>On platforms with tmux, sessions run inside persistent <code>cdb_&lt;id&gt;</code> tmux sessions so they can be resumed and multi-attached:</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Concept</th><th>Meaning</th></tr></thead>
+              <tbody>
+                <tr><td>session</td><td>A persistent <code>cdb_&lt;id&gt;</code> tmux session holding one agent CLI.</td></tr>
+                <tr><td>spawn</td><td><code>provider.spawnSession(ctx, opts)</code> launches the agent into that session.</td></tr>
+                <tr><td>resume</td><td>The same session id can be re-attached / resumed after a disconnect.</td></tr>
+                <tr><td>terminals panel</td><td>The browser UI listing live sessions for attachment, keyed by recipe instance.</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="callout note">
+            <span class="callout-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 8h.01M11 12h1v4h1"/></svg></span>
+            <div class="callout-body"><p class="mb-0">The terminals sidebar is keyed by recipe instance; an <code>agent_sessions</code> mapping resolves a CLI session to its instance. Inline recipes run in the parent agent's session, so they resolve their terminal through the parent.</p></div>
+          </div>
+
+          <h2 id="session-tools">Session tools</h2>
+          <p>Drive a running agent session directly:</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Tool</th><th>Purpose</th></tr></thead>
+              <tbody>
+                <tr><td><code>session.list</code></td><td>List active agent sessions.</td></tr>
+                <tr><td><code>session.read</code></td><td>Read a session's recent output / transcript.</td></tr>
+                <tr><td><code>session.send</code></td><td>Send input (a message / keystrokes) to a session.</td></tr>
+                <tr><td><code>session.kill</code></td><td>Terminate a session.</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h2 id="daemon-tools">Long-running daemons</h2>
+          <p>For processes that must stay alive independently of any one agent run — dev servers, watchers, emulators — use the <code>daemon.*</code> tools. They register, supervise, and tail long-running processes:</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Tool</th><th>Purpose</th></tr></thead>
+              <tbody>
+                <tr><td><code>daemon.register</code></td><td>Register a long-running process definition.</td></tr>
+                <tr><td><code>daemon.start</code> / <code>daemon.stop</code> / <code>daemon.restart</code></td><td>Control the process lifecycle.</td></tr>
+                <tr><td><code>daemon.list</code> / <code>daemon.get</code></td><td>List registered daemons / read one's status.</td></tr>
+                <tr><td><code>daemon.read_logs</code></td><td>Tail a daemon's captured stdout/stderr.</td></tr>
+                <tr><td><code>daemon.delete</code></td><td>Remove a daemon definition.</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <nav class="page-nav">
+            <a class="prev" href="inbox.html"><span class="pn-label">← Previous</span><span class="pn-title">Inbox &amp; Workflow</span></a>
+            <a class="next" href="plugins.html"><span class="pn-label">Next →</span><span class="pn-title">Plugins</span></a>
+          </nav>
+        </div>
+      </main>
+      <nav class="toc" id="toc" aria-label="On this page"></nav>
+    </div>
+    <footer class="site-footer"><p class="mb-0"><strong>ClawDevbox</strong> — engine codename <em>Conductor</em>. MIT licensed. · <a href="https://github.com/kirmad/clawdevbox" target="_blank" rel="noopener">GitHub</a></p></footer>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="assets/js/search-index.js"></script>
+    <script src="assets/js/main.js"></script>
+  </body>
+</html>

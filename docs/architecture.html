@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Architecture · ClawDevbox Docs</title>
+    <meta name="description" content="How ClawDevbox works: the SQLite kernel, the MCP surface, hidden PTY sessions, install modes, the background service, and the security model." />
+    <script>try{var t=localStorage.getItem("cdb-theme");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}</script>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;850&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+    <link id="hljs-dark" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" />
+    <link id="hljs-light" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" disabled />
+    <link rel="stylesheet" href="assets/css/styles.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%235b4bff'/%3E%3Cpath d='M9 10.5 13.5 16 9 21.5' stroke='white' stroke-width='2.4' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M16 21.5h7' stroke='%23ffce7a' stroke-width='2.4' stroke-linecap='round'/%3E%3C/svg%3E" />
+  </head>
+  <body class="has-toc">
+    <header class="topbar" id="topbar"></header>
+    <div class="sidebar-backdrop"></div>
+    <div class="layout">
+      <aside class="sidebar" id="sidebar"></aside>
+      <main class="content">
+        <div class="content-inner">
+          <span class="eyebrow">Introduction</span>
+          <h1>Architecture</h1>
+          <p class="lead">
+            ClawDevbox is a thin substrate around your coding agent. Its only
+            durable state is a single SQLite file; it exposes that state as an
+            MCP server, runs a cron daemon for triggers, and spawns your agent
+            CLI in a hidden pseudo-terminal. That's the whole engine.
+          </p>
+
+          <h2 id="the-key-inversion">The key inversion</h2>
+          <p>
+            The most important design decision: <strong>the sidecar does not run an agent loop — your CLI does.</strong>
+            ClawDevbox's job is to keep the SQLite tables consistent, expose them over MCP, and wake CLIs up when trigger
+            scripts demand it. The agent (Copilot, Claude, Cursor) drives its own loop and calls MCP tools to record what
+            it does. This keeps the host small, testable, and provider-agnostic.
+          </p>
+
+          <h2 id="system-overview">System overview</h2>
+          <div class="diagram">
+<pre>                  Browser viewers                     Side terminal
+             (live xterm · artifacts)          (copilot / claude / cursor)
+                      │  WS                              │ stdin/stdout
+                      ▼                                  │
+      ┌───────────────────────────────────────────────────────────────┐
+      │                    ClawDevbox sidecar (Node)                   │
+      │   ┌──────────────┐   ┌───────────────────┐   ┌──────────────┐  │
+      │   │ WS facade    │   │ HTTP MCP server   │◀──│ meta-tools   │  │
+      │   │ (renderer)   │   │ streamable-http   │   │ list/learn/  │  │
+      │   └──────┬───────┘   └─────────┬─────────┘   │ run_tool     │  │
+      │          │                     │             └──────────────┘  │
+      │   ┌──────┴─────────────────────┴───────────────────────────┐  │
+      │   │  Cron daemon → ticks triggers → spawns tsx/py workers   │  │
+      │   │  Recipe runner → spawns agent CLI in a hidden node-pty  │  │
+      │   └──────────────────────────┬─────────────────────────────┘  │
+      └──────────────────────────────┼────────────────────────────────┘
+                                     ▼
+                     ┌──────────────────────────────┐
+                     │   SQLite kernel (one file)   │
+                     │  inbox · threads · messages  │
+                     │  triggers · approvals · …    │
+                     └──────────────────────────────┘
+
+  Drop-folders (per-workspace, not in the DB):
+   .clawdevbox/recipes/*.yaml      multi-step recipe templates
+   .clawdevbox/triggers.json       registered triggers + triggers/*.ts|py
+   .clawdevbox/skills/*.md         procedural skills the CLI auto-loads
+   .clawdevbox/mcp/*.json          extra MCP server configs</pre>
+          </div>
+          <p>Four moving parts:</p>
+          <div class="feature-list">
+            <div class="feature"><span class="feature-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/></svg></span><div><h3>The kernel</h3><p>A single SQLite file — the only durable state. Everything else is derived or re-scannable.</p></div></div>
+            <div class="feature"><span class="feature-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 6.5a4 4 0 0 0-5.3 5.3L3 18l3 3 6.2-6.2a4 4 0 0 0 5.3-5.3l-2.6 2.6-2.5-2.5 2.6-2.6Z"/></svg></span><div><h3>The MCP server</h3><p>Streamable-HTTP surface exposing every verb as an MCP tool. The primary API — the WS facade is a convenience layer over the same handlers.</p></div></div>
+            <div class="feature"><span class="feature-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 4 14h7l-1 8 9-12h-7l1-8Z"/></svg></span><div><h3>The cron daemon</h3><p>An in-process scheduler that ticks each trigger on its cadence, spawning a worker per tick that decides whether to fire.</p></div></div>
+            <div class="feature"><span class="feature-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3"/><path d="M13 15h4"/></svg></span><div><h3>The side terminal</h3><p>Your agent CLI, spawned in a hidden <code>node-pty</code> (ConPTY on Windows). Browser viewers subscribe over WebSocket.</p></div></div>
+          </div>
+
+          <h2 id="the-kernel">The kernel</h2>
+          <p>
+            Durable state is six logical tables in one SQLite file (plus <code>schema_version</code> and a
+            <code>settings_kv</code>). All access goes through a single library; schema changes are additive only.
+          </p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Table</th><th>What it holds</th></tr></thead>
+              <tbody>
+                <tr><td><code>inbox_items</code></td><td>One actionable thing (a PR, work item, incident, epic, manual ask). The user's primary view.</td></tr>
+                <tr><td><code>threads</code></td><td>One ongoing run for an inbox item. Recursive via <code>parent_thread_id</code> (epic trees).</td></tr>
+                <tr><td><code>messages</code></td><td>Append-only log entries on a thread (agent text, tool calls, results, views).</td></tr>
+                <tr><td><code>triggers</code></td><td>Registered trigger instances + their persisted state and last-run audit.</td></tr>
+                <tr><td><code>approvals</code></td><td>Pending user decisions an agent surfaced — its interrupts.</td></tr>
+                <tr><td><code>artifacts</code></td><td>Files an agent registered (review markdown, walkthroughs, aggregates).</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="callout tip">
+            <span class="callout-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7c.6.5 1 1.3 1 2.3h6c0-1 .4-1.8 1-2.3A7 7 0 0 0 12 2Z"/></svg></span>
+            <div class="callout-body"><p class="mb-0"><strong>The file is the state.</strong> A crashed sidecar recovers by re-scanning on-disk records (e.g. <code>recipe-instances/</code>), because the row on disk <em>is</em> the durable record of what's running.</p></div>
+          </div>
+
+          <h2 id="the-mcp-surface">The MCP surface</h2>
+          <p>
+            The sidecar runs an HTTP MCP server (Streamable HTTP) on a localhost port (default <code>5201</code>). It is
+            <em>the</em> primary surface. Auth is a per-launch 32-byte hex secret in the <code>Authorization</code> header,
+            minted at boot and written into the agent's MCP config. The surface has three faces:
+          </p>
+          <div class="card-grid cols-3">
+            <div class="card"><h3 class="mt-0">Tools (verbs)</h3><p>114 namespaced tools — <code>recipe.*</code>, <code>trigger.*</code>, <code>skill.*</code>, <code>inbox.*</code>, memory, and more — reached through the <code>list_tools</code> / <code>learn_tool</code> / <code>run_tool</code> gateway.</p></div>
+            <div class="card"><h3 class="mt-0">Resources (nouns)</h3><p><code>resources/read</code> returns JSON documents for inbox items, threads, artifacts, and recipes by URI — no round-trip through tools.</p></div>
+            <div class="card"><h3 class="mt-0">Notifications (stream)</h3><p>The sidecar emits <code>notifications/resources/updated</code> whenever an item, thread, or approval changes. The viewer subscribes over WS.</p></div>
+          </div>
+
+          <h2 id="the-side-terminal">The side terminal</h2>
+          <p>This is the load-bearing inversion. What runs in the terminal is <em>your</em> installed CLI — ClawDevbox does not bundle it. The flow:</p>
+          <ol class="steps">
+            <li><h4>Configure</h4><p>At boot the sidecar writes an MCP config (<code>.mcp.json</code>) with the streamable-http URI and the per-launch bearer token, plus any extra servers from <code>.clawdevbox/mcp/*.json</code>.</p></li>
+            <li><h4>Spawn</h4><p>The recipe runner spawns the CLI detached inside a hidden pty (e.g. <code>copilot --allow-all-tools</code> / <code>claude -p</code>) and hands it a system prompt describing the recipe, available tools, and the discipline of recording progress.</p></li>
+            <li><h4>Observe</h4><p>Every meaningful CLI action is mediated by an MCP tool call. The viewer tails the thread's <code>messages</code> and renders — while browser viewers stream the raw xterm over WebSocket.</p></li>
+          </ol>
+
+          <h2 id="install-modes">Install modes</h2>
+          <div class="split">
+            <div class="split-col vs-a"><h4>Global <span class="badge accent">recommended</span></h4><p><code>&lt;globalDir&gt;/config.json</code> holds account-wide settings (port, bearer token, tunnel, notifications, plugin set). Plugins live under <code>&lt;globalDir&gt;/plugins/</code> and are shared across every project. Launch from any directory; the cwd becomes <code>project_dir</code>.</p></div>
+            <div class="split-col vs-b"><h4>Project-specific</h4><p>Writes <code>&lt;projectDir&gt;/.clawdevbox/config.json</code>. Only takes effect when the server is launched against that project. Useful when a particular repo needs a different port / token / tunnel.</p></div>
+          </div>
+
+          <h2 id="background-service">Background service</h2>
+          <p>
+            <code>clawdevbox start --service</code> spawns the HTTP MCP server detached and registers an OS-level auto-start
+            entry so it relaunches at every login — Task Scheduler (Windows), a LaunchAgent (macOS), or a systemd-user unit
+            (Linux, plus <code>loginctl enable-linger</code> for logout survival). <code>&lt;globalDir&gt;/service.json</code>
+            records the PID + port + version so <code>stop</code> and <code>status</code> always find the running instance.
+          </p>
+
+          <h2 id="security-model">Security model</h2>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Vector</th><th>Mitigation</th></tr></thead>
+              <tbody>
+                <tr><td>Random local process pokes the MCP server</td><td>Per-launch 32-byte hex secret in the <code>Authorization</code> header, validated in middleware.</td></tr>
+                <tr><td>Malicious extension reads unrelated env</td><td>A disallowed-keys blocklist applied to every spawned MCP child.</td></tr>
+                <tr><td>PII leak to the LLM</td><td>A bidirectional scrub layer distinguishes structural vs data GUIDs and round-trips them.</td></tr>
+                <tr><td>Secrets embedded in recipes</td><td>Recipes never carry secrets; MCP configs reference env-var names resolved from the OS keychain at spawn time.</td></tr>
+                <tr><td>Approval forgery</td><td>Approvals carry a renderer-minted nonce; <code>approval.resolve</code> requires it.</td></tr>
+                <tr><td>Trigger script flood / runaway</td><td>Per-trigger timeout; the cron daemon serialises ticks per trigger; failing scripts log and continue from last good state.</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout note">
+            <span class="callout-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 8h.01M11 12h1v4h1"/></svg></span>
+            <div class="callout-body"><div class="callout-title">Codename: Conductor</div><p class="mb-0">The internal namespace is <strong>Conductor</strong> — you'll see it in env vars (<code>CLAWDEVBOX_*</code>), on-disk paths (<code>.clawdevbox/</code>), and the engine's internals. The branding is <strong>ClawDevbox</strong>; the engine underneath is the Conductor MCP server. The name is load-bearing and stable.</p></div>
+          </div>
+
+          <nav class="page-nav">
+            <a class="prev" href="getting-started.html"><span class="pn-label">← Previous</span><span class="pn-title">Getting Started</span></a>
+            <a class="next" href="concepts.html"><span class="pn-label">Next →</span><span class="pn-title">Core Concepts</span></a>
+          </nav>
+        </div>
+      </main>
+      <nav class="toc" id="toc" aria-label="On this page"></nav>
+    </div>
+    <footer class="site-footer"><p class="mb-0"><strong>ClawDevbox</strong> — engine codename <em>Conductor</em>. MIT licensed. · <a href="https://github.com/kirmad/clawdevbox" target="_blank" rel="noopener">GitHub</a></p></footer>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="assets/js/search-index.js"></script>
+    <script src="assets/js/main.js"></script>
+  </body>
+</html>

@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Triggers · ClawDevbox Docs</title>
+    <meta name="description" content="Triggers are cron / webhook / manual scripts that fire agents proactively. Learn trigger types vs instances, the stdin envelope contract, firing modes, and the trigger.* tools." />
+    <script>try{var t=localStorage.getItem("cdb-theme");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}</script>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;850&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+    <link id="hljs-dark" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" />
+    <link id="hljs-light" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" disabled />
+    <link rel="stylesheet" href="assets/css/styles.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%235b4bff'/%3E%3Cpath d='M9 10.5 13.5 16 9 21.5' stroke='white' stroke-width='2.4' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M16 21.5h7' stroke='%23ffce7a' stroke-width='2.4' stroke-linecap='round'/%3E%3C/svg%3E" />
+  </head>
+  <body class="has-toc">
+    <header class="topbar" id="topbar"></header>
+    <div class="sidebar-backdrop"></div>
+    <div class="layout">
+      <aside class="sidebar" id="sidebar"></aside>
+      <main class="content">
+        <div class="content-inner">
+          <span class="eyebrow">Building Blocks</span>
+          <h1>Triggers</h1>
+          <p class="lead">
+            Triggers make ClawDevbox proactive. A trigger is a small script that fires on a schedule, a webhook, or a
+            manual poke; it polls whatever it needs, decides whether to act, and dispatches to an agent — no human in the
+            loop required.
+          </p>
+
+          <h2 id="type-vs-instance">Type vs. registered instance</h2>
+          <div class="split">
+            <div class="split-col vs-a"><h4>Trigger type</h4><p>A <em>capability</em> shipped by a plugin or authored in a scope. Declares a script file, a parameter schema, a default cron, and (optionally) an identity param. A type doesn't fire on its own — it must be registered.</p></div>
+            <div class="split-col vs-b"><h4>Registered instance</h4><p>A concrete binding of a type to specific param values, with an optional cron override and an enabled flag. Instances live in <code>.clawdevbox/triggers.json</code> and are what the daemon actually ticks.</p></div>
+          </div>
+
+          <h2 id="firing-modes">Firing modes</h2>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Mode</th><th>How it fires</th></tr></thead>
+              <tbody>
+                <tr><td><span class="badge accent">cron</span></td><td>The in-process cron daemon ticks each registered instance on its cadence.</td></tr>
+                <tr><td><span class="badge">webhook</span></td><td>An external caller <code>POST</code>s to the instance's <code>/hooks/&lt;id&gt;</code> endpoint.</td></tr>
+                <tr><td><span class="badge">manual</span></td><td><code>trigger.instance.fire</code> (or the UI) — always works regardless of cron state.</td></tr>
+                <tr><td><span class="badge">test</span></td><td><code>trigger.test</code> runs the script with a synthesized envelope, non-mutating.</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>The <code>cron</code> field on a registration is three-state: a <strong>string</strong> overrides the default, <strong>null</strong> inherits the type's <code>default_cron</code>, and <strong>false</strong> disables cron (manual / webhook still work).</p>
+
+          <h2 id="envelope">The envelope contract</h2>
+          <p>When a trigger fires, the script is handed a JSON <strong>envelope</strong> on <code>stdin</code> and is expected to observe, optionally dispatch, and always report its new state on <code>stdout</code>:</p>
+          <ol class="steps">
+            <li><h4>Read stdin</h4><p>Parse the <code>TriggerEnvelope</code> — its config and <code>lastFiredAt</code> live on <code>env.state</code>; it also carries <code>output_dir</code>, a <code>dispatch_url</code> / <code>spawn_url</code>, and the <code>CLAWDEVBOX_FIRE_SECRET</code> bearer.</p></li>
+            <li><h4>Observe &amp; decide</h4><p>Poll your source (ADO, the inbox, a metric, anything reachable). Write an <code>observation.json</code> under <code>env.output_dir</code> for the operator to inspect.</p></li>
+            <li><h4>Dispatch (optional)</h4><p>If there's work, <code>POST</code> to <code>dispatch_url</code> (wake / message an existing session) or <code>spawn_url</code> (start a new one), using <code>Authorization: Bearer $CLAWDEVBOX_FIRE_SECRET</code>.</p></li>
+            <li><h4>Emit state</h4><p>Print <code>{ "state": { … } }</code> to <code>stdout</code>. The kernel persists state <em>only</em> by JSON-parsing stdout — this is how cooldown works.</p></li>
+          </ol>
+
+          <div class="callout danger">
+            <span class="callout-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 9v4m0 4h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/></svg></span>
+            <div class="callout-body"><div class="callout-title">The #1 trigger gotcha</div><p class="mb-0">Files written to <code>output_dir</code> are operator artifacts — the kernel does <strong>not</strong> read them back. State persists <strong>only</strong> through the <code>{"state":{…}}</code> JSON you emit on <code>stdout</code>. If you forget to re-emit <code>lastFiredAt</code>, your cooldown silently breaks and the trigger re-fires every tick.</p></div>
+          </div>
+
+          <h2 id="example">Example trigger type</h2>
+          <p>A minimal type declaration plus the registration that activates it:</p>
+          <div class="code-block" data-lang="yaml">
+<pre><code class="language-yaml"># template.yaml — the TYPE (capability)
+id: local.pr-comment-watcher
+description: Watch a PR for new comments and dispatch a reply agent.
+runtime: tsx
+default_cron: "*/5 * * * *"      # every 5 minutes
+identity_param: pr_id            # used to mint the registration id
+accepts_webhook: true
+parameters:
+  - name: pr_id
+    type: string
+    required: true</code></pre>
+          </div>
+          <div class="code-block" data-lang="json">
+<pre><code class="language-json">// trigger.instance.register args — the INSTANCE
+{
+  "type_id": "local.pr-comment-watcher",
+  "params": { "pr_id": "2401" },
+  "cron": null,          // inherit default_cron (*/5 * * * *)
+  "once": false
+}</code></pre>
+          </div>
+
+          <h2 id="authoring">Authoring triggers</h2>
+          <div class="callout warning">
+            <span class="callout-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 9v4m0 4h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/></svg></span>
+            <div class="callout-body"><p class="mb-0"><strong>Prerequisite:</strong> read the <code>authoring-triggers</code> skill before writing any inline script — it codifies the envelope contract, state shape, cursor design, auth, and spawn routing. Skipping it produces subtle silent bugs (events never fire, state never advances).</p></div>
+          </div>
+          <ul>
+            <li>Author a reusable type with <code>trigger.template.create</code> / <code>trigger.template.update</code> (ids must start with <code>local.</code>).</li>
+            <li>Register a concrete instance with <code>trigger.instance.register</code> — params are validated against the type schema.</li>
+            <li>Dry-run with <code>trigger.test</code> before relying on the cron path (it captures stdout, stderr, and any observation files without mutating state).</li>
+          </ul>
+          <div class="callout tip">
+            <span class="callout-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7c.6.5 1 1.3 1 2.3h6c0-1 .4-1.8 1-2.3A7 7 0 0 0 12 2Z"/></svg></span>
+            <div class="callout-body"><p class="mb-0">Registering a side-effecting trigger silently is an anti-pattern. Surface what you registered via the inbox so the user can see and disable it.</p></div>
+          </div>
+
+          <h2 id="trigger-tools">Trigger tools</h2>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Tool</th><th>Purpose</th></tr></thead>
+              <tbody>
+                <tr><td><code>trigger.type.list</code></td><td>List available trigger types (capabilities) from enabled plugins/scopes.</td></tr>
+                <tr><td><code>trigger.template.create</code> / <code>update</code> / <code>delete</code></td><td>Author, edit, or remove an agent-authored trigger type on disk.</td></tr>
+                <tr><td><code>trigger.template.list</code></td><td>List agent-authored trigger templates.</td></tr>
+                <tr><td><code>trigger.instance.register</code></td><td>Bind a type to params and create a registered instance.</td></tr>
+                <tr><td><code>trigger.instance.list</code></td><td>List registered instances from <code>triggers.json</code>.</td></tr>
+                <tr><td><code>trigger.instance.update_params</code></td><td>Change an instance's params / cron without reminting its id.</td></tr>
+                <tr><td><code>trigger.instance.enable</code> / <code>disable</code></td><td>Toggle a registration's enabled flag.</td></tr>
+                <tr><td><code>trigger.instance.fire</code></td><td>Manually fire a registered instance through its webhook.</td></tr>
+                <tr><td><code>trigger.instance.unregister</code></td><td>Remove a registered instance (the type stays available).</td></tr>
+                <tr><td><code>trigger.test</code></td><td>Run a script with a synthesized envelope — non-mutating dry run.</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <nav class="page-nav">
+            <a class="prev" href="recipes.html"><span class="pn-label">← Previous</span><span class="pn-title">Recipes</span></a>
+            <a class="next" href="skills.html"><span class="pn-label">Next →</span><span class="pn-title">Skills</span></a>
+          </nav>
+        </div>
+      </main>
+      <nav class="toc" id="toc" aria-label="On this page"></nav>
+    </div>
+    <footer class="site-footer"><p class="mb-0"><strong>ClawDevbox</strong> — engine codename <em>Conductor</em>. MIT licensed. · <a href="https://github.com/kirmad/clawdevbox" target="_blank" rel="noopener">GitHub</a></p></footer>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="assets/js/search-index.js"></script>
+    <script src="assets/js/main.js"></script>
+  </body>
+</html>
