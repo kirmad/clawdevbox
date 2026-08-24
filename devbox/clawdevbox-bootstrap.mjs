@@ -287,8 +287,13 @@ async function installClawdevbox() {
     let code = -1;
     for (let attempt = 1; attempt <= 2 && code !== 0; attempt++) {
       if (attempt > 1) { log('warn', `npm install failed — retry ${attempt}/2`); await new Promise((r) => setTimeout(r, 8000)); }
-      code = await run('npm', ['install', '--global', '--allow-scripts=clawdevbox-ms', `git+${authUrl}`], {
-        label: `npm install --global --allow-scripts=clawdevbox-ms git+${REPO}`,
+      // Deliberately NO --allow-scripts flag here. npm says it plainly:
+      //   "npm warn allow-scripts .npmrc allow-scripts setting is being ignored
+      //    because --allow-scripts was passed on the command line"
+      // and the command-line form is the one npm >= 11.7 then declines to
+      // honour, so passing it actively disables the config set above.
+      code = await run('npm', ['install', '--global', `git+${authUrl}`], {
+        label: `npm install --global git+${REPO}`,
       });
     }
     await refreshPath();
