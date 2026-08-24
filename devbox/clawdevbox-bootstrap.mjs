@@ -35,7 +35,7 @@
 
 import { createServer, request as httpRequest } from 'node:http';
 import { spawn } from 'node:child_process';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -285,8 +285,8 @@ async function installClawdevbox() {
     });
 
     let code = -1;
-    for (let attempt = 1; attempt <= 3 && code !== 0; attempt++) {
-      if (attempt > 1) { log('warn', `npm install failed — retry ${attempt}/3`); await new Promise((r) => setTimeout(r, 8000)); }
+    for (let attempt = 1; attempt <= 2 && code !== 0; attempt++) {
+      if (attempt > 1) { log('warn', `npm install failed — retry ${attempt}/2`); await new Promise((r) => setTimeout(r, 8000)); }
       code = await run('npm', ['install', '--global', '--allow-scripts=clawdevbox-ms', `git+${authUrl}`], {
         label: `npm install --global --allow-scripts=clawdevbox-ms git+${REPO}`,
       });
@@ -294,30 +294,71 @@ async function installClawdevbox() {
     await refreshPath();
     let now = await detect('clawdevbox', ['--version'], 'clawdevbox');
 
-    // npm may report success while having skipped the package's `prepare`
-    // script, which leaves the global bin pointing at a file that was never
-    // built. Run it by hand rather than failing: this is the difference between
-    // "added 1 package" and an actually working install.
-    if (!now.ok) {
-      log('warn', 'clawdevbox is not on PATH yet - running the package prepare step by hand.');
-      const prefix = await capture('npm', ['prefix', '-g'], 30000);
-      const pkgDir = prefix ? join(prefix.trim(), 'node_modules', 'clawdevbox-ms') : null;
-      if (pkgDir && existsSync(join(pkgDir, 'scripts', 'prepare.mjs'))) {
-        log('step', `running prepare.mjs in ${pkgDir}`);
+    // npm can report success on a git package while leaving the install
+    // incomplete: on Windows it links the global package at a cache temp clone
+    // that it later garbage-collects, so the directory ends up without
+    // scripts/ or bin/ at all. Inspect what actually landed before deciding.
+    const root = (await capture('npm', ['root', '-g'], 30000) || '').trim();
+    const pkgDir = root ? join(root, 'clawdevbox-ms') : null;
+    if (!now.ok && pkgDir) {
+      const listing = existsSync(pkgDir)
+        ? readdirSync(pkgDir).join(', ')
+        : '(directory does not exist)';
+      log('info', `package dir ${pkgDir}: ${listing}`);
+
+      if (existsSync(join(pkgDir, 'scripts', 'prepare.mjs'))) {
+        log('step', 'running the package prepare step by hand');
         await run(process.execPath, [join(pkgDir, 'scripts', 'prepare.mjs')], {
-          label: 'node scripts/prepare.mjs',
-          cwd: pkgDir,
+          label: 'node scripts/prepare.mjs', cwd: pkgDir,
         });
         await refreshPath();
         now = await detect('clawdevbox', ['--version'], 'clawdevbox');
-      } else {
-        log('warn', `no prepare.mjs found under ${pkgDir ?? '(npm prefix unknown)'}`);
+      }
+    }
+
+    // Last resort, and the approach that reliably produces a self-contained
+    // install: clone the repo ourselves, `npm pack` it (which runs prepare in a
+    // normal working directory and honours the package's files list), install
+    // the resulting tarball, then run prepare again because tarball installs
+    // skip it.
+    if (!now.ok) {
+      log('step', 'Falling back to a packed install (clone -> npm pack -> install).');
+      const src = join(tmpdir(), 'clawdevbox-src');
+      try { rmSync(src, { recursive: true, force: true }); } catch { /* nothing to remove */ }
+
+      const cloneCode = await run('git', ['clone', '--depth', '1', authUrl, src], {
+        label: `git clone --depth 1 ${REPO} ${src}`,
+      });
+      if (cloneCode === 0) {
+        await run('npm', ['pack'], { label: 'npm pack', cwd: src });
+        const tgz = existsSync(src)
+          ? readdirSync(src).filter((f) => f.endsWith('.tgz')).sort().pop()
+          : null;
+        if (tgz) {
+          log('info', `packed ${tgz}`);
+          await run('npm', ['install', '--global', join(src, tgz)], {
+            label: `npm install --global ${tgz}`,
+          });
+          await refreshPath();
+          now = await detect('clawdevbox', ['--version'], 'clawdevbox');
+
+          if (!now.ok && pkgDir && existsSync(join(pkgDir, 'scripts', 'prepare.mjs'))) {
+            log('step', 'running prepare for the packed install');
+            await run(process.execPath, [join(pkgDir, 'scripts', 'prepare.mjs')], {
+              label: 'node scripts/prepare.mjs', cwd: pkgDir,
+            });
+            await refreshPath();
+            now = await detect('clawdevbox', ['--version'], 'clawdevbox');
+          }
+        } else {
+          log('error', 'npm pack produced no tarball.');
+        }
       }
     }
 
     if (!now.ok) {
-      log('error', `ClawDevbox install failed (npm exit ${code}).`);
-      emit('finish', { ok: false, error: 'ClawDevbox did not install. The log names the failing step.' });
+      log('error', 'ClawDevbox could not be installed. The log above names the failing step.');
+      emit('finish', { ok: false, error: 'ClawDevbox did not install. See the log.' });
       installBusy = false;
       return;
     }
