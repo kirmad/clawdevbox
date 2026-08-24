@@ -141,6 +141,23 @@ if ((Test-Path $target) -and (Test-Cmd 'node')) {
     } catch {
         Write-Log "could not arm the Run fallback: $($_.Exception.Message)"
     }
+
+    # Make the outcome visible on screen. Nobody reads a log they don't know
+    # exists, and on an unattended box there is no other feedback channel: if
+    # the wizard never came up, show the log instead of leaving a blank desktop.
+    Start-Sleep -Seconds 25
+    $up = $false
+    try {
+        $probe = Invoke-WebRequest -Uri 'http://127.0.0.1:5320/' -UseBasicParsing -TimeoutSec 5
+        $up = ($probe.StatusCode -eq 200)
+    } catch { $up = $false }
+
+    if ($up) {
+        Write-Log 'the first-run experience is serving on 127.0.0.1:5320'
+    } else {
+        Write-Log 'the first-run experience did not come up - opening the log so it is visible'
+        try { Start-Process notepad.exe -ArgumentList "`"$log`"" } catch { }
+    }
 }
 
 Write-Log "first-run setup finished. Log: $log"

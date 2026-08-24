@@ -555,10 +555,16 @@ function openBrowser(url, mode) {
     ];
     const exe = candidates.find((p) => existsSync(p));
     if (exe) {
-      const profile = join(tmpdir(), 'clawdevbox-setup-profile');
+      // Deliberately NOT a separate --user-data-dir. On a managed machine a
+      // fresh profile triggers force-installed enterprise extensions, whose
+      // onboarding pages open on top of (or instead of) the setup window.
+      // Using the default profile keeps the app window in front, and
+      // --disable-extensions keeps it clean either way.
       const args = mode === 'kiosk'
-        ? ['--kiosk', url, '--edge-kiosk-type=fullscreen', '--no-first-run', '--no-default-browser-check', `--user-data-dir=${profile}`]
-        : [`--app=${url}`, '--start-maximized', '--no-first-run', '--no-default-browser-check', `--user-data-dir=${profile}`];
+        ? ['--kiosk', url, '--edge-kiosk-type=fullscreen', '--no-first-run',
+           '--no-default-browser-check', '--disable-extensions', '--disable-features=msEdgeIdentityFre']
+        : [`--app=${url}`, '--start-maximized', '--no-first-run',
+           '--no-default-browser-check', '--disable-extensions', '--disable-features=msEdgeIdentityFre'];
       try {
         spawn(exe, args, { detached: true, stdio: 'ignore' }).unref();
         log('info', `Opened the setup experience full-screen (${mode} mode).`);
