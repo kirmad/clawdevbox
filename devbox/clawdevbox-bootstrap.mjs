@@ -60,6 +60,10 @@ function parseArgs(argv) {
 
 const flags = parseArgs(process.argv.slice(2));
 const REPO = typeof flags.repo === 'string' ? flags.repo : DEFAULT_REPO;
+// Some managed networks block registry.npmjs.org outright (TLS alert 40 on the
+// tarball fetch), so the caller can supply the registry that actually works
+// there. Kept as a parameter so no environment-specific host is published here.
+const NPM_REGISTRY = typeof flags['npm-registry'] === 'string' ? flags['npm-registry'] : '';
 const LOG_DIR = typeof flags['log-dir'] === 'string'
   ? flags['log-dir']
   : join(process.env.LOCALAPPDATA ?? join(homedir(), '.local'), 'ClawDevbox', 'logs');
@@ -114,12 +118,13 @@ try {
 /** Shell only for bare command names; paths with spaces must not be re-parsed. */
 const shellFor = (cmd) => (/[\\/]/.test(cmd) ? false : process.platform === 'win32');
 
-function run(cmd, args, { label, onLine, stdin } = {}) {
+function run(cmd, args, { label, onLine, stdin, cwd } = {}) {
   return new Promise((resolve) => {
     log('info', `> ${label ?? [cmd, ...args].join(' ')}`);
     const child = spawn(cmd, args, {
       shell: shellFor(cmd),
       windowsHide: true,
+      cwd,
       // stdin is a pipe only when we intend to answer a prompt; otherwise it is
       // closed so a stray prompt returns EOF instead of hanging forever.
       stdio: [stdin ? 'pipe' : 'ignore', 'pipe', 'pipe'],
@@ -260,6 +265,25 @@ async function installClawdevbox() {
       return;
     }
     const authUrl = REPO.replace(/^https:\/\//, `https://x-access-token:${ghToken}@`);
+
+    // Prepare npm before installing. Two things bite on a managed dev box:
+    //
+    //  1. registry.npmjs.org can be blocked by the TLS-inspecting proxy, which
+    //     surfaces as ERR_SSL_SSL/TLS_ALERT_HANDSHAKE_FAILURE while fetching a
+    //     tarball - after the git clone itself succeeded, which is confusing.
+    //  2. npm >= 11.7 ignores `--allow-scripts=<pkg>` as an install flag and
+    //     warns instead, so the package's `prepare` never runs and the global
+    //     bin is left pointing at a file that was never materialised. The
+    //     warning itself recommends the config form used here.
+    if (NPM_REGISTRY) {
+      await run('npm', ['config', 'set', 'registry', NPM_REGISTRY, '--location=user'], {
+        label: `npm config set registry ${NPM_REGISTRY}`,
+      });
+    }
+    await run('npm', ['config', 'set', 'allow-scripts=clawdevbox-ms', '--location=user'], {
+      label: 'npm config set allow-scripts=clawdevbox-ms',
+    });
+
     let code = -1;
     for (let attempt = 1; attempt <= 3 && code !== 0; attempt++) {
       if (attempt > 1) { log('warn', `npm install failed — retry ${attempt}/3`); await new Promise((r) => setTimeout(r, 8000)); }
@@ -268,10 +292,32 @@ async function installClawdevbox() {
       });
     }
     await refreshPath();
-    const now = await detect('clawdevbox', ['--version'], 'clawdevbox');
-    if (code !== 0 || !now.ok) {
-      log('error', `ClawDevbox install failed (exit ${code}).`);
-      emit('finish', { ok: false, error: `Install failed with exit code ${code}. See the log.` });
+    let now = await detect('clawdevbox', ['--version'], 'clawdevbox');
+
+    // npm may report success while having skipped the package's `prepare`
+    // script, which leaves the global bin pointing at a file that was never
+    // built. Run it by hand rather than failing: this is the difference between
+    // "added 1 package" and an actually working install.
+    if (!now.ok) {
+      log('warn', 'clawdevbox is not on PATH yet - running the package prepare step by hand.');
+      const prefix = await capture('npm', ['prefix', '-g'], 30000);
+      const pkgDir = prefix ? join(prefix.trim(), 'node_modules', 'clawdevbox-ms') : null;
+      if (pkgDir && existsSync(join(pkgDir, 'scripts', 'prepare.mjs'))) {
+        log('step', `running prepare.mjs in ${pkgDir}`);
+        await run(process.execPath, [join(pkgDir, 'scripts', 'prepare.mjs')], {
+          label: 'node scripts/prepare.mjs',
+          cwd: pkgDir,
+        });
+        await refreshPath();
+        now = await detect('clawdevbox', ['--version'], 'clawdevbox');
+      } else {
+        log('warn', `no prepare.mjs found under ${pkgDir ?? '(npm prefix unknown)'}`);
+      }
+    }
+
+    if (!now.ok) {
+      log('error', `ClawDevbox install failed (npm exit ${code}).`);
+      emit('finish', { ok: false, error: 'ClawDevbox did not install. The log names the failing step.' });
       installBusy = false;
       return;
     }

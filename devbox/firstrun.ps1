@@ -46,6 +46,11 @@ param(
     [ValidateSet('kiosk', 'app', 'tab')]
     [string] $LaunchMode = 'kiosk',
 
+    # npm registry to use on this machine. Managed networks often block
+    # registry.npmjs.org (TLS alert 40), so the caller supplies whichever feed
+    # actually works there rather than hardcoding one here.
+    [string] $NpmRegistry = '',
+
     [switch] $SkipHerdr
 )
 
@@ -146,6 +151,7 @@ if ((Test-Path $target) -and (Test-Cmd 'node')) {
     $node = (Get-Command node).Source
     $argList = @("`"$target`"", '--if-needed', "--$LaunchMode")
     if ($Repo) { $argList += @('--repo', "`"$Repo`"") }
+    if ($NpmRegistry) { $argList += @('--npm-registry', "`"$NpmRegistry`"") }
 
     try {
         Start-Process -FilePath $node -ArgumentList $argList -WindowStyle Hidden -ErrorAction Stop
