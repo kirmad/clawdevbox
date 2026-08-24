@@ -95,6 +95,28 @@ if (-not (Test-Cmd 'node')) {
 if (Test-Cmd 'node') { Write-Log "node $((& node --version) 2>&1)" }
 else { Write-Log 'ERROR: Node.js is unavailable; the first-run wizard cannot start.' }
 
+# ---- 1b. Git ----------------------------------------------------------------
+# Deliberately NOT a ~/winget task in workload.yaml: on these images Git.Git
+# fails every time and, worse, burns the task type's hard 20 minute cap, which
+# blocks every task queued behind it. Most dev box images already ship git
+# (Visual Studio does), so check first and only install if it is genuinely
+# missing - and never let it block the wizard.
+if (Test-Cmd 'git') {
+    Write-Log "git already present: $((& git --version) 2>&1)"
+} else {
+    Write-Log 'git not found - attempting a bounded install'
+    $job = Start-Job {
+        & winget install --id Git.Git --exact --silent --accept-package-agreements `
+            --accept-source-agreements --scope user --disable-interactivity 2>&1
+    }
+    if (Wait-Job $job -Timeout 240) { Receive-Job $job | ForEach-Object { Add-Content -Path $log -Value "    $_" -Encoding utf8 } }
+    else { Write-Log 'git install exceeded 4 minutes - continuing without it'; Stop-Job $job }
+    Remove-Job $job -Force -ErrorAction SilentlyContinue
+    Sync-Path
+    if (Test-Cmd 'git') { Write-Log "git installed: $((& git --version) 2>&1)" }
+    else { Write-Log 'git is unavailable; the wizard will report it if needed' }
+}
+
 # ---- 2. Herdr ----------------------------------------------------------------
 if (-not $SkipHerdr) {
     if (Test-Cmd 'herdr') {
