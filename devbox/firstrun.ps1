@@ -146,23 +146,64 @@ try {
     Write-Log "ERROR: could not download the bootstrapper: $($_.Exception.Message)"
 }
 
-# ---- 4. Launch it, and arm a logon fallback ---------------------------------
+# ---- 4. Start it in the USER'S INTERACTIVE SESSION --------------------------
+# A Dev Box `runAs: User` customization task runs in the user's security
+# context but in SESSION 0, which has no desktop. Anything GUI we spawn from
+# here is therefore invisible: the wizard's HTTP server comes up fine (it is
+# headless) but the kiosk browser renders onto a station nobody can see, and
+# the orphaned node process then squats port 5320 for the life of the box, so
+# every later attempt dies with EADDRINUSE. That is exactly how a dev box ends
+# up with "no wizard, ClawDevbox never installed".
+#
+# The fix is to never run the wizard from session 0. Register a scheduled task
+# with /IT ("interactive only"), which Windows runs INSIDE the logged-on user's
+# session, and kick it with `schtasks /Run`. /SC ONLOGON keeps it armed for the
+# next sign-in if nobody is logged on yet.
 if ((Test-Path $target) -and (Test-Cmd 'node')) {
     $node = (Get-Command node).Source
     $argList = @("`"$target`"", '--if-needed', "--$LaunchMode")
     if ($Repo) { $argList += @('--repo', "`"$Repo`"") }
     if ($NpmRegistry) { $argList += @('--npm-registry', "`"$NpmRegistry`"") }
+    $runCmd = '"' + $node + '" ' + ($argList -join ' ')
 
+    $sessionId = (Get-Process -Id $PID).SessionId
+    $interactive = $sessionId -ne 0
+    Write-Log "running in session $sessionId (interactive=$interactive)"
+
+    $taskName = 'ClawDevbox First-Run Setup'
+    $scheduled = $false
     try {
-        Start-Process -FilePath $node -ArgumentList $argList -WindowStyle Hidden -ErrorAction Stop
-        Write-Log "launched the first-run experience ($LaunchMode)"
+        # /IT is the whole point: it pins execution to the interactive session.
+        # /RL LIMITED keeps it unelevated. Quotes inside /TR must be doubled.
+        $tr = '"' + $node + '" ' + (($argList | ForEach-Object { $_ -replace '"', '\"' }) -join ' ')
+        $out = & schtasks.exe /Create /TN $taskName /TR $tr /SC ONLOGON /RL LIMITED /IT /F 2>&1
+        if ($LASTEXITCODE -eq 0) { $scheduled = $true; Write-Log "registered the logon task '$taskName'" }
+        else { Write-Log "could not register the logon task: $out" }
     } catch {
-        Write-Log "could not launch the first-run experience: $($_.Exception.Message)"
+        Write-Log "could not register the logon task: $($_.Exception.Message)"
     }
 
-    # Per-user Run key needs no privileges, unlike a root scheduled task.
+    if ($scheduled) {
+        # Runs NOW, in the interactive session, so the wizard appears on this
+        # very first sign-in rather than the next one.
+        try {
+            $out = & schtasks.exe /Run /TN $taskName 2>&1
+            if ($LASTEXITCODE -eq 0) { Write-Log "started the first-run experience in the interactive session ($LaunchMode)" }
+            else { Write-Log "could not start the logon task: $out" }
+        } catch { Write-Log "could not start the logon task: $($_.Exception.Message)" }
+    } elseif ($interactive) {
+        # No scheduler: a direct launch is fine because we already have a desktop.
+        try {
+            Start-Process -FilePath $node -ArgumentList $argList -WindowStyle Hidden -ErrorAction Stop
+            Write-Log "launched the first-run experience directly ($LaunchMode)"
+        } catch { Write-Log "could not launch the first-run experience: $($_.Exception.Message)" }
+    } else {
+        Write-Log 'no scheduler and no desktop - leaving the Run key to handle the next sign-in'
+    }
+
+    # Belt and braces: a per-user Run value needs no privileges and covers the
+    # case where the scheduled task could not be registered at all.
     try {
-        $runCmd = '"' + $node + '" ' + ($argList -join ' ')
         Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' `
             -Name 'ClawDevboxFirstRun' -Value $runCmd -ErrorAction Stop
         Write-Log 'armed the HKCU Run fallback'
@@ -170,9 +211,8 @@ if ((Test-Path $target) -and (Test-Cmd 'node')) {
         Write-Log "could not arm the Run fallback: $($_.Exception.Message)"
     }
 
-    # Make the outcome visible on screen. Nobody reads a log they don't know
-    # exists, and on an unattended box there is no other feedback channel: if
-    # the wizard never came up, show the log instead of leaving a blank desktop.
+    # Report the outcome. Only pop Notepad when we actually have a desktop to
+    # pop it onto - in session 0 it would be one more invisible orphan.
     Start-Sleep -Seconds 25
     $up = $false
     try {
@@ -182,11 +222,12 @@ if ((Test-Path $target) -and (Test-Cmd 'node')) {
 
     if ($up) {
         Write-Log 'the first-run experience is serving on 127.0.0.1:5320'
-    } else {
+    } elseif ($interactive) {
         Write-Log 'the first-run experience did not come up - opening the log so it is visible'
         try { Start-Process notepad.exe -ArgumentList "`"$log`"" } catch { }
+    } else {
+        Write-Log 'the first-run experience is not serving yet; the logon task will start it in the user session'
     }
 }
-
 Write-Log "first-run setup finished. Log: $log"
 exit 0

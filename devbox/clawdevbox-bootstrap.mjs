@@ -629,13 +629,43 @@ async function main() {
   });
 
   const wanted = flags.port ? Number(flags.port) : 5320;
-  await new Promise((resolve) => server.listen(wanted, '127.0.0.1', resolve));
+  await listenResilient(server, wanted);
   const target = `http://127.0.0.1:${server.address().port}/`;
   log('step', `Bootstrap ready at ${target}`);
   log('info', `Log file: ${LOG_FILE}`);
 
   if (flags['no-open'] !== true) openBrowser(target, flags.kiosk ? 'kiosk' : flags.tab ? 'tab' : 'app');
   else log('info', 'Not opening a browser (--no-open).');
+}
+
+/**
+ * Bind `wanted`, falling back to an ephemeral port if it is taken.
+ *
+ * Without this, a single stale bootstrapper holding 5320 breaks first-run
+ * FOREVER: `server.listen()` emits an unhandled 'error' on EADDRINUSE, which
+ * kills the process before it can log anything or open a browser. That is
+ * easy to hit because a Dev Box customization task runs in session 0 and its
+ * orphaned server outlives every later sign-in.
+ *
+ * We do not try to reuse the squatter: it may be serving into an invisible
+ * session, so the user still needs a window of their own.
+ */
+function listenResilient(server, wanted) {
+  return new Promise((resolve, reject) => {
+    const onError = (err) => {
+      if (err.code !== 'EADDRINUSE') { reject(err); return; }
+      log('warn', `Port ${wanted} is already in use — starting on a free port instead.`);
+      server.removeListener('error', onError);
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    };
+    server.once('error', onError);
+    server.listen(wanted, '127.0.0.1', () => {
+      server.removeListener('error', onError);
+      server.once('error', (e) => log('warn', `HTTP server error: ${e.message}`));
+      resolve();
+    });
+  });
 }
 
 function openBrowser(url, mode) {
