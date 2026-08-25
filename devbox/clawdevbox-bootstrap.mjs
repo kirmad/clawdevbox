@@ -433,8 +433,11 @@ function markComplete() {
   // Disarm both mechanisms provisioning may have used. --if-needed already
   // makes a re-run a no-op, but leaving a logon entry behind that spawns a
   // process on every sign-in is untidy and looks like malware.
+  //
+  // The task name contains spaces and `shell: true` joins argv without
+  // quoting, so it must be quoted here or schtasks sees three arguments.
   if (process.platform !== 'win32') return;
-  spawn('schtasks', ['/Delete', '/TN', 'ClawDevbox First-Run Setup', '/F'],
+  spawn('schtasks', ['/Delete', '/TN', '"ClawDevbox First-Run Setup"', '/F'],
     { shell: true, windowsHide: true, stdio: 'ignore' }).on('error', () => { /* not registered */ });
   spawn('reg', ['delete', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run', '/v', 'ClawDevboxFirstRun', '/f'],
     { shell: true, windowsHide: true, stdio: 'ignore' }).on('error', () => { /* not present */ });

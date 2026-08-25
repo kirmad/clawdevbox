@@ -173,12 +173,22 @@ if ((Test-Path $target) -and (Test-Cmd 'node')) {
     $taskName = 'ClawDevbox First-Run Setup'
     $scheduled = $false
     try {
-        # /IT is the whole point: it pins execution to the interactive session.
-        # /RL LIMITED keeps it unelevated. Quotes inside /TR must be doubled.
-        $tr = '"' + $node + '" ' + (($argList | ForEach-Object { $_ -replace '"', '\"' }) -join ' ')
-        $out = & schtasks.exe /Create /TN $taskName /TR $tr /SC ONLOGON /RL LIMITED /IT /F 2>&1
-        if ($LASTEXITCODE -eq 0) { $scheduled = $true; Write-Log "registered the logon task '$taskName'" }
-        else { Write-Log "could not register the logon task: $out" }
+        # Register-ScheduledTask, not schtasks.exe: /TR takes the executable AND
+        # its arguments as ONE string, so "C:\Program Files\nodejs\node.exe"
+        # gets split on the space no matter how the quotes are escaped. The
+        # cmdlets keep -Execute and -Argument separate and sidestep it entirely.
+        # LogonType Interactive is the equivalent of schtasks /IT: it pins the
+        # task to the logged-on user's session, which is the whole point.
+        $action = New-ScheduledTaskAction -Execute $node -Argument ($argList -join ' ')
+        $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERNAME"
+        $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" `
+            -LogonType Interactive -RunLevel Limited
+        $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) `
+            -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
+            -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
+        $scheduled = $true
+        Write-Log "registered the logon task '$taskName'"
     } catch {
         Write-Log "could not register the logon task: $($_.Exception.Message)"
     }
@@ -187,9 +197,8 @@ if ((Test-Path $target) -and (Test-Cmd 'node')) {
         # Runs NOW, in the interactive session, so the wizard appears on this
         # very first sign-in rather than the next one.
         try {
-            $out = & schtasks.exe /Run /TN $taskName 2>&1
-            if ($LASTEXITCODE -eq 0) { Write-Log "started the first-run experience in the interactive session ($LaunchMode)" }
-            else { Write-Log "could not start the logon task: $out" }
+            Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
+            Write-Log "started the first-run experience in the interactive session ($LaunchMode)"
         } catch { Write-Log "could not start the logon task: $($_.Exception.Message)" }
     } elseif ($interactive) {
         # No scheduler: a direct launch is fine because we already have a desktop.
