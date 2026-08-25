@@ -671,8 +671,25 @@ function listenResilient(server, wanted) {
   });
 }
 
-function openBrowser(url, mode) {
-  if (mode !== 'tab' && process.platform === 'win32') {
+/**
+ * Record the setup window we just opened.
+ *
+ * We open the kiosk window here, but the developer finishes setup in
+ * `clawdevbox welcome`, which we navigate this SAME window to. That process is
+ * therefore not our child and has no other way to find it. Leaving the pid on
+ * disk lets whoever finishes the flow close the window, instead of stranding a
+ * kiosk window that has no tab strip and no close button.
+ */
+function recordBrowser(pid) {
+  if (!pid) return;
+  try {
+    const p = join(dirname(LOG_DIR), 'browser.json');
+    mkdirSync(dirname(p), { recursive: true });
+    writeFileSync(p, JSON.stringify({ pid, at: new Date().toISOString() }, null, 2), 'utf8');
+  } catch { /* best effort */ }
+}
+
+function openBrowser(url, mode) {  if (mode !== 'tab' && process.platform === 'win32') {
     const candidates = [
       `${process.env['ProgramFiles(x86)'] ?? 'C:\\Program Files (x86)'}\\Microsoft\\Edge\\Application\\msedge.exe`,
       `${process.env.ProgramFiles ?? 'C:\\Program Files'}\\Microsoft\\Edge\\Application\\msedge.exe`,
@@ -691,7 +708,9 @@ function openBrowser(url, mode) {
         : [`--app=${url}`, '--start-maximized', '--no-first-run',
            '--no-default-browser-check', '--disable-extensions', '--disable-features=msEdgeIdentityFre'];
       try {
-        spawn(exe, args, { detached: true, stdio: 'ignore' }).unref();
+        const child = spawn(exe, args, { detached: true, stdio: 'ignore' });
+        recordBrowser(child.pid);
+        child.unref();
         log('info', `Opened the setup experience full-screen (${mode} mode).`);
         return;
       } catch (err) { log('warn', `Could not launch ${exe}: ${err.message}`); }
