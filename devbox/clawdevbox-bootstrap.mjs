@@ -70,6 +70,9 @@ const LOG_DIR = typeof flags['log-dir'] === 'string'
 const STATE_FILE = join(dirname(LOG_DIR), 'first-run.json');
 const LOG_FILE = join(LOG_DIR, 'bootstrap.log');
 const WELCOME_PORT = flags['welcome-port'] ? Number(flags['welcome-port']) : 5321;
+// Identifies this process on /api/whoami so a racing second launch can tell us
+// apart from an unrelated service holding the port.
+const SESSION_ID = `${process.pid}-${Date.now().toString(36)}`;
 
 // ------------------------------------------------------------------- logging
 
@@ -595,6 +598,12 @@ async function main() {
       res.end(page());
       return;
     }
+    if (url.pathname === '/api/whoami') {
+      // Cheap identity probe so a second launch can tell "our bootstrapper is
+      // already serving here" from "some unrelated service owns this port".
+      json(200, { app: 'clawdevbox-bootstrap', pid: process.pid, session: SESSION_ID });
+      return;
+    }
     if (url.pathname === '/api/env') {
       const [node, git, gh, herdr, claw] = await Promise.all([
         detect(process.execPath, ['--version'], 'node'),
@@ -653,21 +662,68 @@ async function main() {
  * We do not try to reuse the squatter: it may be serving into an invisible
  * session, so the user still needs a window of their own.
  */
-function listenResilient(server, wanted) {
-  return new Promise((resolve, reject) => {
-    const onError = (err) => {
-      if (err.code !== 'EADDRINUSE') { reject(err); return; }
-      log('warn', `Port ${wanted} is already in use — starting on a free port instead.`);
-      server.removeListener('error', onError);
-      server.once('error', reject);
-      server.listen(0, '127.0.0.1', resolve);
-    };
+/**
+ * Bind `wanted`. If something is already there, work out what.
+ *
+ * Two mechanisms deliberately race to start this wizard at first logon — the
+ * interactive scheduled task and the HKCU Run value — because either one alone
+ * can be lost. That belt-and-braces is worth keeping, but it means the second
+ * starter must NOT open a second window: the developer would get two identical
+ * kiosk wizards, and two concurrent npm installs behind them.
+ *
+ * So: if the squatter answers /api/whoami as one of us, it is already serving
+ * this session and we bow out. If it is anything else, we take a free port
+ * rather than dying — without that, one stale listener breaks first-run
+ * permanently, because `server.listen()` raises an unhandled 'error' on
+ * EADDRINUSE and the process exits before it can log a thing.
+ */
+async function listenResilient(server, wanted) {
+  const bindTo = (port) => new Promise((resolve, reject) => {
+    const onError = (err) => { server.removeListener('error', onError); reject(err); };
     server.once('error', onError);
-    server.listen(wanted, '127.0.0.1', () => {
+    server.listen(port, '127.0.0.1', () => {
       server.removeListener('error', onError);
       server.once('error', (e) => log('warn', `HTTP server error: ${e.message}`));
       resolve();
     });
+  });
+
+  try {
+    await bindTo(wanted);
+    return;
+  } catch (err) {
+    if (err.code !== 'EADDRINUSE') throw err;
+  }
+
+  const mine = await probeWhoami(wanted);
+  if (mine) {
+    log('info', `The setup experience is already running on port ${wanted} (pid ${mine.pid}) — leaving it alone.`);
+    process.exit(0);
+  }
+
+  log('warn', `Port ${wanted} is held by something else — starting on a free port instead.`);
+  await bindTo(0);
+}
+
+/** Resolve to the peer's identity when it is our bootstrapper, else null. */
+function probeWhoami(port) {
+  return new Promise((resolve) => {
+    const req = httpRequest(
+      { host: '127.0.0.1', port, path: '/api/whoami', method: 'GET', timeout: 2000 },
+      (res) => {
+        let body = '';
+        res.on('data', (c) => { body += c; });
+        res.on('end', () => {
+          try {
+            const j = JSON.parse(body);
+            resolve(j && j.app === 'clawdevbox-bootstrap' ? j : null);
+          } catch { resolve(null); }
+        });
+      },
+    );
+    req.on('error', () => resolve(null));
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+    req.end();
   });
 }
 
