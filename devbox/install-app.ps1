@@ -21,6 +21,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)] [string] $Repo,
+    [string] $Branch = 'main',
     [string] $NpmRegistry = '',
     [int] $Port = 5201
 )
@@ -52,11 +53,50 @@ Section 'upgrading from source'
 if ($NpmRegistry) {
     & npm config set registry $NpmRegistry --location=user 2>&1 | ForEach-Object { "  $_" }
 }
-# The prepare script must run for the CLI to be usable, and passing
-# --allow-scripts on the command line DISABLES the .npmrc setting, so set it
-# in config and pass no flag.
+# The package's prepare script must run for the CLI to be usable, and passing
+# --allow-scripts on the command line DISABLES the .npmrc setting, so set it in
+# config and pass no flag.
 & npm config set allow-scripts=clawdevbox-ms --location=user 2>&1 | ForEach-Object { "  $_" }
-& npm install --global "git+$Repo" 2>&1 | Select-Object -Last 20 | ForEach-Object { "  $_" }
+
+# clone -> pack -> install, NOT `npm install --global git+<url>`.
+#
+# The git form makes npm run `prepare` inside its own cache clone, which does a
+# full mcp-server dependency install over the network. On a dev box behind a
+# TLS-inspecting proxy that took over two hours and produced no output at all.
+# Packing a tarball locally and installing THAT skips prepare (tarball installs
+# do not run it), so we run prepare once ourselves, deliberately -- the same
+# path the first-run bootstrapper uses, which completes in well under a minute.
+$work = Join-Path $env:TEMP ("cdb-upgrade-" + [Guid]::NewGuid().ToString('N').Substring(0, 8))
+New-Item -ItemType Directory -Path $work -Force | Out-Null
+try {
+    Write-Output "  cloning $Repo ($Branch) -> $work"
+    & git clone --depth 1 --branch $Branch $Repo "$work\src" 2>&1 | Select-Object -Last 3 | ForEach-Object { "  $_" }
+    if (-not (Test-Path "$work\src\package.json")) { throw "clone did not produce a package.json" }
+
+    Push-Location "$work\src"
+    Write-Output '  packing...'
+    $tgz = (& npm pack --silent 2>&1 | Select-Object -Last 1).ToString().Trim()
+    Pop-Location
+    $tgzPath = Join-Path "$work\src" $tgz
+    Write-Output "  tarball: $tgz  ($([Math]::Round((Get-Item $tgzPath).Length / 1MB, 1)) MB)"
+
+    & npm install --global $tgzPath 2>&1 | Select-Object -Last 8 | ForEach-Object { "  $_" }
+    Sync-Path
+
+    # Tarball installs skip prepare, so run it against the installed copy.
+    $prefix = (& npm prefix -g 2>&1 | Select-Object -First 1).ToString().Trim()
+    $installed = Join-Path $prefix 'node_modules\clawdevbox-ms'
+    if (Test-Path (Join-Path $installed 'scripts\prepare.mjs')) {
+        Write-Output '  running prepare...'
+        Push-Location $installed
+        & node scripts/prepare.mjs 2>&1 | Select-Object -Last 10 | ForEach-Object { "    $_" }
+        Pop-Location
+    }
+} catch {
+    Write-Output "  UPGRADE FAILED: $($_.Exception.Message)"
+} finally {
+    Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
+}
 Sync-Path
 Write-Output "version after : $(& clawdevbox --version 2>&1)"
 
