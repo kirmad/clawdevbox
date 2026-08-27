@@ -51,7 +51,10 @@ param(
     # actually works there rather than hardcoding one here.
     [string] $NpmRegistry = '',
 
-    [switch] $SkipHerdr
+    [switch] $SkipHerdr,
+
+    # Skip the Agency CLI install (the default agent provider).
+    [switch] $SkipAgency
 )
 
 $ErrorActionPreference = 'Continue'
@@ -134,6 +137,29 @@ if (-not $SkipHerdr) {
             if (Test-Cmd 'herdr') { Write-Log "Herdr installed: $((& herdr --version) 2>&1)" }
             else { Write-Log 'Herdr installer ran but no herdr command appeared.' }
         } catch { Write-Log "Herdr install failed: $($_.Exception.Message)" }
+    }
+}
+
+# ---- 2b. Agency (the default agent CLI) --------------------------------------
+# Agency ships as an internal NuGet package with its own self-updating ring
+# layout, so there is no npm package to install - aka.ms/InstallTool.ps1 is its
+# supported bootstrap. Installed here rather than in the wizard so the binary
+# is already on PATH when the wizard probes for it, which keeps the "Microsoft
+# Agency" row green on the very first screen.
+#
+# Never fatal: a box without agency still gets a working ClawDevbox, and the
+# wizard offers Copilot and Claude as alternatives.
+if (-not $SkipAgency) {
+    if (Test-Cmd 'agency') {
+        Write-Log "Agency already installed: $((& agency --version) 2>&1)"
+    } else {
+        Write-Log 'Installing Agency'
+        try {
+            Invoke-Expression 'iex "& { $(irm aka.ms/InstallTool.ps1)} agency"'
+            Sync-Path
+            if (Test-Cmd 'agency') { Write-Log "Agency installed: $((& agency --version) 2>&1)" }
+            else { Write-Log 'Agency installer ran but no agency command appeared.' }
+        } catch { Write-Log "Agency install failed: $($_.Exception.Message)" }
     }
 }
 
