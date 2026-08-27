@@ -69,8 +69,25 @@ if ($NpmRegistry) {
 $work = Join-Path $env:TEMP ("cdb-upgrade-" + [Guid]::NewGuid().ToString('N').Substring(0, 8))
 New-Item -ItemType Directory -Path $work -Force | Out-Null
 try {
+    # A task has no terminal, so an unauthenticated clone of a private repo
+    # would sit forever on a credential prompt rather than failing. Refuse to
+    # prompt, and supply the token `gh` already holds from the wizard sign-in.
+    $env:GIT_TERMINAL_PROMPT = '0'
+    $env:GCM_INTERACTIVE = 'never'
+
+    $cloneUrl = $Repo
+    $token = ''
+    try { $token = (& gh auth token 2>$null | Select-Object -First 1).ToString().Trim() } catch { }
+    if ($token -and $Repo -match '^https://github\.com/') {
+        $cloneUrl = $Repo -replace '^https://github\.com/', "https://x-access-token:$token@github.com/"
+        Write-Output '  using the gh credential for the clone'
+    } else {
+        Write-Output '  no gh token available - relying on the ambient git credential helper'
+    }
+
     Write-Output "  cloning $Repo ($Branch) -> $work"
-    & git clone --depth 1 --branch $Branch $Repo "$work\src" 2>&1 | Select-Object -Last 3 | ForEach-Object { "  $_" }
+    & git clone --depth 1 --branch $Branch $cloneUrl "$work\src" 2>&1 |
+        Select-Object -Last 3 | ForEach-Object { "  $($_ -replace 'x-access-token:[^@]+@', 'x-access-token:***@')" }
     if (-not (Test-Path "$work\src\package.json")) { throw "clone did not produce a package.json" }
 
     Push-Location "$work\src"
