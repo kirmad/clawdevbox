@@ -246,19 +246,36 @@ if ((Test-Path $target) -and (Test-Cmd 'node')) {
         Write-Log "could not arm the Run fallback: $($_.Exception.Message)"
     }
 
-    # Report the outcome. Only pop Notepad when we actually have a desktop to
-    # pop it onto - in session 0 it would be one more invisible orphan.
-    Start-Sleep -Seconds 25
+    # Report the outcome.
+    #
+    # POLL, don't sample once. This used to sleep 25s and probe a single time,
+    # which on a cold dev box declared failure 34 seconds BEFORE the wizard
+    # finished starting:
+    #
+    #   16:23:44  started the first-run experience (kiosk)
+    #   16:24:11  "did not come up"          <- gave up here
+    #   16:24:45  Bootstrap ready at http://127.0.0.1:5320/
+    #
+    # It then popped Notepad over a wizard that was about to appear, so a
+    # perfectly good deployment looked broken. First boot has to fetch and
+    # start Node, so ~60s is normal and the ceiling needs real headroom.
+    $deadline = (Get-Date).AddSeconds(180)
     $up = $false
-    try {
-        $probe = Invoke-WebRequest -Uri 'http://127.0.0.1:5320/' -UseBasicParsing -TimeoutSec 5
-        $up = ($probe.StatusCode -eq 200)
-    } catch { $up = $false }
+    while (-not $up -and (Get-Date) -lt $deadline) {
+        try {
+            $probe = Invoke-WebRequest -Uri 'http://127.0.0.1:5320/' -UseBasicParsing -TimeoutSec 5
+            $up = ($probe.StatusCode -eq 200)
+        } catch { $up = $false }
+        if (-not $up) { Start-Sleep -Seconds 5 }
+    }
 
     if ($up) {
         Write-Log 'the first-run experience is serving on 127.0.0.1:5320'
     } elseif ($interactive) {
-        Write-Log 'the first-run experience did not come up - opening the log so it is visible'
+        # Only pop Notepad when we actually have a desktop to pop it onto - in
+        # session 0 it would be one more invisible orphan - and only after the
+        # full budget has genuinely elapsed.
+        Write-Log 'the first-run experience did not come up within 180s - opening the log so it is visible'
         try { Start-Process notepad.exe -ArgumentList "`"$log`"" } catch { }
     } else {
         Write-Log 'the first-run experience is not serving yet; the logon task will start it in the user session'
